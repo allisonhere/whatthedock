@@ -25,7 +25,7 @@ func (m Model) View() string {
 	}
 	activityTitle, activityHint := m.activityHeader()
 	panes := [3]tideui.Pane{
-		{Title: "Projects", Hint: "space collapse  / filter", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
+		{Title: "Projects", Hint: "enter/space collapse  / filter", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
 		{Title: "Inspector", Hint: "s start/stop  alt+r restart", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
 	}
@@ -98,8 +98,10 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		case rowService:
 			prefix += "  "
 		case rowContainer:
-			prefix += statusGlyph(*row.container) + " "
-			suffix = statusText(*row.container)
+			healthColor := inspectorStatusColor(*row.container)
+			baseFg := rowForeground(renderer, selected, row.muted)
+			prefix += healthSpan(statusGlyph(*row.container), healthColor, baseFg) + " "
+			suffix = healthSpan(statusText(*row.container), healthColor, baseFg)
 			if row.container.Compose.Service != "" {
 				text = row.container.Compose.Service
 			}
@@ -109,6 +111,29 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		lines = append(lines, renderer.RenderRow(tideui.Row{Prefix: prefix, Text: text, Suffix: suffix, Selected: selected, Muted: row.muted}, width))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// rowForeground returns the foreground color RenderRow will use for a row in
+// the given state, so a colored span within that row can restore it exactly.
+func rowForeground(renderer tideui.Renderer, selected, muted bool) lipgloss.Color {
+	style := renderer.Styles.Item
+	switch {
+	case selected:
+		style = renderer.Styles.ItemSelected
+	case muted:
+		style = renderer.Styles.ItemMuted
+	}
+	if c, ok := style.GetForeground().(lipgloss.Color); ok {
+		return c
+	}
+	return renderer.Styles.Theme.Fg
+}
+
+// healthSpan colors text without a trailing SGR reset, so it can sit inside a
+// RenderRow prefix/suffix without clobbering the row's own background.
+func healthSpan(text string, color, restore lipgloss.Color) string {
+	return ansi.NewStyle().ForegroundColor(color).String() + text +
+		ansi.NewStyle().ForegroundColor(restore).String()
 }
 
 func (m Model) renderActivity(renderer tideui.Renderer) string {
@@ -869,12 +894,16 @@ func (m Model) renderProblems(renderer tideui.Renderer) string {
 	lines := make([]string, 0, len(problems)+1)
 	lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
 	for i, problem := range problems {
+		selected := m.problemSelected(i, problem)
+		muted := problem.severity == "warn"
+		color := severityColor(problem.severity)
+		baseFg := rowForeground(renderer, selected, muted)
 		lines = append(lines, renderer.RenderRow(tideui.Row{
-			Prefix:   problem.severity + "  ",
+			Prefix:   healthSpan(problem.severity, color, baseFg) + "  ",
 			Text:     problem.name,
-			Suffix:   problem.detail,
-			Selected: m.problemSelected(i, problem),
-			Muted:    problem.severity == "warn",
+			Suffix:   healthSpan(problem.detail, color, baseFg),
+			Selected: selected,
+			Muted:    muted,
 		}, width))
 	}
 	return strings.Join(lines, "\n")
@@ -957,39 +986,178 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 		return renderer.Styles.DetailMeta.Render("No container selected.")
 	}
 	ctr := *m.selected
+	width := max(12, m.rightPaneWidth()-4)
 	var lines []string
-	add := func(label, value string) {
-		if strings.TrimSpace(value) == "" {
-			value = "none"
-		}
-		lines = append(lines, renderer.RenderRow(tideui.Row{Prefix: label + "  ", Text: value}, max(12, m.rightPaneWidth()-4)))
+	addSection := func(title string) {
+		lines = append(lines, renderInspectorSection(renderer, width, title))
+	}
+	add := func(label, value, suffix string, color lipgloss.Color) {
+		lines = append(lines, renderInspectorField(renderer, width, label, value, suffix, color)...)
 	}
 	lines = append(lines, renderer.Styles.DetailTitle.Render(ctr.DisplayName()))
-	add("Status", strings.TrimSpace(strings.Join([]string{string(ctr.State), string(ctr.Health)}, " ")))
-	add("Uptime", formatDuration(ctr.Created))
-	add("Image", ctr.Image)
-	add("Image ID", short(ctr.ImageID, 20))
-	add("Restart", ctr.RestartPolicy)
-	add("Restarts", fmt.Sprintf("%d", ctr.RestartCount))
+	addSection("Runtime")
+	add("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr))
+	add("Uptime", formatDuration(ctr.Created), "", "#9aa6b2")
+	add("Restart", ctr.RestartPolicy, "", "")
+	add("Restarts", fmt.Sprintf("%d", ctr.RestartCount), "", restartCountColor(ctr.RestartCount))
+
+	addSection("Image")
+	add("Image", ctr.Image, "c", "#7dcfff")
+	add("Image ID", short(ctr.ImageID, 20), "c", "#9aa6b2")
+
 	if ctr.Compose.Project != "" {
-		add("Project", ctr.Compose.Project)
-		add("Service", ctr.Compose.Service)
+		addSection("Compose")
+		add("Project", ctr.Compose.Project, "c", "#80c990")
+		add("Service", ctr.Compose.Service, "c", "#80c990")
+		add("Number", ctr.Compose.ContainerNumber, "c", "#9aa6b2")
+		add("Config", ctr.Compose.ConfigFiles, "c/o", "#9aa6b2")
 	}
-	add("Ports", formatPorts(ctr.Ports))
-	add("Mounts", formatMounts(ctr.Mounts))
-	add("Networks", strings.Join(ctr.Networks, ", "))
-	add("Env", formatList(ctr.Env, 8))
-	add("Labels", formatMap(ctr.Labels, 8))
+
+	addSection("Network")
+	add("Ports", formatPorts(ctr.Ports), detailHint(len(ctr.Ports) > 0, true), "#e5c07b")
+	add("Networks", strings.Join(ctr.Networks, ", "), "", "#7dcfff")
+
+	addSection("Files")
+	add("Mounts", formatMounts(ctr.Mounts), detailHint(len(ctr.Mounts) > 0, true), "#c678dd")
+
+	addSection("Metadata")
+	add("Env", formatList(ctr.Env, 8), "", "#9aa6b2")
+	add("Labels", formatMap(ctr.Labels, 8), detailHint(len(ctr.Labels) > 0, false), "#9aa6b2")
 	if ctr.HealthCheck != nil {
-		add("Health", strings.Join(ctr.HealthCheck.Test, " "))
+		add("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr))
 	}
 	lines = append(lines, "")
-	lines = append(lines, renderActionBar(renderer, max(12, m.rightPaneWidth()-4)))
+	lines = append(lines, renderActionBar(renderer, width))
 	return strings.Join(lines, "\n")
 }
 
+func renderInspectorSection(renderer tideui.Renderer, width int, title string) string {
+	return renderer.Styles.DetailMeta.Copy().
+		Foreground(renderer.Styles.Theme.Fg).
+		Bold(true).
+		Italic(false).
+		Width(width).
+		Render(" " + strings.ToUpper(title))
+}
+
+func renderInspectorField(renderer tideui.Renderer, width int, label, value, suffix string, color lipgloss.Color) []string {
+	const labelWidth = 8
+	value = strings.TrimSpace(value)
+	muted := false
+	if value == "" {
+		value = "none"
+		muted = true
+		suffix = ""
+	}
+	values := strings.Split(value, "\n")
+	labelStyle := lipgloss.NewStyle().
+		Background(renderer.Styles.Theme.Bg).
+		Foreground(renderer.Styles.Theme.BorderFocus).
+		Bold(true)
+	valueStyle := lipgloss.NewStyle().
+		Background(renderer.Styles.Theme.Bg).
+		Foreground(renderer.Styles.Theme.Fg)
+	if color != "" {
+		valueStyle = valueStyle.Foreground(color)
+	}
+	if muted {
+		valueStyle = valueStyle.Foreground(renderer.Styles.Theme.Dimmed).Italic(true)
+	}
+	hintStyle := lipgloss.NewStyle().
+		Background(renderer.Styles.Theme.Bg).
+		Foreground(renderer.Styles.Theme.Unread)
+
+	out := make([]string, 0, len(values))
+	for i, line := range values {
+		prefix := strings.Repeat(" ", labelWidth+1)
+		rowSuffix := ""
+		if i == 0 {
+			prefix = labelStyle.Render(fmt.Sprintf("%-*s ", labelWidth, label))
+			if suffix != "" {
+				rowSuffix = hintStyle.Render(suffix)
+			}
+		}
+		out = append(out, renderer.RenderRow(tideui.Row{
+			Prefix: prefix,
+			Text:   valueStyle.Render(line),
+			Suffix: rowSuffix,
+			Muted:  muted,
+		}, width))
+	}
+	return out
+}
+
+func inspectorStatusText(ctr domain.Container) string {
+	parts := []string{statusGlyph(ctr)}
+	if ctr.State != "" {
+		parts = append(parts, string(ctr.State))
+	}
+	if ctr.Health != "" {
+		parts = append(parts, string(ctr.Health))
+	}
+	if ctr.Restarting {
+		parts = append(parts, "restarting")
+	}
+	return strings.Join(parts, " ")
+}
+
+func inspectorStatusColor(ctr domain.Container) lipgloss.Color {
+	if ctr.Restarting || ctr.State == domain.StateRestarting {
+		return "#e5c07b"
+	}
+	switch ctr.Health {
+	case domain.HealthHealthy:
+		return "#80c990"
+	case domain.HealthUnhealthy:
+		return "#e06c75"
+	case domain.HealthStarting, domain.HealthUnknown:
+		return "#e5c07b"
+	}
+	switch ctr.State {
+	case domain.StateRunning:
+		return "#80c990"
+	case domain.StateStopped, domain.StateExited:
+		return "#9aa6b2"
+	case domain.StateDead:
+		return "#e06c75"
+	default:
+		return "#7dcfff"
+	}
+}
+
+func severityColor(severity string) lipgloss.Color {
+	switch severity {
+	case "crit":
+		return "#e06c75"
+	case "warn":
+		return "#e5c07b"
+	default:
+		return "#9aa6b2"
+	}
+}
+
+func restartCountColor(count int) lipgloss.Color {
+	if count <= 0 {
+		return "#9aa6b2"
+	}
+	if count < 3 {
+		return "#e5c07b"
+	}
+	return "#e06c75"
+}
+
+func detailHint(hasValue, openable bool) string {
+	if !hasValue {
+		return ""
+	}
+	if openable {
+		return "c/o"
+	}
+	return "c"
+}
+
 func renderActionBar(renderer tideui.Renderer, width int) string {
-	actions := []string{"s start/stop", "r restart", "l logs", "c copy"}
+	actions := []string{"s start/stop", "r restart", "l logs", "c copy", "o open"}
 	for i, action := range actions {
 		actions[i] = "[" + action + "]"
 	}
@@ -1033,9 +1201,63 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return &overlay
 	case overlaySettings:
 		return m.settingsOverlay(renderer)
+	case overlayCopy:
+		return m.copyOverlay(renderer)
+	case overlayOpen:
+		return m.openOverlay(renderer)
 	default:
 		return nil
 	}
+}
+
+func (m Model) openOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(82, max(46, m.width-8))
+	contentWidth := width - 4
+	rows := m.openRows()
+	lines := make([]string, 0, len(rows)+4)
+	if len(rows) == 0 {
+		lines = append(lines, renderer.Styles.DetailMeta.Render("No openable details."))
+	} else {
+		for i, row := range rows {
+			lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     row.label + "  " + row.value,
+				Suffix:   short(row.target, max(12, contentWidth-30)),
+				Selected: i == m.openCursor,
+			}, contentWidth))
+		}
+	}
+	lines = append(lines, "", renderer.RenderSoftHints(contentWidth,
+		tideui.SoftHint{Key: "enter", Label: "open"},
+		tideui.SoftHint{Key: "esc/o", Label: "close"},
+	))
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "open", Content: content, Width: width})
+	return &overlay
+}
+
+func (m Model) copyOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(82, max(46, m.width-8))
+	contentWidth := width - 4
+	rows := m.copyRows()
+	lines := make([]string, 0, len(rows)+4)
+	if len(rows) == 0 {
+		lines = append(lines, renderer.Styles.DetailMeta.Render("No copyable details."))
+	} else {
+		for i, row := range rows {
+			lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     row.label,
+				Suffix:   short(row.value, max(12, contentWidth-24)),
+				Selected: i == m.copyCursor,
+			}, contentWidth))
+		}
+	}
+	lines = append(lines, "", renderer.RenderSoftHints(contentWidth,
+		tideui.SoftHint{Key: "enter", Label: "copy"},
+		tideui.SoftHint{Key: "esc/c", Label: "close"},
+	))
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "copy", Content: content, Width: width})
+	return &overlay
 }
 
 func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
@@ -1121,6 +1343,8 @@ func helpText() string {
 		"s              start/stop selected container",
 		"r              refresh",
 		"Alt+r          restart selected container",
+		"c              copy selected detail",
+		"o              open port, mount, or compose path",
 		"l              logs",
 		"/              filter logs while logs pane is focused",
 		"e / w / i / a  log errors, warnings, info, all",

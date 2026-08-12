@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/allisonhere/tideui"
+	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -876,6 +878,190 @@ func TestCommandPaletteCanOpenSettings(t *testing.T) {
 	}
 }
 
+func TestCopyKeyOpensCopyOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 100, 30
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("copy key returned cmd = %#v, want nil", cmd)
+	}
+	if model.overlay != overlayCopy {
+		t.Fatalf("overlay = %v, want copy", model.overlay)
+	}
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"whatthedock · copy", "Container ID", "Image", "Port", "Mount", "Label com.docker.compose.project"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("copy overlay missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestInspectorShowsContextualCopyOpenHints(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"RUNTIME", "IMAGE", "COMPOSE", "NETWORK", "FILES", "METADATA", "Image", "c", "Ports", "c/o", "Mounts", "Labels"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("inspector missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestInspectorUsesColorWithoutChangingVisibleText(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+
+	rawView := model.View()
+	stripped := ansi.Strip(rawView)
+	if !strings.Contains(rawView, "\x1b[") {
+		t.Fatalf("inspector view missing ANSI color styling:\n%s", rawView)
+	}
+	for _, want := range []string{"Status", "! running unhealthy", "Image", "radarr", "Ports", "7878 -> 7878/tcp"} {
+		if !strings.Contains(stripped, want) {
+			t.Fatalf("stripped inspector missing %q:\n%s", want, stripped)
+		}
+	}
+}
+
+func TestCopyOverlayCopiesSelectedRow(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.overlay = overlayCopy
+	model.copyCursor = 0
+	var out bytes.Buffer
+	originalWriter := clipboardWriter
+	clipboardWriter = &out
+	defer func() { clipboardWriter = originalWriter }()
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want none", model.overlay)
+	}
+	if model.status != "copied container id 1" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want copied status", model.status, model.statusErr)
+	}
+	runCmd(t, cmd)
+	got := out.String()
+	if !strings.HasPrefix(got, "\x1b]52;c;") || !strings.HasSuffix(got, "\a") {
+		t.Fatalf("clipboard output = %q, want OSC52 sequence", got)
+	}
+}
+
+func TestOpenKeyOpensOpenOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 100, 30
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("open key returned cmd = %#v, want nil", cmd)
+	}
+	if model.overlay != overlayOpen {
+		t.Fatalf("overlay = %v, want open", model.overlay)
+	}
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"whatthedock · open", "Port", "0.0.0.0:7878 -> 7878/tcp", "http://localhost:7878", "Mount", "/srv/media/radarr -> /config"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("open overlay missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestOpenOverlayOpensSelectedTarget(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.overlay = overlayOpen
+	model.openCursor = 0
+	var opened string
+	originalOpen := openTarget
+	openTarget = func(target string) error {
+		opened = target
+		return nil
+	}
+	defer func() { openTarget = originalOpen }()
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want none", model.overlay)
+	}
+	if model.status != "opening port 0.0.0.0:7878 -> 7878/tcp" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want opening status", model.status, model.statusErr)
+	}
+	msg := runCmd(t, cmd)
+	if opened != "http://localhost:7878" {
+		t.Fatalf("opened = %q, want localhost port URL", opened)
+	}
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if model.statusErr {
+		t.Fatalf("statusErr = true after successful open, status=%q", model.status)
+	}
+}
+
+func TestOpenOverlayShowsOpenErrors(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	originalOpen := openTarget
+	openTarget = func(string) error { return errors.New("no opener") }
+	defer func() { openTarget = originalOpen }()
+
+	msg := openTargetCmd("Port", "http://localhost:7878")()
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+	if !model.statusErr || !strings.Contains(model.status, "open port: no opener") {
+		t.Fatalf("status/statusErr = %q/%v, want open error", model.status, model.statusErr)
+	}
+}
+
+func TestCommandPaletteCanOpenCopyOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	updated, cmd := model.executeCommand("open-copy")
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("open-copy cmd = %#v, want nil", cmd)
+	}
+	if model.overlay != overlayCopy {
+		t.Fatalf("overlay = %v, want copy", model.overlay)
+	}
+}
+
+func TestCommandPaletteCanOpenPortAndMountOverlays(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		command    actions.ID
+		wantCursor int
+		wantLabel  string
+	}{
+		{"port", actions.OpenPort, 0, "Port"},
+		{"mount", actions.OpenMount, 1, "Mount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := testModelWithSelectedContainer()
+			updated, cmd := model.executeCommand(tc.command)
+			model = updated.(Model)
+			if cmd != nil {
+				t.Fatalf("%s cmd = %#v, want nil", tc.command, cmd)
+			}
+			if model.overlay != overlayOpen {
+				t.Fatalf("overlay = %v, want open", model.overlay)
+			}
+			if model.openCursor != tc.wantCursor {
+				t.Fatalf("openCursor = %d, want %d", model.openCursor, tc.wantCursor)
+			}
+			rows := model.openRows()
+			if rows[model.openCursor].label != tc.wantLabel {
+				t.Fatalf("selected open row = %q, want %q", rows[model.openCursor].label, tc.wantLabel)
+			}
+		})
+	}
+}
+
 func TestSettingsAffectStatsRendering(t *testing.T) {
 	model := testModelInStatsMode()
 	model.settings.GraphStyle = graphStyleBraille
@@ -1006,6 +1192,8 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 		{"filter", overlayFilter, "whatthedock · filter"},
 		{"command", overlayCommandPalette, "whatthedock · command"},
 		{"settings", overlaySettings, "whatthedock · settings"},
+		{"copy", overlayCopy, "whatthedock · copy"},
+		{"open", overlayOpen, "whatthedock · open"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			model.overlay = tc.overlay
@@ -1024,9 +1212,8 @@ func testModel() Model {
 	return model
 }
 
-func testModelInStatsMode() Model {
+func testModelWithSelectedContainer() Model {
 	model := testModel()
-	model.width, model.height = 120, 30
 	model.rows = model.buildRows()
 	for i, row := range model.rows {
 		if row.container != nil && row.container.ID.ID == "1" {
@@ -1036,6 +1223,12 @@ func testModelInStatsMode() Model {
 			break
 		}
 	}
+	return model
+}
+
+func testModelInStatsMode() Model {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
 	model.mode = activityStats
 	model.focus = paneActivity
 	return model
@@ -1044,7 +1237,23 @@ func testModelInStatsMode() Model {
 func newFakeProvider() *fakeProvider {
 	host := domain.Host{ID: "local", Name: "local"}
 	containers := []domain.Container{
-		{ID: domain.ResourceID{Host: "local", ID: "1"}, Name: "radarr-1", Image: "radarr", State: domain.StateRunning, Health: domain.HealthUnhealthy, Compose: domain.ComposeRef{Project: "media", Service: "radarr"}},
+		{
+			ID:      domain.ResourceID{Host: "local", ID: "1"},
+			Name:    "radarr-1",
+			Image:   "radarr",
+			ImageID: "sha256:abc123",
+			State:   domain.StateRunning,
+			Health:  domain.HealthUnhealthy,
+			Compose: domain.ComposeRef{
+				Project:         "media",
+				Service:         "radarr",
+				ContainerNumber: "1",
+				ConfigFiles:     "/srv/media/compose.yml",
+			},
+			Ports:  []domain.Port{{IP: "0.0.0.0", Private: 7878, Public: 7878, Type: "tcp"}},
+			Mounts: []domain.Mount{{Type: "bind", Source: "/srv/media/radarr", Destination: "/config", ReadWrite: true}},
+			Labels: map[string]string{"com.docker.compose.project": "media", "com.docker.compose.service": "radarr"},
+		},
 		{ID: domain.ResourceID{Host: "local", ID: "2"}, Name: "jellyfin-1", Image: "jellyfin", State: domain.StateStopped, Compose: domain.ComposeRef{Project: "media", Service: "jellyfin"}},
 	}
 	snapshot := domain.BuildSnapshot(host, containers, time.Unix(1, 0))

@@ -6,10 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/allisonhere/tideui"
+	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/allisonhere/whatthedock/internal/actions"
@@ -44,6 +49,8 @@ const (
 	overlayCommandPalette
 	overlayThemePicker
 	overlaySettings
+	overlayCopy
+	overlayOpen
 )
 
 type graphStyle int
@@ -123,6 +130,25 @@ type settingsRow struct {
 	action settingsAction
 }
 
+type copyRow struct {
+	label string
+	value string
+}
+
+type openKind int
+
+const (
+	openKindPort openKind = iota
+	openKindMount
+)
+
+type openRow struct {
+	kind   openKind
+	label  string
+	value  string
+	target string
+}
+
 type settingsRowKind int
 
 const (
@@ -189,7 +215,13 @@ type Model struct {
 	settings       appSettings
 	settingsCursor int
 	settingsPath   string
+
+	copyCursor int
+	openCursor int
 }
+
+var clipboardWriter io.Writer = os.Stderr
+var openTarget = defaultOpenTarget
 
 type snapshotMsg struct {
 	snapshot domain.Snapshot
@@ -236,6 +268,11 @@ type logsStartedMsg struct {
 }
 
 type logTickMsg struct{}
+
+type openDoneMsg struct {
+	label string
+	err   error
+}
 
 func NewModel(provider app.Provider) Model {
 	return NewModelWithSettings(provider, config.Settings{}, "")
@@ -443,6 +480,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = msg.label+" complete", false
 		}
 		return m, m.refreshCmd()
+	case openDoneMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "open "+msg.label+": "+msg.err.Error(), true
+		}
+		return m, nil
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 	case tea.KeyMsg:
@@ -545,8 +587,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == paneActivity && m.mode == activityProblems {
 			return m.selectProblem(m.problemCursor)
 		}
-		if row := m.currentRow(); row != nil && row.container != nil {
-			return m, m.loadSelectedCmd()
+		if row := m.currentRow(); row != nil {
+			if row.kind == rowProject {
+				m.collapsed[row.project] = !m.collapsed[row.project]
+				m.rows = m.buildRows()
+				m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+				return m, nil
+			}
+			if row.container != nil {
+				return m, m.loadSelectedCmd()
+			}
 		}
 	case "/":
 		if m.focus == paneActivity && m.mode == activityLogs {
@@ -586,6 +636,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overlay = overlayCommandPalette
 		m.commandFilter = ""
 		m.commandCursor = 0
+	case "c":
+		m.openCopyOverlay()
+	case "o":
+		m.openOpenOverlay()
 	case "r":
 		if msg.Alt {
 			return m, m.actionCmd(actions.Restart, "restart")
@@ -679,6 +733,56 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case overlaySettings:
 		return m.handleSettingsKey(msg)
+	case overlayCopy:
+		return m.handleCopyKey(msg)
+	case overlayOpen:
+		return m.handleOpenKey(msg)
+	}
+	return m, nil
+}
+
+func (m Model) handleCopyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "c":
+		m.overlay = overlayNone
+	case "up", "k":
+		m.moveCopyCursor(-1)
+	case "down", "j", "tab":
+		m.moveCopyCursor(1)
+	case "enter":
+		rows := m.copyRows()
+		if len(rows) == 0 {
+			m.overlay = overlayNone
+			m.status, m.statusErr = "nothing to copy", true
+			return m, nil
+		}
+		row := rows[clamp(m.copyCursor, 0, len(rows)-1)]
+		m.overlay = overlayNone
+		m.status, m.statusErr = "copied "+strings.ToLower(row.label)+" "+short(row.value, 48), false
+		return m, copyTextCmd(row.value)
+	}
+	return m, nil
+}
+
+func (m Model) handleOpenKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "o":
+		m.overlay = overlayNone
+	case "up", "k":
+		m.moveOpenCursor(-1)
+	case "down", "j", "tab":
+		m.moveOpenCursor(1)
+	case "enter":
+		rows := m.openRows()
+		if len(rows) == 0 {
+			m.overlay = overlayNone
+			m.status, m.statusErr = "nothing to open", true
+			return m, nil
+		}
+		row := rows[clamp(m.openCursor, 0, len(rows)-1)]
+		m.overlay = overlayNone
+		m.status, m.statusErr = "opening "+strings.ToLower(row.label)+" "+short(row.value, 48), false
+		return m, openTargetCmd(row.label, row.target)
 	}
 	return m, nil
 }
@@ -765,6 +869,12 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 			m.statsErr = nil
 			return m, m.loadStatsCmd(selected.ID)
 		}
+	case actions.OpenCopy:
+		m.openCopyOverlay()
+	case actions.OpenPort:
+		m.openOpenOverlayFor(openKindPort)
+	case actions.OpenMount:
+		m.openOpenOverlayFor(openKindMount)
 	case actions.OpenFilter:
 		m.overlay = overlayFilter
 		m.filterDraft = m.filter
@@ -796,6 +906,219 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 func (m *Model) openThemePicker() {
 	m.themes.Open(m.theme.Name)
 	m.overlay = overlayThemePicker
+}
+
+func (m *Model) openCopyOverlay() {
+	if m.selectedContainer() == nil {
+		m.status, m.statusErr = "no container selected", true
+		return
+	}
+	m.overlay = overlayCopy
+	m.copyCursor = clamp(m.copyCursor, 0, len(m.copyRows())-1)
+}
+
+func (m *Model) openOpenOverlay() {
+	if m.selectedContainer() == nil {
+		m.status, m.statusErr = "no container selected", true
+		return
+	}
+	rows := m.openRows()
+	if len(rows) == 0 {
+		m.status, m.statusErr = "nothing openable for selected container", true
+		return
+	}
+	m.overlay = overlayOpen
+	m.openCursor = clamp(m.openCursor, 0, len(rows)-1)
+}
+
+func (m *Model) openOpenOverlayFor(kind openKind) {
+	m.openOpenOverlay()
+	if m.overlay != overlayOpen {
+		return
+	}
+	for i, row := range m.openRows() {
+		if row.kind == kind {
+			m.openCursor = i
+			return
+		}
+	}
+}
+
+func (m Model) copyRows() []copyRow {
+	ctr := m.selectedContainer()
+	if ctr == nil {
+		return nil
+	}
+	var rows []copyRow
+	add := func(label, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			rows = append(rows, copyRow{label: label, value: value})
+		}
+	}
+
+	add("Container ID", ctr.ID.ID)
+	add("Name", ctr.DisplayName())
+	add("Image", ctr.Image)
+	add("Image ID", ctr.ImageID)
+	add("Compose project", ctr.Compose.Project)
+	add("Compose service", ctr.Compose.Service)
+	add("Compose number", ctr.Compose.ContainerNumber)
+	add("Compose config", ctr.Compose.ConfigFiles)
+	for _, port := range ctr.Ports {
+		add("Port", copyPortValue(port))
+	}
+	for _, mount := range ctr.Mounts {
+		add("Mount", copyMountValue(mount))
+	}
+	keys := make([]string, 0, len(ctr.Labels))
+	for key := range ctr.Labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		add("Label "+key, key+"="+ctr.Labels[key])
+	}
+	return rows
+}
+
+func (m *Model) moveCopyCursor(delta int) {
+	rows := m.copyRows()
+	if len(rows) == 0 {
+		m.copyCursor = 0
+		return
+	}
+	m.copyCursor = (m.copyCursor + delta + len(rows)) % len(rows)
+}
+
+func copyPortValue(port domain.Port) string {
+	private := fmt.Sprintf("%d/%s", port.Private, port.Type)
+	if port.Public <= 0 {
+		return private
+	}
+	public := fmt.Sprintf("%d", port.Public)
+	if strings.TrimSpace(port.IP) != "" {
+		public = port.IP + ":" + public
+	}
+	return public + " -> " + private
+}
+
+func copyMountValue(mount domain.Mount) string {
+	value := mount.Source + " -> " + mount.Destination
+	var meta []string
+	if mount.Type != "" {
+		meta = append(meta, mount.Type)
+	}
+	if mount.Mode != "" {
+		meta = append(meta, mount.Mode)
+	}
+	if !mount.ReadWrite {
+		meta = append(meta, "ro")
+	}
+	if len(meta) > 0 {
+		value += " (" + strings.Join(meta, ", ") + ")"
+	}
+	return value
+}
+
+func copyTextCmd(value string) tea.Cmd {
+	sequence := osc52.New(value).String()
+	return func() tea.Msg {
+		_, _ = io.WriteString(clipboardWriter, sequence)
+		return nil
+	}
+}
+
+func (m Model) openRows() []openRow {
+	ctr := m.selectedContainer()
+	if ctr == nil {
+		return nil
+	}
+	var rows []openRow
+	for _, port := range ctr.Ports {
+		target := portOpenTarget(port)
+		if target == "" {
+			continue
+		}
+		rows = append(rows, openRow{kind: openKindPort, label: "Port", value: copyPortValue(port), target: target})
+	}
+	for _, mount := range ctr.Mounts {
+		target := strings.TrimSpace(mount.Source)
+		if target == "" {
+			target = strings.TrimSpace(mount.Destination)
+		}
+		if target != "" {
+			rows = append(rows, openRow{kind: openKindMount, label: "Mount", value: copyMountValue(mount), target: target})
+		}
+	}
+	for _, path := range splitComposeConfigFiles(ctr.Compose.ConfigFiles) {
+		rows = append(rows, openRow{kind: openKindMount, label: "Compose config", value: path, target: path})
+	}
+	return rows
+}
+
+func (m *Model) moveOpenCursor(delta int) {
+	rows := m.openRows()
+	if len(rows) == 0 {
+		m.openCursor = 0
+		return
+	}
+	m.openCursor = (m.openCursor + delta + len(rows)) % len(rows)
+}
+
+func portOpenTarget(port domain.Port) string {
+	if port.Public <= 0 {
+		return ""
+	}
+	host := strings.TrimSpace(port.IP)
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "localhost"
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return fmt.Sprintf("http://%s:%d", host, port.Public)
+}
+
+func splitComposeConfigFiles(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n'
+	})
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func openTargetCmd(label, target string) tea.Cmd {
+	return func() tea.Msg {
+		if err := openTarget(target); err != nil {
+			return openDoneMsg{label: strings.ToLower(label), err: err}
+		}
+		return openDoneMsg{label: strings.ToLower(label)}
+	}
+}
+
+func defaultOpenTarget(target string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", target)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", target)
+	default:
+		cmd = exec.Command("xdg-open", target)
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() {
+		_ = cmd.Wait()
+	}()
+	return nil
 }
 
 func (m Model) settingsRows() []settingsRow {

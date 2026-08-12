@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -14,9 +15,21 @@ import (
 	"github.com/allisonhere/whatthedock/internal/ui"
 )
 
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
 func main() {
 	demoMode := flag.Bool("demo", false, "run against WhatTheDock's built-in demo Docker environment")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	provider, err := providerForMode(*demoMode || os.Getenv("WHATTHEDOCK_PROVIDER") == "demo")
 	if err != nil {
@@ -34,6 +47,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func versionString() string {
+	parts := []string{"whatthedock", version}
+	if commit != "" {
+		parts = append(parts, "commit "+commit)
+	}
+	if date != "" {
+		parts = append(parts, "built "+date)
+	}
+	return strings.Join(parts, " ")
 }
 
 func providerForMode(demoMode bool) (app.Provider, error) {

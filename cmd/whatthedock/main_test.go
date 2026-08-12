@@ -6,6 +6,32 @@ import (
 	"testing"
 )
 
+func TestVersionStringDefaultsToDev(t *testing.T) {
+	t.Setenv("WHATTHEDOCK_PROVIDER", "")
+	oldVersion, oldCommit, oldDate := version, commit, date
+	t.Cleanup(func() {
+		version, commit, date = oldVersion, oldCommit, oldDate
+	})
+	version, commit, date = "dev", "", ""
+
+	if got := versionString(); got != "whatthedock dev" {
+		t.Fatalf("versionString() = %q, want dev version", got)
+	}
+}
+
+func TestVersionStringIncludesBuildMetadata(t *testing.T) {
+	oldVersion, oldCommit, oldDate := version, commit, date
+	t.Cleanup(func() {
+		version, commit, date = oldVersion, oldCommit, oldDate
+	})
+	version, commit, date = "v1.2.3", "abc1234", "2026-08-12"
+
+	want := "whatthedock v1.2.3 commit abc1234 built 2026-08-12"
+	if got := versionString(); got != want {
+		t.Fatalf("versionString() = %q, want %q", got, want)
+	}
+}
+
 func TestLoadSettingsIgnoresInvalidConfig(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configDir)

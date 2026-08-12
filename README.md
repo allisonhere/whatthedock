@@ -32,12 +32,14 @@ back to built-in defaults.
 |---|---|
 | `j` / `Down` | Move down |
 | `k` / `Up` | Move up |
-| `Enter` | Select/open |
+| `Enter` | Select/open, or expand/collapse Compose project |
 | `Space` | Expand/collapse Compose project |
 | `/` | Filter projects, services, and containers |
 | `s` | Start/stop selected container |
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
+| `c` | Copy selected container details |
+| `o` | Open selected container ports, mounts, or Compose paths |
 | `l` | Focus logs |
 | `p` | Show problems |
 | `g` | Show stats graphs |
@@ -59,6 +61,12 @@ Mouse row selection and wheel navigation are enabled where the terminal and
 Bubble Tea support them.
 
 ## Build
+
+Install the latest `main` build with Go:
+
+```bash
+go install github.com/allisonhere/whatthedock/cmd/whatthedock@latest
+```
 
 ```bash
 go mod download
@@ -90,6 +98,20 @@ go build -buildvcs=false -o whatthedock ./cmd/whatthedock
 ./whatthedock
 ```
 
+Print the build version:
+
+```bash
+whatthedock --version
+```
+
+Release builds can stamp version metadata with Go linker flags:
+
+```bash
+go build -buildvcs=false \
+  -ldflags "-X main.version=v0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%d)" \
+  -o whatthedock ./cmd/whatthedock
+```
+
 ## Development
 
 ```bash
@@ -118,6 +140,10 @@ make build
   graph colors, log color mode, deltas, refresh interval, and default activity
   pane.
 - Starts, stops, restarts, and refreshes containers.
+- Copies selected container IDs, images, Compose metadata, ports, mounts, and
+  labels via terminal OSC52 clipboard escape sequences.
+- Opens published ports, bind mounts, and Compose config paths from the
+  inspector.
 - Shows actionable Docker connection and permission errors.
 - Includes a built-in demo provider for development on machines without Docker.
 
@@ -139,7 +165,7 @@ WhatTheDock.
 
 - Docker event stream.
 - Exec shell workflow.
-- Copy/open actions for ports, labels, mounts, and environment values.
+- Open/copy actions for environment values.
 - Deeper problem detection for orphaned, stale, and resource-heavy Docker
   resources.
 - Multi-host support for local sockets, Docker contexts, and SSH-backed
