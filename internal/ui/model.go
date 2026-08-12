@@ -175,16 +175,17 @@ type Model struct {
 	focus  pane
 	mode   activityMode
 
-	loading       bool
-	snapshot      domain.Snapshot
-	rows          []treeRow
-	cursor        int
-	problemCursor int
-	collapsed     map[string]bool
-	selectedID    domain.ResourceID
-	selected      *domain.Container
-	filter        string
-	filterDraft   string
+	loading         bool
+	snapshot        domain.Snapshot
+	rows            []treeRow
+	cursor          int
+	problemCursor   int
+	collapsed       map[string]bool
+	selectedID      domain.ResourceID
+	selected        *domain.Container
+	filter          string
+	filterDraft     string
+	inspectorScroll int
 
 	logLines   []string
 	logFilter  string
@@ -230,6 +231,7 @@ type snapshotMsg struct {
 }
 
 type detailMsg struct {
+	id        domain.ResourceID
 	container domain.Container
 	err       error
 }
@@ -295,6 +297,7 @@ func NewModelWithSettings(provider app.Provider, persisted config.Settings, sett
 		logViews:     map[domain.ResourceID]logViewState{},
 		logFollow:    true,
 		collapsed:    map[string]bool{},
+		loading:      true,
 		status:       "connecting to Docker",
 	}
 }
@@ -415,14 +418,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.preserveSelection()
 		return m, m.loadSelectedCmd()
 	case detailMsg:
+		if msg.id != m.selectedID {
+			// A newer selection has since superseded this in-flight request; discard it.
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
 			return m, nil
 		}
 		m.saveLogViewState()
-		selectionChanged := msg.container.ID != m.selectedID
+		selectionChanged := m.selected == nil || msg.container.ID != m.selected.ID
 		m.selected = &msg.container
-		m.selectedID = msg.container.ID
 		if selectionChanged {
 			if m.logCancel != nil {
 				m.logCancel()
@@ -431,6 +437,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logChan = nil
 			m.logLines = nil
 			m.logErr = nil
+			m.inspectorScroll = 0
 		}
 		m.restoreLogViewState(msg.container.ID)
 		if m.mode == activityStats {
@@ -513,27 +520,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.focus = (m.focus + 2) % 3
 	case "j", "down":
-		if m.focus == paneActivity && m.mode == activityProblems {
+		switch {
+		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(1)
-			return m, nil
-		}
-		if m.focus == paneActivity && m.mode == activityLogs {
+		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(1)
-			return m, nil
+		case m.focus == paneInspector:
+			m.scrollInspector(1)
+		case m.focus == paneTree:
+			m.moveCursor(1)
+			return m, m.loadSelectedCmd()
 		}
-		m.moveCursor(1)
-		return m, m.loadSelectedCmd()
+		return m, nil
 	case "k", "up":
-		if m.focus == paneActivity && m.mode == activityProblems {
+		switch {
+		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(-1)
-			return m, nil
-		}
-		if m.focus == paneActivity && m.mode == activityLogs {
+		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(-1)
-			return m, nil
+		case m.focus == paneInspector:
+			m.scrollInspector(-1)
+		case m.focus == paneTree:
+			m.moveCursor(-1)
+			return m, m.loadSelectedCmd()
 		}
-		m.moveCursor(-1)
-		return m, m.loadSelectedCmd()
+		return m, nil
 	case "pgdown":
 		if m.focus == paneActivity && m.mode == activityLogs {
 			m.scrollLogs(max(1, m.logVisibleRows()-1))
@@ -585,24 +596,28 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case " ":
-		if row := m.currentRow(); row != nil && row.kind == rowProject {
-			m.collapsed[row.project] = !m.collapsed[row.project]
-			m.rows = m.buildRows()
-			m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+		if m.focus == paneTree {
+			if row := m.currentRow(); row != nil && row.kind == rowProject {
+				m.collapsed[row.project] = !m.collapsed[row.project]
+				m.rows = m.buildRows()
+				m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+			}
 		}
 	case "enter":
 		if m.focus == paneActivity && m.mode == activityProblems {
 			return m.selectProblem(m.problemCursor)
 		}
-		if row := m.currentRow(); row != nil {
-			if row.kind == rowProject {
-				m.collapsed[row.project] = !m.collapsed[row.project]
-				m.rows = m.buildRows()
-				m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
-				return m, nil
-			}
-			if row.container != nil {
-				return m, m.loadSelectedCmd()
+		if m.focus == paneTree {
+			if row := m.currentRow(); row != nil {
+				if row.kind == rowProject {
+					m.collapsed[row.project] = !m.collapsed[row.project]
+					m.rows = m.buildRows()
+					m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+					return m, nil
+				}
+				if row.container != nil {
+					return m, m.loadSelectedCmd()
+				}
 			}
 		}
 	case "/":
@@ -1375,6 +1390,10 @@ func (m Model) logVisibleRows() int {
 	return max(1, m.height-6)
 }
 
+func (m Model) treeVisibleRows() int {
+	return max(1, m.height-6)
+}
+
 func (m *Model) saveLogViewState() {
 	if m.logViews == nil {
 		m.logViews = map[domain.ResourceID]logViewState{}
@@ -1484,19 +1503,31 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		if m.focus == paneActivity && m.mode == activityProblems {
+		switch {
+		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(-1)
-			return m, nil
+		case m.focus == paneActivity && m.mode == activityLogs:
+			m.scrollLogs(-1)
+		case m.focus == paneInspector:
+			m.scrollInspector(-1)
+		case m.focus == paneTree:
+			m.moveCursor(-1)
+			return m, m.loadSelectedCmd()
 		}
-		m.moveCursor(-1)
-		return m, m.loadSelectedCmd()
+		return m, nil
 	case tea.MouseButtonWheelDown:
-		if m.focus == paneActivity && m.mode == activityProblems {
+		switch {
+		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(1)
-			return m, nil
+		case m.focus == paneInspector:
+			m.scrollInspector(1)
+		case m.focus == paneActivity && m.mode == activityLogs:
+			m.scrollLogs(1)
+		case m.focus == paneTree:
+			m.moveCursor(1)
+			return m, m.loadSelectedCmd()
 		}
-		m.moveCursor(1)
-		return m, m.loadSelectedCmd()
+		return m, nil
 	case tea.MouseButtonLeft:
 		if msg.X < m.leftPaneWidth() && msg.Y > 1 && msg.Y <= len(m.rows)+2 {
 			m.cursor = clamp(msg.Y-3, 0, len(m.rows)-1)
@@ -1509,6 +1540,14 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) scrollInspector(delta int) {
+	m.inspectorScroll = max(0, m.inspectorScroll+delta)
+}
+
+func (m Model) inspectorVisibleRows() int {
+	return max(1, m.height-6)
 }
 
 func (m *Model) moveCursor(delta int) {
@@ -1671,17 +1710,19 @@ func (m Model) refreshCmd() tea.Cmd {
 	}
 }
 
-func (m Model) loadSelectedCmd() tea.Cmd {
+func (m *Model) loadSelectedCmd() tea.Cmd {
 	selected := m.selectedContainer()
 	if selected == nil {
 		return nil
 	}
 	id := selected.ID
+	m.selectedID = id
+	provider := m.provider
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		ctr, err := m.provider.Container(ctx, id)
-		return detailMsg{container: ctr, err: err}
+		ctr, err := provider.Container(ctx, id)
+		return detailMsg{id: id, container: ctr, err: err}
 	}
 }
 

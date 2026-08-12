@@ -27,7 +27,7 @@ func (m Model) View() string {
 	panes := [3]tideui.Pane{
 		{Title: "Projects", Hint: "enter/space collapse  / filter", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
-		{Title: "Inspector", Hint: "s start/stop  alt+r restart", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
+		{Title: "Inspector", Hint: "j/k scroll  s start/stop  alt+r restart", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
@@ -73,6 +73,9 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		return renderer.Styles.DetailMeta.Render("Docker state is unavailable.\n\n" + m.status)
 	}
 	if len(m.rows) == 0 {
+		if m.loading {
+			return renderer.Styles.DetailMeta.Render("Loading containers...")
+		}
 		if strings.TrimSpace(m.filter) != "" {
 			return renderer.Styles.DetailMeta.Render("No projects or containers match " + m.filter + ".")
 		}
@@ -110,7 +113,21 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		}
 		lines = append(lines, renderer.RenderRow(tideui.Row{Prefix: prefix, Text: text, Suffix: suffix, Selected: selected, Muted: row.muted}, width))
 	}
-	return strings.Join(lines, "\n")
+	start, end := visibleRange(len(lines), m.cursor, m.treeVisibleRows())
+	return strings.Join(lines[start:end], "\n")
+}
+
+// visibleRange returns the [start, end) window of size at most limit that
+// keeps cursor in view, centering on it when the content overflows the
+// window. Mirrors tideui's own picker.go windowing so the tree pane scrolls
+// to follow the selection the same way tideui's built-in list widgets do.
+func visibleRange(total, cursor, limit int) (int, int) {
+	if limit >= total {
+		return 0, total
+	}
+	start := cursor - limit/2
+	start = clamp(start, 0, total-limit)
+	return start, start + limit
 }
 
 // rowForeground returns the foreground color RenderRow will use for a row in
@@ -1039,9 +1056,14 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 	if ctr.HealthCheck != nil {
 		add("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr))
 	}
-	lines = append(lines, "")
-	lines = append(lines, renderActionBar(renderer, width))
-	return strings.Join(lines, "\n")
+
+	actionBar := renderActionBar(renderer, width)
+	budget := max(1, m.inspectorVisibleRows()-2)
+	start := clamp(m.inspectorScroll, 0, max(0, len(lines)-budget))
+	end := min(len(lines), start+budget)
+	visible := append([]string(nil), lines[start:end]...)
+	visible = append(visible, "", actionBar)
+	return strings.Join(visible, "\n")
 }
 
 func renderInspectorSection(renderer tideui.Renderer, width int, title string) string {

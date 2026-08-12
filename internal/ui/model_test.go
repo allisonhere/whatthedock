@@ -62,6 +62,71 @@ func (f *fakeProvider) RestartContainer(context.Context, domain.ResourceID) erro
 }
 func (f *fakeProvider) Close() error { return nil }
 
+func TestStaleDetailResponseIgnoredAfterRapidNavigation(t *testing.T) {
+	model := testModel()
+	model.rows = model.buildRows()
+	model.focus = paneTree
+
+	var firstIdx, secondIdx int
+	var firstID, secondID domain.ResourceID
+	for i, row := range model.rows {
+		if row.container == nil {
+			continue
+		}
+		if firstID.ID == "" {
+			firstID, firstIdx = row.container.ID, i
+		} else if secondID.ID == "" {
+			secondID, secondIdx = row.container.ID, i
+			break
+		}
+	}
+	if firstID.ID == "" || secondID.ID == "" {
+		t.Fatal("fixture needs at least two container rows")
+	}
+
+	model.cursor = firstIdx
+	cmd1 := model.loadSelectedCmd() // simulates the first keypress; sets selectedID = firstID
+	model.cursor = secondIdx
+	cmd2 := model.loadSelectedCmd() // simulates a rapid second keypress; sets selectedID = secondID
+
+	// Deliver responses out of order: the second (current) selection resolves first,
+	// then the stale first request arrives late over a slow connection.
+	msg2 := runCmd(t, cmd2).(detailMsg)
+	updated, _ := model.Update(msg2)
+	model = updated.(Model)
+	if model.selected == nil || model.selected.ID != secondID {
+		t.Fatalf("selected = %#v, want %v after its own response", model.selected, secondID)
+	}
+
+	msg1 := runCmd(t, cmd1).(detailMsg)
+	updated, _ = model.Update(msg1)
+	model = updated.(Model)
+	if model.selected == nil || model.selected.ID != secondID {
+		t.Fatalf("selected = %#v, want still %v; a stale response clobbered the current selection", model.selected, secondID)
+	}
+}
+
+func TestTreeShowsLoadingBeforeFirstSnapshot(t *testing.T) {
+	model := NewModel(newFakeProvider())
+	if !model.loading {
+		t.Fatal("loading = false, want true before the first snapshot arrives")
+	}
+	model.width, model.height = 100, 30
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "Loading containers...") {
+		t.Fatalf("view missing loading indicator before first snapshot:\n%s", view)
+	}
+	if strings.Contains(view, "No containers found") {
+		t.Fatalf("view showed empty-host message while still loading:\n%s", view)
+	}
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+	if got.loading {
+		t.Fatal("loading = true, want false after snapshot arrives")
+	}
+}
+
 func TestBuildRowsCollapseAndFilter(t *testing.T) {
 	model := testModel()
 	model.rows = model.buildRows()
@@ -91,6 +156,116 @@ func TestSelectionMovementClamps(t *testing.T) {
 	model.moveCursor(-100)
 	if model.cursor != 0 {
 		t.Fatalf("cursor = %d, want first row", model.cursor)
+	}
+}
+
+func TestTreeScrollsToKeepCursorVisible(t *testing.T) {
+	model := testModel()
+	model.rows = model.buildRows()
+	model.focus = paneTree
+	model.width, model.height = 100, 8 // treeVisibleRows() == 2
+
+	if got := len(model.rows); got <= model.treeVisibleRows() {
+		t.Fatalf("fixture has %d rows, want more than the %d visible rows for this test to be meaningful", got, model.treeVisibleRows())
+	}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "media") {
+		t.Fatalf("initial view missing top row 'media':\n%s", view)
+	}
+
+	model.moveCursor(len(model.rows) - 1)
+	view = ansi.Strip(model.View())
+	if strings.Contains(view, "media") {
+		t.Fatalf("view still shows the scrolled-off top row 'media' after moving the cursor to the bottom row:\n%s", view)
+	}
+	if !strings.Contains(view, "jellyfin") {
+		t.Fatalf("view missing the now-selected bottom row 'jellyfin':\n%s", view)
+	}
+}
+
+func TestMovementKeysNoOpWhenInspectorFocused(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.focus = paneInspector
+	cursor := model.cursor
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	got := updated.(Model)
+	if got.cursor != cursor {
+		t.Fatalf("cursor = %d, want unchanged %d when Inspector is focused", got.cursor, cursor)
+	}
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyDown})
+	got = updated.(Model)
+	if got.cursor != cursor {
+		t.Fatalf("cursor = %d, want unchanged %d after Down with Inspector focused", got.cursor, cursor)
+	}
+}
+
+func TestMovementKeysNoOpInStatsMode(t *testing.T) {
+	model := testModelInStatsMode()
+	cursor := model.cursor
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	got := updated.(Model)
+	if got.cursor != cursor {
+		t.Fatalf("cursor = %d, want unchanged %d in stats mode", got.cursor, cursor)
+	}
+}
+
+func TestCollapseTogglesOnlyWhenTreeFocused(t *testing.T) {
+	model := testModel()
+	model.rows = model.buildRows()
+	model.focus = paneInspector
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	got := updated.(Model)
+	if got.collapsed["media"] {
+		t.Fatalf("space collapsed a project row while Inspector was focused")
+	}
+	got.focus = paneTree
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	got = updated.(Model)
+	if !got.collapsed["media"] {
+		t.Fatalf("space did not collapse the project row while tree was focused")
+	}
+}
+
+func TestInspectorScrollsWhileFocused(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.focus = paneInspector
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	got := updated.(Model)
+	if got.inspectorScroll != 1 {
+		t.Fatalf("inspectorScroll = %d, want 1 after down", got.inspectorScroll)
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	got = updated.(Model)
+	if got.inspectorScroll != 0 {
+		t.Fatalf("inspectorScroll = %d, want 0 after up", got.inspectorScroll)
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	got = updated.(Model)
+	if got.inspectorScroll != 0 {
+		t.Fatalf("inspectorScroll = %d, want clamped at 0, not negative", got.inspectorScroll)
+	}
+}
+
+func TestInspectorScrollResetsOnSelectionChange(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.focus = paneInspector
+	model.inspectorScroll = 3
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.container != nil && row.container.ID.ID == "2" {
+			model.cursor = i
+			break
+		}
+	}
+	msg := runCmd(t, model.loadSelectedCmd()).(detailMsg)
+	updated, _ := model.Update(msg)
+	got := updated.(Model)
+	if got.inspectorScroll != 0 {
+		t.Fatalf("inspectorScroll = %d, want reset to 0 after selection changed", got.inspectorScroll)
 	}
 }
 
@@ -1107,6 +1282,25 @@ func TestProblemsNavigationEnterJumpsTreeToContainer(t *testing.T) {
 	msg := runCmd(t, cmd).(detailMsg)
 	if msg.container.ID.ID != "2" {
 		t.Fatalf("loaded container = %q, want 2", msg.container.ID.ID)
+	}
+}
+
+func TestMouseWheelNoOpWhenInspectorFocused(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+	model.focus = paneInspector
+	cursor := model.cursor
+
+	updated, _ := model.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	got := updated.(Model)
+	if got.cursor != cursor {
+		t.Fatalf("cursor = %d, want unchanged %d after wheel scroll with Inspector focused", got.cursor, cursor)
+	}
+
+	updated, _ = got.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	got = updated.(Model)
+	if got.cursor != cursor {
+		t.Fatalf("cursor = %d, want unchanged %d after wheel scroll up with Inspector focused", got.cursor, cursor)
 	}
 }
 
