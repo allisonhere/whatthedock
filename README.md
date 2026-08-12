@@ -1,6 +1,6 @@
 # WhatTheDock
 
-![WHAT THE DOCK?! logo](assets/whatthedock-logo.svg)
+![WHAT THE DOCK?! logo](assets/whatthedock.png)
 
 **A keyboard-first Docker and Compose manager for the terminal.**
 
