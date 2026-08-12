@@ -99,6 +99,7 @@ type appSettings struct {
 	GraphStyle      graphStyle
 	GraphColor      graphColorMode
 	LogColor        logColorMode
+	LogHealthColor  bool
 	ShowDeltas      bool
 	StatsRefresh    time.Duration
 	DefaultActivity activityMode
@@ -303,6 +304,7 @@ func defaultSettings() appSettings {
 		GraphStyle:      graphStyleWave,
 		GraphColor:      graphColorGradient,
 		LogColor:        logColorFull,
+		LogHealthColor:  true,
 		ShowDeltas:      true,
 		StatsRefresh:    2 * time.Second,
 		DefaultActivity: activityProblems,
@@ -336,6 +338,9 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 	case "full", "":
 		s.LogColor = logColorFull
 	}
+	if persisted.LogHealthColor != nil {
+		s.LogHealthColor = *persisted.LogHealthColor
+	}
 	if persisted.ShowDeltas != nil {
 		s.ShowDeltas = *persisted.ShowDeltas
 	}
@@ -356,10 +361,12 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 
 func (s appSettings) persisted() config.Settings {
 	showDeltas := s.ShowDeltas
+	logHealthColor := s.LogHealthColor
 	return config.Settings{
 		GraphStyle:      s.GraphStyle.String(),
 		GraphColor:      s.GraphColor.String(),
 		LogColor:        s.LogColor.String(),
+		LogHealthColor:  &logHealthColor,
 		ShowDeltas:      &showDeltas,
 		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
 		DefaultActivity: activityModeName(s.DefaultActivity),
@@ -1130,6 +1137,7 @@ func (m Model) settingsRows() []settingsRow {
 		{label: "Stats refresh", value: formatRefreshInterval(m.settings.StatsRefresh)},
 		{label: "Logs", kind: settingsRowSection},
 		{label: "Log color", value: m.settings.LogColor.String()},
+		{label: "Log health color", value: onOff(m.settings.LogHealthColor)},
 		{label: "Behavior", kind: settingsRowSection},
 		{label: "Default pane", value: activityModeName(m.settings.DefaultActivity)},
 		{label: "Maintenance", kind: settingsRowSection},
@@ -1186,6 +1194,8 @@ func (m *Model) cycleSetting(index, direction int) {
 		m.settings.GraphColor = graphColorMode(modIndex(int(m.settings.GraphColor)+direction, 3))
 	case "Log color":
 		m.settings.LogColor = logColorMode(modIndex(int(m.settings.LogColor)+direction, 4))
+	case "Log health color":
+		m.settings.LogHealthColor = !m.settings.LogHealthColor
 	case "Show deltas":
 		m.settings.ShowDeltas = !m.settings.ShowDeltas
 	case "Stats refresh":

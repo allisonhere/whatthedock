@@ -123,10 +123,16 @@ func rowForeground(renderer tideui.Renderer, selected, muted bool) lipgloss.Colo
 	case muted:
 		style = renderer.Styles.ItemMuted
 	}
+	return styleForeground(style, renderer.Styles.Theme.Fg)
+}
+
+// styleForeground returns a style's resolved foreground color, so a colored
+// span rendered through that style can restore it exactly.
+func styleForeground(style lipgloss.Style, fallback lipgloss.Color) lipgloss.Color {
 	if c, ok := style.GetForeground().(lipgloss.Color); ok {
 		return c
 	}
-	return renderer.Styles.Theme.Fg
+	return fallback
 }
 
 // healthSpan colors text without a trailing SGR reset, so it can sit inside a
@@ -164,7 +170,14 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	start := m.logStartIndex(len(filtered), visible)
 	end := min(len(filtered), start+visible)
 	lines := make([]string, 0, end-start+1)
-	lines = append(lines, renderer.Styles.DetailMeta.Width(width).Render(m.logPositionIndicator(len(filtered), visible)))
+	header := m.logPositionIndicator(len(filtered), visible)
+	if m.settings.LogHealthColor {
+		healthColor := inspectorStatusColor(*m.selected)
+		baseFg := styleForeground(renderer.Styles.DetailMeta, renderer.Styles.Theme.Dimmed)
+		header = healthSpan(statusGlyph(*m.selected), healthColor, baseFg) + " " +
+			healthSpan(m.selected.DisplayName(), healthColor, baseFg) + "  " + header
+	}
+	lines = append(lines, renderer.Styles.DetailMeta.Width(width).Render(header))
 	for _, line := range filtered[start:end] {
 		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(renderLogLine(renderer, m.settings.LogColor, m.logFilter, line)))
 	}

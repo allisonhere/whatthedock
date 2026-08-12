@@ -13,6 +13,7 @@ type Settings struct {
 	GraphStyle      string `json:"graphStyle,omitempty"`
 	GraphColor      string `json:"graphColor,omitempty"`
 	LogColor        string `json:"logColor,omitempty"`
+	LogHealthColor  *bool  `json:"logHealthColor,omitempty"`
 	ShowDeltas      *bool  `json:"showDeltas,omitempty"`
 	StatsRefresh    string `json:"statsRefresh,omitempty"`
 	DefaultActivity string `json:"defaultActivity,omitempty"`
