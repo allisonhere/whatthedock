@@ -1,0 +1,273 @@
+package docker
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+
+	"github.com/allisonhere/tidedock/internal/app"
+	"github.com/allisonhere/tidedock/internal/domain"
+)
+
+type LocalProvider struct {
+	host domain.Host
+	cli  *client.Client
+}
+
+func NewLocalProvider() (*LocalProvider, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	return &LocalProvider{host: domain.Host{ID: "local", Name: "local"}, cli: cli}, nil
+}
+
+func (p *LocalProvider) Host() domain.Host { return p.host }
+
+func (p *LocalProvider) Ping(ctx context.Context) error {
+	_, err := p.cli.Ping(ctx)
+	return err
+}
+
+func (p *LocalProvider) Snapshot(ctx context.Context) (domain.Snapshot, error) {
+	items, err := p.cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return domain.Snapshot{Host: p.host, Refreshed: time.Now()}, err
+	}
+	containers := make([]domain.Container, 0, len(items))
+	for _, item := range items {
+		containers = append(containers, FromSummary(p.host.ID, item))
+	}
+	return domain.BuildSnapshot(p.host, containers, time.Now()), nil
+}
+
+func (p *LocalProvider) Container(ctx context.Context, id domain.ResourceID) (domain.Container, error) {
+	inspect, err := p.cli.ContainerInspect(ctx, id.ID)
+	if err != nil {
+		return domain.Container{}, err
+	}
+	return FromInspect(p.host.ID, inspect), nil
+}
+
+func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options app.LogOptions) (io.ReadCloser, error) {
+	tail := options.Tail
+	if tail == "" {
+		tail = "200"
+	}
+	return p.cli.ContainerLogs(ctx, id.ID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     options.Follow,
+		Tail:       tail,
+		Timestamps: true,
+	})
+}
+
+func (p *LocalProvider) StartContainer(ctx context.Context, id domain.ResourceID) error {
+	return p.cli.ContainerStart(ctx, id.ID, container.StartOptions{})
+}
+
+func (p *LocalProvider) StopContainer(ctx context.Context, id domain.ResourceID) error {
+	return p.cli.ContainerStop(ctx, id.ID, container.StopOptions{})
+}
+
+func (p *LocalProvider) RestartContainer(ctx context.Context, id domain.ResourceID) error {
+	return p.cli.ContainerRestart(ctx, id.ID, container.StopOptions{})
+}
+
+func (p *LocalProvider) Close() error {
+	if p.cli == nil {
+		return nil
+	}
+	return p.cli.Close()
+}
+
+func FromSummary(host domain.HostID, item container.Summary) domain.Container {
+	name := ""
+	if len(item.Names) > 0 {
+		name = strings.TrimPrefix(item.Names[0], "/")
+	}
+	created := time.Unix(item.Created, 0)
+	labels := copyLabels(item.Labels)
+	return domain.Container{
+		ID:         domain.ResourceID{Host: host, ID: item.ID},
+		Name:       name,
+		Image:      item.Image,
+		ImageID:    item.ImageID,
+		Command:    item.Command,
+		Created:    created,
+		State:      normalizeState(item.State),
+		Status:     item.Status,
+		Health:     healthFromStatus(item.Status),
+		Restarting: item.State == "restarting",
+		Ports:      fromPorts(item.Ports),
+		Labels:     labels,
+		Compose:    composeFromLabels(labels),
+	}
+}
+
+func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.Container {
+	labels := map[string]string{}
+	if inspect.Config != nil {
+		labels = copyLabels(inspect.Config.Labels)
+	}
+	ctr := domain.Container{
+		ID:      domain.ResourceID{Host: host, ID: inspect.ID},
+		Name:    strings.TrimPrefix(inspect.Name, "/"),
+		Labels:  labels,
+		Compose: composeFromLabels(labels),
+	}
+	if inspect.Config != nil {
+		ctr.Image = inspect.Config.Image
+		ctr.Env = append([]string(nil), inspect.Config.Env...)
+		if inspect.Config.Healthcheck != nil {
+			ctr.HealthCheck = &domain.HealthCheck{
+				Test:        append([]string(nil), inspect.Config.Healthcheck.Test...),
+				Interval:    inspect.Config.Healthcheck.Interval,
+				Timeout:     inspect.Config.Healthcheck.Timeout,
+				Retries:     inspect.Config.Healthcheck.Retries,
+				StartPeriod: inspect.Config.Healthcheck.StartPeriod,
+			}
+		}
+	}
+	if inspect.Image != "" {
+		ctr.ImageID = inspect.Image
+	}
+	if inspect.ContainerJSONBase != nil {
+		ctr.Created = parseDockerTime(inspect.Created)
+	}
+	if inspect.State != nil {
+		ctr.State = normalizeState(inspect.State.Status)
+		ctr.Status = inspect.State.Status
+		ctr.Restarting = inspect.State.Restarting
+		ctr.RestartCount = inspect.RestartCount
+		if inspect.State.Health != nil {
+			ctr.Health = domain.HealthState(inspect.State.Health.Status)
+		}
+	}
+	if inspect.HostConfig != nil {
+		ctr.RestartPolicy = string(inspect.HostConfig.RestartPolicy.Name)
+	}
+	ctr.Mounts = fromMounts(inspect.Mounts)
+	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Networks != nil {
+		for name := range inspect.NetworkSettings.Networks {
+			ctr.Networks = append(ctr.Networks, name)
+		}
+		sort.Strings(ctr.Networks)
+	}
+	if inspect.NetworkSettings != nil {
+		for port, bindings := range inspect.NetworkSettings.Ports {
+			private := uint16(port.Int())
+			proto := port.Proto()
+			if len(bindings) == 0 {
+				ctr.Ports = append(ctr.Ports, domain.Port{Private: private, Type: proto})
+				continue
+			}
+			for _, binding := range bindings {
+				ctr.Ports = append(ctr.Ports, domain.Port{IP: binding.HostIP, Private: private, Public: parsePort(binding.HostPort), Type: proto})
+			}
+		}
+	}
+	sort.Slice(ctr.Ports, func(i, j int) bool {
+		if ctr.Ports[i].Private == ctr.Ports[j].Private {
+			return ctr.Ports[i].Public < ctr.Ports[j].Public
+		}
+		return ctr.Ports[i].Private < ctr.Ports[j].Private
+	})
+	return ctr
+}
+
+func composeFromLabels(labels map[string]string) domain.ComposeRef {
+	return domain.ComposeRef{
+		Project:         labels[domain.LabelComposeProject],
+		Service:         labels[domain.LabelComposeService],
+		ContainerNumber: labels[domain.LabelComposeContainerNo],
+		ConfigFiles:     labels[domain.LabelComposeConfigFiles],
+	}
+}
+
+func normalizeState(state string) domain.ContainerState {
+	switch strings.ToLower(state) {
+	case "running":
+		return domain.StateRunning
+	case "paused":
+		return domain.StatePaused
+	case "restarting":
+		return domain.StateRestarting
+	case "exited", "created", "removing":
+		return domain.StateStopped
+	case "dead":
+		return domain.StateDead
+	default:
+		return domain.StateUnknown
+	}
+}
+
+func healthFromStatus(status string) domain.HealthState {
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "unhealthy"):
+		return domain.HealthUnhealthy
+	case strings.Contains(lower, "healthy"):
+		return domain.HealthHealthy
+	case strings.Contains(lower, "health: starting"):
+		return domain.HealthStarting
+	default:
+		return domain.HealthNone
+	}
+}
+
+func fromPorts(ports []container.Port) []domain.Port {
+	out := make([]domain.Port, 0, len(ports))
+	for _, port := range ports {
+		out = append(out, domain.Port{
+			IP:      port.IP,
+			Private: uint16(port.PrivatePort),
+			Public:  uint16(port.PublicPort),
+			Type:    port.Type,
+		})
+	}
+	return out
+}
+
+func fromMounts(mounts []container.MountPoint) []domain.Mount {
+	out := make([]domain.Mount, 0, len(mounts))
+	for _, mount := range mounts {
+		out = append(out, domain.Mount{
+			Type:        string(mount.Type),
+			Source:      mount.Source,
+			Destination: mount.Destination,
+			Mode:        mount.Mode,
+			ReadWrite:   mount.RW,
+		})
+	}
+	return out
+}
+
+func copyLabels(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels))
+	for key, value := range labels {
+		out[key] = value
+	}
+	return out
+}
+
+func parseDockerTime(value string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func parsePort(value string) uint16 {
+	var port uint16
+	_, _ = fmt.Sscanf(value, "%d", &port)
+	return port
+}
