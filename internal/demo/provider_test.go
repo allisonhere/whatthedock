@@ -64,3 +64,25 @@ func TestProviderLogsStreamDemoLines(t *testing.T) {
 		t.Fatalf("logs = %q, want grafana-like demo lines", string(data))
 	}
 }
+
+func TestProviderStatsVaryAcrossSamples(t *testing.T) {
+	provider := NewProvider()
+	id := domain.ResourceID{Host: "demo", ID: "demo-qbit"}
+	first, err := provider.ContainerStats(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ContainerStats() first err = %v", err)
+	}
+	second, err := provider.ContainerStats(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ContainerStats() second err = %v", err)
+	}
+	if first.ID != id || second.ID != id {
+		t.Fatalf("stats IDs = %#v/%#v, want %v", first.ID, second.ID, id)
+	}
+	if first.CPUPercent == second.CPUPercent &&
+		first.MemoryUsage == second.MemoryUsage &&
+		first.NetworkRx == second.NetworkRx &&
+		first.BlockWrite == second.BlockWrite {
+		t.Fatalf("stats did not vary across samples: %#v", first)
+	}
+}

@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>TideDock Static Prototype</title>
+		<meta name="description" content="Static prototype of the planned TideDock terminal interface.">
+		<style>
+			:root {
+				color-scheme: dark;
+				--bg: #101419;
+				--panel: #171c22;
+				--panel-2: #1e242b;
+				--line: #333c46;
+				--line-strong: #53606c;
+				--text: #e8edf2;
+				--muted: #9aa6b2;
+				--dim: #66727e;
+				--green: #80c990;
+				--yellow: #e8c170;
+				--red: #e06c75;
+				--cyan: #7dcfff;
+				--blue: #8aadf4;
+				--shadow: rgba(0, 0, 0, 0.35);
+			}
+
+			* {
+				box-sizing: border-box;
+			}
+
+			body {
+				margin: 0;
+				min-height: 100vh;
+				background:
+					linear-gradient(180deg, rgba(125, 207, 255, 0.06), transparent 42%),
+					var(--bg);
+				color: var(--text);
+				font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+				font-size: 14px;
+				line-height: 1.45;
+			}
+
+			main {
+				min-height: 100vh;
+				padding: 20px;
+				display: grid;
+				place-items: center;
+			}
+
+			.shell {
+				width: min(1440px, 100%);
+				min-height: min(860px, calc(100vh - 40px));
+				display: grid;
+				grid-template-rows: auto 1fr auto;
+				border: 1px solid var(--line-strong);
+				background: rgba(16, 20, 25, 0.92);
+				box-shadow: 0 28px 80px var(--shadow);
+			}
+
+			.topbar,
+			.statusbar {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 16px;
+				padding: 8px 12px;
+				background: var(--panel-2);
+				border-bottom: 1px solid var(--line);
+				color: var(--muted);
+				white-space: nowrap;
+				overflow: hidden;
+			}
+
+			.statusbar {
+				border-top: 1px solid var(--line);
+				border-bottom: 0;
+			}
+
+			.brand {
+				color: var(--text);
+				font-weight: 700;
+			}
+
+			.host {
+				color: var(--cyan);
+			}
+
+			.grid {
+				min-height: 0;
+				display: grid;
+				grid-template-columns: minmax(260px, 3fr) minmax(340px, 5fr) minmax(300px, 4fr);
+			}
+
+			.pane {
+				min-width: 0;
+				display: grid;
+				grid-template-rows: auto 1fr;
+				border-right: 1px solid var(--line);
+				background: var(--panel);
+			}
+
+			.pane:last-child {
+				border-right: 0;
+			}
+
+			.pane-header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 10px;
+				padding: 8px 10px;
+				border-bottom: 1px solid var(--line);
+				background: #14191f;
+			}
+
+			h1,
+			h2 {
+				margin: 0;
+				font-size: 13px;
+				letter-spacing: 0;
+			}
+
+			.hint {
+				color: var(--dim);
+				font-size: 12px;
+			}
+
+			.content {
+				min-height: 0;
+				overflow: hidden;
+				padding: 8px;
+			}
+
+			.row {
+				display: grid;
+				grid-template-columns: auto minmax(0, 1fr) auto;
+				gap: 8px;
+				align-items: center;
+				min-height: 28px;
+				padding: 3px 6px;
+				border-radius: 4px;
+				color: var(--text);
+			}
+
+			.row.selected {
+				background: #26313a;
+				outline: 1px solid #53606c;
+			}
+
+			.row.muted {
+				color: var(--muted);
+			}
+
+			.row .name,
+			.row .value {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+
+			.indent-1 {
+				padding-left: 20px;
+			}
+
+			.indent-2 {
+				padding-left: 40px;
+			}
+
+			.good {
+				color: var(--green);
+			}
+
+			.warn {
+				color: var(--yellow);
+			}
+
+			.crit {
+				color: var(--red);
+			}
+
+			.info {
+				color: var(--cyan);
+			}
+
+			.problem-count {
+				margin: 0 0 8px;
+				color: var(--muted);
+			}
+
+			.problem {
+				grid-template-columns: 56px minmax(0, 1fr) auto;
+				border-bottom: 1px solid rgba(83, 96, 108, 0.32);
+			}
+
+			.problem:last-child {
+				border-bottom: 0;
+			}
+
+			.tag {
+				font-size: 12px;
+				text-transform: uppercase;
+			}
+
+			.logs {
+				margin-top: 12px;
+				padding-top: 10px;
+				border-top: 1px solid var(--line);
+				color: var(--muted);
+			}
+
+			.logline {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+
+			.inspector-title {
+				margin: 2px 0 10px;
+				color: var(--text);
+				font-size: 16px;
+				font-weight: 700;
+				overflow-wrap: anywhere;
+			}
+
+			.detail {
+				display: grid;
+				grid-template-columns: 96px minmax(0, 1fr);
+				gap: 8px;
+				padding: 5px 0;
+				border-bottom: 1px solid rgba(83, 96, 108, 0.24);
+			}
+
+			.detail dt {
+				color: var(--muted);
+			}
+
+			.detail dd {
+				margin: 0;
+				color: var(--text);
+				overflow-wrap: anywhere;
+			}
+
+			.actions {
+				margin-top: 14px;
+				display: grid;
+				grid-template-columns: repeat(4, minmax(0, 1fr));
+				gap: 6px;
+			}
+
+			button {
+				min-height: 32px;
+				border: 1px solid var(--line-strong);
+				border-radius: 4px;
+				background: #202832;
+				color: var(--text);
+				font: inherit;
+			}
+
+			button:focus-visible {
+				outline: 2px solid var(--cyan);
+				outline-offset: 2px;
+			}
+
+			.kbd {
+				color: var(--blue);
+			}
+
+			@media (max-width: 920px) {
+				main {
+					padding: 12px;
+				}
+
+				.shell {
+					min-height: calc(100vh - 24px);
+				}
+
+				.grid {
+					grid-template-columns: 1fr;
+					grid-template-rows: auto auto auto;
+				}
+
+				.pane {
+					border-right: 0;
+					border-bottom: 1px solid var(--line);
+				}
+
+				.pane:last-child {
+					border-bottom: 0;
+				}
+
+				.content {
+					max-height: none;
+				}
+
+				.topbar,
+				.statusbar {
+					align-items: flex-start;
+					flex-direction: column;
+					white-space: normal;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<main>
+			<section class="shell" aria-label="TideDock terminal prototype">
+				<header class="topbar">
+					<h1><span class="brand">TideDock</span> <span class="host">demo homelab</span></h1>
+					<div>Docker connected · 2 projects · 1 standalone · 3 problems</div>
+				</header>
+
+				<div class="grid">
+					<section class="pane" aria-labelledby="projects-title">
+						<div class="pane-header">
+							<h2 id="projects-title">Projects</h2>
+							<span class="hint">space collapse · / filter</span>
+						</div>
+						<div class="content">
+							<div class="row muted"><span>▾</span><span class="name">media-stack</span><span></span></div>
+							<div class="row indent-1"><span class="good">●</span><span class="name">jellyfin</span><span class="good">healthy</span></div>
+							<div class="row indent-1"><span class="good">●</span><span class="name">radarr</span><span class="good">healthy</span></div>
+							<div class="row indent-1"><span class="good">●</span><span class="name">sonarr</span><span class="good">healthy</span></div>
+							<div class="row indent-1 selected"><span class="crit">▲</span><span class="name">qbittorrent</span><span class="crit">restarting</span></div>
+							<div class="row muted"><span>▾</span><span class="name">monitoring</span><span></span></div>
+							<div class="row indent-1"><span class="good">●</span><span class="name">grafana</span><span class="good">healthy</span></div>
+							<div class="row indent-1"><span class="good">●</span><span class="name">prometheus</span><span class="good">healthy</span></div>
+							<div class="row muted"><span></span><span class="name">Standalone containers</span><span></span></div>
+							<div class="row indent-1"><span class="warn">●</span><span class="name">reverse-proxy</span><span>running</span></div>
+						</div>
+					</section>
+
+					<section class="pane" aria-labelledby="activity-title">
+						<div class="pane-header">
+							<h2 id="activity-title">Problems</h2>
+							<span class="hint">p problems · l logs</span>
+						</div>
+						<div class="content">
+							<p class="problem-count">3 problem(s) found</p>
+							<div class="row problem selected">
+								<span class="tag crit">crit</span>
+								<span class="name">media-qbittorrent-1</span>
+								<span class="crit">restarting (7 restarts)</span>
+							</div>
+							<div class="row problem">
+								<span class="tag warn">warn</span>
+								<span class="name">jellyfin</span>
+								<span>image stale</span>
+							</div>
+							<div class="row problem">
+								<span class="tag warn">warn</span>
+								<span class="name">reverse-proxy</span>
+								<span>public ports</span>
+							</div>
+
+							<div class="logs" aria-label="Recent activity preview">
+								<div class="logline"><span class="info">12:07:18</span> event container restart media-qbittorrent-1</div>
+								<div class="logline"><span class="info">12:07:21</span> health check pending reverse-proxy</div>
+								<div class="logline"><span class="info">12:07:24</span> compose project media-stack refreshed</div>
+							</div>
+						</div>
+					</section>
+
+					<section class="pane" aria-labelledby="inspector-title">
+						<div class="pane-header">
+							<h2 id="inspector-title">Inspector</h2>
+							<span class="hint">s start/stop · alt+r restart</span>
+						</div>
+						<div class="content">
+							<div class="inspector-title">media-qbittorrent-1</div>
+							<dl>
+								<div class="detail"><dt>Status</dt><dd class="crit">restarting</dd></div>
+								<div class="detail"><dt>Project</dt><dd>media-stack</dd></div>
+								<div class="detail"><dt>Service</dt><dd>qbittorrent</dd></div>
+								<div class="detail"><dt>Image</dt><dd>lscr.io/linuxserver/qbittorrent:latest</dd></div>
+								<div class="detail"><dt>Ports</dt><dd>8081 -> 8080/tcp</dd></div>
+								<div class="detail"><dt>Restarts</dt><dd>7</dd></div>
+								<div class="detail"><dt>Networks</dt><dd>media-stack_default</dd></div>
+								<div class="detail"><dt>Mounts</dt><dd>/srv/downloads -> /downloads</dd></div>
+							</dl>
+							<div class="actions" aria-label="Container actions">
+								<button type="button"><span class="kbd">s</span> stop</button>
+								<button type="button"><span class="kbd">r</span> restart</button>
+								<button type="button"><span class="kbd">e</span> exec</button>
+								<button type="button"><span class="kbd">c</span> copy</button>
+							</div>
+						</div>
+					</section>
+				</div>
+
+				<footer class="statusbar">
+					<div><span class="host">demo homelab</span> · Docker connected · filter: none</div>
+					<div><span class="kbd">j/k</span> move · <span class="kbd">enter</span> inspect · <span class="kbd">p</span> problems · <span class="kbd">l</span> logs · <span class="kbd">q</span> quit</div>
+				</footer>
+			</section>
+		</main>
+	</body>
+</html>

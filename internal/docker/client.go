@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -55,6 +56,19 @@ func (p *LocalProvider) Container(ctx context.Context, id domain.ResourceID) (do
 	return FromInspect(p.host.ID, inspect), nil
 }
 
+func (p *LocalProvider) ContainerStats(ctx context.Context, id domain.ResourceID) (domain.ContainerStats, error) {
+	reader, err := p.cli.ContainerStatsOneShot(ctx, id.ID)
+	if err != nil {
+		return domain.ContainerStats{}, err
+	}
+	defer reader.Body.Close()
+	var stats container.StatsResponse
+	if err := json.NewDecoder(reader.Body).Decode(&stats); err != nil {
+		return domain.ContainerStats{}, err
+	}
+	return FromStats(p.host.ID, id.ID, stats), nil
+}
+
 func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options app.LogOptions) (io.ReadCloser, error) {
 	tail := options.Tail
 	if tail == "" {
@@ -67,6 +81,67 @@ func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options 
 		Tail:       tail,
 		Timestamps: true,
 	})
+}
+
+func FromStats(host domain.HostID, containerID string, stats container.StatsResponse) domain.ContainerStats {
+	networkRx, networkTx := uint64(0), uint64(0)
+	for _, network := range stats.Networks {
+		networkRx += network.RxBytes
+		networkTx += network.TxBytes
+	}
+	blockRead, blockWrite := blockIO(stats.BlkioStats, stats.StorageStats)
+	return domain.ContainerStats{
+		ID:          domain.ResourceID{Host: host, ID: containerID},
+		Read:        stats.Read,
+		CPUPercent:  cpuPercent(stats),
+		MemoryUsage: memoryUsage(stats.MemoryStats),
+		MemoryLimit: stats.MemoryStats.Limit,
+		NetworkRx:   networkRx,
+		NetworkTx:   networkTx,
+		BlockRead:   blockRead,
+		BlockWrite:  blockWrite,
+		PIDs:        stats.PidsStats.Current,
+	}
+}
+
+func cpuPercent(stats container.StatsResponse) float64 {
+	if stats.CPUStats.CPUUsage.TotalUsage <= stats.PreCPUStats.CPUUsage.TotalUsage ||
+		stats.CPUStats.SystemUsage <= stats.PreCPUStats.SystemUsage {
+		return 0
+	}
+	cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - stats.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
+	onlineCPUs := float64(stats.CPUStats.OnlineCPUs)
+	if onlineCPUs == 0 {
+		onlineCPUs = float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if cpuDelta <= 0 || systemDelta <= 0 || onlineCPUs <= 0 {
+		return 0
+	}
+	return cpuDelta / systemDelta * onlineCPUs * 100
+}
+
+func memoryUsage(stats container.MemoryStats) uint64 {
+	usage := stats.Usage
+	for _, key := range []string{"inactive_file", "total_inactive_file", "cache"} {
+		if cache := stats.Stats[key]; cache > 0 && cache < usage {
+			return usage - cache
+		}
+	}
+	return usage
+}
+
+func blockIO(linux container.BlkioStats, windows container.StorageStats) (uint64, uint64) {
+	read, write := windows.ReadSizeBytes, windows.WriteSizeBytes
+	for _, entry := range linux.IoServiceBytesRecursive {
+		switch strings.ToLower(entry.Op) {
+		case "read":
+			read += entry.Value
+		case "write":
+			write += entry.Value
+		}
+	}
+	return read, write
 }
 
 func (p *LocalProvider) StartContainer(ctx context.Context, id domain.ResourceID) error {

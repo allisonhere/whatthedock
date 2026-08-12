@@ -12,6 +12,7 @@ type Provider interface {
 	Ping(context.Context) error
 	Snapshot(context.Context) (domain.Snapshot, error)
 	Container(context.Context, domain.ResourceID) (domain.Container, error)
+	ContainerStats(context.Context, domain.ResourceID) (domain.ContainerStats, error)
 	Logs(context.Context, domain.ResourceID, LogOptions) (io.ReadCloser, error)
 	StartContainer(context.Context, domain.ResourceID) error
 	StopContainer(context.Context, domain.ResourceID) error

@@ -14,9 +14,13 @@ const (
 	StartStop      ID = "start-stop-container"
 	Restart        ID = "restart-container"
 	FocusLogs      ID = "focus-logs"
+	ShowProblems   ID = "show-problems"
+	ShowStats      ID = "show-stats"
 	OpenFilter     ID = "open-filter"
+	OpenLogFilter  ID = "open-log-filter"
 	OpenHelp       ID = "open-help"
 	OpenTheme      ID = "open-theme"
+	OpenSettings   ID = "open-settings"
 	CommandPalette ID = "command-palette"
 	Quit           ID = "quit"
 )
@@ -41,9 +45,13 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: StartStop, Name: "Start or stop selected container", Shortcut: "s", Aliases: []string{"start", "stop"}, Enabled: canStartStop, Run: startStop},
 		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Run: restart},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer},
+		{ID: ShowProblems, Name: "Show problems", Shortcut: "p", Aliases: []string{"issues", "health", "unhealthy", "restarting"}, Enabled: true},
+		{ID: ShowStats, Name: "Show stats", Shortcut: "g", Aliases: []string{"graphs", "sparklines", "metrics", "cpu", "memory"}, Enabled: true},
 		{ID: OpenFilter, Name: "Filter projects and containers", Shortcut: "/", Aliases: []string{"search"}, Enabled: true},
+		{ID: OpenLogFilter, Name: "Filter visible logs", Shortcut: "/", Aliases: []string{"logs search", "log search"}, Enabled: hasContainer},
 		{ID: OpenHelp, Name: "Show keyboard help", Shortcut: "?", Aliases: []string{"keys"}, Enabled: true},
 		{ID: OpenTheme, Name: "Choose theme", Shortcut: "T", Aliases: []string{"themes", "palette", "colors"}, Enabled: true},
+		{ID: OpenSettings, Name: "Open settings", Shortcut: ",", Aliases: []string{"preferences", "options", "config"}, Enabled: true},
 		{ID: CommandPalette, Name: "Command palette", Shortcut: "ctrl+k", Aliases: []string{"commands"}, Enabled: true},
 		{ID: Quit, Name: "Quit TideDock", Shortcut: "q", Aliases: []string{"exit"}, Enabled: true},
 	}

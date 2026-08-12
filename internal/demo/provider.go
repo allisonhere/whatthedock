@@ -18,6 +18,7 @@ type Provider struct {
 	host       domain.Host
 	containers map[string]domain.Container
 	logs       map[string][]string
+	statsTicks map[string]int
 }
 
 func NewProvider() *Provider {
@@ -26,6 +27,7 @@ func NewProvider() *Provider {
 		host:       host,
 		containers: map[string]domain.Container{},
 		logs:       map[string][]string{},
+		statsTicks: map[string]int{},
 	}
 	provider.seed()
 	return provider
@@ -53,6 +55,18 @@ func (p *Provider) Container(_ context.Context, id domain.ResourceID) (domain.Co
 		return domain.Container{}, fmt.Errorf("demo container %s no longer exists", id.ID)
 	}
 	return ctr, nil
+}
+
+func (p *Provider) ContainerStats(_ context.Context, id domain.ResourceID) (domain.ContainerStats, error) {
+	p.mu.Lock()
+	ctr, ok := p.containers[id.ID]
+	tick := p.statsTicks[id.ID]
+	p.statsTicks[id.ID] = tick + 1
+	p.mu.Unlock()
+	if !ok {
+		return domain.ContainerStats{}, fmt.Errorf("demo container %s no longer exists", id.ID)
+	}
+	return demoStats(ctr, tick), nil
 }
 
 func (p *Provider) Logs(ctx context.Context, id domain.ResourceID, options app.LogOptions) (io.ReadCloser, error) {
@@ -95,6 +109,56 @@ func (p *Provider) Logs(ctx context.Context, id domain.ResourceID, options app.L
 		}
 	}()
 	return reader, nil
+}
+
+func demoStats(ctr domain.Container, tick int) domain.ContainerStats {
+	base := uint64(len(ctr.ID.ID))*1024*1024 + uint64(ctr.RestartCount)*8*1024*1024
+	wave := demoWave(tick)
+	byteWave := uint64(absInt(wave)) * 1024 * 1024
+	stats := domain.ContainerStats{
+		ID:          ctr.ID,
+		Read:        time.Now(),
+		CPUPercent:  clampFloat(float64((len(ctr.DisplayName())%6)+1)*4.5+float64(wave)*1.7, 0, 100),
+		MemoryUsage: 192*1024*1024 + base + byteWave,
+		MemoryLimit: 2 * 1024 * 1024 * 1024,
+		NetworkRx:   40*1024*1024 + base*2 + uint64(tick%9)*5*1024*1024,
+		NetworkTx:   12*1024*1024 + base + uint64((tick+3)%7)*3*1024*1024,
+		BlockRead:   80*1024*1024 + base + uint64((tick+5)%8)*4*1024*1024,
+		BlockWrite:  24*1024*1024 + base/2 + uint64((tick+2)%6)*2*1024*1024,
+		PIDs:        uint64(8 + len(ctr.Networks)*4 + absInt(wave)%5),
+	}
+	if ctr.Restarting || ctr.State == domain.StateRestarting {
+		stats.CPUPercent = clampFloat(74.2+float64(wave)*2.4, 0, 100)
+		stats.MemoryUsage = 780*1024*1024 + byteWave
+		stats.NetworkRx = 620*1024*1024 + uint64(tick%10)*8*1024*1024
+		stats.NetworkTx = 210*1024*1024 + uint64((tick+4)%8)*6*1024*1024
+		stats.BlockRead = 330*1024*1024 + uint64((tick+6)%7)*5*1024*1024
+		stats.BlockWrite = 140*1024*1024 + uint64((tick+1)%5)*4*1024*1024
+		stats.PIDs = uint64(23 + absInt(wave)%6)
+	}
+	return stats
+}
+
+func demoWave(tick int) int {
+	pattern := []int{0, 2, 4, 3, 1, -1, -3, -4, -2}
+	return pattern[tick%len(pattern)]
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func clampFloat(value, minValue, maxValue float64) float64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func (p *Provider) StartContainer(_ context.Context, id domain.ResourceID) error {

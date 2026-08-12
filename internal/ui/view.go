@@ -2,10 +2,14 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/allisonhere/tideui"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/allisonhere/tidedock/internal/domain"
 )
@@ -15,25 +19,53 @@ func (m Model) View() string {
 		return ""
 	}
 	renderer := tideui.NewRenderer(m.theme, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	topbar := m.renderTopbar(renderer)
+	if m.height == 1 {
+		return topbar
+	}
+	activityTitle, activityHint := m.activityHeader()
 	panes := [3]tideui.Pane{
 		{Title: "Projects", Hint: "space collapse  / filter", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
-		{Title: "Activity", Hint: "logs", Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
+		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
 		{Title: "Inspector", Hint: "s start/stop  alt+r restart", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
 		Left:  m.statusLeft(renderer),
-		Right: "j/k move  space expand  / filter  T themes  ctrl+k commands  ? help  q quit",
+		Right: "j/k move  space expand  / filter  l logs  p problems  g stats  T themes  , settings  ctrl+k commands  ? help  q quit",
 	}
-	return renderer.Render(tideui.Layout{
+	return topbar + "\n" + renderer.Render(tideui.Layout{
 		Width:        m.width,
-		Height:       m.height,
+		Height:       m.height - 1,
 		Mode:         tideui.ThreeColumn,
 		Panes:        panes,
 		Status:       status,
 		Modal:        modal,
 		ColumnRatios: [3]float64{3, 5, 4},
 	})
+}
+
+func (m Model) activityHeader() (string, string) {
+	switch m.mode {
+	case activityProblems:
+		return "Problems", "p problems  l logs  g stats"
+	case activityStats:
+		return "Stats", "g stats  p problems  l logs"
+	default:
+		return "Activity", "j/k scroll  n/N matches  / search  x/esc clear"
+	}
+}
+
+func (m Model) renderTopbar(renderer tideui.Renderer) string {
+	width := max(1, m.width)
+	left := renderer.Styles.StatusNotice.Render(" TideDock ") +
+		renderer.Styles.StatusBar.Render(" "+m.provider.Host().Name)
+	right := fmt.Sprintf("Docker connected · %d projects · %d standalone · %d problems",
+		len(m.snapshot.Projects), len(m.snapshot.Standalone), len(m.snapshotProblems()))
+	if m.statusErr {
+		right = m.status
+	}
+	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, width))
 }
 
 func (m Model) renderTree(renderer tideui.Renderer) string {
@@ -80,6 +112,12 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 }
 
 func (m Model) renderActivity(renderer tideui.Renderer) string {
+	if m.mode == activityStats {
+		return m.renderStats(renderer)
+	}
+	if m.mode == activityProblems {
+		return m.renderProblems(renderer)
+	}
 	if m.selected == nil {
 		return renderer.Styles.DetailMeta.Render("Select a container to view live logs.")
 	}
@@ -93,16 +131,825 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	if width < 20 {
 		width = 20
 	}
-	start := 0
-	visible := max(1, m.height-5)
-	if len(m.logLines) > visible {
-		start = len(m.logLines) - visible
+	filtered := m.visibleLogLines()
+	if len(filtered) == 0 {
+		return renderer.Styles.DetailMeta.Render(m.emptyLogFilterMessage())
 	}
-	lines := make([]string, 0, len(m.logLines)-start)
-	for _, line := range m.logLines[start:] {
-		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(line))
+	visible := m.logVisibleRows()
+	start := m.logStartIndex(len(filtered), visible)
+	end := min(len(filtered), start+visible)
+	lines := make([]string, 0, end-start+1)
+	lines = append(lines, renderer.Styles.DetailMeta.Width(width).Render(m.logPositionIndicator(len(filtered), visible)))
+	for _, line := range filtered[start:end] {
+		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(renderLogLine(renderer, m.settings.LogColor, m.logFilter, line)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) logStartIndex(total, visible int) int {
+	if total <= 0 {
+		return 0
+	}
+	maxStart := max(0, total-visible)
+	if m.logFollow {
+		return maxStart
+	}
+	return clamp(m.logScroll, 0, maxStart)
+}
+
+func (m Model) logPositionIndicator(total, visible int) string {
+	if total == 0 {
+		return strings.Join(append([]string{"tail"}, m.logFilterChips()...), " · ")
+	}
+	start := m.logStartIndex(total, visible)
+	end := min(total, start+visible)
+	chips := m.logFilterChips()
+	if m.logFollow {
+		return strings.Join(append([]string{fmt.Sprintf("tail %d/%d", total, total)}, chips...), " · ")
+	}
+	return strings.Join(append([]string{fmt.Sprintf("paused %d-%d/%d", start+1, end, total)}, chips...), " · ")
+}
+
+func (m Model) logFilterChips() []string {
+	var chips []string
+	if query := strings.TrimSpace(m.logFilter); query != "" {
+		chips = append(chips, "filter "+query)
+		if current, total := m.logMatchStatus(); total > 0 {
+			chips = append(chips, fmt.Sprintf("match %d/%d", current, total))
+		}
+	}
+	if m.logLevel != logSeverityAll {
+		chips = append(chips, m.logLevel.String())
+	}
+	if len(chips) > 0 {
+		chips = append(chips, "x clear")
+	}
+	return chips
+}
+
+func (m Model) emptyLogFilterMessage() string {
+	query := strings.TrimSpace(m.logFilter)
+	if query == "" && m.logLevel == logSeverityAll {
+		return "No logs match."
+	}
+	var target string
+	if query != "" {
+		target = fmt.Sprintf("%q", query)
+	}
+	if m.logLevel != logSeverityAll {
+		if target != "" {
+			target += " · "
+		}
+		target += m.logLevel.String()
+	}
+	return "No logs match " + target + " · esc clear"
+}
+
+var (
+	logTimestampPattern  = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T[^\s]+|\d{2}:\d{2}:\d{2})`)
+	logSeverityPattern   = regexp.MustCompile(`(?i)(\[(?:ERR|ERROR|WRN|WARN|INF|INFO|DBG|DEBUG)\]|\b(?:ERROR|ERR|WARN|WRN|INFO|INF|DEBUG|DBG)\b)`)
+	logHTTPStatusPattern = regexp.MustCompile(`\b([1-5][0-9]{2})\b`)
+	logHTTPMethodPattern = regexp.MustCompile(`\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b`)
+)
+
+func (m Model) visibleLogLines() []string {
+	query := strings.ToLower(strings.TrimSpace(m.logFilter))
+	if query == "" && m.logLevel == logSeverityAll {
+		return m.logLines
+	}
+	lines := make([]string, 0, len(m.logLines))
+	for _, line := range m.logLines {
+		if query != "" && !strings.Contains(strings.ToLower(line), query) {
+			continue
+		}
+		if !logLineMatchesSeverity(line, m.logLevel) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func logLineMatchesSeverity(line string, filter logSeverityFilter) bool {
+	if filter == logSeverityAll {
+		return true
+	}
+	severity := logLineSeverity(line)
+	switch filter {
+	case logSeverityErrors:
+		return severity == "ERROR" || severity == "ERR"
+	case logSeverityWarnings:
+		return severity == "WARN" || severity == "WRN"
+	case logSeverityInfo:
+		return severity == "INFO" || severity == "INF"
+	default:
+		return true
+	}
+}
+
+func logLineSeverity(line string) string {
+	for start := 0; start < len(line); {
+		end := start
+		if isLogSpace(line[start]) {
+			start++
+			continue
+		}
+		for end < len(line) && !isLogSpace(line[end]) {
+			end++
+		}
+		token := line[start:end]
+		if logSeverityPattern.MatchString(token) {
+			return strings.Trim(strings.ToUpper(token), "[]")
+		}
+		start = end
+	}
+	return ""
+}
+
+func renderLogLine(renderer tideui.Renderer, mode logColorMode, query, line string) string {
+	var out strings.Builder
+	for start := 0; start < len(line); {
+		end := start
+		if isLogSpace(line[start]) {
+			for end < len(line) && isLogSpace(line[end]) {
+				end++
+			}
+			out.WriteString(line[start:end])
+			start = end
+			continue
+		}
+		for end < len(line) && !isLogSpace(line[end]) {
+			end++
+		}
+		token := line[start:end]
+		rendered := renderLogToken(renderer, mode, token, start == 0)
+		out.WriteString(renderLogMatch(renderer, query, token, rendered))
+		start = end
+	}
+	return out.String()
+}
+
+func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, first bool) string {
+	if mode == logColorMono {
+		return token
+	}
+	trimmed := strings.Trim(token, `[](),;:"'`)
+	switch {
+	case first && logTimestampPattern.MatchString(token) && (mode == logColorFull || mode == logColorHTTP || mode == logColorSeverity):
+		return logStyle(renderer, "#8aadf4", false).Render(token)
+	case logHTTPMethodPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
+		return logStyle(renderer, "#7dcfff", true).Render(token)
+	case logHTTPStatusPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
+		return logStyle(renderer, httpStatusColor(trimmed), true).Render(token)
+	case logSeverityPattern.MatchString(token) && (mode == logColorFull || mode == logColorSeverity):
+		return logStyle(renderer, logSeverityColor(token), true).Render(token)
+	default:
+		return token
+	}
+}
+
+func renderLogMatch(renderer tideui.Renderer, query, token, rendered string) string {
+	query = strings.TrimSpace(query)
+	if query == "" || !strings.Contains(strings.ToLower(token), strings.ToLower(query)) {
+		return rendered
+	}
+	if ansi.Strip(rendered) != token {
+		return lipgloss.NewStyle().
+			Background(renderer.Styles.Theme.Selected).
+			Foreground(renderer.Styles.Theme.Fg).
+			Bold(true).
+			Render(token)
+	}
+	return lipgloss.NewStyle().
+		Background(renderer.Styles.Theme.Selected).
+		Foreground(renderer.Styles.Theme.Fg).
+		Bold(true).
+		Render(rendered)
+}
+
+func isLogSpace(char byte) bool {
+	return char == ' ' || char == '\t'
+}
+
+func logStyle(renderer tideui.Renderer, color lipgloss.Color, bold bool) lipgloss.Style {
+	return lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(color).Bold(bold)
+}
+
+func httpStatusColor(status string) lipgloss.Color {
+	switch {
+	case strings.HasPrefix(status, "5"):
+		return "#e06c75"
+	case strings.HasPrefix(status, "4"):
+		return "#f5a97f"
+	case strings.HasPrefix(status, "3"):
+		return "#e8c170"
+	case strings.HasPrefix(status, "2"):
+		return "#80c990"
+	default:
+		return "#9aa6b2"
+	}
+}
+
+func logSeverityColor(severity string) lipgloss.Color {
+	normalized := strings.Trim(strings.ToUpper(severity), "[]")
+	switch normalized {
+	case "ERROR", "ERR":
+		return "#e06c75"
+	case "WARN", "WRN":
+		return "#e8c170"
+	case "DEBUG", "DBG":
+		return "#9aa6b2"
+	default:
+		return "#80c990"
+	}
+}
+
+func (m Model) renderStats(renderer tideui.Renderer) string {
+	ctr := m.selectedContainer()
+	if ctr == nil {
+		return renderer.Styles.DetailMeta.Render("Select a container to view stats.")
+	}
+	width := m.centerPaneWidth() - 4
+	if width < 20 {
+		width = 20
+	}
+	stats := m.stats
+	if stats != nil && stats.ID != ctr.ID {
+		stats = nil
+	}
+	notice := "Stats will refresh while this pane is active."
+	if m.statsLoading {
+		notice = "Loading Docker stats for " + ctr.DisplayName() + "..."
+	} else if m.statsErr != nil {
+		notice = "Stats unavailable: " + friendlyDockerError(m.statsErr)
+	} else if stats != nil {
+		notice = "Stats sampled " + formatStatsAge(stats.Read) + "."
+	}
+	history := m.statsHistory[ctr.ID]
+	lines := []string{
+		renderer.Styles.DetailMeta.Render(notice),
+		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), "#7dcfff"),
+		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta), formatMemoryStats(stats), "#80c990"),
+		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
+		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta), formatBytes(statsNetworkTx(stats)), "#8aadf4"),
+		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), "#e8c170"),
+		"",
+		renderStatRow(renderer, m.settings, width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
+		renderStatRow(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#9aa6b2"),
+		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#9aa6b2"),
+		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: ctr.DisplayName()}, width),
+	}
+	return strings.Join(lines, "\n")
+}
+
+type statGraph struct {
+	values        []float64
+	maxValue      float64
+	fallbackLevel int
+	delta         string
+	static        string
+}
+
+func statsCPU(stats *domain.ContainerStats) float64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.CPUPercent
+}
+
+func statsNetworkRx(stats *domain.ContainerStats) uint64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.NetworkRx
+}
+
+func statsNetworkTx(stats *domain.ContainerStats) uint64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.NetworkTx
+}
+
+func statsBlockRead(stats *domain.ContainerStats) uint64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.BlockRead
+}
+
+func statsBlockWrite(stats *domain.ContainerStats) uint64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.BlockWrite
+}
+
+func statsBlockTotal(stats *domain.ContainerStats) uint64 {
+	return statsBlockRead(stats) + statsBlockWrite(stats)
+}
+
+func percentLevel(value float64) int {
+	switch {
+	case value >= 80:
+		return 7
+	case value >= 60:
+		return 6
+	case value >= 40:
+		return 5
+	case value >= 20:
+		return 4
+	case value > 0:
+		return 3
+	default:
+		return 1
+	}
+}
+
+func memoryLevel(stats *domain.ContainerStats) int {
+	if stats == nil || stats.MemoryUsage == 0 {
+		return 1
+	}
+	if stats.MemoryLimit == 0 {
+		return byteLevel(stats.MemoryUsage)
+	}
+	return percentLevel(float64(stats.MemoryUsage) / float64(stats.MemoryLimit) * 100)
+}
+
+func byteLevel(value uint64) int {
+	switch {
+	case value >= 1<<30:
+		return 7
+	case value >= 512<<20:
+		return 6
+	case value >= 128<<20:
+		return 5
+	case value >= 32<<20:
+		return 4
+	case value > 0:
+		return 3
+	default:
+		return 1
+	}
+}
+
+func pidsLevel(stats *domain.ContainerStats) int {
+	if stats == nil {
+		return 1
+	}
+	switch {
+	case stats.PIDs >= 100:
+		return 7
+	case stats.PIDs >= 50:
+		return 6
+	case stats.PIDs >= 20:
+		return 5
+	case stats.PIDs > 0:
+		return 3
+	default:
+		return 1
+	}
+}
+
+func cpuStatGraph(stats *domain.ContainerStats, history statsHistory) statGraph {
+	if len(history.CPU) == 0 {
+		return statGraph{fallbackLevel: percentLevel(statsCPU(stats))}
+	}
+	maxValue := history.maxCPU
+	if maxValue < 100 {
+		maxValue = 100
+	}
+	return statGraph{
+		values:        history.CPU,
+		maxValue:      maxValue,
+		fallbackLevel: percentLevel(statsCPU(stats)),
+		delta:         formatPercentDelta(floatDelta(history.CPU)),
+	}
+}
+
+func uintStatGraph(values []uint64, maxValue uint64, fallbackLevel int, formatDelta func(int64) string) statGraph {
+	if len(values) == 0 || maxValue == 0 {
+		return statGraph{fallbackLevel: fallbackLevel}
+	}
+	asFloat := make([]float64, 0, len(values))
+	for _, value := range values {
+		asFloat = append(asFloat, float64(value))
+	}
+	return statGraph{
+		values:        asFloat,
+		maxValue:      float64(maxValue),
+		fallbackLevel: fallbackLevel,
+		delta:         formatDelta(uintDelta(values)),
+	}
+}
+
+func staticStatGraph(value string, fallbackLevel int) statGraph {
+	return statGraph{static: value, fallbackLevel: fallbackLevel}
+}
+
+func renderStatRow(renderer tideui.Renderer, settings appSettings, width int, label string, graph statGraph, suffix string, color lipgloss.Color) string {
+	room := width - 9 - lipgloss.Width(suffix) - 2
+	if room < 8 {
+		return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Suffix: suffix}, width)
+	}
+	text := renderHybridGraph(renderer, settings, graph, color, room)
+	return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Text: text, Suffix: suffix}, width)
+}
+
+func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph statGraph, color lipgloss.Color, width int) string {
+	if width < 12 {
+		return renderSparkline(renderer, settings, graph, color, width)
+	}
+	meter := renderMeter(renderer, settings, graphLevel(settings, graph), color)
+	sparkWidth := width - lipgloss.Width(meter) - 2
+	delta := graph.delta
+	if !settings.ShowDeltas {
+		delta = ""
+	}
+	if delta != "" && width >= 24 {
+		deltaWidth := lipgloss.Width(delta) + 2
+		if sparkWidth-deltaWidth >= 6 {
+			sparkWidth -= deltaWidth
+		} else {
+			delta = ""
+		}
+	} else {
+		delta = ""
+	}
+	spark := renderSparkline(renderer, settings, graph, color, max(1, sparkWidth))
+	parts := []string{meter, spark}
+	if delta != "" {
+		parts = append(parts, renderer.Styles.DetailMeta.Render(delta))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func renderMeter(renderer tideui.Renderer, settings appSettings, level int, color lipgloss.Color) string {
+	level = clamp(level, 1, 7)
+	filled := clamp((level+1)/2, 1, 5)
+	hotColor := statHeatColor(settings, level, color, renderer)
+	full := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(hotColor).Bold(true).Render(strings.Repeat("▓", filled))
+	empty := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(renderer.Styles.Theme.Dimmed).Render(strings.Repeat("░", 5-filled))
+	return full + empty
+}
+
+func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statGraph, color lipgloss.Color, width int) string {
+	width = max(1, width)
+	glyphs := graphGlyphs(settings)
+	if graph.static != "" {
+		return styleGraphGlyphs(renderer, settings, graph.static, graph.fallbackLevel, color)
+	}
+	if len(graph.values) == 0 || graph.maxValue <= 0 {
+		level := clamp(graph.fallbackLevel, 1, len(glyphs))
+		return styleGraphGlyphs(renderer, settings, strings.Join(glyphs[:level], ""), level, color)
+	}
+	values := graph.values
+	if len(values) > width {
+		values = values[len(values)-width:]
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		level := graphValueLevel(settings, value, graph.maxValue)
+		glyph := glyphs[level-1]
+		out = append(out, lipgloss.NewStyle().
+			Background(renderer.Styles.Theme.Bg).
+			Foreground(statGlyphColor(settings, glyph, color, renderer)).
+			Bold(statGlyphBold(glyph)).
+			Render(glyph))
+	}
+	return strings.Join(out, "")
+}
+
+func graphGlyphs(settings appSettings) []string {
+	switch settings.GraphStyle {
+	case graphStyleBlocks:
+		return []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
+	case graphStyleBraille:
+		return []string{"⣀", "⣤", "⣶", "⣿"}
+	default:
+		return []string{"▁", "▂", "▂", "▃", "▄", "▅", "▇", "█", "▆", "▄", "▃", "▅", "▆", "▇"}
+	}
+}
+
+func staticGraphGlyph(settings appSettings, level int) string {
+	glyphs := graphGlyphs(settings)
+	return glyphs[clamp(level, 1, len(glyphs))-1]
+}
+
+func styleGraphGlyphs(renderer tideui.Renderer, settings appSettings, graph string, _ int, color lipgloss.Color) string {
+	var out []string
+	for _, glyph := range graph {
+		glyph := string(glyph)
+		out = append(out, lipgloss.NewStyle().
+			Background(renderer.Styles.Theme.Bg).
+			Foreground(statGlyphColor(settings, glyph, color, renderer)).
+			Bold(statGlyphBold(glyph)).
+			Render(glyph))
+	}
+	return strings.Join(out, "")
+}
+
+func graphLevel(settings appSettings, graph statGraph) int {
+	if len(graph.values) == 0 || graph.maxValue <= 0 {
+		return clamp(graph.fallbackLevel, 1, len(graphGlyphs(settings)))
+	}
+	return graphValueLevel(settings, graph.values[len(graph.values)-1], graph.maxValue)
+}
+
+func graphValueLevel(settings appSettings, value, maxValue float64) int {
+	if maxValue <= 0 {
+		return 1
+	}
+	glyphs := graphGlyphs(settings)
+	level := int(value/maxValue*float64(len(glyphs)-1)) + 1
+	return clamp(level, 1, len(glyphs))
+}
+
+func statHeatColor(settings appSettings, level int, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
+	switch settings.GraphColor {
+	case graphColorMetric:
+		return color
+	case graphColorMono:
+		return renderer.Styles.Theme.Dimmed
+	}
+	colors := []lipgloss.Color{
+		"#80c990",
+		"#9dce7f",
+		"#bbd36f",
+		"#d8cb6f",
+		"#e8c170",
+		"#edad75",
+		"#f29a7a",
+		"#e06c75",
+	}
+	return colors[clamp(level, 1, len(colors))-1]
+}
+
+func statGlyphColor(settings appSettings, glyph string, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
+	switch settings.GraphColor {
+	case graphColorMetric:
+		return color
+	case graphColorMono:
+		return renderer.Styles.Theme.Dimmed
+	}
+	switch glyph {
+	case "▁":
+		return "#80c990"
+	case "▂":
+		return "#a9d576"
+	case "▃":
+		return "#d1cd70"
+	case "▄":
+		return "#e8c170"
+	case "▅":
+		return "#efaa76"
+	case "▆":
+		return "#f28d78"
+	case "▇":
+		return "#e97876"
+	case "█":
+		return "#e06c75"
+	case "⣀":
+		return "#80c990"
+	case "⣤":
+		return "#d1cd70"
+	case "⣶":
+		return "#efaa76"
+	case "⣿":
+		return "#e06c75"
+	default:
+		return "#9aa6b2"
+	}
+}
+
+func statGlyphBold(glyph string) bool {
+	return glyph == "▅" || glyph == "▆" || glyph == "▇" || glyph == "█"
+}
+
+func floatDelta(values []float64) float64 {
+	if len(values) < 2 {
+		return 0
+	}
+	return values[len(values)-1] - values[len(values)-2]
+}
+
+func uintDelta(values []uint64) int64 {
+	if len(values) < 2 {
+		return 0
+	}
+	current := values[len(values)-1]
+	previous := values[len(values)-2]
+	if current >= previous {
+		return int64(current - previous)
+	}
+	return -int64(previous - current)
+}
+
+func formatPercentDelta(delta float64) string {
+	if delta == 0 {
+		return ""
+	}
+	if delta > 0 {
+		return fmt.Sprintf("↗ %.1f%%", delta)
+	}
+	return fmt.Sprintf("↘ %.1f%%", -delta)
+}
+
+func formatByteDelta(delta int64) string {
+	if delta == 0 {
+		return ""
+	}
+	if delta > 0 {
+		return "↗ +" + formatBytes(uint64(delta))
+	}
+	return "↘ -" + formatBytes(uint64(-delta))
+}
+
+func formatCountDelta(delta int64) string {
+	if delta == 0 {
+		return ""
+	}
+	if delta > 0 {
+		return fmt.Sprintf("↗ +%d", delta)
+	}
+	return fmt.Sprintf("↘ %d", delta)
+}
+
+func formatCPU(stats *domain.ContainerStats) string {
+	if stats == nil {
+		return "pending stats"
+	}
+	return fmt.Sprintf("%.1f%%", stats.CPUPercent)
+}
+
+func formatMemoryStats(stats *domain.ContainerStats) string {
+	if stats == nil {
+		return "pending stats"
+	}
+	if stats.MemoryLimit == 0 {
+		return formatBytes(stats.MemoryUsage)
+	}
+	return formatBytes(stats.MemoryUsage) + " / " + formatBytes(stats.MemoryLimit)
+}
+
+func formatPIDs(stats *domain.ContainerStats) string {
+	if stats == nil {
+		return "pending stats"
+	}
+	return fmt.Sprintf("%d", stats.PIDs)
+}
+
+func formatStatsAge(read time.Time) string {
+	if read.IsZero() {
+		return "just now"
+	}
+	age := time.Since(read).Round(time.Second)
+	if age < time.Second {
+		return "just now"
+	}
+	return age.String() + " ago"
+}
+
+func restartLevel(count int) int {
+	switch {
+	case count <= 0:
+		return 1
+	case count < 3:
+		return 4
+	case count < 6:
+		return 6
+	default:
+		return 12
+	}
+}
+
+func restartColor(count int) lipgloss.Color {
+	if count >= 5 {
+		return "#e06c75"
+	}
+	if count > 0 {
+		return "#e8c170"
+	}
+	return "#80c990"
+}
+
+func uptimeLevel(created time.Time) int {
+	if created.IsZero() {
+		return 1
+	}
+	age := time.Since(created)
+	switch {
+	case age < time.Hour:
+		return 1
+	case age < 24*time.Hour:
+		return 4
+	case age < 7*24*time.Hour:
+		return 6
+	default:
+		return 12
+	}
+}
+
+type problemRow struct {
+	id       domain.ResourceID
+	severity string
+	name     string
+	detail   string
+}
+
+func (m Model) renderProblems(renderer tideui.Renderer) string {
+	problems := m.snapshotProblems()
+	if len(problems) == 0 {
+		return renderer.Styles.DetailMeta.Render("No container problems detected.")
+	}
+	width := m.centerPaneWidth() - 4
+	if width < 20 {
+		width = 20
+	}
+	lines := make([]string, 0, len(problems)+1)
+	lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
+	for i, problem := range problems {
+		lines = append(lines, renderer.RenderRow(tideui.Row{
+			Prefix:   problem.severity + "  ",
+			Text:     problem.name,
+			Suffix:   problem.detail,
+			Selected: m.problemSelected(i, problem),
+			Muted:    problem.severity == "warn",
+		}, width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) problemSelected(index int, problem problemRow) bool {
+	if m.focus == paneActivity && m.mode == activityProblems {
+		return index == m.problemCursor
+	}
+	return m.selectedID == problem.id
+}
+
+func (m Model) snapshotProblems() []problemRow {
+	var problems []problemRow
+	for _, ctr := range m.snapshotContainers() {
+		name := ctr.DisplayName()
+		switch {
+		case ctr.Health == domain.HealthUnhealthy:
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "unhealthy"})
+		case ctr.Restarting || ctr.State == domain.StateRestarting:
+			detail := "restarting"
+			if ctr.RestartCount > 0 {
+				detail = fmt.Sprintf("restarting (%d restarts)", ctr.RestartCount)
+			}
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: detail})
+		case ctr.State == domain.StateDead:
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "dead"})
+		case ctr.RestartCount >= 5:
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: fmt.Sprintf("%d restarts", ctr.RestartCount)})
+		case ctr.State == domain.StateStopped || ctr.State == domain.StateExited:
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: string(ctr.State)})
+		case ctr.Health == domain.HealthUnknown:
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "health unknown"})
+		case ctr.Compose.Project == "" && hasPublicPorts(ctr):
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "public ports"})
+		}
+	}
+	sort.SliceStable(problems, func(i, j int) bool {
+		if severityRank(problems[i].severity) != severityRank(problems[j].severity) {
+			return severityRank(problems[i].severity) < severityRank(problems[j].severity)
+		}
+		return problems[i].name < problems[j].name
+	})
+	return problems
+}
+
+func hasPublicPorts(ctr domain.Container) bool {
+	for _, port := range ctr.Ports {
+		if port.Public > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func severityRank(severity string) int {
+	switch severity {
+	case "crit":
+		return 0
+	case "warn":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func (m Model) snapshotContainers() []domain.Container {
+	var containers []domain.Container
+	for _, project := range m.snapshot.Projects {
+		for _, service := range project.Services {
+			containers = append(containers, service.Containers...)
+		}
+	}
+	containers = append(containers, m.snapshot.Standalone...)
+	return containers
 }
 
 func (m Model) renderInspector(renderer tideui.Renderer) string {
@@ -137,8 +984,16 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 		add("Health", strings.Join(ctr.HealthCheck.Test, " "))
 	}
 	lines = append(lines, "")
-	lines = append(lines, renderer.Styles.DetailMeta.Render("Actions: s start/stop  alt+r restart  l logs  ctrl+k more"))
+	lines = append(lines, renderActionBar(renderer, max(12, m.rightPaneWidth()-4)))
 	return strings.Join(lines, "\n")
+}
+
+func renderActionBar(renderer tideui.Renderer, width int) string {
+	actions := []string{"s start/stop", "r restart", "l logs", "c copy"}
+	for i, action := range actions {
+		actions[i] = "[" + action + "]"
+	}
+	return renderer.Styles.DetailMeta.Width(width).Render("Actions  " + strings.Join(actions, " "))
 }
 
 func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
@@ -159,14 +1014,59 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "filter", Content: content, Width: width})
 		return &overlay
+	case overlayLogFilter:
+		width := min(72, max(40, m.width-8))
+		input := renderer.Styles.InputFocused.Width(max(20, width-8)).Render(m.logDraft)
+		content := renderer.RenderSoftBody(width,
+			renderer.Styles.DetailMeta.Render("Severity  "+m.logLevel.String())+"\n"+
+				input+"\n\n"+
+				renderer.RenderSoftHints(width-4,
+					tideui.SoftHint{Key: "enter", Label: "apply"},
+					tideui.SoftHint{Key: "esc", Label: "cancel"},
+				))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "log filter", Content: content, Width: width})
+		return &overlay
 	case overlayCommandPalette:
 		return m.commandPaletteOverlay(renderer)
 	case overlayThemePicker:
 		overlay := m.themes.SoftModal(renderer, min(72, max(40, m.width-8)), max(8, m.height-4), "tidedock")
 		return &overlay
+	case overlaySettings:
+		return m.settingsOverlay(renderer)
 	default:
 		return nil
 	}
+}
+
+func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(76, max(44, m.width-8))
+	contentWidth := width - 4
+	rows := make([]string, 0, len(m.settingsRows())+4)
+	for i, row := range m.settingsRows() {
+		if row.kind == settingsRowSection {
+			if len(rows) > 0 {
+				rows = append(rows, "")
+			}
+			rows = append(rows, renderer.Styles.DetailMeta.Render(row.label))
+			continue
+		}
+		suffix := row.value
+		if row.kind == settingsRowAction {
+			suffix = "enter"
+		}
+		rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{Text: row.label, Suffix: suffix, Selected: i == m.settingsCursor}, contentWidth))
+	}
+	if m.settingsPath != "" {
+		rows = append(rows, "", renderer.Styles.DetailMeta.Width(contentWidth).Render("Config  "+m.settingsPath))
+	}
+	rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
+		tideui.SoftHint{Key: "enter/space", Label: "change"},
+		tideui.SoftHint{Key: "h/l", Label: "previous/next"},
+		tideui.SoftHint{Key: "esc", Label: "close"},
+	))
+	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "settings", Content: content, Width: width})
+	return &overlay
 }
 
 func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
@@ -202,6 +1102,9 @@ func (m Model) statusLeft(renderer tideui.Renderer) string {
 	if m.statusErr {
 		return renderer.Styles.StatusError.Render(prefix + m.status)
 	}
+	if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
+		return renderer.Styles.StatusNotice.Render(prefix+"logs: "+filterStatus(m.logFilter, m.logLevel)) + renderer.Styles.StatusBar.Render(" "+m.status)
+	}
 	if strings.TrimSpace(m.filter) != "" {
 		return renderer.Styles.StatusNotice.Render(prefix+"filter: "+m.filter) + renderer.Styles.StatusBar.Render(" "+m.status)
 	}
@@ -219,7 +1122,15 @@ func helpText() string {
 		"r              refresh",
 		"Alt+r          restart selected container",
 		"l              logs",
+		"/              filter logs while logs pane is focused",
+		"e / w / i / a  log errors, warnings, info, all",
+		"n / N          next/previous log search match",
+		"f / End        resume live log tail",
+		"x / Esc        clear active log filter",
+		"p              problems",
+		"g              stats graphs",
 		"T              theme picker",
+		",              settings",
 		"Ctrl+K         command palette",
 		"?              keyboard help",
 		"q              quit",
@@ -288,6 +1199,20 @@ func formatMap(values map[string]string, limit int) string {
 	return strings.Join(lines, "\n")
 }
 
+func formatBytes(value uint64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	size := float64(value)
+	unit := 0
+	for size >= 1024 && unit < len(units)-1 {
+		size /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d %s", value, units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", size, units[unit])
+}
+
 func short(value string, n int) string {
 	if len(value) <= n {
 		return value
@@ -319,4 +1244,21 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func alignText(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	if rightWidth >= width {
+		return ansi.Truncate(right, width, "")
+	}
+	if leftWidth+rightWidth+1 > width {
+		left = ansi.Truncate(left, max(0, width-rightWidth-1), "")
+		leftWidth = lipgloss.Width(left)
+	}
+	gap := max(1, width-leftWidth-rightWidth)
+	return left + strings.Repeat(" ", gap) + right
 }

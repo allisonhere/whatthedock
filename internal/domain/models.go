@@ -100,6 +100,19 @@ type Container struct {
 	HealthCheck   *HealthCheck
 }
 
+type ContainerStats struct {
+	ID          ResourceID
+	Read        time.Time
+	CPUPercent  float64
+	MemoryUsage uint64
+	MemoryLimit uint64
+	NetworkRx   uint64
+	NetworkTx   uint64
+	BlockRead   uint64
+	BlockWrite  uint64
+	PIDs        uint64
+}
+
 type ComposeRef struct {
 	Project         string
 	Service         string

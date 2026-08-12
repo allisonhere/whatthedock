@@ -22,6 +22,10 @@ The app should work with zero TideDock-specific configuration. Running
 `tidedock` honors Docker's normal environment and context defaults and connects
 to the local daemon when Docker is available.
 
+User preferences are stored as JSON in the platform config directory, normally
+`~/.config/tidedock/settings.json` on Linux. Missing or invalid settings fall
+back to built-in defaults.
+
 ## Current Controls
 
 | Key | Action |
@@ -35,7 +39,18 @@ to the local daemon when Docker is available.
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
 | `l` | Focus logs |
+| `p` | Show problems |
+| `g` | Show stats graphs |
+| `/` in logs | Filter visible log lines |
+| `e` / `w` / `i` / `a` in logs | Show errors, warnings, info, or all log lines |
+| `j` / `k` in logs | Scroll log history |
+| `PgUp` / `PgDown` in logs | Page through log history |
+| `Home` / `End` in logs | Jump to log start or resume tail |
+| `f` in logs | Resume live log tail |
+| `n` / `N` in logs | Next/previous log search match |
+| `x` / `Esc` in logs | Clear active log filters |
 | `T` | Theme picker |
+| `,` / `Ctrl+,` | Settings |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
 | `q` | Quit |
@@ -91,7 +106,17 @@ make build
 - Shows standalone containers separately.
 - Supports project collapse/expand and fast substring filtering.
 - Displays useful selected-container details without dumping Docker JSON.
-- Streams selected-container logs through a cancellable reader.
+- Streams selected-container logs through a cancellable reader with color-coded
+  timestamps, severity, HTTP methods, and HTTP status codes.
+- Supports log filtering, severity quick filters, match navigation, scrollback,
+  follow-tail pause/resume, and per-container log view state.
+- Shows a problems view for unhealthy, restarting, stopped, dead, high-restart,
+  unknown-health, and public-port containers.
+- Shows polling stats graphs and sparklines for the selected container, with
+  CPU, memory, network, disk I/O, restart, uptime, and PID readouts.
+- Includes a grouped settings panel with reset defaults, persisted graph style,
+  graph colors, log color mode, deltas, refresh interval, and default activity
+  pane.
 - Starts, stops, restarts, and refreshes containers.
 - Shows actionable Docker connection and permission errors.
 - Includes a built-in demo provider for development on machines without Docker.
@@ -112,12 +137,11 @@ TideDock.
 
 ## Planned Features
 
-- Problems view for unhealthy, restarting, orphaned, stale, and resource-heavy
-  Docker resources.
-- Stats graphs and sparklines.
 - Docker event stream.
 - Exec shell workflow.
 - Copy/open actions for ports, labels, mounts, and environment values.
+- Deeper problem detection for orphaned, stale, and resource-heavy Docker
+  resources.
 - Multi-host support for local sockets, Docker contexts, and SSH-backed
   contexts.
 - Image update availability checks based on registry metadata rather than

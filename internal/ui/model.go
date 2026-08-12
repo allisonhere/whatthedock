@@ -14,6 +14,7 @@ import (
 
 	"github.com/allisonhere/tidedock/internal/actions"
 	"github.com/allisonhere/tidedock/internal/app"
+	"github.com/allisonhere/tidedock/internal/config"
 	"github.com/allisonhere/tidedock/internal/domain"
 )
 
@@ -25,15 +26,76 @@ const (
 	paneInspector
 )
 
+type activityMode int
+
+const (
+	activityLogs activityMode = iota
+	activityProblems
+	activityStats
+)
+
 type overlayMode int
 
 const (
 	overlayNone overlayMode = iota
 	overlayHelp
 	overlayFilter
+	overlayLogFilter
 	overlayCommandPalette
 	overlayThemePicker
+	overlaySettings
 )
+
+type graphStyle int
+
+const (
+	graphStyleWave graphStyle = iota
+	graphStyleBlocks
+	graphStyleBraille
+)
+
+type graphColorMode int
+
+const (
+	graphColorGradient graphColorMode = iota
+	graphColorMetric
+	graphColorMono
+)
+
+type logColorMode int
+
+const (
+	logColorFull logColorMode = iota
+	logColorSeverity
+	logColorHTTP
+	logColorMono
+)
+
+type logSeverityFilter int
+
+const (
+	logSeverityAll logSeverityFilter = iota
+	logSeverityErrors
+	logSeverityWarnings
+	logSeverityInfo
+)
+
+type logViewState struct {
+	filter     string
+	level      logSeverityFilter
+	scroll     int
+	follow     bool
+	matchIndex int
+}
+
+type appSettings struct {
+	GraphStyle      graphStyle
+	GraphColor      graphColorMode
+	LogColor        logColorMode
+	ShowDeltas      bool
+	StatsRefresh    time.Duration
+	DefaultActivity activityMode
+}
 
 type rowKind int
 
@@ -54,6 +116,28 @@ type treeRow struct {
 	muted     bool
 }
 
+type settingsRow struct {
+	label  string
+	value  string
+	kind   settingsRowKind
+	action settingsAction
+}
+
+type settingsRowKind int
+
+const (
+	settingsRowSetting settingsRowKind = iota
+	settingsRowSection
+	settingsRowAction
+)
+
+type settingsAction int
+
+const (
+	settingsActionNone settingsAction = iota
+	settingsActionResetDefaults
+)
+
 type Model struct {
 	provider app.Provider
 	theme    tideui.Theme
@@ -62,22 +146,38 @@ type Model struct {
 	width  int
 	height int
 	focus  pane
+	mode   activityMode
 
-	loading     bool
-	snapshot    domain.Snapshot
-	rows        []treeRow
-	cursor      int
-	collapsed   map[string]bool
-	selectedID  domain.ResourceID
-	selected    *domain.Container
-	filter      string
-	filterDraft string
+	loading       bool
+	snapshot      domain.Snapshot
+	rows          []treeRow
+	cursor        int
+	problemCursor int
+	collapsed     map[string]bool
+	selectedID    domain.ResourceID
+	selected      *domain.Container
+	filter        string
+	filterDraft   string
 
 	logLines   []string
+	logFilter  string
+	logDraft   string
+	logLevel   logSeverityFilter
+	logScroll  int
+	logFollow  bool
+	logMatch   int
+	logViews   map[domain.ResourceID]logViewState
+	logViewID  domain.ResourceID
 	logChan    chan string
 	logCancel  context.CancelFunc
 	logLoading bool
 	logErr     error
+
+	stats        *domain.ContainerStats
+	statsID      domain.ResourceID
+	statsHistory map[domain.ResourceID]statsHistory
+	statsLoading bool
+	statsErr     error
 
 	status    string
 	statusErr bool
@@ -85,6 +185,10 @@ type Model struct {
 
 	commandFilter string
 	commandCursor int
+
+	settings       appSettings
+	settingsCursor int
+	settingsPath   string
 }
 
 type snapshotMsg struct {
@@ -95,6 +199,29 @@ type snapshotMsg struct {
 type detailMsg struct {
 	container domain.Container
 	err       error
+}
+
+type statsMsg struct {
+	stats domain.ContainerStats
+	err   error
+}
+
+type statsTickMsg struct {
+	id domain.ResourceID
+}
+
+type statsHistory struct {
+	CPU        []float64
+	Memory     []uint64
+	NetworkRx  []uint64
+	NetworkTx  []uint64
+	BlockTotal []uint64
+	PIDs       []uint64
+	maxCPU     float64
+	maxMemory  uint64
+	maxNetwork uint64
+	maxBlock   uint64
+	maxPIDs    uint64
 }
 
 type actionDoneMsg struct {
@@ -111,13 +238,112 @@ type logsStartedMsg struct {
 type logTickMsg struct{}
 
 func NewModel(provider app.Provider) Model {
-	theme, _ := tideui.ThemeByName("nord")
+	return NewModelWithSettings(provider, config.Settings{}, "")
+}
+
+func NewModelWithSettings(provider app.Provider, persisted config.Settings, settingsPath string) Model {
+	theme := tidedockTheme()
+	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
+	settings := defaultSettings()
+	settings.applyPersisted(persisted)
 	return Model{
-		provider:  provider,
-		theme:     theme,
-		themes:    tideui.NewThemePicker(tideui.ThemePickerOptions{InitialTheme: theme.Name, Title: "THEMES"}),
-		collapsed: map[string]bool{},
-		status:    "connecting to Docker",
+		provider:     provider,
+		theme:        theme,
+		themes:       tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
+		mode:         settings.DefaultActivity,
+		settings:     settings,
+		settingsPath: settingsPath,
+		statsHistory: map[domain.ResourceID]statsHistory{},
+		logViews:     map[domain.ResourceID]logViewState{},
+		logFollow:    true,
+		collapsed:    map[string]bool{},
+		status:       "connecting to Docker",
+	}
+}
+
+func defaultSettings() appSettings {
+	return appSettings{
+		GraphStyle:      graphStyleWave,
+		GraphColor:      graphColorGradient,
+		LogColor:        logColorFull,
+		ShowDeltas:      true,
+		StatsRefresh:    2 * time.Second,
+		DefaultActivity: activityProblems,
+	}
+}
+
+func (s *appSettings) applyPersisted(persisted config.Settings) {
+	switch persisted.GraphStyle {
+	case "blocks":
+		s.GraphStyle = graphStyleBlocks
+	case "braille":
+		s.GraphStyle = graphStyleBraille
+	case "wave", "":
+		s.GraphStyle = graphStyleWave
+	}
+	switch persisted.GraphColor {
+	case "metric":
+		s.GraphColor = graphColorMetric
+	case "mono":
+		s.GraphColor = graphColorMono
+	case "gradient", "":
+		s.GraphColor = graphColorGradient
+	}
+	switch persisted.LogColor {
+	case "severity":
+		s.LogColor = logColorSeverity
+	case "http":
+		s.LogColor = logColorHTTP
+	case "mono":
+		s.LogColor = logColorMono
+	case "full", "":
+		s.LogColor = logColorFull
+	}
+	if persisted.ShowDeltas != nil {
+		s.ShowDeltas = *persisted.ShowDeltas
+	}
+	if persisted.StatsRefresh != "" {
+		if interval, err := time.ParseDuration(persisted.StatsRefresh); err == nil && interval > 0 {
+			s.StatsRefresh = interval
+		}
+	}
+	switch persisted.DefaultActivity {
+	case "logs":
+		s.DefaultActivity = activityLogs
+	case "stats":
+		s.DefaultActivity = activityStats
+	case "problems", "":
+		s.DefaultActivity = activityProblems
+	}
+}
+
+func (s appSettings) persisted() config.Settings {
+	showDeltas := s.ShowDeltas
+	return config.Settings{
+		GraphStyle:      s.GraphStyle.String(),
+		GraphColor:      s.GraphColor.String(),
+		LogColor:        s.LogColor.String(),
+		ShowDeltas:      &showDeltas,
+		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
+		DefaultActivity: activityModeName(s.DefaultActivity),
+	}
+}
+
+func tidedockTheme() tideui.Theme {
+	return tideui.Theme{
+		Name:          "tidedock",
+		Bg:            "#101419",
+		Fg:            "#e8edf2",
+		Border:        "#333c46",
+		BorderFocus:   "#7dcfff",
+		Selected:      "#26313a",
+		Unread:        "#80c990",
+		Dimmed:        "#9aa6b2",
+		StatusBar:     "#1e242b",
+		StatusFg:      "#e8edf2",
+		Error:         "#e06c75",
+		Overlay:       "#171c22",
+		OverlayBorder: "#7dcfff",
 	}
 }
 
@@ -149,8 +375,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
 			return m, nil
 		}
+		m.saveLogViewState()
+		selectionChanged := msg.container.ID != m.selectedID
 		m.selected = &msg.container
 		m.selectedID = msg.container.ID
+		if selectionChanged {
+			if m.logCancel != nil {
+				m.logCancel()
+				m.logCancel = nil
+			}
+			m.logChan = nil
+			m.logLines = nil
+			m.logErr = nil
+		}
+		m.restoreLogViewState(msg.container.ID)
+		if m.mode == activityStats {
+			m.statsLoading = true
+			m.statsErr = nil
+			return m, m.loadStatsCmd(msg.container.ID)
+		}
 		return m, m.startLogsCmd(msg.container.ID)
 	case logsStartedMsg:
 		if m.logCancel != nil {
@@ -173,6 +416,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, tickLogs()
+	case statsMsg:
+		if msg.stats.ID != m.selectedID {
+			return m, nil
+		}
+		m.statsLoading = false
+		m.statsErr = msg.err
+		if msg.err != nil {
+			return m, m.nextStatsTickCmd(msg.stats.ID)
+		}
+		m.stats = &msg.stats
+		m.statsID = msg.stats.ID
+		m.appendStats(msg.stats)
+		return m, m.nextStatsTickCmd(msg.stats.ID)
+	case statsTickMsg:
+		if m.mode != activityStats || msg.id != m.selectedID || m.statsLoading {
+			return m, nil
+		}
+		m.statsLoading = m.stats == nil || m.stats.ID != msg.id
+		m.statsErr = nil
+		return m, m.loadStatsCmd(msg.id)
 	case actionDoneMsg:
 		if msg.err != nil {
 			m.status, m.statusErr = msg.label+": "+friendlyDockerError(msg.err), true
@@ -201,11 +464,77 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.focus = (m.focus + 2) % 3
 	case "j", "down":
+		if m.focus == paneActivity && m.mode == activityProblems {
+			m.moveProblemCursor(1)
+			return m, nil
+		}
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.scrollLogs(1)
+			return m, nil
+		}
 		m.moveCursor(1)
 		return m, m.loadSelectedCmd()
 	case "k", "up":
+		if m.focus == paneActivity && m.mode == activityProblems {
+			m.moveProblemCursor(-1)
+			return m, nil
+		}
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.scrollLogs(-1)
+			return m, nil
+		}
 		m.moveCursor(-1)
 		return m, m.loadSelectedCmd()
+	case "pgdown":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.scrollLogs(max(1, m.logVisibleRows()-1))
+			return m, nil
+		}
+	case "pgup":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.scrollLogs(-max(1, m.logVisibleRows()-1))
+			return m, nil
+		}
+	case "home":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.logFollow = false
+			m.logScroll = 0
+			m.saveLogViewState()
+			return m, nil
+		}
+	case "end", "f":
+		if m.mode == activityLogs {
+			m.focus = paneActivity
+			m.followLogs()
+			return m, nil
+		}
+	case "esc":
+		if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
+			m.clearLogFilter()
+			return m, nil
+		}
+	case "x":
+		if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
+			m.focus = paneActivity
+			m.clearLogFilter()
+			return m, nil
+		}
+	case "n":
+		if m.mode == activityLogs {
+			m.focus = paneActivity
+			if strings.TrimSpace(m.logFilter) == "" {
+				m.openLogFilter()
+				return m, nil
+			}
+			m.jumpLogMatch(1)
+			return m, nil
+		}
+	case "N":
+		if m.mode == activityLogs && strings.TrimSpace(m.logFilter) != "" {
+			m.focus = paneActivity
+			m.jumpLogMatch(-1)
+			return m, nil
+		}
 	case " ":
 		if row := m.currentRow(); row != nil && row.kind == rowProject {
 			m.collapsed[row.project] = !m.collapsed[row.project]
@@ -213,16 +542,46 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
 		}
 	case "enter":
+		if m.focus == paneActivity && m.mode == activityProblems {
+			return m.selectProblem(m.problemCursor)
+		}
 		if row := m.currentRow(); row != nil && row.container != nil {
 			return m, m.loadSelectedCmd()
 		}
 	case "/":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.openLogFilter()
+			return m, nil
+		}
 		m.overlay = overlayFilter
 		m.filterDraft = m.filter
+	case "a":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.setLogSeverityFilter(logSeverityAll)
+			return m, nil
+		}
+	case "e":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.setLogSeverityFilter(logSeverityErrors)
+			return m, nil
+		}
+	case "w":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.setLogSeverityFilter(logSeverityWarnings)
+			return m, nil
+		}
+	case "i":
+		if m.focus == paneActivity && m.mode == activityLogs {
+			m.setLogSeverityFilter(logSeverityInfo)
+			return m, nil
+		}
 	case "?":
 		m.overlay = overlayHelp
 	case "T":
 		m.openThemePicker()
+	case ",", "ctrl+,":
+		m.overlay = overlaySettings
+		m.settingsCursor = m.firstSettingsRow()
 	case "ctrl+k":
 		m.overlay = overlayCommandPalette
 		m.commandFilter = ""
@@ -236,8 +595,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.actionCmd(actions.StartStop, "start/stop")
 	case "l":
 		m.focus = paneActivity
+		m.mode = activityLogs
 		if m.selected != nil {
 			return m, m.startLogsCmd(m.selected.ID)
+		}
+	case "p":
+		m.focus = paneActivity
+		m.mode = activityProblems
+		m.syncProblemCursor()
+	case "g":
+		m.focus = paneActivity
+		m.mode = activityStats
+		if selected := m.selectedContainer(); selected != nil {
+			m.selectedID = selected.ID
+			m.statsLoading = true
+			m.statsErr = nil
+			return m, m.loadStatsCmd(selected.ID)
 		}
 	}
 	return m, nil
@@ -265,6 +638,27 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.filterDraft += string(msg.Runes)
 			}
 		}
+	case overlayLogFilter:
+		switch msg.String() {
+		case "esc":
+			m.overlay = overlayNone
+			m.logDraft = ""
+		case "enter":
+			m.logFilter = strings.TrimSpace(m.logDraft)
+			m.logMatch = 0
+			m.overlay = overlayNone
+			m.clampLogScroll()
+			m.saveLogViewState()
+			m.status, m.statusErr = "log filter: "+filterStatus(m.logFilter, m.logLevel), false
+		case "backspace":
+			if len(m.logDraft) > 0 {
+				m.logDraft = m.logDraft[:len(m.logDraft)-1]
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				m.logDraft += string(msg.Runes)
+			}
+		}
 	case overlayHelp:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "?" {
 			m.overlay = overlayNone
@@ -283,6 +677,26 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			m.theme = m.themes.PreviewTheme()
 		}
+	case overlaySettings:
+		return m.handleSettingsKey(msg)
+	}
+	return m, nil
+}
+
+func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", ",", "ctrl+,":
+		m.overlay = overlayNone
+	case "up", "k":
+		m.moveSettingsCursor(-1)
+	case "down", "j", "tab":
+		m.moveSettingsCursor(1)
+	case "left", "h":
+		m.cycleSetting(m.settingsCursor, -1)
+		m.saveSettings()
+	case "right", "l", "enter", " ":
+		m.cycleSetting(m.settingsCursor, 1)
+		m.saveSettings()
 	}
 	return m, nil
 }
@@ -334,16 +748,44 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		return m, m.actionCmd(actions.Restart, "restart")
 	case actions.FocusLogs:
 		m.focus = paneActivity
+		m.mode = activityLogs
 		if m.selected != nil {
 			return m, m.startLogsCmd(m.selected.ID)
+		}
+	case actions.ShowProblems:
+		m.focus = paneActivity
+		m.mode = activityProblems
+		m.syncProblemCursor()
+	case actions.ShowStats:
+		m.focus = paneActivity
+		m.mode = activityStats
+		if selected := m.selectedContainer(); selected != nil {
+			m.selectedID = selected.ID
+			m.statsLoading = true
+			m.statsErr = nil
+			return m, m.loadStatsCmd(selected.ID)
 		}
 	case actions.OpenFilter:
 		m.overlay = overlayFilter
 		m.filterDraft = m.filter
+	case actions.OpenLogFilter:
+		m.focus = paneActivity
+		m.mode = activityLogs
+		m.openLogFilter()
+		if m.selected != nil && m.logChan == nil && len(m.logLines) == 0 {
+			return m, m.startLogsCmd(m.selected.ID)
+		}
 	case actions.OpenHelp:
 		m.overlay = overlayHelp
 	case actions.OpenTheme:
 		m.openThemePicker()
+	case actions.OpenSettings:
+		m.overlay = overlaySettings
+		m.settingsCursor = m.firstSettingsRow()
+	case actions.CommandPalette:
+		m.overlay = overlayCommandPalette
+		m.commandFilter = ""
+		m.commandCursor = 0
 	case actions.Quit:
 		m.cleanup()
 		return m, tea.Quit
@@ -356,22 +798,381 @@ func (m *Model) openThemePicker() {
 	m.overlay = overlayThemePicker
 }
 
+func (m Model) settingsRows() []settingsRow {
+	return []settingsRow{
+		{label: "Stats", kind: settingsRowSection},
+		{label: "Graph style", value: m.settings.GraphStyle.String()},
+		{label: "Graph color", value: m.settings.GraphColor.String()},
+		{label: "Show deltas", value: onOff(m.settings.ShowDeltas)},
+		{label: "Stats refresh", value: formatRefreshInterval(m.settings.StatsRefresh)},
+		{label: "Logs", kind: settingsRowSection},
+		{label: "Log color", value: m.settings.LogColor.String()},
+		{label: "Behavior", kind: settingsRowSection},
+		{label: "Default pane", value: activityModeName(m.settings.DefaultActivity)},
+		{label: "Maintenance", kind: settingsRowSection},
+		{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
+	}
+}
+
+func (m *Model) moveSettingsCursor(delta int) {
+	rows := m.settingsRows()
+	if len(rows) == 0 {
+		m.settingsCursor = 0
+		return
+	}
+	for i := 0; i < len(rows); i++ {
+		m.settingsCursor = modIndex(m.settingsCursor+delta, len(rows))
+		if rows[m.settingsCursor].kind != settingsRowSection {
+			return
+		}
+	}
+	m.settingsCursor = 0
+}
+
+func (m Model) firstSettingsRow() int {
+	for i, row := range m.settingsRows() {
+		if row.kind != settingsRowSection {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m *Model) cycleSetting(index, direction int) {
+	if direction == 0 {
+		direction = 1
+	}
+	rows := m.settingsRows()
+	if len(rows) == 0 {
+		return
+	}
+	row := rows[clamp(index, 0, len(rows)-1)]
+	if row.kind == settingsRowSection {
+		return
+	}
+	if row.action == settingsActionResetDefaults {
+		m.settings = defaultSettings()
+		m.settingsCursor = clamp(index, 0, len(m.settingsRows())-1)
+		m.status, m.statusErr = "settings reset to defaults", false
+		return
+	}
+	switch row.label {
+	case "Graph style":
+		m.settings.GraphStyle = graphStyle(modIndex(int(m.settings.GraphStyle)+direction, 3))
+	case "Graph color":
+		m.settings.GraphColor = graphColorMode(modIndex(int(m.settings.GraphColor)+direction, 3))
+	case "Log color":
+		m.settings.LogColor = logColorMode(modIndex(int(m.settings.LogColor)+direction, 4))
+	case "Show deltas":
+		m.settings.ShowDeltas = !m.settings.ShowDeltas
+	case "Stats refresh":
+		intervals := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second}
+		current := 1
+		for i, interval := range intervals {
+			if m.settings.StatsRefresh == interval {
+				current = i
+				break
+			}
+		}
+		m.settings.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
+	case "Default pane":
+		m.settings.DefaultActivity = activityMode(modIndex(int(m.settings.DefaultActivity)+direction, 3))
+	}
+}
+
+func (m *Model) saveSettings() {
+	if m.settingsPath == "" {
+		return
+	}
+	if err := config.SaveSettings(m.settingsPath, m.settings.persisted()); err != nil {
+		m.status, m.statusErr = "settings: "+err.Error(), true
+		return
+	}
+	if m.status == "settings reset to defaults" && !m.statusErr {
+		return
+	}
+	m.status, m.statusErr = "settings saved", false
+}
+
+func (s graphStyle) String() string {
+	switch s {
+	case graphStyleBlocks:
+		return "blocks"
+	case graphStyleBraille:
+		return "braille"
+	default:
+		return "wave"
+	}
+}
+
+func (m graphColorMode) String() string {
+	switch m {
+	case graphColorMetric:
+		return "metric"
+	case graphColorMono:
+		return "mono"
+	default:
+		return "gradient"
+	}
+}
+
+func (m logColorMode) String() string {
+	switch m {
+	case logColorSeverity:
+		return "severity"
+	case logColorHTTP:
+		return "http"
+	case logColorMono:
+		return "mono"
+	default:
+		return "full"
+	}
+}
+
+func (m *Model) openLogFilter() {
+	m.overlay = overlayLogFilter
+	m.logDraft = m.logFilter
+}
+
+func (m *Model) setLogSeverityFilter(filter logSeverityFilter) {
+	m.logLevel = filter
+	m.logMatch = 0
+	m.clampLogScroll()
+	m.saveLogViewState()
+	m.status, m.statusErr = "log filter: "+filterStatus(m.logFilter, m.logLevel), false
+}
+
+func (m *Model) clearLogFilter() {
+	m.logFilter = ""
+	m.logDraft = ""
+	m.logLevel = logSeverityAll
+	m.logMatch = 0
+	m.followLogs()
+	m.status, m.statusErr = "log filter cleared", false
+}
+
+func (m *Model) jumpLogMatch(direction int) {
+	matches := m.logMatchIndexes()
+	if len(matches) == 0 {
+		m.status, m.statusErr = "no log matches", false
+		return
+	}
+	if direction == 0 {
+		direction = 1
+	}
+	m.logMatch = modIndex(m.logMatch+direction, len(matches))
+	m.logFollow = false
+	m.logScroll = matches[m.logMatch]
+	m.clampLogScroll()
+	m.saveLogViewState()
+	m.status, m.statusErr = fmt.Sprintf("match %d/%d", m.logMatch+1, len(matches)), false
+}
+
+func (m Model) logMatchIndexes() []int {
+	query := strings.ToLower(strings.TrimSpace(m.logFilter))
+	if query == "" {
+		return nil
+	}
+	lines := m.visibleLogLines()
+	matches := make([]int, 0, len(lines))
+	for i, line := range lines {
+		if strings.Contains(strings.ToLower(line), query) {
+			matches = append(matches, i)
+		}
+	}
+	return matches
+}
+
+func (m Model) logMatchStatus() (int, int) {
+	matches := m.logMatchIndexes()
+	if len(matches) == 0 {
+		return 0, 0
+	}
+	return clamp(m.logMatch, 0, len(matches)-1) + 1, len(matches)
+}
+
+func (m *Model) scrollLogs(delta int) {
+	lines := len(m.visibleLogLines())
+	if lines == 0 {
+		m.logScroll = 0
+		m.logFollow = true
+		m.saveLogViewState()
+		return
+	}
+	visible := m.logVisibleRows()
+	if m.logFollow {
+		m.logScroll = max(0, lines-visible)
+	}
+	m.logFollow = false
+	m.logScroll += delta
+	m.clampLogScroll()
+	m.saveLogViewState()
+}
+
+func (m *Model) followLogs() {
+	m.logFollow = true
+	m.clampLogScroll()
+	m.saveLogViewState()
+}
+
+func (m *Model) clampLogScroll() {
+	lines := len(m.visibleLogLines())
+	if lines == 0 {
+		m.logScroll = max(0, m.logScroll)
+		return
+	}
+	visible := m.logVisibleRows()
+	maxScroll := max(0, lines-visible)
+	if m.logFollow {
+		m.logScroll = maxScroll
+		return
+	}
+	m.logScroll = clamp(m.logScroll, 0, maxScroll)
+	if m.logScroll >= maxScroll {
+		m.logFollow = true
+	}
+	if matchCount := len(m.logMatchIndexes()); matchCount > 0 {
+		m.logMatch = clamp(m.logMatch, 0, matchCount-1)
+	} else {
+		m.logMatch = 0
+	}
+}
+
+func (m Model) logVisibleRows() int {
+	return max(1, m.height-6)
+}
+
+func (m *Model) saveLogViewState() {
+	if m.logViews == nil {
+		m.logViews = map[domain.ResourceID]logViewState{}
+	}
+	id := m.logViewID
+	if id.ID == "" {
+		id = m.selectedID
+	}
+	if id.ID == "" {
+		return
+	}
+	m.logViews[id] = logViewState{
+		filter:     m.logFilter,
+		level:      m.logLevel,
+		scroll:     m.logScroll,
+		follow:     m.logFollow,
+		matchIndex: m.logMatch,
+	}
+	m.logViewID = id
+}
+
+func (m *Model) restoreLogViewState(id domain.ResourceID) {
+	if m.logViews == nil {
+		m.logViews = map[domain.ResourceID]logViewState{}
+	}
+	state, ok := m.logViews[id]
+	if !ok {
+		state = logViewState{follow: true}
+	}
+	m.logFilter = state.filter
+	m.logDraft = state.filter
+	m.logLevel = state.level
+	m.logScroll = state.scroll
+	m.logFollow = state.follow
+	m.logMatch = state.matchIndex
+	if !ok {
+		m.logFollow = true
+	}
+	m.logViewID = id
+	m.clampLogScroll()
+}
+
+func filterStatus(query string, level logSeverityFilter) string {
+	query = strings.TrimSpace(query)
+	status := level.String()
+	if query != "" {
+		status += " matching " + query
+	}
+	return status
+}
+
+func (f logSeverityFilter) String() string {
+	switch f {
+	case logSeverityErrors:
+		return "errors"
+	case logSeverityWarnings:
+		return "warnings"
+	case logSeverityInfo:
+		return "info"
+	default:
+		return "all"
+	}
+}
+
+func activityModeName(mode activityMode) string {
+	switch mode {
+	case activityLogs:
+		return "logs"
+	case activityStats:
+		return "stats"
+	default:
+		return "problems"
+	}
+}
+
+func onOff(value bool) string {
+	if value {
+		return "on"
+	}
+	return "off"
+}
+
+func formatRefreshInterval(interval time.Duration) string {
+	if interval <= 0 {
+		interval = defaultSettings().StatsRefresh
+	}
+	if interval%time.Second == 0 {
+		return fmt.Sprintf("%ds", int(interval/time.Second))
+	}
+	return interval.String()
+}
+
+func modIndex(value, size int) int {
+	if size <= 0 {
+		return 0
+	}
+	value %= size
+	if value < 0 {
+		value += size
+	}
+	return value
+}
+
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
+		if m.focus == paneActivity && m.mode == activityProblems {
+			m.moveProblemCursor(-1)
+			return m, nil
+		}
 		m.moveCursor(-1)
 		return m, m.loadSelectedCmd()
 	case tea.MouseButtonWheelDown:
+		if m.focus == paneActivity && m.mode == activityProblems {
+			m.moveProblemCursor(1)
+			return m, nil
+		}
 		m.moveCursor(1)
 		return m, m.loadSelectedCmd()
 	case tea.MouseButtonLeft:
-		if msg.X < m.leftPaneWidth() && msg.Y > 0 && msg.Y <= len(m.rows) {
-			m.cursor = clamp(msg.Y-1, 0, len(m.rows)-1)
+		if msg.X < m.leftPaneWidth() && msg.Y > 1 && msg.Y <= len(m.rows)+2 {
+			m.cursor = clamp(msg.Y-3, 0, len(m.rows)-1)
 			m.focus = paneTree
 			return m, m.loadSelectedCmd()
+		}
+		if msg.X >= m.leftPaneWidth() && msg.X < m.leftPaneWidth()+m.centerPaneWidth() && m.mode == activityProblems {
+			m.focus = paneActivity
+			return m.selectProblem(msg.Y - 4)
 		}
 	}
 	return m, nil
@@ -383,6 +1184,55 @@ func (m *Model) moveCursor(delta int) {
 		return
 	}
 	m.cursor = clamp(m.cursor+delta, 0, len(m.rows)-1)
+}
+
+func (m *Model) moveProblemCursor(delta int) {
+	problems := m.snapshotProblems()
+	if len(problems) == 0 {
+		m.problemCursor = 0
+		return
+	}
+	m.problemCursor = clamp(m.problemCursor+delta, 0, len(problems)-1)
+}
+
+func (m *Model) syncProblemCursor() {
+	problems := m.snapshotProblems()
+	if len(problems) == 0 {
+		m.problemCursor = 0
+		return
+	}
+	for i, problem := range problems {
+		if problem.id == m.selectedID {
+			m.problemCursor = i
+			return
+		}
+	}
+	m.problemCursor = clamp(m.problemCursor, 0, len(problems)-1)
+}
+
+func (m Model) selectProblem(index int) (tea.Model, tea.Cmd) {
+	problems := m.snapshotProblems()
+	if len(problems) == 0 {
+		return m, nil
+	}
+	index = clamp(index, 0, len(problems)-1)
+	m.problemCursor = index
+	if !m.moveTreeCursorTo(problems[index].id) {
+		return m, nil
+	}
+	m.focus = paneTree
+	return m, m.loadSelectedCmd()
+}
+
+func (m *Model) moveTreeCursorTo(id domain.ResourceID) bool {
+	for i, row := range m.rows {
+		if row.container != nil && row.container.ID == id {
+			m.cursor = i
+			m.selectedID = id
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) currentRow() *treeRow {
@@ -403,6 +1253,14 @@ func (m *Model) preserveSelection() {
 		for i, row := range m.rows {
 			if row.container != nil && row.container.ID == m.selectedID {
 				m.cursor = i
+				return
+			}
+		}
+	}
+	if m.mode == activityProblems {
+		for _, problem := range m.snapshotProblems() {
+			if m.moveTreeCursorTo(problem.id) {
+				m.syncProblemCursor()
 				return
 			}
 		}
@@ -494,6 +1352,83 @@ func (m Model) loadSelectedCmd() tea.Cmd {
 	}
 }
 
+func (m Model) loadStatsCmd(id domain.ResourceID) tea.Cmd {
+	if id.ID == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		stats, err := m.provider.ContainerStats(ctx, id)
+		if stats.ID.ID == "" {
+			stats.ID = id
+		}
+		return statsMsg{stats: stats, err: err}
+	}
+}
+
+func (m Model) nextStatsTickCmd(id domain.ResourceID) tea.Cmd {
+	if m.mode != activityStats || id.ID == "" || id != m.selectedID {
+		return nil
+	}
+	interval := m.settings.StatsRefresh
+	if interval <= 0 {
+		interval = defaultSettings().StatsRefresh
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return statsTickMsg{id: id}
+	})
+}
+
+func (m *Model) appendStats(stats domain.ContainerStats) {
+	if m.statsHistory == nil {
+		m.statsHistory = map[domain.ResourceID]statsHistory{}
+	}
+	history := m.statsHistory[stats.ID]
+	history.CPU = appendFloatHistory(history.CPU, stats.CPUPercent, 24)
+	history.Memory = appendUintHistory(history.Memory, stats.MemoryUsage, 24)
+	history.NetworkRx = appendUintHistory(history.NetworkRx, stats.NetworkRx, 24)
+	history.NetworkTx = appendUintHistory(history.NetworkTx, stats.NetworkTx, 24)
+	history.BlockTotal = appendUintHistory(history.BlockTotal, stats.BlockRead+stats.BlockWrite, 24)
+	history.PIDs = appendUintHistory(history.PIDs, stats.PIDs, 24)
+	history.maxCPU = maxFloat(history.maxCPU, stats.CPUPercent)
+	history.maxMemory = maxUint(history.maxMemory, stats.MemoryUsage)
+	history.maxNetwork = maxUint(history.maxNetwork, maxUint(stats.NetworkRx, stats.NetworkTx))
+	history.maxBlock = maxUint(history.maxBlock, stats.BlockRead+stats.BlockWrite)
+	history.maxPIDs = maxUint(history.maxPIDs, stats.PIDs)
+	m.statsHistory[stats.ID] = history
+}
+
+func appendFloatHistory(values []float64, value float64, limit int) []float64 {
+	values = append(values, value)
+	if len(values) > limit {
+		values = values[len(values)-limit:]
+	}
+	return values
+}
+
+func appendUintHistory(values []uint64, value uint64, limit int) []uint64 {
+	values = append(values, value)
+	if len(values) > limit {
+		values = values[len(values)-limit:]
+	}
+	return values
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxUint(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (m Model) actionCmd(id actions.ID, label string) tea.Cmd {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -579,6 +1514,9 @@ func (m *Model) drainLogs() {
 			m.logLines = append(m.logLines, line)
 			if len(m.logLines) > 1000 {
 				m.logLines = m.logLines[len(m.logLines)-1000:]
+			}
+			if m.logFollow {
+				m.clampLogScroll()
 			}
 		default:
 			return
