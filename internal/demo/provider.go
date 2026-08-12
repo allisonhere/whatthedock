@@ -249,6 +249,32 @@ func (p *Provider) seed() {
 		Ports: []domain.Port{{Private: 80, Public: 8088, Type: "tcp"}, {Private: 443, Public: 8443, Type: "tcp"}},
 		Logs:  []string{"GET /healthz 200", "GET /grafana/ 200", "GET /jellyfin/ 200"}, Created: now.Add(7 * time.Hour),
 	})
+	p.add(containerSeed{
+		ID: "demo-postgres", Name: "media-postgres-1", Image: "postgres:16-alpine", State: domain.StateRunning, Health: domain.HealthUnhealthy,
+		Project: "media-stack", Service: "postgres", Ports: []domain.Port{{Private: 5432, Public: 0, Type: "tcp"}},
+		Mounts: []domain.Mount{{Type: "volume", Source: "media_pgdata", Destination: "/var/lib/postgresql/data", ReadWrite: true}},
+		Logs:   []string{"FATAL: the database system is starting up", "LOG: could not bind IPv4 socket: Address already in use", "HINT: previous instance may still be holding the port"}, Created: now.Add(8 * time.Hour),
+	})
+	p.add(containerSeed{
+		ID: "demo-watchtower", Name: "media-watchtower-1", Image: "containrrr/watchtower:latest", State: domain.StateDead, Health: domain.HealthNone,
+		Project: "media-stack", Service: "watchtower",
+		Logs: []string{"Watchtower started", "level=fatal msg=\"could not do a head request\" error=\"context deadline exceeded\""}, Created: now.Add(9 * time.Hour),
+	})
+	p.add(containerSeed{
+		ID: "demo-adguard", Name: "monitoring-adguard-1", Image: "adguard/adguardhome:latest", State: domain.StateExited, Health: domain.HealthNone,
+		Project: "monitoring", Service: "adguard", Ports: []domain.Port{{Private: 53, Public: 53, Type: "udp"}},
+		Logs: []string{"AdGuard Home started", "Stopping AdGuard Home", "AdGuard Home is exiting"}, Created: now.Add(10 * time.Hour),
+	})
+	p.add(containerSeed{
+		ID: "demo-portainer", Name: "monitoring-portainer-1", Image: "portainer/portainer-ce:latest", State: domain.StateRunning, Health: domain.HealthNone,
+		Project: "monitoring", Service: "portainer", Ports: []domain.Port{{Private: 9000, Public: 9000, Type: "tcp"}},
+		RestartCount: 6, Logs: []string{"level=info msg=\"starting Portainer\"", "level=warn msg=\"lost connection to Docker socket, retrying\""}, Created: now.Add(11 * time.Hour),
+	})
+	p.add(containerSeed{
+		ID: "demo-homeassistant", Name: "monitoring-homeassistant-1", Image: "homeassistant/home-assistant:latest", State: domain.StateRunning, Health: domain.HealthUnknown,
+		Project: "monitoring", Service: "homeassistant", Ports: []domain.Port{{Private: 8123, Public: 8123, Type: "tcp"}},
+		Logs: []string{"Home Assistant Core initialized", "Waiting for integration setup to finish"}, Created: now.Add(12 * time.Hour),
+	})
 }
 
 type containerSeed struct {
