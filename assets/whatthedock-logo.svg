@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 420" role="img" aria-labelledby="title desc">
+  <title id="title">WHAT THE DOCK?! logo</title>
+  <desc id="desc">A funny terminal container sitting on a dock with a surprised face and the words WHAT THE DOCK?!</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101419"/>
+      <stop offset="0.58" stop-color="#18222c"/>
+      <stop offset="1" stop-color="#26313a"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7dcfff"/>
+      <stop offset="0.5" stop-color="#80c990"/>
+      <stop offset="1" stop-color="#e8c170"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#05070a" flood-opacity="0.42"/>
+    </filter>
+  </defs>
+
+  <rect width="1120" height="420" rx="34" fill="url(#sky)"/>
+  <path d="M0 288 C120 268 177 316 290 292 C405 266 476 322 596 296 C727 268 793 315 905 292 C1010 270 1050 286 1120 272 L1120 420 L0 420 Z" fill="#0b1015"/>
+  <path d="M0 306 C122 286 177 334 290 310 C405 284 476 340 596 314 C727 286 793 333 905 310 C1010 288 1050 304 1120 290" fill="none" stroke="url(#water)" stroke-width="9" opacity="0.95"/>
+  <path d="M35 340 H512" stroke="#8aadf4" stroke-width="18" stroke-linecap="round"/>
+  <path d="M90 306 V392 M190 306 V392 M290 306 V392 M390 306 V392" stroke="#4b5968" stroke-width="14" stroke-linecap="round"/>
+  <path d="M40 330 H502" stroke="#e8c170" stroke-width="8" stroke-linecap="round" stroke-dasharray="34 18"/>
+
+  <g filter="url(#shadow)">
+    <rect x="110" y="92" width="342" height="204" rx="18" fill="#171c22" stroke="#7dcfff" stroke-width="8"/>
+    <rect x="130" y="118" width="302" height="38" rx="8" fill="#26313a"/>
+    <circle cx="151" cy="137" r="7" fill="#e06c75"/>
+    <circle cx="174" cy="137" r="7" fill="#e8c170"/>
+    <circle cx="197" cy="137" r="7" fill="#80c990"/>
+    <path d="M146 190 L194 218 L146 246" fill="none" stroke="#80c990" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M230 250 H330" stroke="#7dcfff" stroke-width="16" stroke-linecap="round"/>
+    <circle cx="336" cy="205" r="13" fill="#e8edf2"/>
+    <circle cx="386" cy="205" r="13" fill="#e8edf2"/>
+    <circle cx="336" cy="205" r="5" fill="#101419"/>
+    <circle cx="386" cy="205" r="5" fill="#101419"/>
+    <path d="M345 248 Q362 266 382 248" fill="none" stroke="#e06c75" stroke-width="10" stroke-linecap="round"/>
+    <path d="M396 75 C428 42 482 62 478 104 C474 144 418 132 428 98" fill="none" stroke="#e8c170" stroke-width="14" stroke-linecap="round"/>
+    <circle cx="427" cy="151" r="8" fill="#e8c170"/>
+  </g>
+
+  <g transform="translate(522 78)">
+    <text x="0" y="72" fill="#e8edf2" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="67" font-weight="900" letter-spacing="2">WHAT THE</text>
+    <text x="0" y="154" fill="#7dcfff" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="86" font-weight="1000" letter-spacing="1">DOCK?!</text>
+    <rect x="5" y="184" width="454" height="44" rx="9" fill="#101419" stroke="#333c46" stroke-width="3"/>
+    <text x="24" y="214" fill="#80c990" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="23" font-weight="700">$ docker ps --panic politely</text>
+  </g>
+
+  <g opacity="0.86">
+    <path d="M785 302 h44 m-22 -22 v44" stroke="#80c990" stroke-width="8" stroke-linecap="round"/>
+    <path d="M903 320 h58" stroke="#e8c170" stroke-width="8" stroke-linecap="round"/>
+    <path d="M989 302 h34 m-17 -17 v34" stroke="#e06c75" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>

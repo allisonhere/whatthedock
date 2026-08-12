@@ -1,5 +1,7 @@
 # WhatTheDock
 
+![WHAT THE DOCK?! logo](assets/whatthedock-logo.svg)
+
 **A keyboard-first Docker and Compose manager for the terminal.**
 
 WhatTheDock is a new member of the Tide application family, alongside Tide and
@@ -9,8 +11,6 @@ presentation primitives.
 
 > Early-stage project: this repository currently contains the first working
 > vertical slice, not the full planned Docker operations suite.
-
-Screenshot placeholder: coming soon.
 
 ## Philosophy
 
