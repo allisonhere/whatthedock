@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/allisonhere/tidedock/internal/app"
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 type Provider struct {
@@ -172,7 +172,7 @@ func (p *Provider) StartContainer(_ context.Context, id domain.ResourceID) error
 	ctr.Status = "Up 1 second"
 	ctr.Restarting = false
 	p.containers[id.ID] = ctr
-	p.logs[id.ID] = append(p.logs[id.ID], "container started from TideDock")
+	p.logs[id.ID] = append(p.logs[id.ID], "container started from WhatTheDock")
 	return nil
 }
 
@@ -188,7 +188,7 @@ func (p *Provider) StopContainer(_ context.Context, id domain.ResourceID) error 
 	ctr.Health = domain.HealthNone
 	ctr.Restarting = false
 	p.containers[id.ID] = ctr
-	p.logs[id.ID] = append(p.logs[id.ID], "container stopped from TideDock")
+	p.logs[id.ID] = append(p.logs[id.ID], "container stopped from WhatTheDock")
 	return nil
 }
 
@@ -204,7 +204,7 @@ func (p *Provider) RestartContainer(_ context.Context, id domain.ResourceID) err
 	ctr.Restarting = false
 	ctr.RestartCount++
 	p.containers[id.ID] = ctr
-	p.logs[id.ID] = append(p.logs[id.ID], "container restarted from TideDock")
+	p.logs[id.ID] = append(p.logs[id.ID], "container restarted from WhatTheDock")
 	return nil
 }
 
@@ -269,7 +269,7 @@ type containerSeed struct {
 
 func (p *Provider) add(seed containerSeed) {
 	labels := map[string]string{
-		"org.opencontainers.image.source": "https://example.test/tidedock/demo",
+		"org.opencontainers.image.source": "https://example.test/whatthedock/demo",
 	}
 	if seed.Project != "" {
 		labels[domain.LabelComposeProject] = seed.Project

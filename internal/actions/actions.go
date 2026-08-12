@@ -3,8 +3,8 @@ package actions
 import (
 	"context"
 
-	"github.com/allisonhere/tidedock/internal/app"
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 type ID string
@@ -53,7 +53,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: OpenTheme, Name: "Choose theme", Shortcut: "T", Aliases: []string{"themes", "palette", "colors"}, Enabled: true},
 		{ID: OpenSettings, Name: "Open settings", Shortcut: ",", Aliases: []string{"preferences", "options", "config"}, Enabled: true},
 		{ID: CommandPalette, Name: "Command palette", Shortcut: "ctrl+k", Aliases: []string{"commands"}, Enabled: true},
-		{ID: Quit, Name: "Quit TideDock", Shortcut: "q", Aliases: []string{"exit"}, Enabled: true},
+		{ID: Quit, Name: "Quit WhatTheDock", Shortcut: "q", Aliases: []string{"exit"}, Enabled: true},
 	}
 }
 

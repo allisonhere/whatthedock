@@ -16,10 +16,10 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
-	"github.com/allisonhere/tidedock/internal/app"
-	"github.com/allisonhere/tidedock/internal/config"
-	"github.com/allisonhere/tidedock/internal/domain"
 	"github.com/allisonhere/tideui"
+	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/config"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 type fakeProvider struct {
@@ -208,7 +208,7 @@ func TestLogsRenderColorCodedTokens(t *testing.T) {
 }
 
 func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	line := "2026-08-12T12:00:00Z [WARN] POST /api 404"
 	rendered := renderLogLine(renderer, logColorFull, "", line)
 	if got := ansi.Strip(rendered); got != line {
@@ -298,7 +298,7 @@ func TestLogColorModeControlsTokenStyling(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
 
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	line := "2026-08-12T12:00:00Z [ERROR] POST /api failed 500"
 	full := renderLogLine(renderer, logColorFull, "", line)
 	mono := renderLogLine(renderer, logColorMono, "", line)
@@ -611,7 +611,7 @@ func TestStatsViewShowsHeatSparklineAndDeltas(t *testing.T) {
 }
 
 func TestHeatSparklineStylesEachGlyph(t *testing.T) {
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	graph := statGraph{values: []float64{0, 50, 100}, maxValue: 100, fallbackLevel: 1}
 
 	raw := renderSparkline(renderer, defaultSettings(), graph, lipgloss.Color("#7dcfff"), 10)
@@ -621,7 +621,7 @@ func TestHeatSparklineStylesEachGlyph(t *testing.T) {
 }
 
 func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	for _, tc := range []struct {
 		name  string
 		level int
@@ -642,7 +642,7 @@ func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
 }
 
 func TestStatGlyphColorFollowsSmoothHeightRamp(t *testing.T) {
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	for _, tc := range []struct {
 		glyph string
 		want  lipgloss.Color
@@ -665,7 +665,7 @@ func TestStatGlyphColorFollowsSmoothHeightRamp(t *testing.T) {
 }
 
 func TestStatsRowFallsBackToValueAtTinyWidth(t *testing.T) {
-	renderer := tideui.NewRenderer(tidedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	row := renderStatRow(renderer, defaultSettings(), 18, "CPU", statGraph{values: []float64{10, 80}, maxValue: 100, fallbackLevel: 5}, "80.0%", lipgloss.Color("#7dcfff"))
 	view := ansi.Strip(row)
 
@@ -753,7 +753,7 @@ func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 		t.Fatalf("overlay = %v, want settings", model.overlay)
 	}
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"tidedock · settings", "Stats", "Graph style", "wave", "Logs", "Log color", "full", "Behavior", "Maintenance", "Reset defaults"} {
+	for _, want := range []string{"whatthedock · settings", "Stats", "Graph style", "wave", "Logs", "Log color", "full", "Behavior", "Maintenance", "Reset defaults"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("settings view missing %q:\n%s", want, view)
 		}
@@ -1002,10 +1002,10 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 		overlay overlayMode
 		want    string
 	}{
-		{"help", overlayHelp, "tidedock · help"},
-		{"filter", overlayFilter, "tidedock · filter"},
-		{"command", overlayCommandPalette, "tidedock · command"},
-		{"settings", overlaySettings, "tidedock · settings"},
+		{"help", overlayHelp, "whatthedock · help"},
+		{"filter", overlayFilter, "whatthedock · filter"},
+		{"command", overlayCommandPalette, "whatthedock · command"},
+		{"settings", overlaySettings, "whatthedock · settings"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			model.overlay = tc.overlay

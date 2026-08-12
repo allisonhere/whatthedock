@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/allisonhere/tidedock/internal/app"
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 func TestProviderSnapshotContainsDemoComposeAndStandalone(t *testing.T) {

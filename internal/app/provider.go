@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 type Provider interface {

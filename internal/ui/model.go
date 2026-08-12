@@ -12,10 +12,10 @@ import (
 	"github.com/allisonhere/tideui"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/allisonhere/tidedock/internal/actions"
-	"github.com/allisonhere/tidedock/internal/app"
-	"github.com/allisonhere/tidedock/internal/config"
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/actions"
+	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/config"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 type pane int
@@ -242,7 +242,7 @@ func NewModel(provider app.Provider) Model {
 }
 
 func NewModelWithSettings(provider app.Provider, persisted config.Settings, settingsPath string) Model {
-	theme := tidedockTheme()
+	theme := whatthedockTheme()
 	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
 	settings := defaultSettings()
 	settings.applyPersisted(persisted)
@@ -329,9 +329,9 @@ func (s appSettings) persisted() config.Settings {
 	}
 }
 
-func tidedockTheme() tideui.Theme {
+func whatthedockTheme() tideui.Theme {
 	return tideui.Theme{
-		Name:          "tidedock",
+		Name:          "whatthedock",
 		Bg:            "#101419",
 		Fg:            "#e8edf2",
 		Border:        "#333c46",

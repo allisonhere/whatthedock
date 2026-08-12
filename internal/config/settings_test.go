@@ -62,7 +62,7 @@ func TestSettingsPathUsesUserConfigDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SettingsPath() err = %v", err)
 	}
-	want := filepath.Join(configDir, "tidedock", settingsFileName)
+	want := filepath.Join(configDir, "whatthedock", settingsFileName)
 	if path != want {
 		t.Fatalf("SettingsPath() = %q, want %q", path, want)
 	}

@@ -13,6 +13,6 @@ build:
 	go build -buildvcs=false ./...
 
 demo:
-	go run -buildvcs=false ./cmd/tidedock --demo
+	go run -buildvcs=false ./cmd/whatthedock --demo
 
 check: fmt test vet build

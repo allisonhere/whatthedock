@@ -1,4 +1,4 @@
-module github.com/allisonhere/tidedock
+module github.com/allisonhere/whatthedock
 
 go 1.26.1
 

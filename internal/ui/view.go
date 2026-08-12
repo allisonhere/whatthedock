@@ -11,7 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 func (m Model) View() string {
@@ -58,7 +58,7 @@ func (m Model) activityHeader() (string, string) {
 
 func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	width := max(1, m.width)
-	left := renderer.Styles.StatusNotice.Render(" TideDock ") +
+	left := renderer.Styles.StatusNotice.Render(" WHAT THE DOCK?! ") +
 		renderer.Styles.StatusBar.Render(" "+m.provider.Host().Name)
 	right := fmt.Sprintf("Docker connected · %d projects · %d standalone · %d problems",
 		len(m.snapshot.Projects), len(m.snapshot.Standalone), len(m.snapshotProblems()))
@@ -1002,7 +1002,7 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		width := min(72, max(40, m.width-8))
 		content := renderer.RenderSoftBody(width, helpText()+"\n\n"+
 			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/?/q", Label: "close"}))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "help", Content: content, Width: width})
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
 		return &overlay
 	case overlayFilter:
 		width := min(72, max(40, m.width-8))
@@ -1012,7 +1012,7 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 				tideui.SoftHint{Key: "enter", Label: "apply"},
 				tideui.SoftHint{Key: "esc", Label: "cancel"},
 			))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "filter", Content: content, Width: width})
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "filter", Content: content, Width: width})
 		return &overlay
 	case overlayLogFilter:
 		width := min(72, max(40, m.width-8))
@@ -1024,12 +1024,12 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 					tideui.SoftHint{Key: "enter", Label: "apply"},
 					tideui.SoftHint{Key: "esc", Label: "cancel"},
 				))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "log filter", Content: content, Width: width})
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "log filter", Content: content, Width: width})
 		return &overlay
 	case overlayCommandPalette:
 		return m.commandPaletteOverlay(renderer)
 	case overlayThemePicker:
-		overlay := m.themes.SoftModal(renderer, min(72, max(40, m.width-8)), max(8, m.height-4), "tidedock")
+		overlay := m.themes.SoftModal(renderer, min(72, max(40, m.width-8)), max(8, m.height-4), "whatthedock")
 		return &overlay
 	case overlaySettings:
 		return m.settingsOverlay(renderer)
@@ -1065,7 +1065,7 @@ func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		tideui.SoftHint{Key: "esc", Label: "close"},
 	))
 	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
-	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "settings", Content: content, Width: width})
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "settings", Content: content, Width: width})
 	return &overlay
 }
 
@@ -1092,7 +1092,7 @@ func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		tideui.SoftHint{Key: "esc", Label: "close"},
 	))
 	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
-	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "tidedock", Title: "command", Content: content, Width: width})
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "command", Content: content, Width: width})
 	return &overlay
 }
 

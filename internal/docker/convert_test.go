@@ -6,7 +6,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 
-	"github.com/allisonhere/tidedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 func TestFromSummaryMapsComposeLabelsAndHealth(t *testing.T) {

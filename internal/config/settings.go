@@ -23,7 +23,7 @@ func SettingsPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "tidedock", settingsFileName), nil
+	return filepath.Join(dir, "whatthedock", settingsFileName), nil
 }
 
 func LoadSettings(path string) (Settings, error) {

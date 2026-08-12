@@ -1,8 +1,8 @@
-# TideDock
+# WhatTheDock
 
 **A keyboard-first Docker and Compose manager for the terminal.**
 
-TideDock is a new member of the Tide application family, alongside Tide and
+WhatTheDock is a new member of the Tide application family, alongside Tide and
 TideMail. It uses [TideUI](https://github.com/allisonhere/tideui) for the shared
 three-pane terminal shell, themes, pane chrome, row styling, overlays, and other
 presentation primitives.
@@ -14,16 +14,16 @@ Screenshot placeholder: coming soon.
 
 ## Philosophy
 
-TideDock treats Compose projects as first-class objects. The default view is not
+WhatTheDock treats Compose projects as first-class objects. The default view is not
 a flat dump of containers; it starts from projects and services, then keeps
 standalone containers in a separate section.
 
-The app should work with zero TideDock-specific configuration. Running
-`tidedock` honors Docker's normal environment and context defaults and connects
+The app should work with zero WhatTheDock-specific configuration. Running
+`whatthedock` honors Docker's normal environment and context defaults and connects
 to the local daemon when Docker is available.
 
 User preferences are stored as JSON in the platform config directory, normally
-`~/.config/tidedock/settings.json` on Linux. Missing or invalid settings fall
+`~/.config/whatthedock/settings.json` on Linux. Missing or invalid settings fall
 back to built-in defaults.
 
 ## Current Controls
@@ -68,26 +68,26 @@ go build ./...
 Run locally:
 
 ```bash
-go run -buildvcs=false ./cmd/tidedock
+go run -buildvcs=false ./cmd/whatthedock
 ```
 
 Run without Docker using the built-in demo homelab:
 
 ```bash
-go run -buildvcs=false ./cmd/tidedock --demo
+go run -buildvcs=false ./cmd/whatthedock --demo
 ```
 
 You can also use:
 
 ```bash
-TIDEDOCK_PROVIDER=demo go run -buildvcs=false ./cmd/tidedock
+WHATTHEDOCK_PROVIDER=demo go run -buildvcs=false ./cmd/whatthedock
 ```
 
 Or build a binary:
 
 ```bash
-go build -buildvcs=false -o tidedock ./cmd/tidedock
-./tidedock
+go build -buildvcs=false -o whatthedock ./cmd/whatthedock
+./whatthedock
 ```
 
 ## Development
@@ -123,7 +123,7 @@ make build
 
 ## Relationship To TideUI
 
-TideDock depends on TideUI for reusable Tide-family TUI presentation:
+WhatTheDock depends on TideUI for reusable Tide-family TUI presentation:
 
 - three-column layout
 - themed panes and borders
@@ -133,7 +133,7 @@ TideDock depends on TideUI for reusable Tide-family TUI presentation:
 - terminal theme primitives
 
 Application state, Docker access, filtering, actions, and log lifecycles stay in
-TideDock.
+WhatTheDock.
 
 ## Planned Features
 

@@ -9,7 +9,7 @@ import (
 func TestLoadSettingsIgnoresInvalidConfig(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configDir)
-	path := filepath.Join(configDir, "tidedock", "settings.json")
+	path := filepath.Join(configDir, "whatthedock", "settings.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll() err = %v", err)
 	}
