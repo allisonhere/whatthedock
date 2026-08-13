@@ -69,14 +69,12 @@ returned channel.
 
 ### `internal/demo` (`Provider.Events`)
 
-A goroutine on a jittered multi-second ticker picks a random container from
-the in-memory fixture, mutates its state (flip health, toggle
-running↔restarting — reusing whatever state transitions the existing demo
-fixtures already model) and emits a matching `ContainerEvent`. The demo
-provider's `Snapshot()` reflects the same mutation, so a poll-triggered
-refresh in demo mode actually shows something different — the live-update
-behavior is visible and testable without a real Docker host or the jarvis
-tunnel.
+A no-op stub: returns a channel that's never written to (and closes when
+`ctx` is cancelled). Satisfies the `app.Provider` interface without
+synthesizing fake state changes. This feature is validated against the real
+jarvis Docker host directly, so demo mode doesn't need to simulate it —
+keeping the demo provider simple outweighs the benefit of a fully-simulated
+demo here.
 
 ## Bubble Tea integration
 
@@ -189,7 +187,7 @@ where no stream is running yet, still starts one.
   existing `snapshotMsg` error path, which already surfaces
   `friendlyDockerError` in the status bar. No new error handling needed —
   this path already exists for manual refresh failures.
-- Demo provider's synthetic events never error.
+- Demo provider's `Events()` stub never errors.
 
 ## Testing plan
 
@@ -197,10 +195,8 @@ where no stream is running yet, still starts one.
 - `internal/docker`: add a focused test converting a sample `events.Message`
   into a `domain.ContainerEvent` (action/ID mapping), following the existing
   pattern in `convert_test.go`. No live-Docker test.
-- `internal/demo`: test that `Events()` eventually emits at least one event,
-  and that the corresponding container's state actually changed in a
-  subsequent `Snapshot()` — bounded wait (e.g. a timeout-guarded channel
-  read), not a sleep-and-hope.
+- `internal/demo`: test that `Events()` returns a channel that closes when
+  its context is cancelled, and never sends anything before that.
 - `internal/ui`: extend `fakeProvider` with a controllable `Events()`
   channel (nil/never-fires by default, so all existing tests are
   unaffected). New model tests:
