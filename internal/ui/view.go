@@ -1087,41 +1087,42 @@ func renderInspectorField(renderer tideui.Renderer, width int, label, value, suf
 		suffix = ""
 	}
 	values := strings.Split(value, "\n")
-	labelStyle := lipgloss.NewStyle().
-		Background(renderer.Styles.Theme.Bg).
-		Foreground(renderer.Styles.Theme.BorderFocus).
-		Bold(true)
-	valueStyle := lipgloss.NewStyle().
-		Background(renderer.Styles.Theme.Bg).
-		Foreground(renderer.Styles.Theme.Fg)
+	baseFg := styleForeground(renderer.Styles.Item, renderer.Styles.Theme.Fg)
+	valueFg := renderer.Styles.Theme.Fg
 	if color != "" {
-		valueStyle = valueStyle.Foreground(color)
+		valueFg = color
 	}
 	if muted {
-		valueStyle = valueStyle.Foreground(renderer.Styles.Theme.Dimmed).Italic(true)
+		valueFg = renderer.Styles.Theme.Dimmed
 	}
-	hintStyle := lipgloss.NewStyle().
-		Background(renderer.Styles.Theme.Bg).
-		Foreground(renderer.Styles.Theme.Unread)
 
 	out := make([]string, 0, len(values))
 	for i, line := range values {
 		prefix := strings.Repeat(" ", labelWidth+1)
 		rowSuffix := ""
 		if i == 0 {
-			prefix = labelStyle.Render(fmt.Sprintf("%-*s ", labelWidth, label))
+			prefix = foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, label), renderer.Styles.Theme.BorderFocus, baseFg, true)
 			if suffix != "" {
-				rowSuffix = hintStyle.Render(suffix)
+				rowSuffix = foregroundSpan(suffix, renderer.Styles.Theme.Unread, baseFg, false)
 			}
 		}
 		out = append(out, renderer.RenderRow(tideui.Row{
 			Prefix: prefix,
-			Text:   valueStyle.Render(line),
+			Text:   foregroundSpan(line, valueFg, baseFg, false),
 			Suffix: rowSuffix,
 			Muted:  muted,
 		}, width))
 	}
 	return out
+}
+
+func foregroundSpan(text string, color, restore lipgloss.Color, bold bool) string {
+	style := ansi.NewStyle().ForegroundColor(color)
+	if bold {
+		style = style.Bold()
+	}
+	restoreStyle := ansi.NewStyle().ForegroundColor(restore).Normal().Italic(false)
+	return style.String() + text + restoreStyle.String()
 }
 
 func inspectorStatusText(ctr domain.Container) string {
@@ -1447,7 +1448,8 @@ func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
 		tideui.SoftHint{Key: "enter/space", Label: "change"},
 		tideui.SoftHint{Key: "h/l", Label: "previous/next"},
-		tideui.SoftHint{Key: "esc", Label: "close"},
+		tideui.SoftHint{Key: "ctrl+s", Label: "save"},
+		tideui.SoftHint{Key: "esc", Label: "cancel"},
 	))
 	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "settings", Content: content, Width: width})
@@ -1476,7 +1478,8 @@ func (m Model) systemsOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			}, contentWidth))
 		}
 		rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
-			tideui.SoftHint{Key: "enter", Label: "save"},
+			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
+			tideui.SoftHint{Key: "enter", Label: "next/change"},
 			tideui.SoftHint{Key: "esc", Label: "cancel"},
 			tideui.SoftHint{Key: "h/l", Label: "change choice"},
 			tideui.SoftHint{Key: "ctrl+u", Label: "clear"},
@@ -1634,6 +1637,7 @@ func helpText() string {
 		"g              stats graphs",
 		"T              theme picker",
 		",              settings",
+		"Ctrl+S         save settings/forms",
 		"S              systems",
 		"Systems: enter switch, t test, a add, e edit, d delete",
 		"Ctrl+K         command palette",

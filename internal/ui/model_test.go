@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1332,7 +1333,7 @@ func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 		t.Fatalf("overlay = %v, want settings", model.overlay)
 	}
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"whatthedock · settings", "Stats", "Graph style", "wave", "Logs", "Log color", "full", "Behavior", "Maintenance", "Reset defaults"} {
+	for _, want := range []string{"whatthedock · settings", "Stats", "Graph style", "wave", "Logs", "Log color", "full", "Behavior", "Maintenance", "Reset defaults", "ctrl+s save"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("settings view missing %q:\n%s", want, view)
 		}
@@ -1343,15 +1344,18 @@ func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.settings.GraphStyle != graphStyleBlocks {
-		t.Fatalf("GraphStyle = %v, want blocks", model.settings.GraphStyle)
+	if model.settingsDraft.GraphStyle != graphStyleBlocks {
+		t.Fatalf("draft GraphStyle = %v, want blocks", model.settingsDraft.GraphStyle)
+	}
+	if model.settings.GraphStyle != graphStyleWave {
+		t.Fatalf("committed GraphStyle = %v, want unchanged wave", model.settings.GraphStyle)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model = updated.(Model)
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.settings.GraphColor != graphColorMetric {
-		t.Fatalf("GraphColor = %v, want metric", model.settings.GraphColor)
+	if model.settingsDraft.GraphColor != graphColorMetric {
+		t.Fatalf("draft GraphColor = %v, want metric", model.settingsDraft.GraphColor)
 	}
 }
 
@@ -1359,19 +1363,30 @@ func TestSettingsResetDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	model := testModel()
 	model.settingsPath = path
-	model.overlay = overlaySettings
-	model.settingsCursor = len(model.settingsRows()) - 1
 	model.settings.GraphStyle = graphStyleBraille
 	model.settings.GraphColor = graphColorMono
 	model.settings.LogColor = logColorMono
 	model.settings.ShowDeltas = false
 	model.settings.StatsRefresh = 5 * time.Second
 	model.settings.DefaultActivity = activityStats
+	model.openSettingsOverlay()
+	model.settingsCursor = len(model.settingsRows()) - 1
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
+	if model.settingsDraft != defaultSettings() {
+		t.Fatalf("settings draft = %#v, want defaults %#v", model.settingsDraft, defaultSettings())
+	}
+	if model.settings == defaultSettings() {
+		t.Fatalf("committed settings reset before ctrl+s: %#v", model.settings)
+	}
+	if model.status != "settings reset staged" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want staged reset status", model.status, model.statusErr)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
 	if model.settings != defaultSettings() {
-		t.Fatalf("settings = %#v, want defaults %#v", model.settings, defaultSettings())
+		t.Fatalf("settings = %#v, want defaults after ctrl+s", model.settings)
 	}
 	saved, err := config.LoadSettings(path)
 	if err != nil {
@@ -1380,8 +1395,28 @@ func TestSettingsResetDefaults(t *testing.T) {
 	if saved.GraphStyle != "wave" || saved.GraphColor != "gradient" || saved.LogColor != "full" || saved.StatsRefresh != "2s" || saved.DefaultActivity != "problems" {
 		t.Fatalf("saved settings = %#v, want defaults", saved)
 	}
-	if model.status != "settings reset to defaults" || model.statusErr {
-		t.Fatalf("status/statusErr = %q/%v, want reset status", model.status, model.statusErr)
+	if model.status != "settings saved" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want saved status", model.status, model.statusErr)
+	}
+}
+
+func TestSettingsEscCancelsDraft(t *testing.T) {
+	model := testModel()
+	model.openSettingsOverlay()
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.settingsDraft.GraphStyle != graphStyleBlocks {
+		t.Fatalf("draft GraphStyle = %v, want blocks", model.settingsDraft.GraphStyle)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want none", model.overlay)
+	}
+	if model.settings.GraphStyle != graphStyleWave || model.settingsDraft.GraphStyle != graphStyleWave {
+		t.Fatalf("settings/draft GraphStyle = %v/%v, want canceled wave", model.settings.GraphStyle, model.settingsDraft.GraphStyle)
 	}
 }
 
@@ -1412,10 +1447,14 @@ func TestSettingsSaveAfterChange(t *testing.T) {
 	model.settingsPath = path
 	model.systems = []config.System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis"}}
 	model.activeSystem = "jarvis"
-	model.overlay = overlaySettings
-	model.settingsCursor = model.firstSettingsRow()
+	model.openSettingsOverlay()
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("settings file exists before ctrl+s: err=%v", err)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	saved, err := config.LoadSettings(path)
 	if err != nil {
@@ -1439,9 +1478,9 @@ func TestSettingsSaveErrorShowsStatus(t *testing.T) {
 	}
 	model := testModel()
 	model.settingsPath = path
-	model.overlay = overlaySettings
+	model.openSettingsOverlay()
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	if !model.statusErr || !strings.Contains(model.status, "settings:") {
 		t.Fatalf("status/statusErr = %q/%v, want settings save error", model.status, model.statusErr)
@@ -1604,6 +1643,14 @@ func TestSystemsOverlayValidationBlocksInvalidSSHSystem(t *testing.T) {
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
+	if model.statusErr {
+		t.Fatalf("enter on text field set error status: %q", model.status)
+	}
+	if model.systemField != systemFieldKind {
+		t.Fatalf("systemField = %v, want next field kind after enter", model.systemField)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
 	if !model.statusErr || !strings.Contains(model.status, "ssh host is required") {
 		t.Fatalf("status/statusErr = %q/%v, want ssh host validation", model.status, model.statusErr)
 	}
@@ -1613,10 +1660,28 @@ func TestSystemsOverlayValidationBlocksInvalidSSHSystem(t *testing.T) {
 
 	model.systemDraft.SSHHost = "jarvis"
 	model.systemDraft.SSHPort = "abc"
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	if !model.statusErr || !strings.Contains(model.status, "ssh port must be 1-65535") {
 		t.Fatalf("status/statusErr = %q/%v, want ssh port validation", model.status, model.statusErr)
+	}
+}
+
+func TestSystemsOverlaySavesDraftWithCtrlS(t *testing.T) {
+	model := testModel()
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemDraft.SSHHost = "jarvis"
+	model.systemDraft.SSHUser = "allie"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+
+	if model.systemMode != systemModeList {
+		t.Fatalf("systemMode = %v, want list after ctrl+s", model.systemMode)
+	}
+	if len(model.systems) != 2 || model.systems[1].SSHHost != "jarvis" || model.systems[1].SSHUser != "allie" {
+		t.Fatalf("systems = %#v, want saved ssh system", model.systems)
 	}
 }
 
@@ -1773,6 +1838,55 @@ func TestInspectorUsesColorWithoutChangingVisibleText(t *testing.T) {
 			t.Fatalf("stripped inspector missing %q:\n%s", want, stripped)
 		}
 	}
+}
+
+func TestInspectorFieldRowsUseOnlyPaneBackgroundInLavenderTheme(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	renderer := tideui.NewRenderer(tideui.LavenderFieldsForever, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	rows := renderInspectorField(renderer, 44, "Image", "radarr", "c", "#7dcfff")
+	if len(rows) == 0 {
+		t.Fatal("renderInspectorField returned no rows")
+	}
+	backgrounds := trueColorBackgrounds(rows[0])
+	if len(backgrounds) == 0 {
+		t.Fatalf("inspector row has no explicit background styling:\n%q", rows[0])
+	}
+	if hasMidRowReset(rows[0]) {
+		t.Fatalf("inspector row contains a mid-row full reset that can drop the pane background:\n%q", rows[0])
+	}
+	want := backgrounds[0]
+	for _, bg := range backgrounds {
+		if bg != want {
+			t.Fatalf("inspector row used mixed backgrounds %s and %s in Lavender theme:\n%q", want, bg, rows[0])
+		}
+	}
+}
+
+func trueColorBackgrounds(value string) []string {
+	matches := regexp.MustCompile(`\x1b\[[0-9;]*48;2;([0-9]+;[0-9]+;[0-9]+)[0-9;]*m`).FindAllStringSubmatch(value, -1)
+	out := make([]string, 0, len(matches))
+	for _, match := range matches {
+		out = append(out, match[1])
+	}
+	return out
+}
+
+func hasMidRowReset(value string) bool {
+	resetPattern := regexp.MustCompile(`\x1b\[(?:0)?m`)
+	resets := resetPattern.FindAllStringIndex(value, -1)
+	if len(resets) == 0 {
+		return false
+	}
+	for _, reset := range resets {
+		suffix := value[reset[0]:]
+		if resetPattern.ReplaceAllString(suffix, "") != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCopyOverlayCopiesSelectedRow(t *testing.T) {
@@ -2111,7 +2225,7 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	model.overlay = overlayHelp
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"S              systems", "Systems: enter switch, t test, a add, e edit, d delete"} {
+	for _, want := range []string{"Ctrl+S         save settings/forms", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q:\n%s", want, view)
 		}

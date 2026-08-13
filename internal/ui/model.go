@@ -259,6 +259,7 @@ type Model struct {
 	commandCursor int
 
 	settings       appSettings
+	settingsDraft  appSettings
 	settingsCursor int
 	settingsPath   string
 	systems        []config.System
@@ -380,21 +381,22 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 	settings.applyPersisted(persisted)
 	persisted = config.NormalizeSystems(persisted)
 	return Model{
-		provider:     provider,
-		theme:        theme,
-		themes:       tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
-		mode:         settings.DefaultActivity,
-		settings:     settings,
-		settingsPath: settingsPath,
-		systems:      persisted.Systems,
-		activeSystem: persisted.ActiveSystem,
-		providerFor:  factory,
-		statsHistory: map[domain.ResourceID]statsHistory{},
-		logViews:     map[domain.ResourceID]logViewState{},
-		logFollow:    true,
-		collapsed:    map[string]bool{},
-		loading:      true,
-		status:       "connecting to Docker",
+		provider:      provider,
+		theme:         theme,
+		themes:        tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
+		mode:          settings.DefaultActivity,
+		settings:      settings,
+		settingsDraft: settings,
+		settingsPath:  settingsPath,
+		systems:       persisted.Systems,
+		activeSystem:  persisted.ActiveSystem,
+		providerFor:   factory,
+		statsHistory:  map[domain.ResourceID]statsHistory{},
+		logViews:      map[domain.ResourceID]logViewState{},
+		logFollow:     true,
+		collapsed:     map[string]bool{},
+		loading:       true,
+		status:        "connecting to Docker",
 	}
 }
 
@@ -838,8 +840,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "T":
 		m.openThemePicker()
 	case ",", "ctrl+,":
-		m.overlay = overlaySettings
-		m.settingsCursor = m.firstSettingsRow()
+		m.openSettingsOverlay()
 	case "S":
 		m.openSystemsOverlay()
 	case "ctrl+k":
@@ -1002,6 +1003,7 @@ func (m Model) handleOpenKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q", ",", "ctrl+,":
+		m.settingsDraft = m.settings
 		m.overlay = overlayNone
 	case "up", "k":
 		m.moveSettingsCursor(-1)
@@ -1009,10 +1011,10 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveSettingsCursor(1)
 	case "left", "h":
 		m.cycleSetting(m.settingsCursor, -1)
-		m.saveSettings()
 	case "right", "l", "enter", " ":
 		m.cycleSetting(m.settingsCursor, 1)
-		m.saveSettings()
+	case "ctrl+s":
+		m.saveSettingsDraft()
 	}
 	return m, nil
 }
@@ -1101,6 +1103,8 @@ func (m Model) handleSystemsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.cycleSystemChoice()
 				return m, nil
 			}
+			m.moveSystemField(1)
+		case "ctrl+s":
 			m.saveSystemDraft()
 		case "backspace":
 			m.editSystemFieldBackspace()
@@ -1618,8 +1622,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.OpenTheme:
 		m.openThemePicker()
 	case actions.OpenSettings:
-		m.overlay = overlaySettings
-		m.settingsCursor = m.firstSettingsRow()
+		m.openSettingsOverlay()
 	case actions.OpenSystems:
 		m.openSystemsOverlay()
 	case actions.CommandPalette:
@@ -1636,6 +1639,12 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 func (m *Model) openThemePicker() {
 	m.themes.Open(m.theme.Name)
 	m.overlay = overlayThemePicker
+}
+
+func (m *Model) openSettingsOverlay() {
+	m.settingsDraft = m.settings
+	m.overlay = overlaySettings
+	m.settingsCursor = m.firstSettingsRow()
 }
 
 func (m *Model) openCopyOverlay() {
@@ -1852,20 +1861,28 @@ func defaultOpenTarget(target string) error {
 }
 
 func (m Model) settingsRows() []settingsRow {
+	settings := m.settingsForRows()
 	return []settingsRow{
 		{label: "Stats", kind: settingsRowSection},
-		{label: "Graph style", value: m.settings.GraphStyle.String()},
-		{label: "Graph color", value: m.settings.GraphColor.String()},
-		{label: "Show deltas", value: onOff(m.settings.ShowDeltas)},
-		{label: "Stats refresh", value: formatRefreshInterval(m.settings.StatsRefresh)},
+		{label: "Graph style", value: settings.GraphStyle.String()},
+		{label: "Graph color", value: settings.GraphColor.String()},
+		{label: "Show deltas", value: onOff(settings.ShowDeltas)},
+		{label: "Stats refresh", value: formatRefreshInterval(settings.StatsRefresh)},
 		{label: "Logs", kind: settingsRowSection},
-		{label: "Log color", value: m.settings.LogColor.String()},
-		{label: "Log health color", value: onOff(m.settings.LogHealthColor)},
+		{label: "Log color", value: settings.LogColor.String()},
+		{label: "Log health color", value: onOff(settings.LogHealthColor)},
 		{label: "Behavior", kind: settingsRowSection},
-		{label: "Default pane", value: activityModeName(m.settings.DefaultActivity)},
+		{label: "Default pane", value: activityModeName(settings.DefaultActivity)},
 		{label: "Maintenance", kind: settingsRowSection},
 		{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
 	}
+}
+
+func (m Model) settingsForRows() appSettings {
+	if m.overlay == overlaySettings {
+		return m.settingsDraft
+	}
+	return m.settings
 }
 
 func (m *Model) moveSettingsCursor(delta int) {
@@ -1905,35 +1922,40 @@ func (m *Model) cycleSetting(index, direction int) {
 		return
 	}
 	if row.action == settingsActionResetDefaults {
-		m.settings = defaultSettings()
+		m.settingsDraft = defaultSettings()
 		m.settingsCursor = clamp(index, 0, len(m.settingsRows())-1)
-		m.status, m.statusErr = "settings reset to defaults", false
+		m.status, m.statusErr = "settings reset staged", false
 		return
 	}
 	switch row.label {
 	case "Graph style":
-		m.settings.GraphStyle = graphStyle(modIndex(int(m.settings.GraphStyle)+direction, 3))
+		m.settingsDraft.GraphStyle = graphStyle(modIndex(int(m.settingsDraft.GraphStyle)+direction, 3))
 	case "Graph color":
-		m.settings.GraphColor = graphColorMode(modIndex(int(m.settings.GraphColor)+direction, 3))
+		m.settingsDraft.GraphColor = graphColorMode(modIndex(int(m.settingsDraft.GraphColor)+direction, 3))
 	case "Log color":
-		m.settings.LogColor = logColorMode(modIndex(int(m.settings.LogColor)+direction, 4))
+		m.settingsDraft.LogColor = logColorMode(modIndex(int(m.settingsDraft.LogColor)+direction, 4))
 	case "Log health color":
-		m.settings.LogHealthColor = !m.settings.LogHealthColor
+		m.settingsDraft.LogHealthColor = !m.settingsDraft.LogHealthColor
 	case "Show deltas":
-		m.settings.ShowDeltas = !m.settings.ShowDeltas
+		m.settingsDraft.ShowDeltas = !m.settingsDraft.ShowDeltas
 	case "Stats refresh":
 		intervals := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second}
 		current := 1
 		for i, interval := range intervals {
-			if m.settings.StatsRefresh == interval {
+			if m.settingsDraft.StatsRefresh == interval {
 				current = i
 				break
 			}
 		}
-		m.settings.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
+		m.settingsDraft.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
 	case "Default pane":
-		m.settings.DefaultActivity = activityMode(modIndex(int(m.settings.DefaultActivity)+direction, 3))
+		m.settingsDraft.DefaultActivity = activityMode(modIndex(int(m.settingsDraft.DefaultActivity)+direction, 3))
 	}
+}
+
+func (m *Model) saveSettingsDraft() {
+	m.settings = m.settingsDraft
+	m.saveSettings()
 }
 
 func (m *Model) saveSettings() {

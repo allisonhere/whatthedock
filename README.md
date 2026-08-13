@@ -51,12 +51,13 @@ SSH systems support two auth modes:
 
 WhatTheDock does not store SSH passwords or private keys.
 
-Systems editor text fields support normal caret editing with `Left`/`Right`,
-`Backspace`, `Delete`, `Home`, `End`, and `Ctrl+U` to clear the active field.
-Choice fields such as `Kind` and `Auth` cycle with `Left`/`Right`, `h`/`l`, or
-`Enter`. SSH systems are validated before save, switch, or test: `Host` is
-required, `Port` must be numeric when set, and both Docker socket paths must be
-present.
+Settings and Systems form changes are saved with `Ctrl+S`; `Esc` cancels
+unsaved form edits. Systems editor text fields support normal caret editing
+with `Left`/`Right`, `Backspace`, `Delete`, `Home`, `End`, and `Ctrl+U` to clear
+the active field. Choice fields such as `Kind` and `Auth` cycle with
+`Left`/`Right`, `h`/`l`, or `Enter`. SSH systems are validated before save,
+switch, or test: `Host` is required, `Port` must be numeric when set, and both
+Docker socket paths must be present.
 
 ## Current Controls
 
@@ -86,6 +87,7 @@ present.
 | `T` | Theme picker |
 | `S` | Manage local and remote Docker systems |
 | `,` / `Ctrl+,` | Settings |
+| `Ctrl+S` in settings/forms | Save changes |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
 | `q` | Quit |
