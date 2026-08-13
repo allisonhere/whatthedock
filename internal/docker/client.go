@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 
 	"github.com/allisonhere/whatthedock/internal/app"
@@ -46,6 +48,36 @@ func (p *LocalProvider) Snapshot(ctx context.Context) (domain.Snapshot, error) {
 		containers = append(containers, FromSummary(p.host.ID, item))
 	}
 	return domain.BuildSnapshot(p.host, containers, time.Now()), nil
+}
+
+func (p *LocalProvider) Events(ctx context.Context) (<-chan domain.ContainerEvent, error) {
+	msgs, errs := p.cli.Events(ctx, events.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("type", string(events.ContainerEventType))),
+	})
+	out := make(chan domain.ContainerEvent)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err, ok := <-errs:
+				if !ok || err != nil {
+					return
+				}
+			case msg, ok := <-msgs:
+				if !ok {
+					return
+				}
+				select {
+				case out <- FromEventMessage(p.host.ID, msg):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
 }
 
 func (p *LocalProvider) Container(ctx context.Context, id domain.ResourceID) (domain.Container, error) {
@@ -142,6 +174,18 @@ func blockIO(linux container.BlkioStats, windows container.StorageStats) (uint64
 		}
 	}
 	return read, write
+}
+
+func FromEventMessage(host domain.HostID, msg events.Message) domain.ContainerEvent {
+	eventTime := time.Unix(msg.Time, 0)
+	if msg.TimeNano != 0 {
+		eventTime = time.Unix(0, msg.TimeNano)
+	}
+	return domain.ContainerEvent{
+		ID:     domain.ResourceID{Host: host, ID: msg.Actor.ID},
+		Action: string(msg.Action),
+		Time:   eventTime,
+	}
 }
 
 func (p *LocalProvider) StartContainer(ctx context.Context, id domain.ResourceID) error {

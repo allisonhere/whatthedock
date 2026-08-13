@@ -25,9 +25,9 @@ func (m Model) View() string {
 	}
 	activityTitle, activityHint := m.activityHeader()
 	panes := [3]tideui.Pane{
-		{Title: "Projects", Hint: "enter/space collapse  / filter", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
+		{Title: "Projects", Hint: "tree", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
-		{Title: "Inspector", Hint: "j/k scroll  s start/stop  alt+r restart", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
+		{Title: "Inspector", Hint: "details", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
@@ -48,11 +48,11 @@ func (m Model) View() string {
 func (m Model) activityHeader() (string, string) {
 	switch m.mode {
 	case activityProblems:
-		return "Problems", "p problems  l logs  g stats"
+		return "Problems", "activity"
 	case activityStats:
-		return "Stats", "g stats  p problems  l logs"
+		return "Stats", "activity"
 	default:
-		return "Activity", "j/k scroll  n/N matches  / search  x/esc clear"
+		return "Activity", "logs"
 	}
 }
 
@@ -114,7 +114,8 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		lines = append(lines, renderer.RenderRow(tideui.Row{Prefix: prefix, Text: text, Suffix: suffix, Selected: selected, Muted: row.muted}, width))
 	}
 	start, end := visibleRange(len(lines), m.cursor, m.treeVisibleRows())
-	return strings.Join(lines[start:end], "\n")
+	content := strings.Join(lines[start:end], "\n")
+	return m.withPaneActionStrip(renderer, paneTree, width, content)
 }
 
 // visibleRange returns the [start, end) window of size at most limit that
@@ -161,27 +162,29 @@ func healthSpan(text string, color, restore lipgloss.Color) string {
 
 func (m Model) renderActivity(renderer tideui.Renderer) string {
 	if m.mode == activityStats {
-		return m.renderStats(renderer)
+		content, width := m.renderStatsContent(renderer)
+		return m.withPaneActionStrip(renderer, paneActivity, width, content)
 	}
 	if m.mode == activityProblems {
-		return m.renderProblems(renderer)
-	}
-	if m.selected == nil {
-		return renderer.Styles.DetailMeta.Render("Select a container to view live logs.")
-	}
-	if m.logErr != nil {
-		return renderer.Styles.StatusError.Render(friendlyDockerError(m.logErr))
-	}
-	if len(m.logLines) == 0 {
-		return renderer.Styles.DetailMeta.Render("Waiting for logs from " + m.selected.DisplayName() + "...")
+		content, width := m.renderProblemsContent(renderer)
+		return m.withPaneActionStrip(renderer, paneActivity, width, content)
 	}
 	width := m.centerPaneWidth() - 4
 	if width < 20 {
 		width = 20
 	}
+	if m.selected == nil {
+		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Select a container to view live logs."))
+	}
+	if m.logErr != nil {
+		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.StatusError.Render(friendlyDockerError(m.logErr)))
+	}
+	if len(m.logLines) == 0 {
+		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Waiting for logs from "+m.selected.DisplayName()+"..."))
+	}
 	filtered := m.visibleLogLines()
 	if len(filtered) == 0 {
-		return renderer.Styles.DetailMeta.Render(m.emptyLogFilterMessage())
+		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render(m.emptyLogFilterMessage()))
 	}
 	visible := m.logVisibleRows()
 	start := m.logStartIndex(len(filtered), visible)
@@ -198,7 +201,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	for _, line := range filtered[start:end] {
 		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(renderLogLine(renderer, m.settings.LogColor, m.logFilter, line)))
 	}
-	return strings.Join(lines, "\n")
+	return m.withPaneActionStrip(renderer, paneActivity, width, strings.Join(lines, "\n"))
 }
 
 func (m Model) logStartIndex(total, visible int) int {
@@ -419,30 +422,22 @@ func logSeverityColor(severity string) lipgloss.Color {
 	}
 }
 
-func (m Model) renderStats(renderer tideui.Renderer) string {
+func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 	ctr := m.selectedContainer()
-	if ctr == nil {
-		return renderer.Styles.DetailMeta.Render("Select a container to view stats.")
-	}
 	width := m.centerPaneWidth() - 4
 	if width < 20 {
 		width = 20
+	}
+	if ctr == nil {
+		return renderer.Styles.DetailMeta.Render("Select a container to view stats."), width
 	}
 	stats := m.stats
 	if stats != nil && stats.ID != ctr.ID {
 		stats = nil
 	}
-	notice := "Stats will refresh while this pane is active."
-	if m.statsLoading {
-		notice = "Loading Docker stats for " + ctr.DisplayName() + "..."
-	} else if m.statsErr != nil {
-		notice = "Stats unavailable: " + friendlyDockerError(m.statsErr)
-	} else if stats != nil {
-		notice = "Stats sampled " + formatStatsAge(stats.Read) + "."
-	}
 	history := m.statsHistory[ctr.ID]
 	lines := []string{
-		renderer.Styles.DetailMeta.Render(notice),
+		renderer.Styles.DetailMeta.Render(""),
 		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), "#7dcfff"),
 		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta), formatMemoryStats(stats), "#80c990"),
 		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
@@ -454,7 +449,11 @@ func (m Model) renderStats(renderer tideui.Renderer) string {
 		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#9aa6b2"),
 		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: ctr.DisplayName()}, width),
 	}
-	return strings.Join(lines, "\n")
+	if m.focus == paneActivity {
+		limit := max(1, m.activityVisibleRows()-2)
+		lines = lines[:min(len(lines), limit)]
+	}
+	return strings.Join(lines, "\n"), width
 }
 
 type statGraph struct {
@@ -912,14 +911,14 @@ type problemRow struct {
 	detail   string
 }
 
-func (m Model) renderProblems(renderer tideui.Renderer) string {
+func (m Model) renderProblemsContent(renderer tideui.Renderer) (string, int) {
 	problems := m.snapshotProblems()
-	if len(problems) == 0 {
-		return renderer.Styles.DetailMeta.Render("No container problems detected.")
-	}
 	width := m.centerPaneWidth() - 4
 	if width < 20 {
 		width = 20
+	}
+	if len(problems) == 0 {
+		return renderer.Styles.DetailMeta.Render("No container problems detected."), width
 	}
 	lines := make([]string, 0, len(problems)+1)
 	lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
@@ -936,7 +935,11 @@ func (m Model) renderProblems(renderer tideui.Renderer) string {
 			Muted:    muted,
 		}, width))
 	}
-	return strings.Join(lines, "\n")
+	if m.focus == paneActivity {
+		limit := max(1, m.activityVisibleRows()-2)
+		lines = lines[:min(len(lines), limit)]
+	}
+	return strings.Join(lines, "\n"), width
 }
 
 func (m Model) problemSelected(index int, problem problemRow) bool {
@@ -1057,13 +1060,10 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 		add("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr))
 	}
 
-	actionBar := renderActionBar(renderer, width)
-	budget := max(1, m.inspectorVisibleRows()-2)
+	budget := max(1, m.inspectorVisibleRows()-m.paneActionStripRows(paneInspector))
 	start := clamp(m.inspectorScroll, 0, max(0, len(lines)-budget))
 	end := min(len(lines), start+budget)
-	visible := append([]string(nil), lines[start:end]...)
-	visible = append(visible, "", actionBar)
-	return strings.Join(visible, "\n")
+	return m.withPaneActionStrip(renderer, paneInspector, width, strings.Join(lines[start:end], "\n"))
 }
 
 func renderInspectorSection(renderer tideui.Renderer, width int, title string) string {
@@ -1191,12 +1191,136 @@ func detailHint(hasValue, openable bool) string {
 	return "c"
 }
 
-func renderActionBar(renderer tideui.Renderer, width int) string {
-	actions := []string{"s start/stop", "r restart", "l logs", "c copy", "o open"}
-	for i, action := range actions {
-		actions[i] = "[" + action + "]"
+type paneAction struct {
+	key   string
+	label string
+}
+
+func (m Model) withPaneActionStrip(renderer tideui.Renderer, pane pane, width int, content string) string {
+	if m.focus != pane {
+		return content
 	}
-	return renderer.Styles.DetailMeta.Width(width).Render("Actions  " + strings.Join(actions, " "))
+	strip := m.renderPaneActionStrip(renderer, pane, width)
+	if strip == "" {
+		return content
+	}
+	contentRows := max(1, m.paneContentRows())
+	footerRows := m.paneActionStripRows(pane)
+	if footerRows == 0 || contentRows <= footerRows {
+		return content
+	}
+	bodyRows := contentRows - footerRows
+	lines := []string{}
+	if content != "" {
+		lines = strings.Split(content, "\n")
+	}
+	if len(lines) > bodyRows {
+		lines = lines[:bodyRows]
+	}
+	blank := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Width(width).Render("")
+	for len(lines) < bodyRows {
+		lines = append(lines, blank)
+	}
+	lines = append(lines, strip)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderPaneActionStrip(renderer tideui.Renderer, pane pane, width int) string {
+	actions := m.paneActions(pane)
+	if len(actions) == 0 {
+		return ""
+	}
+	chipBg := renderer.Styles.Theme.StatusBar
+	if chipBg == "" {
+		chipBg = renderer.Styles.Theme.Border
+	}
+	keyStyle := lipgloss.NewStyle().
+		Background(renderer.Styles.Theme.BorderFocus).
+		Foreground(styleForeground(renderer.Styles.PaneHeaderActive, renderer.Styles.Theme.Fg)).
+		Bold(true)
+	labelStyle := lipgloss.NewStyle().
+		Background(chipBg).
+		Foreground(styleForeground(renderer.Styles.StatusBar, renderer.Styles.Theme.StatusFg))
+	gap := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Render(" ")
+	parts := make([]string, 0, len(actions))
+	for _, action := range actions {
+		if action.key == "" || action.label == "" {
+			continue
+		}
+		chip := keyStyle.Render(" "+action.key+" ") + labelStyle.Render(strings.ToLower(action.label)+" ")
+		parts = append(parts, chip)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	line := ""
+	for _, part := range parts {
+		candidate := part
+		if line != "" {
+			candidate = line + gap + part
+		}
+		if lipgloss.Width(ansi.Strip(candidate)) > width {
+			break
+		}
+		line = candidate
+	}
+	if line == "" {
+		return ""
+	}
+	return renderer.Styles.DetailMeta.Width(width).Render(line)
+}
+
+func (m Model) paneActions(pane pane) []paneAction {
+	switch pane {
+	case paneTree:
+		actions := []paneAction{
+			{key: "enter", label: "select"},
+			{key: "space", label: "fold"},
+			{key: "/", label: "filter"},
+			{key: "r", label: "refresh"},
+		}
+		if row := m.currentRow(); row != nil && row.container != nil {
+			actions = append(actions, paneAction{key: "s", label: "start/stop"})
+		}
+		return actions
+	case paneActivity:
+		switch m.mode {
+		case activityProblems:
+			return []paneAction{
+				{key: "enter", label: "inspect"},
+				{key: "r", label: "refresh"},
+				{key: "l", label: "logs"},
+				{key: "g", label: "stats"},
+			}
+		case activityStats:
+			return []paneAction{
+				{key: "r", label: "refresh"},
+				{key: "l", label: "logs"},
+				{key: "p", label: "problems"},
+			}
+		default:
+			follow := paneAction{key: "f", label: "live"}
+			if m.logFollow {
+				follow = paneAction{key: "k", label: "pause"}
+			}
+			return []paneAction{
+				follow,
+				{key: "/", label: "search"},
+				{key: "x", label: "clear"},
+				{key: "n/N", label: "match"},
+			}
+		}
+	case paneInspector:
+		return []paneAction{
+			{key: "s", label: "start/stop"},
+			{key: "alt+r", label: "restart"},
+			{key: "l", label: "logs"},
+			{key: "c", label: "copy"},
+			{key: "o", label: "open"},
+		}
+	default:
+		return nil
+	}
 }
 
 func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {

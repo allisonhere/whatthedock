@@ -124,6 +124,15 @@ type treeRow struct {
 	muted     bool
 }
 
+type treeRowKey struct {
+	valid       bool
+	kind        rowKind
+	label       string
+	project     string
+	service     string
+	containerID domain.ResourceID
+}
+
 type settingsRow struct {
 	label  string
 	value  string
@@ -179,6 +188,7 @@ type Model struct {
 	snapshot        domain.Snapshot
 	rows            []treeRow
 	cursor          int
+	focusedTreeKey  treeRowKey
 	problemCursor   int
 	collapsed       map[string]bool
 	selectedID      domain.ResourceID
@@ -187,19 +197,25 @@ type Model struct {
 	filterDraft     string
 	inspectorScroll int
 
-	logLines   []string
-	logFilter  string
-	logDraft   string
-	logLevel   logSeverityFilter
-	logScroll  int
-	logFollow  bool
-	logMatch   int
-	logViews   map[domain.ResourceID]logViewState
-	logViewID  domain.ResourceID
-	logChan    chan string
-	logCancel  context.CancelFunc
-	logLoading bool
-	logErr     error
+	logLines          []string
+	logFilter         string
+	logDraft          string
+	logLevel          logSeverityFilter
+	logScroll         int
+	logFollow         bool
+	logMatch          int
+	logViews          map[domain.ResourceID]logViewState
+	logViewID         domain.ResourceID
+	logChan           chan string
+	logCancel         context.CancelFunc
+	logLoading        bool
+	logErr            error
+	logReplaceOnDrain bool
+
+	eventChan     <-chan domain.ContainerEvent
+	eventCancel   context.CancelFunc
+	snapshotDirty bool
+	eventBackoff  time.Duration
 
 	stats        *domain.ContainerStats
 	statsID      domain.ResourceID
@@ -257,6 +273,7 @@ type statsHistory struct {
 	maxNetwork uint64
 	maxBlock   uint64
 	maxPIDs    uint64
+	lastStats  *domain.ContainerStats
 }
 
 type actionDoneMsg struct {
@@ -265,10 +282,27 @@ type actionDoneMsg struct {
 }
 
 type logsStartedMsg struct {
+	id     domain.ResourceID
 	lines  <-chan string
 	cancel context.CancelFunc
 	err    error
 }
+
+type eventsStartedMsg struct {
+	events <-chan domain.ContainerEvent
+	cancel context.CancelFunc
+	err    error
+}
+
+type containerEventMsg struct {
+	event domain.ContainerEvent
+}
+
+type eventStreamClosedMsg struct{}
+
+type eventsReconnectTickMsg struct{}
+
+type eventRefreshTickMsg struct{}
 
 type logTickMsg struct{}
 
@@ -395,7 +429,7 @@ func whatthedockTheme() tideui.Theme {
 }
 
 func (m Model) Init() tea.Cmd {
-	return m.refreshCmd()
+	return tea.Batch(m.refreshCmd(), m.startEventsCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -409,14 +443,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
 			m.snapshot = domain.Snapshot{Host: m.provider.Host(), Refreshed: time.Now()}
 			m.rows = m.buildRows()
-			m.selected = nil
+			m.focusedTreeKey = treeRowKey{}
+			m.clearSelectedContainer()
 			return m, nil
 		}
 		m.status, m.statusErr = "Docker connected", false
+		if !m.focusedTreeKey.valid {
+			m.syncFocusedTreeKey()
+		}
+		previousCursor := m.cursor
 		m.snapshot = msg.snapshot
 		m.rows = m.buildRows()
-		m.preserveSelection()
-		return m, m.loadSelectedCmd()
+		return m, m.restoreFocusedTreeRow(previousCursor, true)
 	case detailMsg:
 		if msg.id != m.selectedID {
 			// A newer selection has since superseded this in-flight request; discard it.
@@ -437,6 +475,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logChan = nil
 			m.logLines = nil
 			m.logErr = nil
+			m.logReplaceOnDrain = false
 			m.inspectorScroll = 0
 		}
 		m.restoreLogViewState(msg.container.ID)
@@ -445,15 +484,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statsErr = nil
 			return m, m.loadStatsCmd(msg.container.ID)
 		}
+		if !selectionChanged && m.logChan != nil {
+			return m, nil
+		}
 		return m, m.startLogsCmd(msg.container.ID)
 	case logsStartedMsg:
+		if msg.id != m.selectedID {
+			if msg.cancel != nil {
+				msg.cancel()
+			}
+			return m, nil
+		}
 		if m.logCancel != nil {
 			m.logCancel()
 		}
-		m.logLines = nil
+		if len(m.logLines) == 0 {
+			m.logLines = nil
+			m.logReplaceOnDrain = false
+		} else {
+			m.logReplaceOnDrain = true
+		}
 		m.logErr = msg.err
 		m.logLoading = false
 		if msg.err != nil {
+			m.logReplaceOnDrain = false
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
 			return m, nil
 		}
@@ -461,6 +515,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.logCancel = msg.cancel
 		go forwardLogs(msg.lines, m.logChan)
 		return m, tickLogs()
+	case eventsStartedMsg:
+		if msg.err != nil {
+			m.advanceEventBackoff()
+			return m, m.eventsReconnectCmd()
+		}
+		m.eventChan = msg.events
+		m.eventCancel = msg.cancel
+		m.eventBackoff = 0
+		return m, waitForContainerEvent(m.eventChan)
+	case containerEventMsg:
+		alreadyDirty := m.snapshotDirty
+		m.snapshotDirty = true
+		if alreadyDirty {
+			return m, waitForContainerEvent(m.eventChan)
+		}
+		return m, tea.Batch(waitForContainerEvent(m.eventChan), eventRefreshTickCmd())
+	case eventStreamClosedMsg:
+		m.eventChan = nil
+		if m.eventCancel != nil {
+			m.eventCancel()
+			m.eventCancel = nil
+		}
+		m.advanceEventBackoff()
+		return m, m.eventsReconnectCmd()
+	case eventsReconnectTickMsg:
+		return m, m.startEventsCmd()
+	case eventRefreshTickMsg:
+		if !m.snapshotDirty {
+			return m, nil
+		}
+		m.snapshotDirty = false
+		return m, m.refreshCmd()
 	case logTickMsg:
 		m.drainLogs()
 		if m.logChan == nil {
@@ -528,8 +614,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneInspector:
 			m.scrollInspector(1)
 		case m.focus == paneTree:
-			m.moveCursor(1)
-			return m, m.loadSelectedCmd()
+			return m, m.focusTreeIndex(m.cursor + 1)
 		}
 		return m, nil
 	case "k", "up":
@@ -541,8 +626,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneInspector:
 			m.scrollInspector(-1)
 		case m.focus == paneTree:
-			m.moveCursor(-1)
-			return m, m.loadSelectedCmd()
+			return m, m.focusTreeIndex(m.cursor - 1)
 		}
 		return m, nil
 	case "pgdown":
@@ -599,8 +683,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == paneTree {
 			if row := m.currentRow(); row != nil && row.kind == rowProject {
 				m.collapsed[row.project] = !m.collapsed[row.project]
+				previousCursor := m.cursor
 				m.rows = m.buildRows()
-				m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+				return m, m.restoreFocusedTreeRow(previousCursor, false)
 			}
 		}
 	case "enter":
@@ -611,9 +696,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if row := m.currentRow(); row != nil {
 				if row.kind == rowProject {
 					m.collapsed[row.project] = !m.collapsed[row.project]
+					previousCursor := m.cursor
 					m.rows = m.buildRows()
-					m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
-					return m, nil
+					return m, m.restoreFocusedTreeRow(previousCursor, false)
 				}
 				if row.container != nil {
 					return m, m.loadSelectedCmd()
@@ -621,7 +706,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/":
-		if m.focus == paneActivity && m.mode == activityLogs {
+		if m.mode == activityLogs {
+			m.focus = paneActivity
 			m.openLogFilter()
 			return m, nil
 		}
@@ -702,9 +788,9 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.filter = strings.TrimSpace(m.filterDraft)
 			m.overlay = overlayNone
+			previousCursor := m.cursor
 			m.rows = m.buildRows()
-			m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
-			return m, m.loadSelectedCmd()
+			return m, m.restoreFocusedTreeRow(previousCursor, true)
 		case "backspace":
 			if len(m.filterDraft) > 0 {
 				m.filterDraft = m.filterDraft[:len(m.filterDraft)-1]
@@ -1387,11 +1473,21 @@ func (m *Model) clampLogScroll() {
 }
 
 func (m Model) logVisibleRows() int {
-	return max(1, m.height-6)
+	headerRows := 1
+	return max(1, m.activityVisibleRows()-headerRows)
 }
 
 func (m Model) treeVisibleRows() int {
-	return max(1, m.height-6)
+	return max(1, m.paneContentRows()-m.paneActionStripRows(paneTree))
+}
+
+func (m Model) activityVisibleRows() int {
+	return max(1, m.paneContentRows()-m.paneActionStripRows(paneActivity))
+}
+
+func (m Model) treeVisibleStart() int {
+	start, _ := visibleRange(len(m.rows), m.cursor, m.treeVisibleRows())
+	return start
 }
 
 func (m *Model) saveLogViewState() {
@@ -1419,12 +1515,16 @@ func (m *Model) restoreLogViewState(id domain.ResourceID) {
 	if m.logViews == nil {
 		m.logViews = map[domain.ResourceID]logViewState{}
 	}
+	draft := m.logDraft
 	state, ok := m.logViews[id]
 	if !ok {
 		state = logViewState{follow: true}
 	}
 	m.logFilter = state.filter
 	m.logDraft = state.filter
+	if m.overlay == overlayLogFilter {
+		m.logDraft = draft
+	}
 	m.logLevel = state.level
 	m.logScroll = state.scroll
 	m.logFollow = state.follow
@@ -1511,8 +1611,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneInspector:
 			m.scrollInspector(-1)
 		case m.focus == paneTree:
-			m.moveCursor(-1)
-			return m, m.loadSelectedCmd()
+			return m, m.focusTreeIndex(m.cursor - 1)
 		}
 		return m, nil
 	case tea.MouseButtonWheelDown:
@@ -1524,15 +1623,15 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(1)
 		case m.focus == paneTree:
-			m.moveCursor(1)
-			return m, m.loadSelectedCmd()
+			return m, m.focusTreeIndex(m.cursor + 1)
 		}
 		return m, nil
 	case tea.MouseButtonLeft:
-		if msg.X < m.leftPaneWidth() && msg.Y > 1 && msg.Y <= len(m.rows)+2 {
-			m.cursor = clamp(msg.Y-3, 0, len(m.rows)-1)
+		treeRowOffset := msg.Y - 3
+		visibleTreeRows := min(len(m.rows), m.treeVisibleRows())
+		if msg.X < m.leftPaneWidth() && treeRowOffset >= 0 && treeRowOffset < visibleTreeRows {
 			m.focus = paneTree
-			return m, m.loadSelectedCmd()
+			return m, m.focusTreeIndex(m.treeVisibleStart() + treeRowOffset)
 		}
 		if msg.X >= m.leftPaneWidth() && msg.X < m.leftPaneWidth()+m.centerPaneWidth() && m.mode == activityProblems {
 			m.focus = paneActivity
@@ -1547,15 +1646,25 @@ func (m *Model) scrollInspector(delta int) {
 }
 
 func (m Model) inspectorVisibleRows() int {
-	return max(1, m.height-6)
+	return m.paneContentRows()
+}
+
+func (m Model) paneActionStripRows(pane pane) int {
+	if m.focus != pane {
+		return 0
+	}
+	if m.height < 10 {
+		return 0
+	}
+	return 1
+}
+
+func (m Model) paneContentRows() int {
+	return max(1, m.height-5)
 }
 
 func (m *Model) moveCursor(delta int) {
-	if len(m.rows) == 0 {
-		m.cursor = 0
-		return
-	}
-	m.cursor = clamp(m.cursor+delta, 0, len(m.rows)-1)
+	_ = m.focusTreeIndex(m.cursor + delta)
 }
 
 func (m *Model) moveProblemCursor(delta int) {
@@ -1600,6 +1709,7 @@ func (m *Model) moveTreeCursorTo(id domain.ResourceID) bool {
 	for i, row := range m.rows {
 		if row.container != nil && row.container.ID == id {
 			m.cursor = i
+			m.focusedTreeKey = row.key()
 			m.selectedID = id
 			return true
 		}
@@ -1614,44 +1724,133 @@ func (m Model) currentRow() *treeRow {
 	return &m.rows[m.cursor]
 }
 
-func (m *Model) preserveSelection() {
-	m.rows = m.buildRows()
-	if len(m.rows) == 0 {
-		m.cursor = 0
-		m.selected = nil
+func (r treeRow) key() treeRowKey {
+	if r.container != nil {
+		return treeRowKey{
+			valid:       true,
+			kind:        rowContainer,
+			containerID: r.container.ID,
+		}
+	}
+	return treeRowKey{
+		valid:   true,
+		kind:    r.kind,
+		label:   r.label,
+		project: r.project,
+		service: r.service,
+	}
+}
+
+func (m *Model) syncFocusedTreeKey() {
+	if row := m.currentRow(); row != nil {
+		m.focusedTreeKey = row.key()
 		return
 	}
+	m.focusedTreeKey = treeRowKey{}
+}
+
+func (m *Model) focusTreeIndex(index int) tea.Cmd {
+	if len(m.rows) == 0 {
+		m.cursor = 0
+		m.focusedTreeKey = treeRowKey{}
+		m.clearSelectedContainer()
+		return nil
+	}
+	m.cursor = clamp(index, 0, len(m.rows)-1)
+	m.syncFocusedTreeKey()
+	return m.applyFocusedTreeRow()
+}
+
+func (m *Model) applyFocusedTreeRow() tea.Cmd {
+	row := m.currentRow()
+	if row == nil || row.container == nil {
+		m.clearSelectedContainer()
+		return nil
+	}
+	m.selectedID = row.container.ID
+	return m.loadSelectedCmd()
+}
+
+func (m *Model) clearSelectedContainer() {
 	if m.selectedID.ID != "" {
-		for i, row := range m.rows {
-			if row.container != nil && row.container.ID == m.selectedID {
-				m.cursor = i
-				return
-			}
+		m.saveLogViewState()
+	}
+	m.selectedID = domain.ResourceID{}
+	m.selected = nil
+	m.stats = nil
+	m.statsID = domain.ResourceID{}
+	m.statsLoading = false
+	m.statsErr = nil
+	m.inspectorScroll = 0
+	if m.logCancel != nil {
+		m.logCancel()
+		m.logCancel = nil
+	}
+	m.logChan = nil
+	m.logLines = nil
+	m.logErr = nil
+	m.logReplaceOnDrain = false
+	m.logLoading = false
+}
+
+func (m *Model) restoreFocusedTreeRow(previousCursor int, selectInitial bool) tea.Cmd {
+	if len(m.rows) == 0 {
+		m.cursor = 0
+		m.focusedTreeKey = treeRowKey{}
+		m.clearSelectedContainer()
+		return nil
+	}
+	if m.focusedTreeKey.valid && m.moveTreeCursorToKey(m.focusedTreeKey) {
+		return m.applyFocusedTreeRow()
+	}
+	if !m.focusedTreeKey.valid && selectInitial {
+		if m.selectFirstContainer() {
+			return m.loadSelectedCmd()
 		}
 	}
-	if m.mode == activityProblems {
-		for _, problem := range m.snapshotProblems() {
-			if m.moveTreeCursorTo(problem.id) {
-				m.syncProblemCursor()
-				return
-			}
+	m.cursor = clamp(previousCursor, 0, len(m.rows)-1)
+	m.syncFocusedTreeKey()
+	m.clearSelectedContainer()
+	return nil
+}
+
+func (m *Model) moveTreeCursorToKey(key treeRowKey) bool {
+	if !key.valid {
+		return false
+	}
+	for i, row := range m.rows {
+		if row.key() == key {
+			m.cursor = i
+			m.focusedTreeKey = key
+			return true
 		}
 	}
+	return false
+}
+
+func (m *Model) selectFirstContainer() bool {
 	for i, row := range m.rows {
 		if row.container != nil {
 			m.cursor = i
+			m.focusedTreeKey = row.key()
 			m.selectedID = row.container.ID
-			return
+			return true
 		}
 	}
 	m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
+	m.syncFocusedTreeKey()
+	m.clearSelectedContainer()
+	return false
 }
 
 func (m Model) selectedContainer() *domain.Container {
 	if row := m.currentRow(); row != nil && row.container != nil {
 		return row.container
 	}
-	return m.selected
+	if m.selectedID.ID != "" {
+		return m.selected
+	}
+	return nil
 }
 
 func (m Model) buildRows() []treeRow {
@@ -1761,16 +1960,31 @@ func (m *Model) appendStats(stats domain.ContainerStats) {
 	history := m.statsHistory[stats.ID]
 	history.CPU = appendFloatHistory(history.CPU, stats.CPUPercent, 24)
 	history.Memory = appendUintHistory(history.Memory, stats.MemoryUsage, 24)
-	history.NetworkRx = appendUintHistory(history.NetworkRx, stats.NetworkRx, 24)
-	history.NetworkTx = appendUintHistory(history.NetworkTx, stats.NetworkTx, 24)
-	history.BlockTotal = appendUintHistory(history.BlockTotal, stats.BlockRead+stats.BlockWrite, 24)
+	if history.lastStats != nil {
+		history.NetworkRx = appendUintHistory(history.NetworkRx, counterDelta(history.lastStats.NetworkRx, stats.NetworkRx), 24)
+		history.NetworkTx = appendUintHistory(history.NetworkTx, counterDelta(history.lastStats.NetworkTx, stats.NetworkTx), 24)
+		history.BlockTotal = appendUintHistory(history.BlockTotal, counterDelta(history.lastStats.BlockRead+history.lastStats.BlockWrite, stats.BlockRead+stats.BlockWrite), 24)
+	}
 	history.PIDs = appendUintHistory(history.PIDs, stats.PIDs, 24)
 	history.maxCPU = maxFloat(history.maxCPU, stats.CPUPercent)
 	history.maxMemory = maxUint(history.maxMemory, stats.MemoryUsage)
-	history.maxNetwork = maxUint(history.maxNetwork, maxUint(stats.NetworkRx, stats.NetworkTx))
-	history.maxBlock = maxUint(history.maxBlock, stats.BlockRead+stats.BlockWrite)
+	if len(history.NetworkRx) > 0 {
+		history.maxNetwork = maxUint(history.maxNetwork, maxUint(history.NetworkRx[len(history.NetworkRx)-1], history.NetworkTx[len(history.NetworkTx)-1]))
+	}
+	if len(history.BlockTotal) > 0 {
+		history.maxBlock = maxUint(history.maxBlock, history.BlockTotal[len(history.BlockTotal)-1])
+	}
 	history.maxPIDs = maxUint(history.maxPIDs, stats.PIDs)
+	copied := stats
+	history.lastStats = &copied
 	m.statsHistory[stats.ID] = history
+}
+
+func counterDelta(previous, current uint64) uint64 {
+	if current < previous {
+		return 0
+	}
+	return current - previous
 }
 
 func appendFloatHistory(values []float64, value float64, limit int) []float64 {
@@ -1827,6 +2041,52 @@ func (m Model) actionCmd(id actions.ID, label string) tea.Cmd {
 	}
 }
 
+func (m Model) startEventsCmd() tea.Cmd {
+	provider := m.provider
+	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(context.Background())
+		events, err := provider.Events(ctx)
+		if err != nil {
+			cancel()
+			return eventsStartedMsg{err: err}
+		}
+		return eventsStartedMsg{events: events, cancel: cancel}
+	}
+}
+
+func (m *Model) advanceEventBackoff() {
+	if m.eventBackoff <= 0 {
+		m.eventBackoff = time.Second
+	} else {
+		m.eventBackoff *= 2
+		if m.eventBackoff > 30*time.Second {
+			m.eventBackoff = 30 * time.Second
+		}
+	}
+}
+
+func (m Model) eventsReconnectCmd() tea.Cmd {
+	backoff := m.eventBackoff
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	return tea.Tick(backoff, func(time.Time) tea.Msg { return eventsReconnectTickMsg{} })
+}
+
+func eventRefreshTickCmd() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return eventRefreshTickMsg{} })
+}
+
+func waitForContainerEvent(events <-chan domain.ContainerEvent) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-events
+		if !ok {
+			return eventStreamClosedMsg{}
+		}
+		return containerEventMsg{event: event}
+	}
+}
+
 func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 	if id.ID == "" {
 		return nil
@@ -1836,11 +2096,11 @@ func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 		stream, err := m.provider.Logs(ctx, id, app.LogOptions{Tail: "300", Follow: true})
 		if err != nil {
 			cancel()
-			return logsStartedMsg{err: err}
+			return logsStartedMsg{id: id, err: err}
 		}
 		lines := make(chan string, 256)
 		go readLogLines(stream, lines, cancel)
-		return logsStartedMsg{lines: lines, cancel: cancel}
+		return logsStartedMsg{id: id, lines: lines, cancel: cancel}
 	}
 }
 
@@ -1883,7 +2143,12 @@ func (m *Model) drainLogs() {
 		case line, ok := <-m.logChan:
 			if !ok {
 				m.logChan = nil
+				m.logReplaceOnDrain = false
 				return
+			}
+			if m.logReplaceOnDrain {
+				m.logLines = nil
+				m.logReplaceOnDrain = false
 			}
 			m.logLines = append(m.logLines, line)
 			if len(m.logLines) > 1000 {
@@ -1902,6 +2167,10 @@ func (m *Model) cleanup() {
 	if m.logCancel != nil {
 		m.logCancel()
 		m.logCancel = nil
+	}
+	if m.eventCancel != nil {
+		m.eventCancel()
+		m.eventCancel = nil
 	}
 	_ = m.provider.Close()
 }

@@ -33,6 +33,12 @@ type Host struct {
 	Name string
 }
 
+type ContainerEvent struct {
+	ID     ResourceID
+	Action string
+	Time   time.Time
+}
+
 type ContainerState string
 
 const (

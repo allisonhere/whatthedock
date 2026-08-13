@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 
 	"github.com/allisonhere/whatthedock/internal/domain"
 )
@@ -87,5 +88,23 @@ func TestFromStatsAggregatesDockerStats(t *testing.T) {
 	}
 	if stats.PIDs != 9 {
 		t.Fatalf("PIDs = %d, want 9", stats.PIDs)
+	}
+}
+
+func TestFromEventMessageMapsContainerEvent(t *testing.T) {
+	got := FromEventMessage("local", events.Message{
+		Action:   events.ActionDie,
+		Actor:    events.Actor{ID: "abcdef"},
+		TimeNano: time.Unix(100, 200).UnixNano(),
+	})
+
+	if got.ID != (domain.ResourceID{Host: "local", ID: "abcdef"}) {
+		t.Fatalf("ID = %#v, want local/abcdef", got.ID)
+	}
+	if got.Action != string(events.ActionDie) {
+		t.Fatalf("Action = %q, want %q", got.Action, events.ActionDie)
+	}
+	if want := time.Unix(100, 200); !got.Time.Equal(want) {
+		t.Fatalf("Time = %v, want %v", got.Time, want)
 	}
 }

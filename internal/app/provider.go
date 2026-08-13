@@ -11,6 +11,7 @@ type Provider interface {
 	Host() domain.Host
 	Ping(context.Context) error
 	Snapshot(context.Context) (domain.Snapshot, error)
+	Events(context.Context) (<-chan domain.ContainerEvent, error)
 	Container(context.Context, domain.ResourceID) (domain.Container, error)
 	ContainerStats(context.Context, domain.ResourceID) (domain.ContainerStats, error)
 	Logs(context.Context, domain.ResourceID, LogOptions) (io.ReadCloser, error)

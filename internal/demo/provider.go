@@ -47,6 +47,15 @@ func (p *Provider) Snapshot(_ context.Context) (domain.Snapshot, error) {
 	return domain.BuildSnapshot(p.host, containers, time.Now()), nil
 }
 
+func (p *Provider) Events(ctx context.Context) (<-chan domain.ContainerEvent, error) {
+	ch := make(chan domain.ContainerEvent)
+	go func() {
+		defer close(ch)
+		<-ctx.Done()
+	}()
+	return ch, nil
+}
+
 func (p *Provider) Container(_ context.Context, id domain.ResourceID) (domain.Container, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

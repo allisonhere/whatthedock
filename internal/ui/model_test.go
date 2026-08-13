@@ -48,6 +48,9 @@ func (f *fakeProvider) ContainerStats(_ context.Context, id domain.ResourceID) (
 func (f *fakeProvider) Logs(context.Context, domain.ResourceID, app.LogOptions) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("one\ntwo\n")), nil
 }
+func (f *fakeProvider) Events(context.Context) (<-chan domain.ContainerEvent, error) {
+	return make(chan domain.ContainerEvent), nil
+}
 func (f *fakeProvider) StartContainer(context.Context, domain.ResourceID) error {
 	f.starts++
 	return nil
@@ -181,6 +184,136 @@ func TestTreeScrollsToKeepCursorVisible(t *testing.T) {
 	}
 	if !strings.Contains(view, "jellyfin") {
 		t.Fatalf("view missing the now-selected bottom row 'jellyfin':\n%s", view)
+	}
+}
+
+func TestSnapshotRefreshPreservesSelectedContainerByID(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	for i, row := range model.rows {
+		if row.container != nil && row.container.ID.ID == "2" {
+			model.cursor = i
+			model.selectedID = row.container.ID
+			model.selected = row.container
+			break
+		}
+	}
+
+	updated, cmd := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	model = updated.(Model)
+	if row := model.currentRow(); row == nil || row.container == nil || row.container.ID.ID != "2" {
+		t.Fatalf("currentRow = %#v, want refresh to keep selected container id 2", row)
+	}
+	if cmd == nil {
+		t.Fatal("cmd is nil, want preserved selected container detail reload")
+	}
+	msg := runCmd(t, cmd).(detailMsg)
+	if msg.id.ID != "2" {
+		t.Fatalf("detail load id = %q, want 2", msg.id.ID)
+	}
+}
+
+func TestSnapshotRefreshDoesNotPromoteFallbackWhenSelectedContainerDisappears(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	provider := model.provider.(*fakeProvider)
+	remaining := provider.containers["2"]
+	snapshot := domain.BuildSnapshot(provider.host, []domain.Container{remaining}, time.Unix(2, 0))
+
+	updated, cmd := model.Update(snapshotMsg{snapshot: snapshot})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil because passive refresh should not load a fallback selection", cmd)
+	}
+	if model.selectedID.ID != "" {
+		t.Fatalf("selectedID = %q, want cleared instead of promoted to remaining container", model.selectedID.ID)
+	}
+	if model.selected != nil {
+		t.Fatalf("selected = %#v, want nil after selected container disappeared", model.selected)
+	}
+}
+
+func TestSnapshotRefreshPreservesFocusedProjectRowOverSelectedContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.cursor = 0
+	if row := model.currentRow(); row == nil || row.kind != rowProject {
+		t.Fatalf("currentRow = %#v, want project row fixture setup", row)
+	}
+	if model.selectedID.ID == "" {
+		t.Fatal("selectedID is empty, want prior container selection to reproduce refresh jump")
+	}
+
+	updated, cmd := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil because refresh kept focus on a non-container row", cmd)
+	}
+	if row := model.currentRow(); row == nil || row.kind != rowProject || row.project != "media" {
+		t.Fatalf("currentRow = %#v, want refresh to preserve focused project row", row)
+	}
+}
+
+func TestSnapshotRefreshPreservesFocusedServiceRowOverSelectedContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	for i, row := range model.rows {
+		if row.kind == rowService && row.service == "radarr" {
+			model.cursor = i
+			break
+		}
+	}
+	if row := model.currentRow(); row == nil || row.kind != rowService {
+		t.Fatalf("currentRow = %#v, want service row fixture setup", row)
+	}
+	if model.selectedID.ID == "" {
+		t.Fatal("selectedID is empty, want prior container selection to reproduce refresh jump")
+	}
+
+	updated, cmd := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil because refresh kept focus on a non-container row", cmd)
+	}
+	if row := model.currentRow(); row == nil || row.kind != rowService || row.service != "radarr" {
+		t.Fatalf("currentRow = %#v, want refresh to preserve focused service row", row)
+	}
+}
+
+func TestTreeHeaderFocusClearsContainerTarget(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.focus = paneTree
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil when moving onto a service header", cmd)
+	}
+	if row := model.currentRow(); row == nil || row.kind != rowService {
+		t.Fatalf("currentRow = %#v, want service header after moving up from container", row)
+	}
+	if model.selectedID.ID != "" || model.selected != nil {
+		t.Fatalf("selectedID/selected = %q/%#v, want cleared on header focus", model.selectedID.ID, model.selected)
+	}
+	if selected := model.selectedContainer(); selected != nil {
+		t.Fatalf("selectedContainer = %#v, want nil while focused on header", selected)
+	}
+}
+
+func TestSnapshotRefreshPreservesFocusedContainerByIDWhenGroupingChanges(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	provider := model.provider.(*fakeProvider)
+	ctr := provider.containers["1"]
+	ctr.Compose.Service = "zz-radarr"
+	snapshot := domain.BuildSnapshot(provider.host, []domain.Container{provider.containers["2"], ctr}, time.Unix(2, 0))
+
+	updated, cmd := model.Update(snapshotMsg{snapshot: snapshot})
+	model = updated.(Model)
+	if row := model.currentRow(); row == nil || row.container == nil || row.container.ID.ID != "1" {
+		t.Fatalf("currentRow = %#v, want refresh to keep focused container id 1 after regrouping", row)
+	}
+	if cmd == nil {
+		t.Fatal("cmd is nil, want preserved selected container detail reload")
+	}
+	msg := runCmd(t, cmd).(detailMsg)
+	if msg.id.ID != "1" {
+		t.Fatalf("detail load id = %q, want 1", msg.id.ID)
 	}
 }
 
@@ -384,6 +517,95 @@ func TestLogsRenderColorCodedTokens(t *testing.T) {
 	}
 }
 
+func TestFocusedPaneActionStripIsContextual(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 220, 30
+	model.mode = activityLogs
+	model.logLines = numberedLogLines(5)
+
+	model.focus = paneTree
+	treeRaw := model.View()
+	treeView := ansi.Strip(treeRaw)
+	if !strings.Contains(treeView, "space fold") || !strings.Contains(treeView, "/ filter") || !strings.Contains(treeView, "r refresh") {
+		t.Fatalf("tree action strip missing contextual actions:\n%s", treeView)
+	}
+	if strings.Contains(treeView, "[space fold]") || !strings.Contains(treeRaw, "\x1b[") {
+		t.Fatalf("tree action strip should be styled chips, not bracket text:\n%s", treeView)
+	}
+	if strings.Contains(treeView, "alt+r restart") {
+		t.Fatalf("tree action strip leaked inspector action:\n%s", treeView)
+	}
+
+	model.focus = paneInspector
+	inspectorView := ansi.Strip(model.View())
+	if !strings.Contains(inspectorView, "alt+r restart") || !strings.Contains(inspectorView, "o open") {
+		t.Fatalf("inspector action strip missing container actions:\n%s", inspectorView)
+	}
+	if strings.Contains(inspectorView, "space fold") {
+		t.Fatalf("inspector action strip leaked tree action:\n%s", inspectorView)
+	}
+}
+
+func TestActivityActionStripChangesByMode(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 220, 30
+	model.focus = paneActivity
+	model.mode = activityLogs
+	model.logLines = numberedLogLines(5)
+	model.logFollow = true
+
+	logView := ansi.Strip(model.View())
+	for _, want := range []string{"k pause", "/ search", "n/N match", "x clear"} {
+		if !strings.Contains(logView, want) {
+			t.Fatalf("logs action strip missing %q:\n%s", want, logView)
+		}
+	}
+
+	model.logFollow = false
+	pausedView := ansi.Strip(model.View())
+	if !strings.Contains(pausedView, "f live") || strings.Contains(pausedView, "k pause") {
+		t.Fatalf("paused logs action strip =\n%s", pausedView)
+	}
+
+	model.mode = activityProblems
+	problemsView := ansi.Strip(model.View())
+	for _, want := range []string{"enter inspect", "r refresh", "l logs", "g stats"} {
+		if !strings.Contains(problemsView, want) {
+			t.Fatalf("problems action strip missing %q:\n%s", want, problemsView)
+		}
+	}
+
+	model.mode = activityStats
+	statsView := ansi.Strip(model.View())
+	for _, want := range []string{"r refresh", "l logs", "p problems"} {
+		if !strings.Contains(statsView, want) {
+			t.Fatalf("stats action strip missing %q:\n%s", want, statsView)
+		}
+	}
+	if strings.Contains(statsView, "k pause") || strings.Contains(statsView, "f live") {
+		t.Fatalf("stats action strip should not advertise log live controls:\n%s", statsView)
+	}
+}
+
+func TestLogActionStripStaysVisibleWhenLogPaneIsFull(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 100, 12
+	model.focus = paneActivity
+	model.mode = activityLogs
+	model.logLines = numberedLogLines(50)
+	model.logFollow = true
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"k pause", "/ search", "x clear"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("full log pane missing persistent footer chip %q:\n%s", want, view)
+		}
+	}
+	if !strings.Contains(view, "tail 50/50") || !strings.Contains(view, "line-50") {
+		t.Fatalf("full log pane should keep tail content above footer:\n%s", view)
+	}
+}
+
 func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	line := "2026-08-12T12:00:00Z [WARN] POST /api 404"
@@ -431,6 +653,25 @@ func TestLogFilterOverlayFiltersVisibleLogsAndHighlightsMatches(t *testing.T) {
 	}
 	if !strings.Contains(rawView, "\x1b[") {
 		t.Fatalf("filtered log match should be highlighted:\n%s", rawView)
+	}
+}
+
+func TestSlashSearchesLogsWhenLogsAreVisibleFromTreeFocus(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.focus = paneTree
+	model.mode = activityLogs
+	ctr := model.provider.(*fakeProvider).containers["1"]
+	model.selected = &ctr
+	model.selectedID = ctr.ID
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	model = updated.(Model)
+	if model.focus != paneActivity || model.overlay != overlayLogFilter {
+		t.Fatalf("focus/overlay = %v/%v, want activity/log filter", model.focus, model.overlay)
+	}
+	if model.overlay == overlayFilter {
+		t.Fatal("slash opened project filter while logs were visible")
 	}
 }
 
@@ -595,7 +836,7 @@ func TestXClearsActiveLogFilterFromAnyFocus(t *testing.T) {
 	if model.focus != paneActivity || model.logFilter != "" || model.logLevel != logSeverityAll || !model.logFollow {
 		t.Fatalf("log state = focus:%v filter:%q level:%v follow:%v, want activity/empty/all/follow", model.focus, model.logFilter, model.logLevel, model.logFollow)
 	}
-	if view := ansi.Strip(model.View()); strings.Contains(view, "x clear") || !strings.Contains(view, "line-05") {
+	if view := ansi.Strip(model.View()); strings.Contains(view, "No logs match") || !strings.Contains(view, "line-05") {
 		t.Fatalf("x-cleared log view =\n%s", view)
 	}
 }
@@ -714,6 +955,108 @@ func TestLogViewStateIsPreservedPerContainer(t *testing.T) {
 	}
 }
 
+func TestLogRefreshDoesNotClobberOpenFilterDraft(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.mode = activityLogs
+	model.focus = paneActivity
+	model.openLogFilter()
+	for _, char := range []rune("500") {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}})
+		model = updated.(Model)
+	}
+	if model.logDraft != "500" {
+		t.Fatalf("logDraft = %q, want typed filter before refresh", model.logDraft)
+	}
+
+	container := *model.selected
+	updated, _ := model.Update(detailMsg{id: model.selectedID, container: container})
+	model = updated.(Model)
+	if model.overlay != overlayLogFilter || model.logDraft != "500" {
+		t.Fatalf("overlay/logDraft = %v/%q, want open filter draft preserved across refresh", model.overlay, model.logDraft)
+	}
+}
+
+func TestBackgroundRefreshDoesNotRestartLogStreamForSameContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.mode = activityLogs
+	model.logChan = make(chan string)
+	model.logLines = []string{"already here"}
+	container := *model.selected
+
+	updated, cmd := model.Update(detailMsg{id: model.selectedID, container: container})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil for same-container background refresh", cmd)
+	}
+	if model.logChan == nil {
+		t.Fatal("logChan was cleared, want the already-running stream left alone")
+	}
+	if strings.Join(model.logLines, "\n") != "already here" {
+		t.Fatalf("logLines = %#v, want existing lines preserved", model.logLines)
+	}
+}
+
+func TestSelectionChangeStillStartsLogStream(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.mode = activityLogs
+	model.logChan = make(chan string)
+	other := newFakeProvider().containers["2"]
+	model.selectedID = other.ID
+
+	updated, cmd := model.Update(detailMsg{id: other.ID, container: other})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("cmd = nil, want startLogsCmd after a real selection change")
+	}
+	if model.selected == nil || model.selected.ID != other.ID {
+		t.Fatalf("selected = %#v, want %v", model.selected, other.ID)
+	}
+}
+
+func TestSameContainerLogReconnectDoesNotRenderEmptyFrame(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.mode = activityLogs
+	model.width, model.height = 100, 30
+	model.logLines = []string{"old redis line"}
+	id := model.selectedID
+	lines := make(chan string, 1)
+
+	updated, cmd := model.Update(logsStartedMsg{id: id, lines: lines, cancel: func() {}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("cmd = nil, want log drain tick")
+	}
+	if len(model.logLines) != 1 || model.logLines[0] != "old redis line" {
+		t.Fatalf("logLines after reconnect start = %#v, want old line preserved until first replacement line", model.logLines)
+	}
+	view := ansi.Strip(model.View())
+	if strings.Contains(view, "Waiting for logs") {
+		t.Fatalf("view rendered transient waiting state during same-container reconnect:\n%s", view)
+	}
+
+	model.logChan <- "new redis line"
+	model.drainLogs()
+	if len(model.logLines) != 1 || model.logLines[0] != "new redis line" {
+		t.Fatalf("logLines after first replacement drain = %#v, want replacement line only", model.logLines)
+	}
+	close(lines)
+}
+
+func TestStaleLogsStartedMessageIsIgnored(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.logLines = []string{"current container line"}
+	stale := newFakeProvider().containers["2"].ID
+
+	updated, cmd := model.Update(logsStartedMsg{id: stale, lines: make(chan string), cancel: func() {}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil for stale log stream", cmd)
+	}
+	if len(model.logLines) != 1 || model.logLines[0] != "current container line" {
+		t.Fatalf("logLines = %#v, want stale stream ignored", model.logLines)
+	}
+}
+
 func TestLogTokenColors(t *testing.T) {
 	if got := httpStatusColor("200"); got != lipgloss.Color("#80c990") {
 		t.Fatalf("httpStatusColor(200) = %q, want green", got)
@@ -777,13 +1120,71 @@ func TestStatsViewShowsHeatSparklineAndDeltas(t *testing.T) {
 
 	rawView := model.View()
 	view := ansi.Strip(rawView)
-	for _, want := range []string{"▓▓▓▓░", "▂▃", "↗ 72.0%", "↗ +16.0 MiB", "↗ +4"} {
+	for _, want := range []string{"▓▓▓▓░", "▂▃", "↗ 72.0%", "↗ +4"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing hybrid stats treatment %q:\n%s", want, view)
 		}
 	}
 	if strings.Count(rawView, "\x1b[") < 8 {
 		t.Fatalf("View() missing heat-colored graph styling:\n%s", rawView)
+	}
+}
+
+func TestStatsViewOmitsSampledNoticeAfterStatsLoad(t *testing.T) {
+	model := testModelInStatsMode()
+	stats := newFakeProvider().stats["1"]
+	model.stats = &stats
+	model.appendStats(stats)
+
+	view := ansi.Strip(model.View())
+	for _, unwanted := range []string{"Stats sampled", "Stats will refresh", "Loading Docker stats", "Stats unavailable"} {
+		if strings.Contains(view, unwanted) {
+			t.Fatalf("stats view should keep a quiet spacer row instead of %q:\n%s", unwanted, view)
+		}
+	}
+	model.statsLoading = true
+	view = ansi.Strip(model.View())
+	if strings.Contains(view, "Loading Docker stats") {
+		t.Fatalf("stats loading state should not render transient spacer text:\n%s", view)
+	}
+	model.statsLoading = false
+	model.statsErr = errors.New("boom")
+	view = ansi.Strip(model.View())
+	if strings.Contains(view, "Stats unavailable") {
+		t.Fatalf("stats view should keep a quiet spacer row instead of sampled notice:\n%s", view)
+	}
+	if !strings.Contains(view, "CPU") {
+		t.Fatalf("stats view missing stat rows:\n%s", view)
+	}
+}
+
+func TestStatsHistoryUsesCounterDeltasForCumulativeIO(t *testing.T) {
+	model := testModelInStatsMode()
+	id := domain.ResourceID{Host: "local", ID: "1"}
+
+	model.appendStats(domain.ContainerStats{
+		ID:        id,
+		NetworkRx: 100,
+		NetworkTx: 50,
+		BlockRead: 200,
+	})
+	model.appendStats(domain.ContainerStats{
+		ID:         id,
+		NetworkRx:  160,
+		NetworkTx:  90,
+		BlockRead:  220,
+		BlockWrite: 30,
+	})
+	history := model.statsHistory[id]
+
+	if got := history.NetworkRx; len(got) != 1 || got[0] != 60 {
+		t.Fatalf("NetworkRx history = %#v, want one delta sample 60", got)
+	}
+	if got := history.NetworkTx; len(got) != 1 || got[0] != 40 {
+		t.Fatalf("NetworkTx history = %#v, want one delta sample 40", got)
+	}
+	if got := history.BlockTotal; len(got) != 1 || got[0] != 50 {
+		t.Fatalf("BlockTotal history = %#v, want one delta sample 50", got)
 	}
 }
 
@@ -1304,6 +1705,41 @@ func TestMouseWheelNoOpWhenInspectorFocused(t *testing.T) {
 	}
 }
 
+func TestTreeMouseClickUsesScrolledVisibleRows(t *testing.T) {
+	model := testModel()
+	model.rows = model.buildRows()
+	model.width, model.height = 120, 8 // treeVisibleRows() == 2
+	model.focus = paneTree
+	for i, row := range model.rows {
+		if row.container != nil && row.container.ID.ID == "2" {
+			model.cursor = i
+			break
+		}
+	}
+
+	if start := model.treeVisibleStart(); start == 0 {
+		t.Fatalf("treeVisibleStart = %d, want scrolled tree for this regression", start)
+	}
+
+	updated, cmd := model.Update(tea.MouseMsg{
+		X:      2,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	model = updated.(Model)
+	if row := model.currentRow(); row == nil || row.container == nil || row.container.ID.ID != "2" {
+		t.Fatalf("currentRow = %#v, want click on second visible scrolled row to select jellyfin", row)
+	}
+	if cmd == nil {
+		t.Fatal("cmd is nil, want selected container load")
+	}
+	msg := runCmd(t, cmd).(detailMsg)
+	if msg.container.ID.ID != "2" {
+		t.Fatalf("loaded container = %q, want 2", msg.container.ID.ID)
+	}
+}
+
 func TestProblemMouseClickJumpsTreeToContainer(t *testing.T) {
 	model := testModel()
 	model.rows = model.buildRows()
@@ -1494,4 +1930,169 @@ func runCmd(t *testing.T, cmd tea.Cmd) tea.Msg {
 		t.Fatal("cmd is nil")
 	}
 	return cmd()
+}
+
+func TestWaitForContainerEventReturnsEventOrClosedSignal(t *testing.T) {
+	ch := make(chan domain.ContainerEvent, 1)
+	ch <- domain.ContainerEvent{ID: domain.ResourceID{Host: "local", ID: "1"}, Action: "start"}
+
+	msg := runCmd(t, waitForContainerEvent(ch))
+	if _, ok := msg.(containerEventMsg); !ok {
+		t.Fatalf("msg = %#v, want containerEventMsg", msg)
+	}
+
+	close(ch)
+	msg = runCmd(t, waitForContainerEvent(ch))
+	if _, ok := msg.(eventStreamClosedMsg); !ok {
+		t.Fatalf("msg = %#v, want eventStreamClosedMsg", msg)
+	}
+}
+
+func TestInitStartsSnapshotAndEventSubscription(t *testing.T) {
+	model := testModel()
+
+	msg := runCmd(t, model.Init())
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("Init() batch length = %d, want snapshot refresh and event subscription", len(batch))
+	}
+}
+
+func TestContainerEventMarksSnapshotDirtyAndReArmsListenLoop(t *testing.T) {
+	model := testModel()
+	model.eventChan = make(chan domain.ContainerEvent)
+
+	updated, cmd := model.Update(containerEventMsg{event: domain.ContainerEvent{
+		ID:     domain.ResourceID{Host: "local", ID: "1"},
+		Action: "die",
+	}})
+	model = updated.(Model)
+
+	if !model.snapshotDirty {
+		t.Fatal("snapshotDirty = false after containerEventMsg, want true")
+	}
+	if cmd == nil {
+		t.Fatal("containerEventMsg returned nil cmd, want the listen loop re-armed")
+	}
+}
+
+func TestEventRefreshTickRefreshesOnlyWhenDirty(t *testing.T) {
+	model := testModel()
+
+	updated, cmd := model.Update(eventRefreshTickMsg{})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("clean eventRefreshTickMsg returned cmd = %#v, want nil", cmd)
+	}
+
+	model.snapshotDirty = true
+	updated, cmd = model.Update(eventRefreshTickMsg{})
+	model = updated.(Model)
+	if model.snapshotDirty {
+		t.Fatal("snapshotDirty = true after eventRefreshTickMsg, want false before refresh starts")
+	}
+	if cmd == nil {
+		t.Fatal("dirty eventRefreshTickMsg returned nil cmd, want snapshot refresh")
+	}
+	if _, ok := runCmd(t, cmd).(snapshotMsg); !ok {
+		t.Fatalf("eventRefreshTickMsg cmd did not return snapshotMsg")
+	}
+}
+
+func TestEventsStartedResetsBackoffAndArmsListenLoop(t *testing.T) {
+	model := testModel()
+	model.eventBackoff = 10 * time.Second
+	ch := make(chan domain.ContainerEvent)
+
+	updated, cmd := model.Update(eventsStartedMsg{events: ch, cancel: func() {}})
+	model = updated.(Model)
+
+	if model.eventBackoff != 0 {
+		t.Fatalf("eventBackoff = %v, want reset to 0 on successful (re)connect", model.eventBackoff)
+	}
+	if cmd == nil {
+		t.Fatal("eventsStartedMsg success returned nil cmd, want the listen loop armed")
+	}
+}
+
+func TestEventStreamClosedSchedulesReconnectWithIncreasingBackoff(t *testing.T) {
+	model := testModel()
+	model.eventBackoff = 0
+
+	updated, cmd := model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("eventStreamClosedMsg returned nil cmd, want a reconnect tick scheduled")
+	}
+	if model.eventBackoff != time.Second {
+		t.Fatalf("eventBackoff = %v, want 1s after the first failure", model.eventBackoff)
+	}
+
+	updated, cmd = model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("eventStreamClosedMsg returned nil cmd, want a reconnect tick scheduled")
+	}
+	if model.eventBackoff != 2*time.Second {
+		t.Fatalf("eventBackoff = %v, want 2s after a second consecutive failure", model.eventBackoff)
+	}
+}
+
+func TestEventBackoffCapsAt30Seconds(t *testing.T) {
+	model := testModel()
+	model.eventBackoff = 20 * time.Second
+
+	updated, _ := model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if model.eventBackoff != 30*time.Second {
+		t.Fatalf("eventBackoff = %v, want capped at 30s", model.eventBackoff)
+	}
+
+	updated, _ = model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if model.eventBackoff != 30*time.Second {
+		t.Fatalf("eventBackoff = %v, want to stay capped at 30s", model.eventBackoff)
+	}
+}
+
+func TestEventsReconnectTickRetriesSubscription(t *testing.T) {
+	model := testModel()
+
+	_, cmd := model.Update(eventsReconnectTickMsg{})
+	if cmd == nil {
+		t.Fatal("eventsReconnectTickMsg returned nil cmd, want a retry of startEventsCmd")
+	}
+	msg := runCmd(t, cmd)
+	started, ok := msg.(eventsStartedMsg)
+	if !ok || started.err != nil {
+		t.Fatalf("msg = %#v, want a successful eventsStartedMsg", msg)
+	}
+}
+
+func TestEventsStartedErrorAdvancesBackoff(t *testing.T) {
+	model := testModel()
+	model.eventBackoff = 0
+
+	// First eventsStartedMsg error: backoff should advance to 1s
+	updated, cmd := model.Update(eventsStartedMsg{err: errors.New("connection failed")})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("eventsStartedMsg error returned nil cmd, want a reconnect tick scheduled")
+	}
+	if model.eventBackoff != time.Second {
+		t.Fatalf("eventBackoff = %v after first error, want 1s", model.eventBackoff)
+	}
+
+	// Second eventsStartedMsg error: backoff should double to 2s
+	updated, cmd = model.Update(eventsStartedMsg{err: errors.New("connection failed again")})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("eventsStartedMsg error returned nil cmd, want a reconnect tick scheduled")
+	}
+	if model.eventBackoff != 2*time.Second {
+		t.Fatalf("eventBackoff = %v after second error, want 2s", model.eventBackoff)
+	}
 }
