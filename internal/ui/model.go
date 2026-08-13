@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/systems"
 )
 
 type pane int
@@ -51,6 +54,7 @@ const (
 	overlaySettings
 	overlayCopy
 	overlayOpen
+	overlaySystems
 )
 
 type graphStyle int
@@ -174,6 +178,30 @@ const (
 	settingsActionResetDefaults
 )
 
+type systemOverlayMode int
+
+const (
+	systemModeList systemOverlayMode = iota
+	systemModeEdit
+	systemModeDelete
+)
+
+type systemField int
+
+const (
+	systemFieldName systemField = iota
+	systemFieldKind
+	systemFieldDockerHost
+	systemFieldSSHHost
+	systemFieldSSHUser
+	systemFieldSSHPort
+	systemFieldSSHAuth
+	systemFieldRemoteSocket
+	systemFieldLocalSocket
+)
+
+type providerFactory func(context.Context, config.System) (app.Provider, error)
+
 type Model struct {
 	provider app.Provider
 	theme    tideui.Theme
@@ -233,6 +261,15 @@ type Model struct {
 	settings       appSettings
 	settingsCursor int
 	settingsPath   string
+	systems        []config.System
+	activeSystem   string
+	systemsCursor  int
+	systemMode     systemOverlayMode
+	systemDraft    config.System
+	systemDraftNew bool
+	systemField    systemField
+	systemCursor   int
+	providerFor    providerFactory
 
 	copyCursor int
 	openCursor int
@@ -311,15 +348,37 @@ type openDoneMsg struct {
 	err   error
 }
 
+type systemSwitchMsg struct {
+	system   config.System
+	provider app.Provider
+	err      error
+}
+
+type systemTunnelMsg struct {
+	system config.System
+	test   bool
+	err    error
+}
+
+type systemTestMsg struct {
+	system config.System
+	err    error
+}
+
 func NewModel(provider app.Provider) Model {
 	return NewModelWithSettings(provider, config.Settings{}, "")
 }
 
 func NewModelWithSettings(provider app.Provider, persisted config.Settings, settingsPath string) Model {
+	return NewModelWithProviderFactory(provider, persisted, settingsPath, nil)
+}
+
+func NewModelWithProviderFactory(provider app.Provider, persisted config.Settings, settingsPath string, factory providerFactory) Model {
 	theme := whatthedockTheme()
 	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
 	settings := defaultSettings()
 	settings.applyPersisted(persisted)
+	persisted = config.NormalizeSystems(persisted)
 	return Model{
 		provider:     provider,
 		theme:        theme,
@@ -327,6 +386,9 @@ func NewModelWithSettings(provider app.Provider, persisted config.Settings, sett
 		mode:         settings.DefaultActivity,
 		settings:     settings,
 		settingsPath: settingsPath,
+		systems:      persisted.Systems,
+		activeSystem: persisted.ActiveSystem,
+		providerFor:  factory,
 		statsHistory: map[domain.ResourceID]statsHistory{},
 		logViews:     map[domain.ResourceID]logViewState{},
 		logFollow:    true,
@@ -408,6 +470,13 @@ func (s appSettings) persisted() config.Settings {
 		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
 		DefaultActivity: activityModeName(s.DefaultActivity),
 	}
+}
+
+func (m Model) persistedSettings() config.Settings {
+	settings := m.settings.persisted()
+	settings.Systems = append([]config.System(nil), m.systems...)
+	settings.ActiveSystem = m.activeSystem
+	return config.NormalizeSystems(settings)
 }
 
 func whatthedockTheme() tideui.Theme {
@@ -585,6 +654,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "open "+msg.label+": "+msg.err.Error(), true
 		}
 		return m, nil
+	case systemSwitchMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "system: "+msg.err.Error(), true
+			return m, nil
+		}
+		m.cleanup()
+		m.provider = msg.provider
+		m.activeSystem = msg.system.ID
+		m.overlay = overlayNone
+		m.resetDockerState()
+		m.saveSettings()
+		m.status, m.statusErr = "system: "+msg.system.Name, false
+		return m, tea.Batch(m.refreshCmd(), m.startEventsCmd())
+	case systemTunnelMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "system: "+msg.err.Error(), true
+			return m, nil
+		}
+		if msg.test {
+			m.status, m.statusErr = "SSH tunnel ready; testing "+msg.system.Name, false
+			return m, m.providerTestCmd(msg.system)
+		}
+		m.status, m.statusErr = "SSH tunnel ready; switching to "+msg.system.Name, false
+		return m, m.providerSwitchCmd(msg.system)
+	case systemTestMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "test "+msg.system.Name+": "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.status, m.statusErr = "test "+msg.system.Name+": connected", false
+		return m, nil
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 	case tea.KeyMsg:
@@ -740,6 +840,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case ",", "ctrl+,":
 		m.overlay = overlaySettings
 		m.settingsCursor = m.firstSettingsRow()
+	case "S":
+		m.openSystemsOverlay()
 	case "ctrl+k":
 		m.overlay = overlayCommandPalette
 		m.commandFilter = ""
@@ -841,6 +943,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case overlaySettings:
 		return m.handleSettingsKey(msg)
+	case overlaySystems:
+		return m.handleSystemsKey(msg)
 	case overlayCopy:
 		return m.handleCopyKey(msg)
 	case overlayOpen:
@@ -911,6 +1015,522 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.saveSettings()
 	}
 	return m, nil
+}
+
+func (m Model) handleSystemsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.systemMode {
+	case systemModeList:
+		switch msg.String() {
+		case "esc", "q", "S":
+			m.overlay = overlayNone
+		case "up", "k":
+			m.moveSystemsCursor(-1)
+		case "down", "j", "tab":
+			m.moveSystemsCursor(1)
+		case "enter":
+			system := m.currentSystem()
+			if err := validateSystem(system); err != nil {
+				m.status, m.statusErr = "system: "+err.Error(), true
+				return m, nil
+			}
+			m.status, m.statusErr = systemSwitchStatus(system), false
+			return m, m.switchSystemCmd(system)
+		case "t":
+			system := m.currentSystem()
+			if err := validateSystem(system); err != nil {
+				m.status, m.statusErr = "test "+system.Name+": "+err.Error(), true
+				return m, nil
+			}
+			m.status, m.statusErr = systemTestStatus(system), false
+			return m, m.testSystemCmd(system)
+		case "a":
+			m.startAddSystem()
+		case "e":
+			m.startEditSystem()
+		case "d":
+			if len(m.systems) > 1 && m.currentSystem().ID != m.activeSystem {
+				m.systemMode = systemModeDelete
+			}
+		}
+	case systemModeEdit:
+		switch msg.String() {
+		case "esc":
+			m.systemMode = systemModeList
+		case "up":
+			m.moveSystemField(-1)
+		case "down", "tab":
+			m.moveSystemField(1)
+		case "k":
+			if m.isSystemChoiceField() {
+				m.moveSystemField(-1)
+				return m, nil
+			}
+			m.editSystemFieldString("k")
+		case "j":
+			if m.isSystemChoiceField() {
+				m.moveSystemField(1)
+				return m, nil
+			}
+			m.editSystemFieldString("j")
+		case "left":
+			if m.isSystemChoiceField() {
+				m.cycleSystemChoice()
+			} else {
+				m.moveSystemCursor(-1)
+			}
+		case "right":
+			if m.isSystemChoiceField() {
+				m.cycleSystemChoice()
+			} else {
+				m.moveSystemCursor(1)
+			}
+		case "h":
+			if m.isSystemChoiceField() {
+				m.cycleSystemChoice()
+				return m, nil
+			}
+			m.editSystemFieldString("h")
+		case "l":
+			if m.isSystemChoiceField() {
+				m.cycleSystemChoice()
+				return m, nil
+			}
+			m.editSystemFieldString("l")
+		case "enter":
+			if m.isSystemChoiceField() {
+				m.cycleSystemChoice()
+				return m, nil
+			}
+			m.saveSystemDraft()
+		case "backspace":
+			m.editSystemFieldBackspace()
+		case "delete":
+			m.editSystemFieldDelete()
+		case "home", "ctrl+a":
+			m.systemCursor = 0
+		case "end", "ctrl+e":
+			m.systemCursor = len([]rune(m.systemFieldValue()))
+		case "ctrl+u":
+			if !m.isSystemChoiceField() {
+				m.setSystemFieldValue("")
+				m.systemCursor = 0
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				m.editSystemFieldString(string(msg.Runes))
+			}
+		}
+	case systemModeDelete:
+		switch msg.String() {
+		case "esc", "n", "q":
+			m.systemMode = systemModeList
+		case "y":
+			m.deleteCurrentSystem()
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) openSystemsOverlay() {
+	m.systems = config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems}).Systems
+	m.activeSystem = config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems}).ActiveSystem
+	m.overlay = overlaySystems
+	m.systemMode = systemModeList
+	m.systemsCursor = clamp(m.systemsCursor, 0, len(m.systems)-1)
+}
+
+func (m *Model) moveSystemsCursor(delta int) {
+	if len(m.systems) == 0 {
+		m.systemsCursor = 0
+		return
+	}
+	m.systemsCursor = modIndex(m.systemsCursor+delta, len(m.systems))
+}
+
+func (m Model) currentSystem() config.System {
+	systems := config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems}).Systems
+	if len(systems) == 0 {
+		return config.DefaultSystem()
+	}
+	return systems[clamp(m.systemsCursor, 0, len(systems)-1)]
+}
+
+func (m *Model) startAddSystem() {
+	next := len(m.systems) + 1
+	m.systemDraft = config.System{
+		ID:           fmt.Sprintf("remote-%d", next),
+		Name:         fmt.Sprintf("remote %d", next),
+		Kind:         "ssh",
+		RemoteSocket: "/var/run/docker.sock",
+		LocalSocket:  filepath.Join(os.TempDir(), fmt.Sprintf("whatthedock-remote-%d.sock", next)),
+	}
+	m.systemDraftNew = true
+	m.systemField = systemFieldName
+	m.systemCursor = len([]rune(m.systemDraft.Name))
+	m.systemMode = systemModeEdit
+}
+
+func (m *Model) startEditSystem() {
+	m.systemDraft = m.currentSystem()
+	m.systemDraftNew = false
+	m.systemField = systemFieldName
+	m.systemCursor = len([]rune(m.systemDraft.Name))
+	m.systemMode = systemModeEdit
+}
+
+func (m *Model) moveSystemField(delta int) {
+	fields := m.visibleSystemFields()
+	if len(fields) == 0 {
+		m.systemField = systemFieldName
+		m.systemCursor = 0
+		return
+	}
+	current := 0
+	for i, field := range fields {
+		if field == m.systemField {
+			current = i
+			break
+		}
+	}
+	m.systemField = fields[modIndex(current+delta, len(fields))]
+	m.systemCursor = len([]rune(m.systemFieldValue()))
+}
+
+func (m Model) visibleSystemFields() []systemField {
+	fields := []systemField{systemFieldName, systemFieldKind}
+	if m.systemDraft.Kind == "ssh" {
+		return append(fields, systemFieldSSHHost, systemFieldSSHUser, systemFieldSSHPort, systemFieldSSHAuth, systemFieldRemoteSocket, systemFieldLocalSocket)
+	}
+	return append(fields, systemFieldDockerHost)
+}
+
+func (m Model) isSystemChoiceField() bool {
+	return m.systemField == systemFieldKind || m.systemField == systemFieldSSHAuth
+}
+
+func (m *Model) cycleSystemChoice() {
+	switch m.systemField {
+	case systemFieldKind:
+		m.toggleSystemKind()
+	case systemFieldSSHAuth:
+		m.toggleSystemAuth()
+	}
+}
+
+func (m *Model) toggleSystemKind() {
+	if m.systemDraft.Kind == "ssh" {
+		m.systemDraft.Kind = "local"
+		m.systemDraft.SSHAuth = ""
+		return
+	}
+	m.systemDraft.Kind = "ssh"
+	if m.systemDraft.SSHAuth == "" {
+		m.systemDraft.SSHAuth = "config"
+	}
+	if m.systemDraft.RemoteSocket == "" {
+		m.systemDraft.RemoteSocket = "/var/run/docker.sock"
+	}
+	if m.systemDraft.LocalSocket == "" {
+		id := m.systemDraft.ID
+		if id == "" {
+			id = "remote"
+		}
+		m.systemDraft.LocalSocket = filepath.Join(os.TempDir(), "whatthedock-"+id+".sock")
+	}
+}
+
+func (m *Model) toggleSystemAuth() {
+	if m.systemDraft.Kind != "ssh" {
+		return
+	}
+	if m.systemDraft.SSHAuth == "password" {
+		m.systemDraft.SSHAuth = "config"
+		return
+	}
+	m.systemDraft.SSHAuth = "password"
+}
+
+func (m *Model) editSystemFieldBackspace() {
+	value := m.systemFieldValue()
+	runes := []rune(value)
+	m.systemCursor = clamp(m.systemCursor, 0, len(runes))
+	if m.systemCursor == 0 {
+		return
+	}
+	runes = append(runes[:m.systemCursor-1], runes[m.systemCursor:]...)
+	m.systemCursor--
+	m.setSystemFieldValue(string(runes))
+}
+
+func (m *Model) editSystemFieldDelete() {
+	if m.isSystemChoiceField() {
+		return
+	}
+	runes := []rune(m.systemFieldValue())
+	m.systemCursor = clamp(m.systemCursor, 0, len(runes))
+	if m.systemCursor >= len(runes) {
+		return
+	}
+	runes = append(runes[:m.systemCursor], runes[m.systemCursor+1:]...)
+	m.setSystemFieldValue(string(runes))
+}
+
+func (m *Model) editSystemFieldString(value string) {
+	if m.isSystemChoiceField() {
+		return
+	}
+	runes := []rune(m.systemFieldValue())
+	insert := []rune(value)
+	m.systemCursor = clamp(m.systemCursor, 0, len(runes))
+	updated := append([]rune{}, runes[:m.systemCursor]...)
+	updated = append(updated, insert...)
+	updated = append(updated, runes[m.systemCursor:]...)
+	m.systemCursor += len(insert)
+	m.setSystemFieldValue(string(updated))
+}
+
+func (m *Model) moveSystemCursor(delta int) {
+	if m.isSystemChoiceField() {
+		return
+	}
+	m.systemCursor = clamp(m.systemCursor+delta, 0, len([]rune(m.systemFieldValue())))
+}
+
+func (m Model) systemFieldValue() string {
+	switch m.systemField {
+	case systemFieldName:
+		return m.systemDraft.Name
+	case systemFieldDockerHost:
+		return m.systemDraft.DockerHost
+	case systemFieldSSHHost:
+		return m.systemDraft.SSHHost
+	case systemFieldSSHUser:
+		return m.systemDraft.SSHUser
+	case systemFieldSSHPort:
+		return m.systemDraft.SSHPort
+	case systemFieldSSHAuth:
+		return systemAuthLabel(m.systemDraft.SSHAuth)
+	case systemFieldRemoteSocket:
+		return m.systemDraft.RemoteSocket
+	case systemFieldLocalSocket:
+		return m.systemDraft.LocalSocket
+	default:
+		return m.systemDraft.Kind
+	}
+}
+
+func (m Model) systemFieldValueWithCaret() string {
+	runes := []rune(m.systemFieldValue())
+	cursor := clamp(m.systemCursor, 0, len(runes))
+	withCaret := append([]rune{}, runes[:cursor]...)
+	withCaret = append(withCaret, '|')
+	withCaret = append(withCaret, runes[cursor:]...)
+	return string(withCaret)
+}
+
+func (m *Model) setSystemFieldValue(value string) {
+	switch m.systemField {
+	case systemFieldName:
+		m.systemDraft.Name = value
+	case systemFieldDockerHost:
+		m.systemDraft.DockerHost = value
+	case systemFieldSSHHost:
+		m.systemDraft.SSHHost = value
+	case systemFieldSSHUser:
+		m.systemDraft.SSHUser = value
+	case systemFieldSSHPort:
+		m.systemDraft.SSHPort = value
+	case systemFieldRemoteSocket:
+		m.systemDraft.RemoteSocket = value
+	case systemFieldLocalSocket:
+		m.systemDraft.LocalSocket = value
+	}
+}
+
+func (m *Model) saveSystemDraft() {
+	m.systemDraft = config.NormalizeSystems(config.Settings{ActiveSystem: m.systemDraft.ID, Systems: []config.System{m.systemDraft}}).Systems[0]
+	if err := validateSystem(m.systemDraft); err != nil {
+		m.status, m.statusErr = "system: "+err.Error(), true
+		return
+	}
+	if m.systemDraftNew {
+		m.systems = append(m.systems, m.systemDraft)
+		m.systemsCursor = len(m.systems) - 1
+	} else {
+		index := clamp(m.systemsCursor, 0, len(m.systems)-1)
+		m.systems[index] = m.systemDraft
+	}
+	m.systemMode = systemModeList
+	m.saveSettings()
+}
+
+func (m *Model) deleteCurrentSystem() {
+	if len(m.systems) <= 1 {
+		m.systemMode = systemModeList
+		return
+	}
+	index := clamp(m.systemsCursor, 0, len(m.systems)-1)
+	deleted := m.systems[index]
+	if deleted.ID == m.activeSystem {
+		m.systemMode = systemModeList
+		m.status, m.statusErr = "switch systems before deleting the active system", true
+		return
+	}
+	m.systems = append(m.systems[:index], m.systems[index+1:]...)
+	m.systemsCursor = clamp(index, 0, len(m.systems)-1)
+	m.systemMode = systemModeList
+	m.saveSettings()
+}
+
+func (m Model) switchSystemCmd(system config.System) tea.Cmd {
+	if system.ID == "" || system.ID == m.activeSystem {
+		return nil
+	}
+	if m.providerFor == nil {
+		return func() tea.Msg {
+			return systemSwitchMsg{system: system, err: errors.New("system switching is unavailable in this build")}
+		}
+	}
+	if system.Kind == "ssh" && system.SSHAuth == "password" {
+		cmd, err := systems.SSHCommand(system)
+		if err != nil {
+			return func() tea.Msg {
+				return systemSwitchMsg{system: system, err: err}
+			}
+		}
+		if cmd != nil {
+			return tea.ExecProcess(cmd, func(err error) tea.Msg {
+				return systemTunnelMsg{system: system, err: err}
+			})
+		}
+	}
+	return m.providerSwitchCmd(system)
+}
+
+func (m Model) testSystemCmd(system config.System) tea.Cmd {
+	if m.providerFor == nil {
+		return func() tea.Msg {
+			return systemTestMsg{system: system, err: errors.New("system testing is unavailable in this build")}
+		}
+	}
+	if system.Kind == "ssh" && system.SSHAuth == "password" {
+		cmd, err := systems.SSHCommand(system)
+		if err != nil {
+			return func() tea.Msg {
+				return systemTestMsg{system: system, err: err}
+			}
+		}
+		if cmd != nil {
+			return tea.ExecProcess(cmd, func(err error) tea.Msg {
+				return systemTunnelMsg{system: system, test: true, err: err}
+			})
+		}
+	}
+	return m.providerTestCmd(system)
+}
+
+func (m Model) providerSwitchCmd(system config.System) tea.Cmd {
+	factory := m.providerFor
+	return func() tea.Msg {
+		provider, err := factory(context.Background(), system)
+		if err == nil && provider == nil {
+			err = errors.New("system provider is unavailable")
+		}
+		return systemSwitchMsg{system: system, provider: provider, err: err}
+	}
+}
+
+func (m Model) providerTestCmd(system config.System) tea.Cmd {
+	factory := m.providerFor
+	return func() tea.Msg {
+		ctx := context.Background()
+		provider, err := factory(ctx, system)
+		if err != nil {
+			return systemTestMsg{system: system, err: err}
+		}
+		if provider == nil {
+			return systemTestMsg{system: system, err: errors.New("system provider is unavailable")}
+		}
+		defer provider.Close()
+		return systemTestMsg{system: system, err: provider.Ping(ctx)}
+	}
+}
+
+func validateSystem(system config.System) error {
+	system = config.NormalizeSystems(config.Settings{ActiveSystem: system.ID, Systems: []config.System{system}}).Systems[0]
+	if strings.TrimSpace(system.Name) == "" {
+		return errors.New("name is required")
+	}
+	switch system.Kind {
+	case "ssh":
+		if strings.TrimSpace(system.SSHHost) == "" {
+			return errors.New("ssh host is required")
+		}
+		if strings.TrimSpace(system.SSHPort) != "" {
+			port, err := strconv.Atoi(system.SSHPort)
+			if err != nil || port < 1 || port > 65535 {
+				return errors.New("ssh port must be 1-65535")
+			}
+		}
+		if strings.TrimSpace(system.RemoteSocket) == "" {
+			return errors.New("remote socket is required")
+		}
+		if strings.TrimSpace(system.LocalSocket) == "" {
+			return errors.New("local socket is required")
+		}
+	case "local", "":
+	default:
+		return fmt.Errorf("unknown system kind %q", system.Kind)
+	}
+	return nil
+}
+
+func systemSwitchStatus(system config.System) string {
+	if system.Kind == "ssh" && system.SSHAuth == "password" {
+		return "opening SSH password prompt for " + system.Name
+	}
+	return "switching system to " + system.Name
+}
+
+func systemTestStatus(system config.System) string {
+	if system.Kind == "ssh" && system.SSHAuth == "password" {
+		return "opening SSH password prompt to test " + system.Name
+	}
+	return "testing system " + system.Name
+}
+
+func systemAuthLabel(auth string) string {
+	if auth == "password" {
+		return "password prompt"
+	}
+	return "config/agent"
+}
+
+func (m *Model) resetDockerState() {
+	m.loading = true
+	m.snapshot = domain.Snapshot{}
+	m.rows = nil
+	m.cursor = 0
+	m.focusedTreeKey = treeRowKey{}
+	m.problemCursor = 0
+	m.selectedID = domain.ResourceID{}
+	m.selected = nil
+	m.inspectorScroll = 0
+	m.logLines = nil
+	m.logChan = nil
+	m.logCancel = nil
+	m.logErr = nil
+	m.logLoading = false
+	m.logReplaceOnDrain = false
+	m.stats = nil
+	m.statsID = domain.ResourceID{}
+	m.statsHistory = map[domain.ResourceID]statsHistory{}
+	m.statsLoading = false
+	m.statsErr = nil
+	m.eventChan = nil
+	m.eventCancel = nil
+	m.snapshotDirty = false
+	m.eventBackoff = 0
 }
 
 func (m Model) handleCommandPaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1000,6 +1620,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.OpenSettings:
 		m.overlay = overlaySettings
 		m.settingsCursor = m.firstSettingsRow()
+	case actions.OpenSystems:
+		m.openSystemsOverlay()
 	case actions.CommandPalette:
 		m.overlay = overlayCommandPalette
 		m.commandFilter = ""
@@ -1318,7 +1940,7 @@ func (m *Model) saveSettings() {
 	if m.settingsPath == "" {
 		return
 	}
-	if err := config.SaveSettings(m.settingsPath, m.settings.persisted()); err != nil {
+	if err := config.SaveSettings(m.settingsPath, m.persistedSettings()); err != nil {
 		m.status, m.statusErr = "settings: "+err.Error(), true
 		return
 	}

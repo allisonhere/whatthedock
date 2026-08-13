@@ -26,6 +26,38 @@ User preferences are stored as JSON in the platform config directory, normally
 `~/.config/whatthedock/settings.json` on Linux. Missing or invalid settings fall
 back to built-in defaults.
 
+## Systems
+
+Press `S` to manage Docker systems from inside the app. The Systems overlay can
+switch between named systems, test a system connection, add new systems, edit
+existing systems, and delete inactive systems.
+
+Supported system types:
+
+- `local`: uses Docker's normal defaults, or an optional explicit Docker host.
+- `ssh`: opens an SSH socket tunnel from a local unix socket to a remote Docker
+  socket.
+
+SSH systems have separate `Host`, `User`, and optional `Port` fields. Existing
+settings that used `user@host` in the host field are still accepted and are
+shown as separate user and host values in the app.
+
+SSH systems support two auth modes:
+
+- `config/agent`: uses your existing SSH config, keys, and agent in the
+  background.
+- `password prompt`: temporarily hands the terminal to `ssh` while switching
+  systems so OpenSSH can ask for the password, then returns to WhatTheDock.
+
+WhatTheDock does not store SSH passwords or private keys.
+
+Systems editor text fields support normal caret editing with `Left`/`Right`,
+`Backspace`, `Delete`, `Home`, `End`, and `Ctrl+U` to clear the active field.
+Choice fields such as `Kind` and `Auth` cycle with `Left`/`Right`, `h`/`l`, or
+`Enter`. SSH systems are validated before save, switch, or test: `Host` is
+required, `Port` must be numeric when set, and both Docker socket paths must be
+present.
+
 ## Current Controls
 
 | Key | Action |
@@ -52,6 +84,7 @@ back to built-in defaults.
 | `n` / `N` in logs | Next/previous log search match |
 | `x` / `Esc` in logs | Clear active log filters |
 | `T` | Theme picker |
+| `S` | Manage local and remote Docker systems |
 | `,` / `Ctrl+,` | Settings |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |

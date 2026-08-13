@@ -11,7 +11,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
+	"github.com/allisonhere/whatthedock/internal/systems"
 )
 
 func (m Model) View() string {
@@ -32,7 +34,7 @@ func (m Model) View() string {
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
 		Left:  m.statusLeft(renderer),
-		Right: "j/k move  space expand  / filter  l logs  p problems  g stats  T themes  , settings  ctrl+k commands  ? help  q quit",
+		Right: "j/k move  space expand  / filter  l logs  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  q quit",
 	}
 	return topbar + "\n" + renderer.Render(tideui.Layout{
 		Width:        m.width,
@@ -1360,6 +1362,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return &overlay
 	case overlaySettings:
 		return m.settingsOverlay(renderer)
+	case overlaySystems:
+		return m.systemsOverlay(renderer)
 	case overlayCopy:
 		return m.copyOverlay(renderer)
 	case overlayOpen:
@@ -1450,6 +1454,122 @@ func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	return &overlay
 }
 
+func (m Model) systemsOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(86, max(50, m.width-8))
+	contentWidth := width - 4
+	var rows []string
+	switch m.systemMode {
+	case systemModeEdit:
+		title := "add system"
+		if !m.systemDraftNew {
+			title = "edit system"
+		}
+		for _, field := range m.visibleSystemFields() {
+			label, value := m.systemFieldDisplay(field)
+			if field == m.systemField && !m.isSystemChoiceField() {
+				value = m.systemFieldValueWithCaret()
+			}
+			rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     label,
+				Suffix:   short(value, max(12, contentWidth-22)),
+				Selected: field == m.systemField,
+			}, contentWidth))
+		}
+		rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter", Label: "save"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+			tideui.SoftHint{Key: "h/l", Label: "change choice"},
+			tideui.SoftHint{Key: "ctrl+u", Label: "clear"},
+		))
+		content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
+		return &overlay
+	case systemModeDelete:
+		system := m.currentSystem()
+		rows = append(rows,
+			renderer.Styles.DetailMeta.Width(contentWidth).Render("Delete "+system.Name+"?"),
+			"",
+			renderer.RenderSoftHints(contentWidth,
+				tideui.SoftHint{Key: "y", Label: "delete"},
+				tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+			),
+		)
+		content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "delete system", Content: content, Width: width})
+		return &overlay
+	default:
+		systems := config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems}).Systems
+		for i, system := range systems {
+			prefix := "  "
+			if system.ID == m.activeSystem {
+				prefix = "* "
+			}
+			rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     prefix + system.Name,
+				Suffix:   systemSummary(system),
+				Selected: i == m.systemsCursor,
+			}, contentWidth))
+		}
+		rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter", Label: "switch"},
+			tideui.SoftHint{Key: "t", Label: "test"},
+			tideui.SoftHint{Key: "a", Label: "add"},
+			tideui.SoftHint{Key: "e", Label: "edit"},
+			tideui.SoftHint{Key: "d", Label: "delete"},
+			tideui.SoftHint{Key: "esc", Label: "close"},
+		))
+		content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "systems", Content: content, Width: width})
+		return &overlay
+	}
+}
+
+func (m Model) systemFieldDisplay(field systemField) (string, string) {
+	switch field {
+	case systemFieldName:
+		return "Name", m.systemDraft.Name
+	case systemFieldKind:
+		return "Kind", m.systemDraft.Kind
+	case systemFieldDockerHost:
+		return "Docker host", emptyAsDefault(m.systemDraft.DockerHost)
+	case systemFieldSSHHost:
+		return "Host", m.systemDraft.SSHHost
+	case systemFieldSSHUser:
+		return "User", emptyAsDefault(m.systemDraft.SSHUser)
+	case systemFieldSSHPort:
+		return "Port", emptyAsDefault(m.systemDraft.SSHPort)
+	case systemFieldSSHAuth:
+		return "Auth", systemAuthLabel(m.systemDraft.SSHAuth)
+	case systemFieldRemoteSocket:
+		return "Remote socket", m.systemDraft.RemoteSocket
+	case systemFieldLocalSocket:
+		return "Local socket", m.systemDraft.LocalSocket
+	default:
+		return "", ""
+	}
+}
+
+func systemSummary(system config.System) string {
+	switch system.Kind {
+	case "ssh":
+		if system.SSHHost != "" {
+			return "ssh " + systems.SSHTarget(system)
+		}
+		return "ssh"
+	case "local", "":
+		return emptyAsDefault(system.DockerHost)
+	default:
+		return system.Kind
+	}
+}
+
+func emptyAsDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "default"
+	}
+	return value
+}
+
 func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	items := m.filteredCommands()
 	width := min(76, max(44, m.width-8))
@@ -1514,6 +1634,8 @@ func helpText() string {
 		"g              stats graphs",
 		"T              theme picker",
 		",              settings",
+		"S              systems",
+		"Systems: enter switch, t test, a add, e edit, d delete",
 		"Ctrl+K         command palette",
 		"?              keyboard help",
 		"q              quit",

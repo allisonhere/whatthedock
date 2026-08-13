@@ -29,13 +29,14 @@ type fakeProvider struct {
 	snapshot   domain.Snapshot
 	containers map[string]domain.Container
 	stats      map[string]domain.ContainerStats
+	pingErr    error
 	starts     int
 	stops      int
 	restarts   int
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
-func (f *fakeProvider) Ping(context.Context) error { return nil }
+func (f *fakeProvider) Ping(context.Context) error { return f.pingErr }
 func (f *fakeProvider) Snapshot(context.Context) (domain.Snapshot, error) {
 	return f.snapshot, nil
 }
@@ -1409,6 +1410,8 @@ func TestSettingsSaveAfterChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	model := testModel()
 	model.settingsPath = path
+	model.systems = []config.System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis"}}
+	model.activeSystem = "jarvis"
 	model.overlay = overlaySettings
 	model.settingsCursor = model.firstSettingsRow()
 
@@ -1420,6 +1423,9 @@ func TestSettingsSaveAfterChange(t *testing.T) {
 	}
 	if saved.GraphStyle != "blocks" {
 		t.Fatalf("saved GraphStyle = %q, want blocks", saved.GraphStyle)
+	}
+	if saved.ActiveSystem != "jarvis" || len(saved.Systems) != 1 || saved.Systems[0].ID != "jarvis" {
+		t.Fatalf("saved systems = active:%q systems:%#v, want jarvis preserved", saved.ActiveSystem, saved.Systems)
 	}
 	if model.status != "settings saved" || model.statusErr {
 		t.Fatalf("status/statusErr = %q/%v, want settings saved/false", model.status, model.statusErr)
@@ -1451,6 +1457,269 @@ func TestCommandPaletteCanOpenSettings(t *testing.T) {
 	}
 	if model.overlay != overlaySettings {
 		t.Fatalf("overlay = %v, want settings", model.overlay)
+	}
+}
+
+func TestSystemsOverlayListsAndEditsSystems(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 30
+	model.systems = []config.System{
+		{ID: "local", Name: "local", Kind: "local"},
+		{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "jarvis", SSHUser: "allie", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/jarvis.sock"},
+	}
+	model.activeSystem = "local"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	model = updated.(Model)
+	if model.overlay != overlaySystems || model.systemMode != systemModeList {
+		t.Fatalf("overlay/mode = %v/%v, want systems/list", model.overlay, model.systemMode)
+	}
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"whatthedock · systems", "* local", "Jarvis", "a add", "e edit"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("systems overlay missing %q:\n%s", want, view)
+		}
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	model = updated.(Model)
+	if model.systemMode != systemModeEdit || !model.systemDraftNew {
+		t.Fatalf("systemMode/new = %v/%v, want edit/new", model.systemMode, model.systemDraftNew)
+	}
+	view = ansi.Strip(model.View())
+	for _, want := range []string{"whatthedock · add system", "Name", "Kind", "Host", "User", "Port", "Auth", "config/agent", "Remote socket", "Local socket"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("add system overlay missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestSystemsOverlayCanSelectSSHPasswordPrompt(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemField = systemFieldSSHAuth
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.systemDraft.SSHAuth != "password" {
+		t.Fatalf("SSHAuth = %q, want password", model.systemDraft.SSHAuth)
+	}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "password prompt") {
+		t.Fatalf("systems overlay missing password prompt auth:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	model = updated.(Model)
+	if model.systemDraft.SSHAuth != "config" {
+		t.Fatalf("SSHAuth = %q, want config", model.systemDraft.SSHAuth)
+	}
+}
+
+func TestSystemsOverlayCanTypeUsernameWithNavigationLetters(t *testing.T) {
+	model := testModel()
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemField = systemFieldSSHUser
+
+	for _, char := range "allie" {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}})
+		model = updated.(Model)
+	}
+
+	if model.systemDraft.SSHUser != "allie" {
+		t.Fatalf("SSHUser = %q, want allie", model.systemDraft.SSHUser)
+	}
+}
+
+func TestSystemsOverlayTextEditingUsesCaretAndClear(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemField = systemFieldSSHUser
+
+	for _, char := range "alie" {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}})
+		model = updated.(Model)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	model = updated.(Model)
+
+	if model.systemDraft.SSHUser != "allie" {
+		t.Fatalf("SSHUser = %q, want allie after caret insert", model.systemDraft.SSHUser)
+	}
+	if model.systemCursor != 3 {
+		t.Fatalf("systemCursor = %d, want 3", model.systemCursor)
+	}
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "all|ie") {
+		t.Fatalf("systems overlay missing visible caret:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = updated.(Model)
+	if model.systemDraft.SSHUser != "" || model.systemCursor != 0 {
+		t.Fatalf("field/cursor = %q/%d, want cleared", model.systemDraft.SSHUser, model.systemCursor)
+	}
+}
+
+func TestSystemsOverlayBackspaceAndDeleteEditAroundCaret(t *testing.T) {
+	model := testModel()
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemField = systemFieldSSHHost
+	for _, char := range "jxrvis" {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}})
+		model = updated.(Model)
+	}
+	for i := 0; i < 5; i++ {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		model = updated.(Model)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDelete})
+	model = updated.(Model)
+	if model.systemDraft.SSHHost != "jrvis" {
+		t.Fatalf("SSHHost = %q, want jrvis after delete", model.systemDraft.SSHHost)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	model = updated.(Model)
+	if model.systemDraft.SSHHost != "rvis" {
+		t.Fatalf("SSHHost = %q, want rvis after backspace", model.systemDraft.SSHHost)
+	}
+}
+
+func TestSystemsOverlayValidationBlocksInvalidSSHSystem(t *testing.T) {
+	model := testModel()
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemDraft.SSHHost = ""
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.statusErr || !strings.Contains(model.status, "ssh host is required") {
+		t.Fatalf("status/statusErr = %q/%v, want ssh host validation", model.status, model.statusErr)
+	}
+	if model.systemMode != systemModeEdit {
+		t.Fatalf("systemMode = %v, want edit after validation failure", model.systemMode)
+	}
+
+	model.systemDraft.SSHHost = "jarvis"
+	model.systemDraft.SSHPort = "abc"
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.statusErr || !strings.Contains(model.status, "ssh port must be 1-65535") {
+		t.Fatalf("status/statusErr = %q/%v, want ssh port validation", model.status, model.statusErr)
+	}
+}
+
+func TestSystemsOverlayTestsProvider(t *testing.T) {
+	model := testModel()
+	model.systems = []config.System{
+		{ID: "local", Name: "local", Kind: "local"},
+		{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "jarvis", SSHUser: "allie", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/jarvis.sock"},
+	}
+	model.activeSystem = "local"
+	model.providerFor = func(_ context.Context, system config.System) (app.Provider, error) {
+		provider := newFakeProvider()
+		provider.host = domain.Host{ID: domain.HostID(system.ID), Name: system.Name}
+		return provider, nil
+	}
+	model.overlay = overlaySystems
+	model.systemsCursor = 1
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("cmd = nil, want test command")
+	}
+	if model.status != "testing system Jarvis" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want testing status", model.status, model.statusErr)
+	}
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if model.status != "test Jarvis: connected" || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want connected", model.status, model.statusErr)
+	}
+}
+
+func TestSystemsOverlayTestReportsPingError(t *testing.T) {
+	model := testModel()
+	model.systems = []config.System{{ID: "local", Name: "local", Kind: "local"}}
+	model.activeSystem = "local"
+	model.providerFor = func(context.Context, config.System) (app.Provider, error) {
+		provider := newFakeProvider()
+		provider.pingErr = errors.New("no route")
+		return provider, nil
+	}
+	model.overlay = overlaySystems
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if !model.statusErr || !strings.Contains(model.status, "no route") {
+		t.Fatalf("status/statusErr = %q/%v, want ping error", model.status, model.statusErr)
+	}
+}
+
+func TestSystemsOverlaySwitchesProvider(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+	model.systems = []config.System{
+		{ID: "local", Name: "local", Kind: "local"},
+		{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/jarvis.sock"},
+	}
+	model.activeSystem = "local"
+	var requested config.System
+	model.providerFor = func(_ context.Context, system config.System) (app.Provider, error) {
+		requested = system
+		provider := newFakeProvider()
+		provider.host = domain.Host{ID: domain.HostID(system.ID), Name: system.Name}
+		return provider, nil
+	}
+	model.overlay = overlaySystems
+	model.systemsCursor = 1
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("cmd = nil, want provider switch command")
+	}
+	msg := runCmd(t, cmd)
+	updated, cmd = model.Update(msg)
+	model = updated.(Model)
+	if requested.ID != "jarvis" || model.activeSystem != "jarvis" {
+		t.Fatalf("requested/active = %#v/%q, want jarvis", requested, model.activeSystem)
+	}
+	if model.selected != nil || model.selectedID.ID != "" || !model.loading {
+		t.Fatalf("state after switch selected=%#v id=%#v loading=%v, want reset/loading", model.selected, model.selectedID, model.loading)
+	}
+	if cmd == nil {
+		t.Fatal("switch update returned nil cmd, want refresh/events batch")
+	}
+}
+
+func TestSystemsOverlayDoesNotDeleteActiveSystem(t *testing.T) {
+	model := testModel()
+	model.systems = []config.System{{ID: "local", Name: "local", Kind: "local"}, {ID: "jarvis", Name: "Jarvis", Kind: "ssh"}}
+	model.activeSystem = "local"
+	model.overlay = overlaySystems
+	model.systemsCursor = 0
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	if model.systemMode == systemModeDelete {
+		t.Fatal("active system entered delete confirmation, want deletion blocked")
 	}
 }
 
@@ -1822,6 +2091,7 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 		{"filter", overlayFilter, "whatthedock · filter"},
 		{"command", overlayCommandPalette, "whatthedock · command"},
 		{"settings", overlaySettings, "whatthedock · settings"},
+		{"systems", overlaySystems, "whatthedock · systems"},
 		{"copy", overlayCopy, "whatthedock · copy"},
 		{"open", overlayOpen, "whatthedock · open"},
 	} {
@@ -1832,6 +2102,19 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 				t.Fatalf("View() missing soft panel title %q:\n%s", tc.want, view)
 			}
 		})
+	}
+}
+
+func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.overlay = overlayHelp
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"S              systems", "Systems: enter switch, t test, a add, e edit, d delete"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("help view missing %q:\n%s", want, view)
+		}
 	}
 }
 

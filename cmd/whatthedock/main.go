@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/demo"
-	dockerprovider "github.com/allisonhere/whatthedock/internal/docker"
+	"github.com/allisonhere/whatthedock/internal/systems"
 	"github.com/allisonhere/whatthedock/internal/ui"
 )
 
@@ -31,17 +32,18 @@ func main() {
 		return
 	}
 
-	provider, err := providerForMode(*demoMode || os.Getenv("WHATTHEDOCK_PROVIDER") == "demo")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
-		os.Exit(1)
-	}
 	settingsPath, settings, err := loadSettings()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
 		os.Exit(1)
 	}
-	model := ui.NewModelWithSettings(provider, settings, settingsPath)
+	factory := systems.NewFactory()
+	provider, err := providerForMode(context.Background(), *demoMode || os.Getenv("WHATTHEDOCK_PROVIDER") == "demo", settings, factory)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
+		os.Exit(1)
+	}
+	model := ui.NewModelWithProviderFactory(provider, settings, settingsPath, factory.Provider)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
@@ -60,11 +62,17 @@ func versionString() string {
 	return strings.Join(parts, " ")
 }
 
-func providerForMode(demoMode bool) (app.Provider, error) {
+func providerForMode(ctx context.Context, demoMode bool, settings config.Settings, factory systems.Factory) (app.Provider, error) {
 	if demoMode {
 		return demo.NewProvider(), nil
 	}
-	return dockerprovider.NewLocalProvider()
+	settings = config.NormalizeSystems(settings)
+	system := config.FindSystem(settings.Systems, settings.ActiveSystem)
+	if system == nil {
+		local := config.DefaultSystem()
+		system = &local
+	}
+	return factory.Provider(ctx, *system)
 }
 
 func loadSettings() (string, config.Settings, error) {
@@ -77,5 +85,5 @@ func loadSettings() (string, config.Settings, error) {
 		fmt.Fprintf(os.Stderr, "whatthedock: ignoring settings: %v\n", err)
 		return path, config.Settings{}, nil
 	}
-	return path, settings, nil
+	return path, config.NormalizeSystems(settings), nil
 }

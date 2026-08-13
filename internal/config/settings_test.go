@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -11,7 +12,7 @@ func TestLoadSettingsMissingFileReturnsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSettings() err = %v, want nil for missing file", err)
 	}
-	if settings != (Settings{}) {
+	if !reflect.DeepEqual(settings, Settings{}) {
 		t.Fatalf("settings = %#v, want zero settings", settings)
 	}
 }
@@ -36,6 +37,15 @@ func TestSaveAndLoadSettingsRoundTrip(t *testing.T) {
 		ShowDeltas:      &showDeltas,
 		StatsRefresh:    "5s",
 		DefaultActivity: "stats",
+		ActiveSystem:    "jarvis",
+		Systems: []System{{
+			ID:           "jarvis",
+			Name:         "Jarvis",
+			Kind:         "ssh",
+			SSHHost:      "allie@jarvis",
+			RemoteSocket: "/var/run/docker.sock",
+			LocalSocket:  "/tmp/jarvis.sock",
+		}},
 	}
 	if err := SaveSettings(path, want); err != nil {
 		t.Fatalf("SaveSettings() err = %v", err)
@@ -50,8 +60,61 @@ func TestSaveAndLoadSettingsRoundTrip(t *testing.T) {
 		got.ShowDeltas == nil ||
 		*got.ShowDeltas != showDeltas ||
 		got.StatsRefresh != want.StatsRefresh ||
-		got.DefaultActivity != want.DefaultActivity {
+		got.DefaultActivity != want.DefaultActivity ||
+		!reflect.DeepEqual(got.Systems, want.Systems) ||
+		got.ActiveSystem != want.ActiveSystem {
 		t.Fatalf("settings = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeSystemsCreatesLocalDefault(t *testing.T) {
+	settings := NormalizeSystems(Settings{})
+	if len(settings.Systems) != 1 {
+		t.Fatalf("systems = %#v, want one default", settings.Systems)
+	}
+	if settings.ActiveSystem != "local" || settings.Systems[0] != DefaultSystem() {
+		t.Fatalf("settings = %#v, want active local default", settings)
+	}
+}
+
+func TestNormalizeSystemsDefaultsSSHFields(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis"}},
+	})
+	got := settings.Systems[0]
+	if got.SSHHost != "jarvis" || got.SSHUser != "allie" {
+		t.Fatalf("ssh target = user:%q host:%q, want allie/jarvis", got.SSHUser, got.SSHHost)
+	}
+	if got.SSHAuth != "config" {
+		t.Fatalf("SSHAuth = %q, want config default", got.SSHAuth)
+	}
+	if got.RemoteSocket != "/var/run/docker.sock" {
+		t.Fatalf("RemoteSocket = %q, want Docker socket default", got.RemoteSocket)
+	}
+	if got.LocalSocket == "" {
+		t.Fatal("LocalSocket is empty, want generated temp socket")
+	}
+	if settings.ActiveSystem != "jarvis" {
+		t.Fatalf("ActiveSystem = %q, want jarvis", settings.ActiveSystem)
+	}
+}
+
+func TestNormalizeSystemsPreservesSeparateSSHUserHostPort(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "jarvis.lan", SSHUser: "allie", SSHPort: "2222"}},
+	})
+	got := settings.Systems[0]
+	if got.SSHHost != "jarvis.lan" || got.SSHUser != "allie" || got.SSHPort != "2222" {
+		t.Fatalf("ssh fields = user:%q host:%q port:%q, want allie/jarvis.lan/2222", got.SSHUser, got.SSHHost, got.SSHPort)
+	}
+}
+
+func TestNormalizeSystemsPreservesSSHPasswordPrompt(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis", SSHAuth: "password"}},
+	})
+	if got := settings.Systems[0].SSHAuth; got != "password" {
+		t.Fatalf("SSHAuth = %q, want password", got)
 	}
 }
 

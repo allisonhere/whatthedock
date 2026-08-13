@@ -24,6 +24,7 @@ const (
 	OpenHelp       ID = "open-help"
 	OpenTheme      ID = "open-theme"
 	OpenSettings   ID = "open-settings"
+	OpenSystems    ID = "open-systems"
 	CommandPalette ID = "command-palette"
 	Quit           ID = "quit"
 )
@@ -58,6 +59,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: OpenHelp, Name: "Show keyboard help", Shortcut: "?", Aliases: []string{"keys"}, Enabled: true},
 		{ID: OpenTheme, Name: "Choose theme", Shortcut: "T", Aliases: []string{"themes", "palette", "colors"}, Enabled: true},
 		{ID: OpenSettings, Name: "Open settings", Shortcut: ",", Aliases: []string{"preferences", "options", "config"}, Enabled: true},
+		{ID: OpenSystems, Name: "Manage systems", Shortcut: "S", Aliases: []string{"hosts", "profiles", "docker hosts", "remote"}, Enabled: true},
 		{ID: CommandPalette, Name: "Command palette", Shortcut: "ctrl+k", Aliases: []string{"commands"}, Enabled: true},
 		{ID: Quit, Name: "Quit WhatTheDock", Shortcut: "q", Aliases: []string{"exit"}, Enabled: true},
 	}

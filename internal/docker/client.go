@@ -24,11 +24,25 @@ type LocalProvider struct {
 }
 
 func NewLocalProvider() (*LocalProvider, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	return NewProvider("local", "local", "")
+}
+
+func NewProvider(id, name, dockerHost string) (*LocalProvider, error) {
+	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
+	if dockerHost != "" {
+		opts = append([]client.Opt{client.WithHost(dockerHost)}, client.WithAPIVersionNegotiation())
+	}
+	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &LocalProvider{host: domain.Host{ID: "local", Name: "local"}, cli: cli}, nil
+	if id == "" {
+		id = "local"
+	}
+	if name == "" {
+		name = id
+	}
+	return &LocalProvider{host: domain.Host{ID: domain.HostID(id), Name: name}, cli: cli}, nil
 }
 
 func (p *LocalProvider) Host() domain.Host { return p.host }
