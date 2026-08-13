@@ -1820,6 +1820,44 @@ func TestInspectorShowsContextualCopyOpenHints(t *testing.T) {
 	}
 }
 
+func TestContainerTitleIsConsistentAcrossPanes(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 140, 30
+	model.mode = activityLogs
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"radarr-1", "Logs: radarr-1", "Inspector: radarr-1"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing consistent container title %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "│  ! radarr ") {
+		t.Fatalf("tree rendered compose service as container title, want Docker container name:\n%s", view)
+	}
+}
+
+func TestInspectorTitleUsesPaneBackgroundInLavenderTheme(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	renderer := tideui.NewRenderer(tideui.LavenderFieldsForever, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	title := renderInspectorTitle(renderer, 44, "radarr-1")
+	backgrounds := trueColorBackgrounds(title)
+	if len(backgrounds) == 0 {
+		t.Fatalf("inspector title has no explicit background styling:\n%q", title)
+	}
+	want := backgrounds[0]
+	for _, bg := range backgrounds {
+		if bg != want {
+			t.Fatalf("inspector title used mixed backgrounds %s and %s in Lavender theme:\n%q", want, bg, title)
+		}
+	}
+	if strings.Contains(title, "48;2;160;128;225") {
+		t.Fatalf("inspector title used Lavender accent background, want pane background:\n%q", title)
+	}
+}
+
 func TestInspectorUsesColorWithoutChangingVisibleText(t *testing.T) {
 	original := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)

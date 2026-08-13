@@ -26,10 +26,14 @@ func (m Model) View() string {
 		return topbar
 	}
 	activityTitle, activityHint := m.activityHeader()
+	inspectorTitle := "Inspector"
+	if selected := m.selectedContainer(); selected != nil {
+		inspectorTitle = "Inspector: " + containerTitle(*selected)
+	}
 	panes := [3]tideui.Pane{
 		{Title: "Projects", Hint: "tree", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
-		{Title: "Inspector", Hint: "details", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
+		{Title: inspectorTitle, Hint: "details", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
@@ -52,10 +56,20 @@ func (m Model) activityHeader() (string, string) {
 	case activityProblems:
 		return "Problems", "activity"
 	case activityStats:
+		if selected := m.selectedContainer(); selected != nil {
+			return "Stats: " + containerTitle(*selected), "activity"
+		}
 		return "Stats", "activity"
 	default:
+		if selected := m.selectedContainer(); selected != nil {
+			return "Logs: " + containerTitle(*selected), "logs"
+		}
 		return "Activity", "logs"
 	}
+}
+
+func containerTitle(ctr domain.Container) string {
+	return ctr.DisplayName()
 }
 
 func (m Model) renderTopbar(renderer tideui.Renderer) string {
@@ -107,9 +121,7 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 			baseFg := rowForeground(renderer, selected, row.muted)
 			prefix += healthSpan(statusGlyph(*row.container), healthColor, baseFg) + " "
 			suffix = healthSpan(statusText(*row.container), healthColor, baseFg)
-			if row.container.Compose.Service != "" {
-				text = row.container.Compose.Service
-			}
+			text = containerTitle(*row.container)
 		case rowSection:
 			prefix += ""
 		}
@@ -182,7 +194,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.StatusError.Render(friendlyDockerError(m.logErr)))
 	}
 	if len(m.logLines) == 0 {
-		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Waiting for logs from "+m.selected.DisplayName()+"..."))
+		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Waiting for logs from "+containerTitle(*m.selected)+"..."))
 	}
 	filtered := m.visibleLogLines()
 	if len(filtered) == 0 {
@@ -197,7 +209,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 		healthColor := inspectorStatusColor(*m.selected)
 		baseFg := styleForeground(renderer.Styles.DetailMeta, renderer.Styles.Theme.Dimmed)
 		header = healthSpan(statusGlyph(*m.selected), healthColor, baseFg) + " " +
-			healthSpan(m.selected.DisplayName(), healthColor, baseFg) + "  " + header
+			healthSpan(containerTitle(*m.selected), healthColor, baseFg) + "  " + header
 	}
 	lines = append(lines, renderer.Styles.DetailMeta.Width(width).Render(header))
 	for _, line := range filtered[start:end] {
@@ -449,7 +461,7 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 		renderStatRow(renderer, m.settings, width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
 		renderStatRow(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#9aa6b2"),
 		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#9aa6b2"),
-		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: ctr.DisplayName()}, width),
+		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: containerTitle(*ctr)}, width),
 	}
 	if m.focus == paneActivity {
 		limit := max(1, m.activityVisibleRows()-2)
@@ -1029,7 +1041,7 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 	add := func(label, value, suffix string, color lipgloss.Color) {
 		lines = append(lines, renderInspectorField(renderer, width, label, value, suffix, color)...)
 	}
-	lines = append(lines, renderer.Styles.DetailTitle.Render(ctr.DisplayName()))
+	lines = append(lines, renderInspectorTitle(renderer, width, containerTitle(ctr)))
 	addSection("Runtime")
 	add("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr))
 	add("Uptime", formatDuration(ctr.Created), "", "#9aa6b2")
@@ -1075,6 +1087,13 @@ func renderInspectorSection(renderer tideui.Renderer, width int, title string) s
 		Italic(false).
 		Width(width).
 		Render(" " + strings.ToUpper(title))
+}
+
+func renderInspectorTitle(renderer tideui.Renderer, width int, title string) string {
+	return renderer.Styles.DetailBody.Copy().
+		Bold(true).
+		Width(width).
+		Render(title)
 }
 
 func renderInspectorField(renderer tideui.Renderer, width int, label, value, suffix string, color lipgloss.Color) []string {
