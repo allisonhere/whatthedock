@@ -3,8 +3,9 @@ module github.com/allisonhere/whatthedock
 go 1.26.4
 
 require (
+	github.com/allisonhere/cli-spinners v0.0.0-00010101000000-000000000000
 	github.com/allisonhere/ripple v0.3.0
-	github.com/allisonhere/tideui v0.2.2
+	github.com/allisonhere/tideui v0.2.3-0.20260814213102-c2c10e5e6863
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -16,8 +17,8 @@ require (
 )
 
 require (
+	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.4.21 // indirect
-	github.com/allisonhere/cli-spinners v0.0.0-00010101000000-000000000000 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/bubbles v1.0.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
@@ -61,7 +62,5 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
-
-replace github.com/allisonhere/tideui => /home/allieb/Projects/tideui
 
 replace github.com/allisonhere/cli-spinners => github.com/allisonhere/cli-spinners-GO-library v0.1.0
