@@ -60,40 +60,53 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			Selected: field == m.createField,
 		}, formWidth))
 	}
-	previewLines := []string{renderer.Styles.DetailMeta.Render("Preview")}
+	// The preview column is styled to look like a black terminal surface,
+	// distinct from the rest of the panel — every line gets an explicit
+	// Background(previewBG) rather than inheriting the theme's panel color,
+	// since a bare Width-only wrapper leaves ungapped/unstyled runs showing
+	// whatever sits behind them instead of a solid fill.
+	previewBG := lipgloss.Color("#000000")
+	blankPreviewLine := lipgloss.NewStyle().Width(previewWidth).Background(previewBG).Render("")
+	previewLines := []string{renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Preview")}
 	if m.createDraft.Mode == createModeCompose {
-		// Syntax-highlighted lines already carry their own color codes;
-		// wrapping them in another Foreground-bearing style would clobber
-		// the colors partway through (each highlighted span resets on its
-		// own end) — pad with a plain, color-less Width style instead.
+		// Syntax-highlighted lines already carry their own foreground color
+		// codes, never a background, so wrapping them in a Background-only
+		// style paints the black surface behind them without clobbering the
+		// highlight colors.
 		for _, line := range highlightComposeYAML(m.createDraft.Preview()) {
-			previewLines = append(previewLines, lipgloss.NewStyle().Width(previewWidth).Render(line))
+			previewLines = append(previewLines, lipgloss.NewStyle().Width(previewWidth).Background(previewBG).Render(line))
 		}
 	} else {
 		for _, line := range strings.Split(m.createDraft.Preview(), "\n") {
-			previewLines = append(previewLines, renderer.Styles.DetailBody.Width(previewWidth).Render(line))
+			previewLines = append(previewLines, renderer.Styles.DetailBody.Background(previewBG).Width(previewWidth).Render(line))
 		}
 	}
 	if m.createDraft.Mode == createModeCompose {
 		composeFileLine := "Local compose file  " + short(m.createDraft.ComposeFile, max(12, previewWidth-20))
-		previewLines = append(previewLines, "", renderer.Styles.DetailMeta.Width(previewWidth).Render(composeFileLine))
+		previewLines = append(previewLines, blankPreviewLine, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render(composeFileLine))
 		switch {
 		case m.createDraft.OverrideLoaded:
-			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  existing file loaded (ctrl+y to edit)"))
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Override YAML  existing file loaded (ctrl+y to edit)"))
 		case m.createDraft.OverrideRawSet:
-			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  hand-edited (ctrl+y to re-edit)"))
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Override YAML  hand-edited (ctrl+y to re-edit)"))
 		default:
-			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  generated (ctrl+y to edit)"))
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Override YAML  generated (ctrl+y to edit)"))
 		}
 	} else {
-		previewLines = append(previewLines, "", renderer.Styles.DetailMeta.Width(previewWidth).Render("Docker API create preview"))
+		previewLines = append(previewLines, blankPreviewLine, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Docker API create preview"))
 	}
-	validation := renderer.Styles.DetailMeta.Width(previewWidth).Render("Draft looks good")
+	validation := renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Draft looks good")
 	if err := m.createDraft.Validate(); err != nil {
-		validation = renderer.Styles.StatusError.Width(previewWidth).Render(short(err.Error(), previewWidth))
+		validation = renderer.Styles.StatusError.Background(previewBG).Width(previewWidth).Render(short(err.Error(), previewWidth))
 	}
-	previewLines = append(previewLines, "", validation)
+	previewLines = append(previewLines, blankPreviewLine, validation)
 
+	// A row past the shorter column's line count (the preview is usually
+	// taller than the field list) leaves that side an empty string with no
+	// background of its own — Width-padding it without a style falls
+	// through to the raw terminal default (glaring black in a light theme)
+	// instead of blending into the panel like every populated row does.
+	panelBG := renderer.Styles.OverlayBody.GetBackground()
 	formText := strings.Split(strings.Join(formRows, "\n"), "\n")
 	previewText := strings.Split(strings.Join(previewLines, "\n"), "\n")
 	rowCount := max(len(formText), len(previewText))
@@ -106,10 +119,10 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		if i < len(previewText) {
 			right = previewText[i]
 		}
-		bodyRows = append(bodyRows, lipgloss.NewStyle().Width(formWidth).Render(left)+" "+renderer.Styles.DetailMeta.Render("│")+" "+lipgloss.NewStyle().Width(previewWidth).Render(right))
+		bodyRows = append(bodyRows, lipgloss.NewStyle().Width(formWidth).Background(panelBG).Render(left)+" "+renderer.Styles.DetailMeta.Render("│")+lipgloss.NewStyle().Background(previewBG).Render(" ")+lipgloss.NewStyle().Width(previewWidth).Render(right))
 	}
 	bodyRows = append(bodyRows,
-		"",
+		lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(""),
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "[/]", Label: "mode"},
 			tideui.SoftHint{Key: "tab", Label: "next"},
@@ -182,15 +195,23 @@ func renderCreateModeTabs(renderer tideui.Renderer, width int, active createMode
 	// padding stacks into an extra highlighted blank column on each side
 	// that isn't part of the label. StatusHint has no built-in padding, so
 	// the inactive pill still adds its own spaces to match width.
+	// Every non-pill segment of the row (gaps, the unfocused rail, the
+	// inactive tab) gets the panel body's own background explicitly — a
+	// bare unstyled space here would otherwise show whatever's behind the
+	// row instead of blending into the panel, and StatusHint's own
+	// background is tuned for the status bar, not this row, so it needs the
+	// same override.
+	panelBG := renderer.Styles.OverlayBody.GetBackground()
 	activeStyle := renderer.Styles.OverlayTitle
-	inactiveStyle := renderer.Styles.StatusHint
+	inactiveStyle := renderer.Styles.StatusHint.Background(panelBG)
 	railStyle := renderer.Styles.OverlayTitle.Padding(0)
+	fill := lipgloss.NewStyle().Background(panelBG)
 
-	rail := "  "
+	rail := fill.Render("  ")
 	if focused {
-		rail = railStyle.Render("▌") + " "
+		rail = railStyle.Render("▌") + fill.Render(" ")
 	}
-	blank := "  "
+	blank := fill.Render("  ")
 
 	compose := "Compose service"
 	standalone := "Standalone container"
@@ -200,11 +221,11 @@ func renderCreateModeTabs(renderer tideui.Renderer, width int, active createMode
 	// instead of pointing at the wrong one when Standalone is selected.
 	var out string
 	if active == createModeCompose {
-		out = rail + activeStyle.Render(compose) + " " + blank + inactiveStyle.Render(" "+standalone+" ")
+		out = rail + activeStyle.Render(compose) + fill.Render(" ") + blank + inactiveStyle.Render(" "+standalone+" ")
 	} else {
-		out = blank + inactiveStyle.Render(" "+compose+" ") + " " + rail + activeStyle.Render(standalone)
+		out = blank + inactiveStyle.Render(" "+compose+" ") + fill.Render(" ") + rail + activeStyle.Render(standalone)
 	}
-	return lipgloss.NewStyle().Width(width).Render(" " + out)
+	return lipgloss.NewStyle().Width(width).Background(panelBG).Render(fill.Render(" ") + out)
 }
 
 func (m Model) createFileBrowserOverlay(renderer tideui.Renderer, width int, contentWidth int) *tideui.Overlay {
