@@ -49,6 +49,50 @@ func TestProviderActionsMutateContainerState(t *testing.T) {
 	}
 }
 
+func TestProviderRemoveContainerDeletesEntry(t *testing.T) {
+	provider := NewProvider()
+	id := domain.ResourceID{Host: "demo", ID: "demo-nginx"}
+	if err := provider.RemoveContainer(context.Background(), id, true); err != nil {
+		t.Fatalf("RemoveContainer() err = %v", err)
+	}
+	if _, err := provider.Container(context.Background(), id); err == nil {
+		t.Fatal("Container() after remove = nil error, want it to be gone")
+	}
+	snapshot, err := provider.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() err = %v", err)
+	}
+	for _, project := range snapshot.Projects {
+		for _, service := range project.Services {
+			for _, ctr := range service.Containers {
+				if ctr.ID == id {
+					t.Fatalf("snapshot still contains removed container %v", id)
+				}
+			}
+		}
+	}
+	for _, ctr := range snapshot.Standalone {
+		if ctr.ID == id {
+			t.Fatalf("snapshot still contains removed container %v", id)
+		}
+	}
+}
+
+func TestProviderRemoveContainerUnknownID(t *testing.T) {
+	provider := NewProvider()
+	err := provider.RemoveContainer(context.Background(), domain.ResourceID{Host: "demo", ID: "does-not-exist"}, true)
+	if err == nil {
+		t.Fatal("RemoveContainer(unknown id) = nil, want an error")
+	}
+}
+
+func TestProviderPullImageNoop(t *testing.T) {
+	provider := NewProvider()
+	if err := provider.PullImage(context.Background(), "anything:latest"); err != nil {
+		t.Fatalf("PullImage() err = %v, want nil (no-op in demo mode)", err)
+	}
+}
+
 func TestProviderLogsStreamDemoLines(t *testing.T) {
 	provider := NewProvider()
 	stream, err := provider.Logs(context.Background(), domain.ResourceID{Host: "demo", ID: "demo-grafana"}, app.LogOptions{})

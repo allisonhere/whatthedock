@@ -18,6 +18,7 @@ import (
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
+	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
 )
 
@@ -94,12 +95,7 @@ type createFileEntry struct {
 // checked synchronously (a fast stat+read); SSH systems return a Cmd since
 // that's a network round trip (see checkRemoteOverrideCmd).
 func (m *Model) openCreateOverlay() tea.Cmd {
-	m.createDraft = m.defaultCreateDraft()
-	m.overlay = overlayCreate
-	m.createField = m.visibleCreateFields()[0]
-	m.createCursor = len([]rune(m.createFieldValue()))
-	m.createEditingCompose = false
-	m.status, m.statusErr = "create draft ready", false
+	m.openCreateOverlayWithDraft(m.defaultCreateDraft())
 
 	if m.createDraft.Mode != createModeCompose {
 		return nil
@@ -116,6 +112,27 @@ func (m *Model) openCreateOverlay() tea.Cmd {
 		m.status, m.statusErr = "loaded existing override for "+m.createDraft.Service, false
 	}
 	return nil
+}
+
+// openCloneOverlay opens the create form prefilled from the selected
+// container under a new name (see defaultCloneDraft) — unlike
+// openCreateOverlay, it never checks for an existing override: a "-clone"
+// identity has none, and even a name collision must never load-and-overwrite
+// the original's override under the new identity.
+func (m *Model) openCloneOverlay() {
+	m.openCreateOverlayWithDraft(m.defaultCloneDraft())
+	m.status, m.statusErr = "clone draft ready — rename before confirming", false
+}
+
+// openCreateOverlayWithDraft sets the create-overlay state shared by a fresh
+// Create draft and a Clone draft.
+func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
+	m.createDraft = draft
+	m.overlay = overlayCreate
+	m.createField = m.visibleCreateFields()[0]
+	m.createCursor = len([]rune(m.createFieldValue()))
+	m.createEditingCompose = false
+	m.status, m.statusErr = "create draft ready", false
 }
 
 // existingOverrideContent reads a local compose.whatthedock.<service>.yml
@@ -192,6 +209,87 @@ func (m Model) defaultCreateDraft() createDraft {
 		}
 	}
 	return draft
+}
+
+// defaultCloneDraft mirrors defaultCreateDraft but carries the selected
+// container's full runtime shape (Ports/Mounts/Env/Restart/Command) into the
+// draft — defaultCreateDraft only carries Image/Project/Service/ComposeFile,
+// which is enough for a fresh draft but not for duplicating something that
+// already exists — and suffixes the identity field so the user renames it
+// before confirming. Clone must never silently overwrite the original.
+func (m Model) defaultCloneDraft() createDraft {
+	draft := m.defaultCreateDraft()
+	selected := m.selectedContainer()
+	if selected == nil {
+		return draft
+	}
+	draft.Ports = formatDraftPorts(selected.Ports)
+	draft.Mounts = formatDraftMounts(selected.Mounts)
+	draft.Env = strings.Join(selected.Env, ", ")
+	if selected.RestartPolicy != "" {
+		draft.Restart = selected.RestartPolicy
+	}
+	draft.Command = selected.Command
+	if draft.Mode == createModeStandalone {
+		draft.ContainerName = selected.DisplayName() + "-clone"
+	} else {
+		draft.Service = selected.Compose.Service + "-clone"
+	}
+	return draft
+}
+
+// replicateContainerSpec builds an app.ContainerCreateSpec identical to
+// selected's current shape (same name, image, ports, mounts, env, restart,
+// command) — used by Replicate's standalone path to recreate the container
+// in place after pulling a fresh image. Reuses the same field-mapping
+// defaultCloneDraft uses, minus the "-clone" identity suffix, and the
+// existing createDraft.ContainerSpec() parsing instead of duplicating it.
+func replicateContainerSpec(selected domain.Container) (app.ContainerCreateSpec, error) {
+	draft := createDraft{
+		Mode:          createModeStandalone,
+		ContainerName: selected.DisplayName(),
+		Image:         selected.Image,
+		Command:       selected.Command,
+		Ports:         formatDraftPorts(selected.Ports),
+		Mounts:        formatDraftMounts(selected.Mounts),
+		Env:           strings.Join(selected.Env, ", "),
+		Restart:       selected.RestartPolicy,
+	}
+	return draft.ContainerSpec()
+}
+
+// formatDraftPorts renders a container's published ports into the
+// comma-joined "host:container/proto" shape splitDraftList expects — the
+// reverse of parseCreatePorts. Unpublished ports (Public == 0) have nothing
+// meaningful to prefill.
+func formatDraftPorts(ports []domain.Port) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		if p.Public == 0 {
+			continue
+		}
+		entry := fmt.Sprintf("%d:%d/%s", p.Public, p.Private, emptyAs(p.Type, "tcp"))
+		if p.IP != "" && p.IP != "0.0.0.0" {
+			entry = p.IP + ":" + entry
+		}
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// formatDraftMounts renders a container's mounts into the comma-joined
+// "source:target[:ro]" shape splitDraftList expects — the reverse of
+// parseCreateMounts.
+func formatDraftMounts(mounts []domain.Mount) string {
+	parts := make([]string, 0, len(mounts))
+	for _, mnt := range mounts {
+		entry := mnt.Source + ":" + mnt.Destination
+		if !mnt.ReadWrite {
+			entry += ":ro"
+		}
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -351,6 +449,24 @@ func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
 		defer cancel()
 		err := apply(ctx, spec)
 		return createDoneMsg{name: spec.Service, err: err}
+	}
+}
+
+func (m Model) deleteComposeCmd(spec composeCreateSpec) tea.Cmd {
+	apply := applyComposeDelete
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return actionDoneMsg{label: "delete " + spec.Service, err: apply(ctx, spec)}
+	}
+}
+
+func (m Model) replicateComposeCmd(spec composeCreateSpec) tea.Cmd {
+	apply := applyComposeReplicate
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
+		defer cancel()
+		return actionDoneMsg{label: "replicate " + spec.Service, err: apply(ctx, spec)}
 	}
 }
 
@@ -973,12 +1089,92 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 	return composeCommand(ctx, spec, "up", "-d", spec.Service)
 }
 
+// composeSpecForSelected builds a composeCreateSpec targeting selected's
+// actual Compose service, for Delete/Replicate — which act on what's
+// already running rather than a freshly-filled-in draft. Content is left
+// empty: Delete never writes override content, and Replicate's pull/up
+// calls only read Project/BaseFile/OverrideFile/System, never Content.
+// Reuses createDraft.ComposeSpec for path derivation and validation instead
+// of duplicating it.
+func composeSpecForSelected(selected *domain.Container, system config.System) (composeCreateSpec, error) {
+	draft := createDraft{
+		Mode:    createModeCompose,
+		Project: selected.Compose.Project,
+		Service: selected.Compose.Service,
+		Image:   selected.Image,
+	}
+	if files := splitComposeConfigFiles(selected.Compose.ConfigFiles); len(files) > 0 {
+		draft.ComposeFile = files[0]
+	}
+	return draft.ComposeSpec(system)
+}
+
+// withExistingOverrideOnly clears spec.OverrideFile if no WhatTheDock
+// override actually exists on disk, so a plain, never-customized Compose
+// service can still be replicated without docker compose failing on a
+// missing -f target. Delete already handles this explicitly for its own
+// reconcile-to-base step; Replicate needs the same check since, unlike
+// Create, it's never about to write one.
+func withExistingOverrideOnly(ctx context.Context, spec composeCreateSpec) composeCreateSpec {
+	if spec.System.Kind == "ssh" {
+		if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+			spec.OverrideFile = ""
+		}
+		return spec
+	}
+	if _, err := os.Stat(spec.OverrideFile); err != nil {
+		spec.OverrideFile = ""
+	}
+	return spec
+}
+
+// defaultApplyComposeDelete removes the WhatTheDock-generated override and
+// reconciles the service back to its base definition — the inverse of
+// defaultApplyComposeCreate's write/promote, without touching the base
+// compose file itself.
+func defaultApplyComposeDelete(ctx context.Context, spec composeCreateSpec) error {
+	if spec.System.Kind == "ssh" {
+		return applyComposeDeleteRemote(ctx, spec)
+	}
+	if err := os.Remove(spec.OverrideFile); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	baseOnly := spec
+	baseOnly.OverrideFile = ""
+	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+}
+
+// applyComposeDeleteRemote is defaultApplyComposeDelete's SSH counterpart.
+func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error {
+	if _, err := sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+		return err
+	}
+	baseOnly := spec
+	baseOnly.OverrideFile = ""
+	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+}
+
+// defaultApplyComposeReplicate pulls a fresh copy of the image and
+// recreates the service in place — docker compose's own "up -d" already
+// recreates a service when its image changed, so no separate remove step
+// is needed here (unlike the standalone-container path).
+func defaultApplyComposeReplicate(ctx context.Context, spec composeCreateSpec) error {
+	spec = withExistingOverrideOnly(ctx, spec)
+	if err := composeCommand(ctx, spec, "pull", spec.Service); err != nil {
+		return err
+	}
+	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+}
+
 func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...string) error {
 	baseArgs := []string{"compose"}
 	if strings.TrimSpace(spec.Project) != "" {
 		baseArgs = append(baseArgs, "-p", spec.Project)
 	}
-	baseArgs = append(baseArgs, "-f", spec.BaseFile, "-f", spec.OverrideFile)
+	baseArgs = append(baseArgs, "-f", spec.BaseFile)
+	if strings.TrimSpace(spec.OverrideFile) != "" {
+		baseArgs = append(baseArgs, "-f", spec.OverrideFile)
+	}
 	baseArgs = append(baseArgs, args...)
 	if spec.System.Kind == "ssh" {
 		quoted := make([]string, len(baseArgs))

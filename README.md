@@ -72,6 +72,9 @@ Docker socket paths must be present.
 | `s` | Start/stop selected container |
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
+| `u` | Replicate: pull the latest image and recreate in place |
+| `D` | Delete (override + reconcile for a Compose service, `docker rm` for a standalone container) |
+| `C` | Clone under a new name via the create overlay |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
 | `l` | Focus logs |
@@ -205,6 +208,14 @@ More detail:
   override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
   editor, with real-time lint feedback and an optional persistent vim mode
   (Settings → Editor).
+- Deletes (`D`), replicates (`u`), and clones (`C`) the selected container or
+  Compose service. Delete removes just the generated override and reconciles
+  the service back to its base definition for a Compose service, or a real
+  `docker rm -f` for a standalone container. Replicate pulls a fresh copy of
+  the image and recreates the same container/service in place under its
+  existing identity. Clone opens the create overlay prefilled with the
+  original's full ports/mounts/env/restart/command under a new,
+  `-clone`-suffixed name, producing an independent second container/service.
 - Copies selected container IDs, images, Compose metadata, ports, mounts, and
   labels via terminal OSC52 clipboard escape sequences.
 - Opens published ports, bind mounts, and Compose config paths from the

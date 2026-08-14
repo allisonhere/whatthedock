@@ -1341,6 +1341,9 @@ func (m Model) paneActions(pane pane) []paneAction {
 			{key: "l", label: "logs"},
 			{key: "c", label: "copy"},
 			{key: "o", label: "open"},
+			{key: "u", label: "replicate"},
+			{key: "D", label: "delete"},
+			{key: "C", label: "clone"},
 		}
 	default:
 		return nil
@@ -1398,9 +1401,65 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.copyOverlay(renderer)
 	case overlayOpen:
 		return m.openOverlay(renderer)
+	case overlayDelete:
+		return m.deleteOverlay(renderer)
+	case overlayReplicate:
+		return m.replicateOverlay(renderer)
 	default:
 		return nil
 	}
+}
+
+// deleteOverlay confirms Delete — its prompt branches on Compose vs
+// standalone since the two paths do genuinely different things (see
+// Model.startDelete): removing just the generated override and reconciling
+// to base, versus a real docker rm.
+func (m Model) deleteOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	prompt := "No container selected."
+	if selected := m.selectedContainer(); selected != nil {
+		if selected.Compose.Project != "" {
+			prompt = "Delete the generated override for " + selected.Compose.Service + " and reconcile it to its base definition?"
+		} else {
+			prompt = "Remove container " + selected.DisplayName() + "?"
+		}
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: "delete"},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "delete", Content: content, Width: width})
+	return &overlay
+}
+
+// replicateOverlay confirms Replicate — pulling a fresh image and
+// recreating the container/service in place under the same identity.
+func (m Model) replicateOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	prompt := "No container selected."
+	if selected := m.selectedContainer(); selected != nil {
+		target := selected.DisplayName()
+		if selected.Compose.Project != "" {
+			target = selected.Compose.Service
+		}
+		prompt = "Pull the latest image and recreate " + target + " in place?"
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: "replicate"},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "replicate", Content: content, Width: width})
+	return &overlay
 }
 
 func (m Model) openOverlay(renderer tideui.Renderer) *tideui.Overlay {

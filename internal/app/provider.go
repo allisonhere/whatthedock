@@ -19,6 +19,8 @@ type Provider interface {
 	StartContainer(context.Context, domain.ResourceID) error
 	StopContainer(context.Context, domain.ResourceID) error
 	RestartContainer(context.Context, domain.ResourceID) error
+	RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error
+	PullImage(ctx context.Context, image string) error
 	Close() error
 }
 

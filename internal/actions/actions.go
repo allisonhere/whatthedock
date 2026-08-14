@@ -14,6 +14,9 @@ const (
 	Create         ID = "create-container"
 	StartStop      ID = "start-stop-container"
 	Restart        ID = "restart-container"
+	Delete         ID = "delete-container"
+	Replicate      ID = "replicate-container"
+	Clone          ID = "clone-container"
 	FocusLogs      ID = "focus-logs"
 	ShowProblems   ID = "show-problems"
 	ShowStats      ID = "show-stats"
@@ -51,6 +54,9 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: Create, Name: "Create container or Compose service", Shortcut: "n", Aliases: []string{"new", "run", "compose service"}, Enabled: true},
 		{ID: StartStop, Name: "Start or stop selected container", Shortcut: "s", Aliases: []string{"start", "stop"}, Enabled: canStartStop, Run: startStop},
 		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Run: restart},
+		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer},
+		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer},
+		{ID: Clone, Name: "Clone container or Compose service under a new name", Shortcut: "C", Aliases: []string{"duplicate", "copy container"}, Enabled: hasContainer},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer},
 		{ID: ShowProblems, Name: "Show problems", Shortcut: "p", Aliases: []string{"issues", "health", "unhealthy", "restarting"}, Enabled: true},
 		{ID: ShowStats, Name: "Show stats", Shortcut: "g", Aliases: []string{"graphs", "sparklines", "metrics", "cpu", "memory"}, Enabled: true},

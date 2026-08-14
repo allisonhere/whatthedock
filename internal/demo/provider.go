@@ -266,6 +266,25 @@ func (p *Provider) RestartContainer(_ context.Context, id domain.ResourceID) err
 	return nil
 }
 
+func (p *Provider) RemoveContainer(_ context.Context, id domain.ResourceID, _ bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.containers[id.ID]; !ok {
+		return fmt.Errorf("demo container %s no longer exists", id.ID)
+	}
+	delete(p.containers, id.ID)
+	delete(p.logs, id.ID)
+	delete(p.statsTicks, id.ID)
+	return nil
+}
+
+// PullImage is a no-op in demo mode — there's no real registry to pull from,
+// and Replicate's visible effect for a standalone container is carried
+// entirely by the remove+recreate step, not by a fabricated image change.
+func (p *Provider) PullImage(_ context.Context, _ string) error {
+	return nil
+}
+
 func (p *Provider) Close() error { return nil }
 
 func (p *Provider) seed() {

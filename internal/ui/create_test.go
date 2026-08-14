@@ -535,6 +535,125 @@ func TestApplyComposeCreateRemovesTempOnValidationFailure(t *testing.T) {
 	}
 }
 
+func TestDefaultApplyComposeDeleteRemovesOverrideAndRunsUp(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	overridePath := filepath.Join(dir, "compose.whatthedock.cache.yml")
+	if err := os.WriteFile(overridePath, []byte("services:\n  cache:\n    image: redis:7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     filepath.Join(dir, "compose.yml"),
+		OverrideFile: overridePath,
+	}
+
+	if err := defaultApplyComposeDelete(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeDelete() error = %v", err)
+	}
+	if _, err := os.Stat(overridePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("override still exists or stat failed unexpectedly: %v", err)
+	}
+	if len(calls) != 1 || calls[0] != " up -d cache" {
+		t.Fatalf("compose calls = %#v, want a single base-only up -d call", calls)
+	}
+}
+
+func TestDefaultApplyComposeDeleteIsIdempotentWhenOverrideAlreadyGone(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	composeCommand = func(context.Context, composeCreateSpec, ...string) error { return nil }
+	dir := t.TempDir()
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     filepath.Join(dir, "compose.yml"),
+		OverrideFile: filepath.Join(dir, "compose.whatthedock.cache.yml"),
+	}
+
+	if err := defaultApplyComposeDelete(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeDelete() with no existing override, error = %v, want nil", err)
+	}
+}
+
+func TestDefaultApplyComposeReplicatePullsThenUp(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	overridePath := filepath.Join(dir, "compose.whatthedock.cache.yml")
+	if err := os.WriteFile(overridePath, []byte("services:\n  cache:\n    image: redis:7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     filepath.Join(dir, "compose.yml"),
+		OverrideFile: overridePath,
+	}
+
+	if err := defaultApplyComposeReplicate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeReplicate() error = %v", err)
+	}
+	if len(calls) != 2 || calls[0] != overridePath+" pull cache" || calls[1] != overridePath+" up -d cache" {
+		t.Fatalf("compose calls = %#v, want pull then up -d, both against the existing override", calls)
+	}
+}
+
+func TestDefaultApplyComposeReplicateOmitsOverrideWhenNoneExists(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     filepath.Join(dir, "compose.yml"),
+		OverrideFile: filepath.Join(dir, "compose.whatthedock.cache.yml"), // never written
+	}
+
+	if err := defaultApplyComposeReplicate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeReplicate() error = %v", err)
+	}
+	if len(calls) != 2 || calls[0] != " pull cache" || calls[1] != " up -d cache" {
+		t.Fatalf("compose calls = %#v, want pull/up with OverrideFile cleared since none exists", calls)
+	}
+}
+
+func TestRunDockerComposeOmitsMissingOverrideFile(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:  "media",
+		Service:  "cache",
+		BaseFile: "/srv/media/compose.yml",
+		System:   system,
+	}
+
+	if err := runDockerCompose(context.Background(), spec, "pull", "cache"); err != nil {
+		t.Fatalf("runDockerCompose() error = %v", err)
+	}
+	want := "docker 'compose' '-p' 'media' '-f' '/srv/media/compose.yml' 'pull' 'cache'"
+	if len(fake.calls) != 1 || fake.calls[0] != want {
+		t.Fatalf("calls = %#v, want a single call with exactly one -f: %q", fake.calls, want)
+	}
+}
+
 // fakeSSHRun swaps in for sshRun so remote-Compose tests never shell out to a
 // real ssh binary. It records every script (and stdin) it was called with, in
 // order, and dispatches canned responses by exact script match.
@@ -716,6 +835,35 @@ func TestApplyComposeCreateRemoteCleansUpTempOnValidationFailure(t *testing.T) {
 	for _, call := range fake.calls {
 		if strings.HasPrefix(call, "mv ") {
 			t.Fatalf("promoted the override despite failed validation: %#v", fake.calls)
+		}
+	}
+}
+
+func TestApplyComposeDeleteRemoteRunsRmAndUp(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "media-stack",
+		Service:      "cache",
+		BaseFile:     "/srv/media-stack/compose.yml",
+		OverrideFile: "/srv/media-stack/compose.whatthedock.cache.yml",
+		System:       system,
+	}
+
+	if err := applyComposeDeleteRemote(context.Background(), spec); err != nil {
+		t.Fatalf("applyComposeDeleteRemote() error = %v", err)
+	}
+
+	wantScripts := []string{
+		"rm -f '/srv/media-stack/compose.whatthedock.cache.yml'",
+		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' 'up' '-d' 'cache'",
+	}
+	if len(fake.calls) != len(wantScripts) {
+		t.Fatalf("calls = %#v, want %#v", fake.calls, wantScripts)
+	}
+	for i, want := range wantScripts {
+		if fake.calls[i] != want {
+			t.Fatalf("call %d = %q, want %q", i, fake.calls[i], want)
 		}
 	}
 }
@@ -1127,6 +1275,69 @@ func modelSelecting(project, service, composeFile string) Model {
 	model.selected = &ctr
 	model.selectedID = id
 	return model
+}
+
+func TestDefaultCloneDraftCarriesPortsMountsEnvRestartCommand(t *testing.T) {
+	model := modelSelecting("media", "radarr", "/srv/media/compose.yml")
+	model.selected.Ports = []domain.Port{{IP: "0.0.0.0", Private: 7878, Public: 7878, Type: "tcp"}}
+	model.selected.Mounts = []domain.Mount{{Source: "/srv/media/radarr", Destination: "/config", ReadWrite: false}}
+	model.selected.Env = []string{"PUID=1000", "TZ=UTC"}
+	model.selected.RestartPolicy = "always"
+	model.selected.Command = "run --flag"
+
+	draft := model.defaultCloneDraft()
+
+	ports, err := parseCreatePorts(draft.Ports)
+	if err != nil || len(ports) != 1 || ports[0].ContainerPort != 7878 || ports[0].HostPort != 7878 {
+		t.Fatalf("Ports = %q (parsed %#v, err %v), want a single 7878:7878/tcp binding", draft.Ports, ports, err)
+	}
+	mounts, err := parseCreateMounts(draft.Mounts)
+	if err != nil || len(mounts) != 1 || mounts[0].Source != "/srv/media/radarr" || mounts[0].Destination != "/config" || !mounts[0].ReadOnly {
+		t.Fatalf("Mounts = %q (parsed %#v, err %v), want a single read-only /srv/media/radarr:/config mount", draft.Mounts, mounts, err)
+	}
+	if draft.Env != "PUID=1000, TZ=UTC" {
+		t.Fatalf("Env = %q, want PUID=1000, TZ=UTC", draft.Env)
+	}
+	if draft.Restart != "always" {
+		t.Fatalf("Restart = %q, want always", draft.Restart)
+	}
+	if draft.Command != "run --flag" {
+		t.Fatalf("Command = %q, want %q", draft.Command, "run --flag")
+	}
+}
+
+func TestDefaultCloneDraftSuffixesIdentity(t *testing.T) {
+	compose := modelSelecting("media", "radarr", "/srv/media/compose.yml")
+	if got := compose.defaultCloneDraft(); got.Service != "radarr-clone" {
+		t.Fatalf("compose clone Service = %q, want radarr-clone", got.Service)
+	}
+
+	standalone := modelSelecting("", "", "")
+	standalone.selected.Name = "grafana"
+	if got := standalone.defaultCloneDraft(); got.Mode != createModeStandalone || got.ContainerName != "grafana-clone" {
+		t.Fatalf("standalone clone Mode/ContainerName = %v/%q, want standalone/grafana-clone", got.Mode, got.ContainerName)
+	}
+}
+
+func TestOpenCloneOverlaySkipsOverrideDetection(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compose.whatthedock.radarr.yml"), []byte("services:\n  radarr:\n    image: radarr:custom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCloneOverlay()
+
+	if model.createDraft.OverrideRawSet || model.createDraft.OverrideLoaded {
+		t.Fatalf("OverrideRawSet/OverrideLoaded = %v/%v, want both false — Clone must not load the original's override", model.createDraft.OverrideRawSet, model.createDraft.OverrideLoaded)
+	}
+	if model.createDraft.Service != "radarr-clone" {
+		t.Fatalf("Service = %q, want radarr-clone", model.createDraft.Service)
+	}
 }
 
 func TestOpenCreateOverlayLoadsExistingLocalOverride(t *testing.T) {

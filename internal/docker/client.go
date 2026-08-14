@@ -13,8 +13,10 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/go-connections/nat"
 
 	"github.com/allisonhere/whatthedock/internal/app"
@@ -284,6 +286,25 @@ func (p *LocalProvider) StopContainer(ctx context.Context, id domain.ResourceID)
 
 func (p *LocalProvider) RestartContainer(ctx context.Context, id domain.ResourceID) error {
 	return p.cli.ContainerRestart(ctx, id.ID, container.StopOptions{})
+}
+
+func (p *LocalProvider) RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error {
+	return p.cli.ContainerRemove(ctx, id.ID, container.RemoveOptions{Force: force})
+}
+
+// PullImage drains the pull's streamed JSON progress messages through
+// DisplayJSONMessagesStream (the same helper the docker CLI itself uses)
+// rather than io.Copy(io.Discard, ...) — a mid-stream failure (bad manifest,
+// layer checksum mismatch) shows up as an error field inside a JSON message,
+// not as a Go error from the reader, so a plain drain would silently report
+// success.
+func (p *LocalProvider) PullImage(ctx context.Context, image string) error {
+	rc, err := p.cli.ImagePull(ctx, image, imagetypes.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return jsonmessage.DisplayJSONMessagesStream(rc, io.Discard, 0, false, nil)
 }
 
 func (p *LocalProvider) Close() error {

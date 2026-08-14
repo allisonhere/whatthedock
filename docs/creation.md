@@ -181,6 +181,36 @@ Standalone creation supports:
 After creation, WhatTheDock refreshes Docker state and targets the returned
 container ID when Docker provides one.
 
+## Delete, Replicate, and Clone
+
+These act on the currently selected container/Compose service, from the
+inspector pane or the command palette.
+
+**Delete (`D`)** — undoes whatever create/replicate produced. For a Compose
+service, this removes only the generated `compose.whatthedock.<service>.yml`
+override and re-runs `docker compose up -d <service>` against the base file
+alone, so the service falls back to its base definition — the base compose
+file itself is never touched. For a standalone container, there's no
+override to fall back to, so Delete is a real `docker rm -f` (stop-if-running
++ remove). Confirm with `y`, cancel with `n`/`Esc`.
+
+**Replicate (`u`)** — pulls a fresh copy of the image and recreates the same
+container/service in place, under its existing identity (name stays the
+same). For a Compose service: `docker compose pull <service>` then
+`up -d <service>` — Compose's own `up -d` recreates the container when the
+image changed. For a standalone container: pull the image, stop and remove
+the existing container, then recreate it with an identical spec (same name,
+ports, mounts, env, restart policy, command). Confirm with `y`, cancel with
+`n`/`Esc`.
+
+**Clone (`C`)** — duplicates the selected container/service under a *new*
+name. Opens the create overlay prefilled with the original's image, ports,
+mounts, env, restart policy, and command, with the identity field
+(`Service` or `Name`) suffixed `-clone` so you rename it before confirming.
+Unlike opening create for an already-managed service, Clone never loads an
+existing override — the original is left completely untouched, and
+confirming produces an independent second container/service.
+
 ## Current Limits
 
 - Compose creation writes generated override files; it does not yet edit or
@@ -190,3 +220,5 @@ container ID when Docker provides one.
   a shared multiplexed connection, so each has its own connection-setup
   latency — noticeable but not prohibitive for typical use.
 - Standalone command parsing uses whitespace splitting, not full shell quoting.
+- Replicate only has a visible effect on mutable tags (`:latest`-style);
+  pulling an image pinned to a fixed tag or digest is a no-op.

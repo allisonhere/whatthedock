@@ -28,13 +28,18 @@ Untracked local files at handoff:
 ## Main Code Paths
 
 - `internal/actions/actions.go`
-  - Adds the `create-container` action.
+  - Adds the `create-container`, `delete-container`, `replicate-container`,
+    and `clone-container` actions.
 - `internal/app/provider.go`
-  - Adds `CreateContainer` and the typed container create spec.
+  - Adds `CreateContainer`/`RemoveContainer`/`PullImage` and the typed
+    container create spec.
 - `internal/docker/client.go`
-  - Implements Docker container creation through the Docker Go client.
+  - Implements Docker container creation, removal, and image pulling
+    through the Docker Go client (`ContainerRemove`, `ImagePull` drained via
+    `jsonmessage.DisplayJSONMessagesStream`).
 - `internal/demo/provider.go`
-  - Implements synthetic demo container creation.
+  - Implements synthetic demo container creation and removal; `PullImage` is
+    a no-op (no real registry in demo mode).
 - `internal/ui/model.go`
   - Owns general app state, top-level `Update` message routing, and settings
     (including the persistent vim-mode toggle for the override editor).
@@ -47,7 +52,10 @@ Untracked local files at handoff:
     form's fields back from loaded or hand-edited override YAML), local and
     remote (SSH) file browser state, override-detection on open, and
     confirmation handling and command execution for both local and SSH
-    systems.
+    systems. Also owns Delete's override-removal-and-reconcile and
+    Replicate's pull-then-up-d functions (both local/SSH), and Clone's
+    extended prefill (`defaultCloneDraft`, carrying Ports/Mounts/Env/
+    Restart/Command that a fresh Create draft doesn't need).
 - `internal/ui/create_view.go`
   - Renders the create form, mode tabs, confirmation view, Compose file
     browser, and the syntax-highlighted override preview/editor.
@@ -135,13 +143,17 @@ Done since this doc was first written:
 - Loading or hand-editing override YAML now parses it back into the
   structured form fields (Image, Restart, Command, Ports, Mounts, Env), so
   the form stays in sync with whatever content will actually be written.
+- Added `D`/`u`/`C` (Delete/Replicate/Clone) on the selected container or
+  Compose service — Delete removes just the generated override and
+  reconciles to base (or a real `docker rm -f` for a standalone container),
+  Replicate pulls a fresh image and recreates in place, and Clone opens
+  create prefilled from the original under a new name. This is the delete-
+  or-replace-an-existing-override capability this doc used to list as
+  remaining work.
 
 Remaining:
 
 - Improve standalone command parsing if quoted arguments become important.
-- Add a way to delete or replace an existing WhatTheDock-generated override
-  independent of re-opening create for that service (today it's load-on-open
-  only, or overwrite it via a fresh confirm).
 - Decide whether Compose service creation should default to generated override
   files forever or become a stepping stone toward merge-aware YAML edits.
 - Remote (SSH) Compose operations are one `ssh` invocation per step rather

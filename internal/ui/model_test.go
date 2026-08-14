@@ -35,6 +35,11 @@ type fakeProvider struct {
 	stops      int
 	restarts   int
 	creates    []app.ContainerCreateSpec
+	removed    []domain.ResourceID
+	forced     []bool
+	pulled     []string
+	removeErr  error
+	pullErr    error
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -73,6 +78,19 @@ func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCrea
 	f.containers[id.ID] = ctr
 	f.snapshot.Standalone = append(f.snapshot.Standalone, ctr)
 	return id, nil
+}
+func (f *fakeProvider) RemoveContainer(_ context.Context, id domain.ResourceID, force bool) error {
+	f.removed = append(f.removed, id)
+	f.forced = append(f.forced, force)
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	delete(f.containers, id.ID)
+	return nil
+}
+func (f *fakeProvider) PullImage(_ context.Context, image string) error {
+	f.pulled = append(f.pulled, image)
+	return f.pullErr
 }
 func (f *fakeProvider) Close() error { return nil }
 
@@ -1864,6 +1882,145 @@ func TestCopyKeyOpensCopyOverlay(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("copy overlay missing %q:\n%s", want, view)
 		}
+	}
+}
+
+// modelSelectingStandalone builds a model with a selected container that has
+// no Compose project — the standalone-path fixture for Delete/Replicate
+// tests, alongside modelSelecting (create_test.go) for the Compose path.
+func modelSelectingStandalone(name, image string) Model {
+	model := modelSelecting("", "", "")
+	model.selected.Name = name
+	model.selected.Image = image
+	model.selectedID = model.selected.ID
+	return model
+}
+
+func TestPressDOpensDeleteOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("D key returned cmd = %#v, want nil (opens a confirmation, doesn't act yet)", cmd)
+	}
+	if model.overlay != overlayDelete {
+		t.Fatalf("overlay = %v, want overlayDelete", model.overlay)
+	}
+}
+
+func TestPressUOpensReplicateOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("u key returned cmd = %#v, want nil (opens a confirmation, doesn't act yet)", cmd)
+	}
+	if model.overlay != overlayReplicate {
+		t.Fatalf("overlay = %v, want overlayReplicate", model.overlay)
+	}
+}
+
+func TestPressCOpensCloneOverlayPrefilled(t *testing.T) {
+	model := testModelWithSelectedContainer() // radarr-1, Compose service "radarr"
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate (Clone reuses the create overlay)", model.overlay)
+	}
+	if model.createDraft.Service != "radarr-clone" {
+		t.Fatalf("Service = %q, want radarr-clone", model.createDraft.Service)
+	}
+}
+
+func TestHandleDeleteKeyStandaloneCallsRemoveContainer(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana")
+	model.overlay = overlayDelete
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone after confirming delete", model.overlay)
+	}
+	if cmd == nil {
+		t.Fatal("y on overlayDelete returned a nil Cmd")
+	}
+	done, ok := runCmd(t, cmd).(actionDoneMsg)
+	if !ok {
+		t.Fatalf("msg = %#v, want actionDoneMsg", done)
+	}
+	if done.err != nil {
+		t.Fatalf("actionDoneMsg.err = %v, want nil", done.err)
+	}
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 1 || fp.removed[0] != model.selected.ID {
+		t.Fatalf("removed = %#v, want a single call for %v", fp.removed, model.selected.ID)
+	}
+	if len(fp.forced) != 1 || !fp.forced[0] {
+		t.Fatalf("forced = %#v, want [true]", fp.forced)
+	}
+}
+
+func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.selected.Ports = []domain.Port{{IP: "0.0.0.0", Private: 3000, Public: 3000, Type: "tcp"}}
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("y on overlayReplicate returned a nil Cmd")
+	}
+	done, ok := runCmd(t, cmd).(actionDoneMsg)
+	if !ok {
+		t.Fatalf("msg = %#v, want actionDoneMsg", done)
+	}
+	if done.err != nil {
+		t.Fatalf("actionDoneMsg.err = %v, want nil", done.err)
+	}
+	fp := model.provider.(*fakeProvider)
+	if len(fp.pulled) != 1 || fp.pulled[0] != "grafana/grafana:latest" {
+		t.Fatalf("pulled = %#v, want a single pull of the original image", fp.pulled)
+	}
+	if len(fp.removed) != 1 || fp.removed[0] != model.selected.ID {
+		t.Fatalf("removed = %#v, want a single call for %v", fp.removed, model.selected.ID)
+	}
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want a single recreate call", fp.creates)
+	}
+	created := fp.creates[0]
+	if created.Name != "grafana" || created.Image != "grafana/grafana:latest" {
+		t.Fatalf("recreated spec = %#v, want the same identity as the original, not a -clone name", created)
+	}
+	if len(created.Ports) != 1 || created.Ports[0].ContainerPort != 3000 {
+		t.Fatalf("recreated ports = %#v, want the original 3000 binding carried over", created.Ports)
+	}
+}
+
+func TestHandleDeleteKeyEscCancels(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.overlay = overlayDelete
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone after esc", model.overlay)
+	}
+	if cmd != nil {
+		t.Fatal("esc on overlayDelete returned a non-nil Cmd, want no action taken")
+	}
+}
+
+func TestHandleReplicateKeyEscCancels(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone after esc", model.overlay)
+	}
+	if cmd != nil {
+		t.Fatal("esc on overlayReplicate returned a non-nil Cmd, want no action taken")
 	}
 }
 

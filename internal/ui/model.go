@@ -59,6 +59,8 @@ const (
 	overlaySystems
 	overlayCreate
 	overlayAbout
+	overlayDelete
+	overlayReplicate
 )
 
 type graphStyle int
@@ -469,6 +471,8 @@ func (m Model) tickAboutEmbers() Model {
 var clipboardWriter io.Writer = os.Stderr
 var openTarget = defaultOpenTarget
 var applyComposeCreate = defaultApplyComposeCreate
+var applyComposeDelete = defaultApplyComposeDelete
+var applyComposeReplicate = defaultApplyComposeReplicate
 var composeCommand = runDockerCompose
 
 type snapshotMsg struct {
@@ -1136,6 +1140,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statsErr = nil
 			return m, m.loadStatsCmd(selected.ID)
 		}
+	case "D":
+		if selected := m.selectedContainer(); selected != nil {
+			m.overlay = overlayDelete
+		}
+	case "u":
+		if selected := m.selectedContainer(); selected != nil {
+			m.overlay = overlayReplicate
+		}
+	case "C":
+		if selected := m.selectedContainer(); selected != nil {
+			m.openCloneOverlay()
+		}
 	}
 	return m, nil
 }
@@ -1215,8 +1231,101 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleOpenKey(msg)
 	case overlayCreate:
 		return m.handleCreateKey(msg)
+	case overlayDelete:
+		return m.handleDeleteKey(msg)
+	case overlayReplicate:
+		return m.handleReplicateKey(msg)
 	}
 	return m, nil
+}
+
+// handleDeleteKey gates the Delete confirmation the same way Systems' own
+// destructive delete does (systemModeDelete): esc/n/q cancels, y proceeds.
+func (m Model) handleDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "n", "q":
+		m.overlay = overlayNone
+	case "y":
+		m.overlay = overlayNone
+		return m.startDelete()
+	}
+	return m, nil
+}
+
+func (m Model) handleReplicateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "n", "q":
+		m.overlay = overlayNone
+	case "y":
+		m.overlay = overlayNone
+		return m.startReplicate()
+	}
+	return m, nil
+}
+
+// startDelete dispatches to the Compose (override removal + reconcile) or
+// standalone (real container removal) path depending on the selected
+// container, mirroring the same Compose-vs-standalone test defaultCreateDraft
+// already uses.
+func (m Model) startDelete() (tea.Model, tea.Cmd) {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return m, nil
+	}
+	if selected.Compose.Project != "" {
+		spec, err := composeSpecForSelected(selected, m.activeSystemConfig())
+		if err != nil {
+			m.status, m.statusErr = "delete "+selected.Compose.Service+": "+err.Error(), true
+			return m, nil
+		}
+		return m, m.deleteComposeCmd(spec)
+	}
+	provider := m.provider
+	id := selected.ID
+	label := "delete " + selected.DisplayName()
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return actionDoneMsg{label: label, err: provider.RemoveContainer(ctx, id, true)}
+	}
+}
+
+// startReplicate dispatches to the Compose (pull + up -d) or standalone
+// (pull + remove + recreate with an identical spec) path.
+func (m Model) startReplicate() (tea.Model, tea.Cmd) {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return m, nil
+	}
+	if selected.Compose.Project != "" {
+		spec, err := composeSpecForSelected(selected, m.activeSystemConfig())
+		if err != nil {
+			m.status, m.statusErr = "replicate "+selected.Compose.Service+": "+err.Error(), true
+			return m, nil
+		}
+		return m, m.replicateComposeCmd(spec)
+	}
+	spec, err := replicateContainerSpec(*selected)
+	if err != nil {
+		m.status, m.statusErr = "replicate "+selected.DisplayName()+": "+err.Error(), true
+		return m, nil
+	}
+	provider := m.provider
+	id := selected.ID
+	image := selected.Image
+	label := "replicate " + selected.DisplayName()
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
+		defer cancel()
+		if err := provider.PullImage(ctx, image); err != nil {
+			return actionDoneMsg{label: label, err: err}
+		}
+		if err := provider.RemoveContainer(ctx, id, true); err != nil {
+			return actionDoneMsg{label: label, err: err}
+		}
+		_, err := provider.CreateContainer(ctx, spec)
+		return actionDoneMsg{label: label, err: err}
+	}
 }
 
 func (m Model) handleCopyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1849,6 +1958,18 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		return m, m.actionCmd(actions.StartStop, "start/stop")
 	case actions.Restart:
 		return m, m.actionCmd(actions.Restart, "restart")
+	case actions.Delete:
+		if selected := m.selectedContainer(); selected != nil {
+			m.overlay = overlayDelete
+		}
+	case actions.Replicate:
+		if selected := m.selectedContainer(); selected != nil {
+			m.overlay = overlayReplicate
+		}
+	case actions.Clone:
+		if selected := m.selectedContainer(); selected != nil {
+			m.openCloneOverlay()
+		}
 	case actions.FocusLogs:
 		m.focus = paneActivity
 		m.mode = activityLogs
