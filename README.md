@@ -106,6 +106,21 @@ Docker socket paths must be present.
 Mouse row selection and wheel navigation are enabled where the terminal and
 Bubble Tea support them.
 
+## Install
+
+Install the latest published release for your platform (Linux/macOS,
+amd64/arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/allisonhere/whatthedock/main/scripts/install.sh | sh
+```
+
+Downloads the binary attached to the latest GitHub release, verifies it runs,
+and installs it to `/usr/local/bin` (or `~/.local/bin` if that isn't
+writable — set `INSTALL_DIR` to override either). Only a platform actually
+published for the latest release will succeed; see [Release](#release)
+below for how releases get published.
+
 ## Build
 
 Install the latest `main` build with Go:
@@ -157,6 +172,21 @@ go build -buildvcs=false \
   -ldflags "-X main.version=v0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%d)" \
   -o whatthedock ./cmd/whatthedock
 ```
+
+## Release
+
+Publishing a release (build, tag, push the tag, and create the GitHub
+release with the binary attached) is a small TUI, not a manual sequence of
+commands:
+
+```bash
+go run ./cmd/release
+```
+
+Shows the branch, latest tag, and commit log/diff stat since that tag, lets
+you confirm or edit the suggested next version, then runs every step with
+live progress. Add `-dry-run` to walk through the whole flow (including a
+real build) without actually tagging, pushing, or publishing anything.
 
 ## Development
 
