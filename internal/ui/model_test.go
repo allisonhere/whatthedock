@@ -1594,6 +1594,63 @@ func TestSettingsVimModeTogglePersistsAndAppliesToEditors(t *testing.T) {
 	}
 }
 
+func TestSettingsModalShadowTogglePersistsAndAppliesToView(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	path := filepath.Join(t.TempDir(), "settings.json")
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.settingsPath = path
+	if !model.settings.ModalShadow {
+		t.Fatal("ModalShadow should default to true")
+	}
+
+	model.overlay = overlayHelp
+	viewWithShadow := model.View()
+
+	model.openSettingsOverlay()
+
+	rows := model.settingsRows()
+	cursor := -1
+	for i, row := range rows {
+		if row.label == "Modal shadow" {
+			cursor = i
+			break
+		}
+	}
+	if cursor == -1 {
+		t.Fatal("settings rows missing Modal shadow")
+	}
+	model.settingsCursor = cursor
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.settingsDraft.ModalShadow {
+		t.Fatal("settingsDraft.ModalShadow = true after toggle, want false")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+	if model.settings.ModalShadow {
+		t.Fatal("settings.ModalShadow = true after save, want false")
+	}
+
+	saved, err := config.LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() err = %v", err)
+	}
+	if saved.ModalShadow == nil || *saved.ModalShadow {
+		t.Fatalf("persisted ModalShadow = %v, want false", saved.ModalShadow)
+	}
+
+	model.overlay = overlayHelp
+	if model.View() == viewWithShadow {
+		t.Fatal("expected help overlay to render differently after ModalShadow=false")
+	}
+}
+
 func TestCommandPaletteCanOpenSettings(t *testing.T) {
 	model := testModel()
 	updated, cmd := model.executeCommand("open-settings")

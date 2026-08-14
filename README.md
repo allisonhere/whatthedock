@@ -188,8 +188,8 @@ More detail:
 - Shows polling stats graphs and sparklines for the selected container, with
   CPU, memory, network, disk I/O, restart, uptime, and PID readouts.
 - Includes a grouped settings panel with reset defaults, persisted graph style,
-  graph colors, log color mode, log health color, deltas, refresh interval, and
-  default activity pane.
+  graph colors, log color mode, log health color, deltas, refresh interval,
+  default activity pane, and a modal drop shadow toggle.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and

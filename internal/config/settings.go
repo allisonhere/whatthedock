@@ -16,6 +16,7 @@ type Settings struct {
 	LogHealthColor  *bool    `json:"logHealthColor,omitempty"`
 	ShowDeltas      *bool    `json:"showDeltas,omitempty"`
 	CreateVim       *bool    `json:"createVim,omitempty"`
+	ModalShadow     *bool    `json:"modalShadow,omitempty"`
 	StatsRefresh    string   `json:"statsRefresh,omitempty"`
 	DefaultActivity string   `json:"defaultActivity,omitempty"`
 	ActiveSystem    string   `json:"activeSystem,omitempty"`

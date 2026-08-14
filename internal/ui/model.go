@@ -112,6 +112,7 @@ type appSettings struct {
 	LogHealthColor  bool
 	ShowDeltas      bool
 	CreateVim       bool
+	ModalShadow     bool
 	StatsRefresh    time.Duration
 	DefaultActivity activityMode
 }
@@ -643,6 +644,7 @@ func defaultSettings() appSettings {
 		LogColor:        logColorFull,
 		LogHealthColor:  true,
 		ShowDeltas:      true,
+		ModalShadow:     true,
 		StatsRefresh:    2 * time.Second,
 		DefaultActivity: activityProblems,
 	}
@@ -684,6 +686,9 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 	if persisted.CreateVim != nil {
 		s.CreateVim = *persisted.CreateVim
 	}
+	if persisted.ModalShadow != nil {
+		s.ModalShadow = *persisted.ModalShadow
+	}
 	if persisted.StatsRefresh != "" {
 		if interval, err := time.ParseDuration(persisted.StatsRefresh); err == nil && interval > 0 {
 			s.StatsRefresh = interval
@@ -703,6 +708,7 @@ func (s appSettings) persisted() config.Settings {
 	showDeltas := s.ShowDeltas
 	logHealthColor := s.LogHealthColor
 	createVim := s.CreateVim
+	modalShadow := s.ModalShadow
 	return config.Settings{
 		GraphStyle:      s.GraphStyle.String(),
 		GraphColor:      s.GraphColor.String(),
@@ -710,6 +716,7 @@ func (s appSettings) persisted() config.Settings {
 		LogHealthColor:  &logHealthColor,
 		ShowDeltas:      &showDeltas,
 		CreateVim:       &createVim,
+		ModalShadow:     &modalShadow,
 		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
 		DefaultActivity: activityModeName(s.DefaultActivity),
 	}
@@ -2392,6 +2399,7 @@ func (m Model) settingsRows() []settingsRow {
 		{label: "Log health color", value: onOff(settings.LogHealthColor)},
 		{label: "Behavior", kind: settingsRowSection},
 		{label: "Default pane", value: activityModeName(settings.DefaultActivity)},
+		{label: "Modal shadow", value: onOff(settings.ModalShadow)},
 		{label: "Editor", kind: settingsRowSection},
 		{label: "Vim mode", value: onOff(settings.CreateVim)},
 		{label: "Maintenance", kind: settingsRowSection},
@@ -2471,6 +2479,8 @@ func (m *Model) cycleSetting(index, direction int) {
 		m.settingsDraft.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
 	case "Default pane":
 		m.settingsDraft.DefaultActivity = activityMode(modIndex(int(m.settingsDraft.DefaultActivity)+direction, 3))
+	case "Modal shadow":
+		m.settingsDraft.ModalShadow = !m.settingsDraft.ModalShadow
 	case "Vim mode":
 		m.settingsDraft.CreateVim = !m.settingsDraft.CreateVim
 	}

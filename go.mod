@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/allisonhere/cli-spinners v0.0.0-00010101000000-000000000000
 	github.com/allisonhere/ripple v0.3.0
-	github.com/allisonhere/tideui v0.2.3-0.20260814213102-c2c10e5e6863
+	github.com/allisonhere/tideui v0.2.3-0.20260814231802-d2120af2e714
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0

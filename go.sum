@@ -6,8 +6,8 @@ github.com/allisonhere/cli-spinners-GO-library v0.1.0 h1:IY+pCgU+YEjshLP82Bhe9F8
 github.com/allisonhere/cli-spinners-GO-library v0.1.0/go.mod h1:BKYLH1Orh1vtvIlgd8s1bmsoZoU2c7ZR+lR+t8kOhHE=
 github.com/allisonhere/ripple v0.3.0 h1:0g/sPUnVhxl8rNEjnU8XJH6J0ri6iaUxd++p2PvzSpY=
 github.com/allisonhere/ripple v0.3.0/go.mod h1:tUOwwHoip07xZ2C+xDtwLFF5dkPCUliQ8OqL6FEbO+I=
-github.com/allisonhere/tideui v0.2.3-0.20260814213102-c2c10e5e6863 h1:z9Mo0h3jcQ6P6pfa6+/iJX2YDdbrhfF2iij7RyaVVCE=
-github.com/allisonhere/tideui v0.2.3-0.20260814213102-c2c10e5e6863/go.mod h1:5PuSjpG2GO1HN1yQZi1ZpEbJOqKYhaLY/Wkb+cj/mAQ=
+github.com/allisonhere/tideui v0.2.3-0.20260814231802-d2120af2e714 h1:zXgarvXaeOXG3nIEWSXFMDoKlorRi2DMYSi8cRnYBxw=
+github.com/allisonhere/tideui v0.2.3-0.20260814231802-d2120af2e714/go.mod h1:gGvJLtvSPce3sf/1caa7xWw/YjXHKi311T6DUaLs4gQ=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1 h1:HwpRHbFMcZLEVr42D4p7XBqjyuxQH5SMiErDT4WkJ2k=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1/go.mod h1:uYgXzlJ7ZpABp8OJ+exZzJJhRNQ2ASbcXHWsFqH8hp8=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=
