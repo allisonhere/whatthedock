@@ -130,6 +130,28 @@ func TestEditorAreaViewAppliesHighlighting(t *testing.T) {
 	}
 }
 
+// TestEditorAreaViewUsesBlackBackground guards against a real bug: the
+// syntax styles only set Foreground, and the Style callback's default case
+// (plain runs — indentation, punctuation, unquoted scalars) returned text
+// completely unstyled, so once any styled run reset, everything after it
+// fell through to whatever sat behind the editor instead of a solid black
+// terminal surface.
+func TestEditorAreaViewUsesBlackBackground(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	e := newEditorArea()
+	e.SetSize(40, 3)
+	e.SetValue("image: redis:7")
+	e.Focus()
+
+	view := e.View()
+	if !strings.Contains(view, "48;2;0;0;0") {
+		t.Fatalf("expected a black (#000000) background SGR in the rendered view, got: %q", view)
+	}
+}
+
 func TestHighlightComposeYAML(t *testing.T) {
 	original := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)

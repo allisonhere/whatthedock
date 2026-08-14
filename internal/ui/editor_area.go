@@ -57,13 +57,21 @@ type editorArea struct {
 	CommentStyle     lipgloss.Style
 }
 
+// composeEditorBG is the terminal-black background for the Compose YAML
+// surface — both the live Ripple editor and the static create-form preview
+// — so it reads as a distinct terminal surface regardless of the active
+// theme, matching the rest of the black-background YAML preview treatment.
+var composeEditorBG = lipgloss.Color("#000000")
+
 // Compose YAML syntax colors, shared between the live Ripple editor and the
 // static preview shown on the create form before Ctrl+Y opens it, so a
 // draft looks the same whether or not you've opened the real editor yet.
+// Each carries its own Background so every styled run — not just the gaps
+// an outer wrap can reach — paints black.
 var (
-	composeKeyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7dcfff")).Bold(true)
-	composeStringStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#e0af68"))
-	composeCommentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89")).Italic(true)
+	composeKeyStyle     = lipgloss.NewStyle().Background(composeEditorBG).Foreground(lipgloss.Color("#7dcfff")).Bold(true)
+	composeStringStyle  = lipgloss.NewStyle().Background(composeEditorBG).Foreground(lipgloss.Color("#e0af68"))
+	composeCommentStyle = lipgloss.NewStyle().Background(composeEditorBG).Foreground(lipgloss.Color("#565f89")).Italic(true)
 )
 
 func newEditorArea() editorArea {
@@ -76,7 +84,7 @@ func newEditorArea() editorArea {
 		ed:               ed,
 		CursorStyle:      lipgloss.NewStyle().Reverse(true),
 		SelectedStyle:    lipgloss.NewStyle().Reverse(true),
-		PlaceholderStyle: lipgloss.NewStyle().Faint(true),
+		PlaceholderStyle: lipgloss.NewStyle().Background(composeEditorBG).Faint(true),
 		KeyStyle:         composeKeyStyle,
 		StringStyle:      composeStringStyle,
 		CommentStyle:     composeCommentStyle,
@@ -143,7 +151,12 @@ func (e editorArea) View() string {
 			case "comment":
 				return e.CommentStyle.Render(text)
 			default:
-				return text
+				// Plain runs (indentation, punctuation, unquoted scalars)
+				// have no syntax color of their own but still need the
+				// black background — otherwise they fall through to
+				// whatever's behind the editor the moment a styled run
+				// next to them has already reset.
+				return lipgloss.NewStyle().Background(composeEditorBG).Render(text)
 			}
 		},
 	}

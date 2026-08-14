@@ -163,17 +163,30 @@ func (m Model) createEditorOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			status = "vim · " + mode
 		}
 	}
-	lint := renderer.Styles.DetailMeta.Render("valid YAML")
+	// Every segment gets the panel's own background explicitly — the outer
+	// Width wrap only paints padding it appends itself, not the gap after
+	// whatever segment happens to render last, so without this the trailing
+	// space past the lint message fell through to the raw terminal default
+	// instead of matching the panel.
+	panelBG := renderer.Styles.OverlayBody.GetBackground()
+	lint := renderer.Styles.DetailMeta.Background(panelBG).Render("valid YAML")
 	if err := lintComposeYAML(editor.Value()); err != nil {
 		lint = renderer.Styles.StatusError.Render(short(err.Error(), max(20, contentWidth-50)))
 	}
-	header := lipgloss.NewStyle().Width(contentWidth).Render(
-		renderer.Styles.DetailMeta.Render("Editing override YAML  ·  "+status+"  ·  ") + lint)
+	header := lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(
+		renderer.Styles.DetailMeta.Background(panelBG).Render("Editing override YAML  ·  "+status+"  ·  ") + lint)
+
+	// The editor's own styling (see editor_area.go) covers every styled
+	// character run, but ripple pads unfilled rows below short documents
+	// with bare empty strings and doesn't right-pad short lines itself —
+	// wrapping the whole block here fills both with black instead of the
+	// panel's normal background.
+	editorBody := lipgloss.NewStyle().Width(contentWidth).Background(composeEditorBG).Render(editor.View())
 
 	body := strings.Join([]string{
 		header,
 		"",
-		editor.View(),
+		editorBody,
 		"",
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
