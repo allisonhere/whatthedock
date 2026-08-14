@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,7 +39,7 @@ func (m Model) View() string {
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
 		Left:  m.statusLeft(renderer),
-		Right: "j/k move  space expand  / filter  l logs  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  q quit",
+		Right: "j/k move  space expand  / filter  n create  l logs  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  A about  q quit",
 	}
 	return topbar + "\n" + renderer.Render(tideui.Layout{
 		Width:        m.width,
@@ -1300,6 +1301,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 			{key: "space", label: "fold"},
 			{key: "/", label: "filter"},
 			{key: "r", label: "refresh"},
+			{key: "n", label: "new"},
 		}
 		if row := m.currentRow(); row != nil && row.container != nil {
 			actions = append(actions, paneAction{key: "s", label: "start/stop"})
@@ -1353,6 +1355,12 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/?/q", Label: "close"}))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
 		return &overlay
+	case overlayAbout:
+		width := min(82, max(46, m.width-8))
+		content := renderer.RenderSoftBody(width, m.aboutText(renderer, aboutContentWidth(m.width))+"\n\n"+
+			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/A/q", Label: "close"}))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "about", Content: content, Width: width})
+		return &overlay
 	case overlayFilter:
 		width := min(72, max(40, m.width-8))
 		input := renderer.Styles.InputFocused.Width(max(20, width-8)).Render(m.filterDraft)
@@ -1384,6 +1392,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.settingsOverlay(renderer)
 	case overlaySystems:
 		return m.systemsOverlay(renderer)
+	case overlayCreate:
+		return m.createOverlay(renderer)
 	case overlayCopy:
 		return m.copyOverlay(renderer)
 	case overlayOpen:
@@ -1642,6 +1652,7 @@ func helpText() string {
 		"Space          expand/collapse project",
 		"/              filter projects, services, containers",
 		"s              start/stop selected container",
+		"n              create container or Compose service",
 		"r              refresh",
 		"Alt+r          restart selected container",
 		"c              copy selected detail",
@@ -1661,8 +1672,227 @@ func helpText() string {
 		"Systems: enter switch, t test, a add, e edit, d delete",
 		"Ctrl+K         command palette",
 		"?              keyboard help",
+		"A              about screen",
 		"q              quit",
 	}, "\n")
+}
+
+// aboutContentWidth mirrors the panel-width math in renderOverlay so the
+// ember simulation (run in Update, which has no renderer) samples ignition
+// at the same columns the view actually draws.
+func aboutContentWidth(termWidth int) int {
+	return min(82, max(46, termWidth-8)) - 4
+}
+
+func (m Model) aboutText(renderer tideui.Renderer, width int) string {
+	logo := aboutLogo()
+	rows := len(logo)
+	grid := make([][]aboutCell, aboutEmberRows+rows)
+	for i := 0; i < aboutEmberRows; i++ {
+		grid[i] = blankCells(width)
+	}
+	for row, line := range logo {
+		delays := rowDelays(m.aboutIgnite, row, width)
+		grid[aboutEmberRows+row] = burnRevealCells(line, row, rows, delays, m.aboutFrame)
+	}
+	for _, e := range m.aboutEmbers {
+		gr := aboutEmberRows + roundToInt(e.row)
+		if gr < 0 || gr >= len(grid) {
+			continue
+		}
+		cells := grid[gr]
+		gc := roundToInt(e.col)
+		if gc < 0 || gc >= len(cells) {
+			continue
+		}
+		t := float64(e.age) / float64(e.life)
+		if t > 1 {
+			t = 1
+		}
+		cells[gc] = aboutCell{r: e.glyph, color: lerpHexColor("#ffcc66", "#3a2a20", t)}
+	}
+
+	lines := make([]string, 0, len(grid))
+	for _, cells := range grid {
+		lines = append(lines, lipgloss.NewStyle().Width(width).Render(renderCells(cells)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func aboutLogo() []string {
+	return []string{
+		" __    __ _           _  _____ _             ___           _    ",
+		"/ / /\\ \\ \\ |__   __ _| |/__   \\ |__   ___   /   \\___   ___| | __",
+		"\\ \\/  \\/ / '_ \\ / _` | __|/ /\\/ '_ \\ / _ \\ / /\\ / _ \\ / __| |/ /",
+		" \\  /\\  /| | | | (_| | |_/ /  | | | |  __// /_// (_) | (__|   < ",
+		"  \\/  \\/ |_| |_|\\__,_|\\__\\/   |_| |_|\\___/___,' \\___/ \\___|_|\\_\\",
+		"                                                                ",
+	}
+}
+
+const (
+	// aboutEmberRows reserves blank rows above the logo for embers to rise
+	// into once they detach from a burning glyph.
+	aboutEmberRows = 3
+	// aboutMaxEmbers caps live particles so the about screen stays cheap to
+	// render even if it's left open for a while.
+	aboutMaxEmbers = 48
+)
+
+// aboutCell is one rune of the about-screen render grid: a glyph plus the
+// hex color it should be painted, so embers can be composited on top of the
+// burn-reveal text without re-parsing ANSI output.
+type aboutCell struct {
+	r     rune
+	color string
+}
+
+func blankCells(width int) []aboutCell {
+	cells := make([]aboutCell, width)
+	for i := range cells {
+		cells[i] = aboutCell{r: ' '}
+	}
+	return cells
+}
+
+func renderCells(cells []aboutCell) string {
+	var out strings.Builder
+	for _, c := range cells {
+		if c.r == ' ' || c.color == "" {
+			out.WriteRune(' ')
+			continue
+		}
+		out.WriteString(colorRune(c.r, c.color))
+	}
+	return out.String()
+}
+
+// burnRevealCells renders one logo row at a given frame, using a
+// precomputed per-column ignition delay (see aboutIgnitionOrder) rather
+// than a formula, so the flame front follows the randomized connected burn
+// order instead of a uniform radial wipe.
+func burnRevealCells(line string, row int, rows int, delays []int, frame int) []aboutCell {
+	width := len(delays)
+	runes := []rune(centerPlainText(line, width))
+	cells := make([]aboutCell, len(runes))
+	for col, r := range runes {
+		if r == ' ' {
+			cells[col] = aboutCell{r: ' '}
+			continue
+		}
+		delay := 0
+		if col < len(delays) {
+			delay = delays[col]
+		}
+		progress := frame - delay
+		switch {
+		case progress < 0:
+			cells[col] = aboutCell{r: r, color: "#837373"}
+		case progress < 6:
+			cells[col] = aboutCell{r: burnGlyph(r, row, col, progress), color: burnColor(progress)}
+		default:
+			cells[col] = aboutCell{r: r, color: burnFinalColor(row, rows)}
+		}
+	}
+	return cells
+}
+
+func burnReveal(line string, row int, rows int, delays []int, frame int) string {
+	return renderCells(burnRevealCells(line, row, rows, delays, frame))
+}
+
+func centerPlainText(line string, width int) string {
+	runes := []rune(line)
+	if width <= len(runes) {
+		return line
+	}
+	left := (width - len(runes)) / 2
+	right := width - len(runes) - left
+	return strings.Repeat(" ", left) + line + strings.Repeat(" ", right)
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+// burnGlyph textures the ignition instant so the burn looks like flame
+// licking across the glyph rather than a flat color wipe: full block
+// characters at the white-hot instant (progress 0), cooling through half
+// blocks and quarter blocks, down to a fading ember, before settling on the
+// original character.
+func burnGlyph(original rune, row int, col int, progress int) rune {
+	switch progress {
+	case 0:
+		return flameChar(row, col, []rune{'█', '▓', '▉'})
+	case 1:
+		return flameChar(row, col, []rune{'▀', '▄', '█'})
+	case 2:
+		return flameChar(row, col, []rune{'▙', '▟', '▛', '▜'})
+	case 3:
+		return flameChar(row, col, []rune{'▖', '▗', '▘', '▝'})
+	case 4:
+		return '.'
+	default:
+		return original
+	}
+}
+
+func flameChar(row int, col int, options []rune) rune {
+	return options[(row*11+col*7)%len(options)]
+}
+
+func roundToInt(v float64) int {
+	if v >= 0 {
+		return int(v + 0.5)
+	}
+	return -int(-v + 0.5)
+}
+
+func burnColor(progress int) string {
+	colors := []string{"#ffffff", "#fff75d", "#fe650d", "#8a003c", "#510100", "#510100"}
+	return colors[clamp(progress, 0, len(colors)-1)]
+}
+
+func burnFinalColor(row int, rows int) string {
+	if rows <= 1 {
+		return "#ffff1c"
+	}
+	t := float64(row) / float64(rows-1)
+	return lerpHexColor("#00c3ff", "#ffff1c", t)
+}
+
+func colorRune(r rune, color string) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(string(r))
+}
+
+func lerpHexColor(from string, to string, t float64) string {
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	fr, fg, fb := parseHexColor(from)
+	tr, tg, tb := parseHexColor(to)
+	return fmt.Sprintf("#%02x%02x%02x",
+		int(float64(fr)+float64(tr-fr)*t+0.5),
+		int(float64(fg)+float64(tg-fg)*t+0.5),
+		int(float64(fb)+float64(tb-fb)*t+0.5),
+	)
+}
+
+func parseHexColor(value string) (int, int, int) {
+	value = strings.TrimPrefix(value, "#")
+	if len(value) != 6 {
+		return 255, 255, 255
+	}
+	r, _ := strconv.ParseInt(value[0:2], 16, 0)
+	g, _ := strconv.ParseInt(value[2:4], 16, 0)
+	b, _ := strconv.ParseInt(value[4:6], 16, 0)
+	return int(r), int(g), int(b)
 }
 
 func formatPorts(ports []domain.Port) string {

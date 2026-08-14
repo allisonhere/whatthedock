@@ -185,6 +185,55 @@ func (p *Provider) StartContainer(_ context.Context, id domain.ResourceID) error
 	return nil
 }
 
+func (p *Provider) CreateContainer(_ context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	id := fmt.Sprintf("demo-created-%d", len(p.containers)+1)
+	name := strings.TrimSpace(spec.Name)
+	if name == "" {
+		name = id
+	}
+	ctr := domain.Container{
+		ID:            domain.ResourceID{Host: p.host.ID, ID: id},
+		Name:          name,
+		Image:         spec.Image,
+		Command:       strings.Join(spec.Command, " "),
+		Created:       time.Now(),
+		State:         domain.StateStopped,
+		Status:        "Created",
+		Env:           append([]string(nil), spec.Env...),
+		RestartPolicy: spec.RestartPolicy,
+		Labels:        map[string]string{},
+	}
+	if spec.Start {
+		ctr.State = domain.StateRunning
+		ctr.Status = "Up 1 second"
+	}
+	for _, binding := range spec.Ports {
+		ctr.Ports = append(ctr.Ports, domain.Port{
+			IP:      binding.HostIP,
+			Private: binding.ContainerPort,
+			Public:  binding.HostPort,
+			Type:    binding.Protocol,
+		})
+	}
+	for _, binding := range spec.Mounts {
+		mountType := "volume"
+		if strings.HasPrefix(binding.Source, "/") {
+			mountType = "bind"
+		}
+		ctr.Mounts = append(ctr.Mounts, domain.Mount{
+			Type:        mountType,
+			Source:      binding.Source,
+			Destination: binding.Destination,
+			ReadWrite:   !binding.ReadOnly,
+		})
+	}
+	p.containers[id] = ctr
+	p.logs[id] = []string{"container created from WhatTheDock"}
+	return ctr.ID, nil
+}
+
 func (p *Provider) StopContainer(_ context.Context, id domain.ResourceID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -68,6 +68,7 @@ Docker socket paths must be present.
 | `Enter` | Select/open, or expand/collapse Compose project |
 | `Space` | Expand/collapse Compose project |
 | `/` | Filter projects, services, and containers |
+| `n` | Create container or Compose service draft |
 | `s` | Start/stop selected container |
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
@@ -88,8 +89,10 @@ Docker socket paths must be present.
 | `S` | Manage local and remote Docker systems |
 | `,` / `Ctrl+,` | Settings |
 | `Ctrl+S` in settings/forms | Save changes |
+| `o` / `Ctrl+O` in Compose create form | Browse for local Compose files |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
+| `A` | About screen with Burn-style ANSI splash animation |
 | `q` | Quit |
 
 Mouse row selection and wheel navigation are enabled where the terminal and
@@ -156,6 +159,11 @@ make vet
 make build
 ```
 
+More detail:
+
+- [Container and Compose creation workflow](docs/creation.md)
+- [Engineering handoff](docs/handoff.md)
+
 ## Current Features
 
 - Connects through the official Docker Go client using Docker defaults.
@@ -175,6 +183,15 @@ make build
   graph colors, log color mode, log health color, deltas, refresh interval, and
   default activity pane.
 - Starts, stops, restarts, and refreshes containers.
+- Drafts new Compose services or standalone containers in a keyboard-first
+  creation overlay with live generated previews and local-only validation.
+  Standalone drafts can be created and started after an explicit confirmation.
+  Compose drafts write a `compose.whatthedock.<service>.yml` override beside the
+  selected local Compose file after first validating a temporary override with
+  `docker compose config`, then run `docker compose up -d <service>` after
+  confirmation. The Compose file field includes a local file browser for finding
+  `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`, and
+  `docker-compose*.yaml` files.
 - Copies selected container IDs, images, Compose metadata, ports, mounts, and
   labels via terminal OSC52 clipboard escape sequences.
 - Opens published ports, bind mounts, and Compose config paths from the
@@ -199,6 +216,7 @@ WhatTheDock.
 ## Planned Features
 
 - Docker event stream.
+- Full Compose file editing and merge-aware service updates.
 - Exec shell workflow.
 - Open/copy actions for environment values.
 - Deeper problem detection for orphaned, stale, and resource-heavy Docker

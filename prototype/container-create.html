@@ -1,0 +1,808 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>WhatTheDock Container Creation Prototype</title>
+	<meta name="description" content="Static WhatTheDock prototype for Compose service and standalone container creation workflows.">
+	<style>
+		:root {
+			color-scheme: dark;
+			--bg: #101216;
+			--panel: #151820;
+			--panel-strong: #1b202a;
+			--panel-soft: #12151c;
+			--line: #2a303c;
+			--line-hot: #78a6ff;
+			--text: #d8dee9;
+			--muted: #8994a3;
+			--dim: #5f6977;
+			--green: #80c990;
+			--blue: #7dcfff;
+			--yellow: #e5c07b;
+			--red: #ff7b86;
+			--violet: #c792ea;
+			--status: #0c0f14;
+			--shadow: rgba(0, 0, 0, 0.52);
+			--focus: #d5a43a;
+			font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		html,
+		body {
+			min-height: 100%;
+		}
+
+		body {
+			margin: 0;
+			background: var(--bg);
+			color: var(--text);
+			font-size: 14px;
+			line-height: 1.4;
+		}
+
+		button,
+		input,
+		select,
+		textarea {
+			font: inherit;
+		}
+
+		button:focus-visible,
+		input:focus-visible,
+		select:focus-visible,
+		textarea:focus-visible {
+			outline: 2px solid var(--focus);
+			outline-offset: 2px;
+		}
+
+		.shell {
+			min-height: 100vh;
+			display: grid;
+			grid-template-rows: minmax(0, 1fr) auto;
+			padding: 12px;
+			gap: 8px;
+		}
+
+		.panes {
+			display: grid;
+			grid-template-columns: minmax(220px, 0.9fr) minmax(280px, 1.15fr) minmax(260px, 1fr);
+			gap: 8px;
+			min-height: 0;
+		}
+
+		.pane {
+			min-width: 0;
+			min-height: 0;
+			border: 1px solid var(--line);
+			background: var(--panel);
+			display: grid;
+			grid-template-rows: auto minmax(0, 1fr) auto;
+			overflow: hidden;
+		}
+
+		.pane.focused {
+			border-color: var(--line-hot);
+			box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line-hot), transparent 60%);
+		}
+
+		.pane-title,
+		.status-bar {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 12px;
+			background: var(--status);
+			color: var(--muted);
+			min-height: 30px;
+			padding: 5px 9px;
+			white-space: nowrap;
+			overflow: hidden;
+		}
+
+		.pane-title strong,
+		.status-host {
+			color: var(--text);
+			font-weight: 700;
+		}
+
+		.pane-title span,
+		.status-right {
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+
+		.pane-body {
+			padding: 8px;
+			overflow: hidden;
+		}
+
+		.row {
+			display: grid;
+			grid-template-columns: auto minmax(0, 1fr) auto;
+			gap: 8px;
+			align-items: center;
+			min-height: 28px;
+			padding: 3px 6px;
+			color: var(--muted);
+		}
+
+		.row strong,
+		.row .name {
+			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.row.selected {
+			background: var(--panel-strong);
+			color: var(--text);
+		}
+
+		.row.muted {
+			color: var(--dim);
+		}
+
+		.row .suffix {
+			color: var(--muted);
+			white-space: nowrap;
+		}
+
+		.row .state-running,
+		.green {
+			color: var(--green);
+		}
+
+		.row .state-warn,
+		.yellow {
+			color: var(--yellow);
+		}
+
+		.blue {
+			color: var(--blue);
+		}
+
+		.violet {
+			color: var(--violet);
+		}
+
+		.red {
+			color: var(--red);
+		}
+
+		.section-title {
+			color: var(--text);
+			font-weight: 700;
+			text-transform: uppercase;
+			margin: 10px 0 4px;
+		}
+
+		.section-title:first-child {
+			margin-top: 0;
+		}
+
+		.field {
+			display: grid;
+			grid-template-columns: 86px minmax(0, 1fr) auto;
+			gap: 8px;
+			min-height: 24px;
+			align-items: start;
+			color: var(--muted);
+		}
+
+		.field b {
+			color: var(--muted);
+			font-weight: 400;
+		}
+
+		.field span {
+			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: var(--text);
+		}
+
+		.footer {
+			display: flex;
+			gap: 8px;
+			align-items: center;
+			min-height: 32px;
+			padding: 5px 8px;
+			border-top: 1px solid var(--line);
+			overflow: hidden;
+		}
+
+		.hint {
+			display: inline-flex;
+			align-items: center;
+			min-width: 0;
+			white-space: nowrap;
+			color: var(--muted);
+		}
+
+		.hint kbd {
+			border: 1px solid var(--line);
+			background: var(--panel-strong);
+			color: var(--blue);
+			font: inherit;
+			font-weight: 700;
+			padding: 1px 5px;
+			margin-right: 4px;
+			border-radius: 2px;
+		}
+
+		.status-bar {
+			border: 1px solid var(--line);
+		}
+
+		.status-message {
+			color: var(--green);
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+
+		.overlay-backdrop {
+			position: fixed;
+			inset: 0;
+			display: grid;
+			place-items: center;
+			padding: 18px;
+			background: rgba(7, 9, 12, 0.62);
+		}
+
+		.modal {
+			width: min(1120px, 100%);
+			max-height: min(760px, calc(100vh - 36px));
+			display: grid;
+			grid-template-rows: auto minmax(0, 1fr) auto;
+			border: 1px solid var(--line-hot);
+			background: var(--panel-soft);
+			box-shadow: 0 28px 80px var(--shadow);
+			overflow: hidden;
+		}
+
+		.modal-title {
+			display: flex;
+			justify-content: space-between;
+			gap: 12px;
+			align-items: center;
+			padding: 9px 12px;
+			background: var(--status);
+			border-bottom: 1px solid var(--line);
+		}
+
+		.modal-title strong {
+			color: var(--text);
+		}
+
+		.modal-title span {
+			color: var(--muted);
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.modal-body {
+			min-height: 0;
+			display: grid;
+			grid-template-columns: minmax(300px, 0.95fr) minmax(320px, 1.05fr);
+			gap: 1px;
+			background: var(--line);
+			overflow: hidden;
+		}
+
+		.form-panel,
+		.preview-panel {
+			min-width: 0;
+			min-height: 0;
+			background: var(--panel);
+			padding: 12px;
+			overflow: auto;
+		}
+
+		.mode-tabs {
+			display: grid;
+			grid-template-columns: 1fr 1fr;
+			gap: 6px;
+			margin-bottom: 12px;
+		}
+
+		.mode-tabs button,
+		.action-button {
+			border: 1px solid var(--line);
+			background: var(--panel-soft);
+			color: var(--muted);
+			min-height: 34px;
+			padding: 6px 10px;
+			cursor: pointer;
+		}
+
+		.mode-tabs button.active,
+		.action-button.primary {
+			border-color: var(--line-hot);
+			color: var(--text);
+			background: var(--panel-strong);
+		}
+
+		.action-button.primary {
+			color: var(--green);
+		}
+
+		.form-grid {
+			display: grid;
+			gap: 10px;
+		}
+
+		label {
+			display: grid;
+			gap: 4px;
+			color: var(--muted);
+		}
+
+		label span {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+		}
+
+		label em {
+			color: var(--dim);
+			font-style: normal;
+		}
+
+		input,
+		select,
+		textarea {
+			width: 100%;
+			border: 1px solid var(--line);
+			background: #0d1016;
+			color: var(--text);
+			padding: 7px 8px;
+			min-height: 34px;
+			border-radius: 0;
+		}
+
+		textarea {
+			resize: vertical;
+			min-height: 72px;
+		}
+
+		.preview-head {
+			display: flex;
+			justify-content: space-between;
+			align-items: baseline;
+			gap: 12px;
+			margin-bottom: 8px;
+		}
+
+		.preview-head strong {
+			color: var(--text);
+		}
+
+		.preview-head span {
+			color: var(--muted);
+			white-space: nowrap;
+		}
+
+		pre {
+			margin: 0;
+			white-space: pre-wrap;
+			word-break: break-word;
+			color: var(--text);
+			background: #0d1016;
+			border: 1px solid var(--line);
+			padding: 10px;
+			min-height: 286px;
+		}
+
+		.validation {
+			margin-top: 10px;
+			border: 1px solid var(--line);
+			background: #0d1016;
+			padding: 8px;
+			color: var(--muted);
+			min-height: 44px;
+		}
+
+		.modal-footer {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 12px;
+			padding: 8px 10px;
+			background: var(--status);
+			border-top: 1px solid var(--line);
+		}
+
+		.hints {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 8px;
+			min-width: 0;
+		}
+
+		.actions {
+			display: flex;
+			gap: 8px;
+			flex-shrink: 0;
+		}
+
+		@media (max-width: 900px) {
+			.shell {
+				padding: 8px;
+			}
+
+			.panes {
+				grid-template-columns: 1fr;
+				grid-auto-rows: minmax(180px, auto);
+			}
+
+			.modal-body {
+				grid-template-columns: 1fr;
+			}
+
+			.modal-footer {
+				align-items: stretch;
+				flex-direction: column;
+			}
+
+			.actions {
+				width: 100%;
+			}
+
+			.action-button {
+				flex: 1;
+			}
+		}
+	</style>
+</head>
+<body>
+	<main class="shell" aria-label="WhatTheDock container creation prototype">
+		<section class="panes" aria-label="WhatTheDock panes">
+			<article class="pane" aria-labelledby="projects-title">
+				<header class="pane-title">
+					<strong id="projects-title">Projects</strong>
+					<span>tree</span>
+				</header>
+				<div class="pane-body">
+					<div class="row"><span class="green">▾</span><strong>media</strong><span class="suffix">3</span></div>
+					<div class="row muted"><span></span><span class="name">  jellyfin</span><span class="suffix state-running">running</span></div>
+					<div class="row selected"><span class="green">●</span><span class="name">  redis-cache</span><span class="suffix">draft</span></div>
+					<div class="row muted"><span></span><span class="name">  radarr</span><span class="suffix">stopped</span></div>
+					<div class="row"><span class="green">▾</span><strong>monitoring</strong><span class="suffix">2</span></div>
+					<div class="row muted"><span></span><span class="name">  grafana</span><span class="suffix state-running">running</span></div>
+					<div class="row muted"><span></span><span class="name">  prometheus</span><span class="suffix state-running">running</span></div>
+					<div class="row"><span></span><strong>Standalone</strong><span class="suffix">1</span></div>
+					<div class="row muted"><span></span><span class="name">  watchtower</span><span class="suffix state-warn">exited</span></div>
+				</div>
+				<footer class="footer" aria-label="Project pane keys">
+					<span class="hint"><kbd>enter</kbd>select</span>
+					<span class="hint"><kbd>space</kbd>fold</span>
+					<span class="hint"><kbd>/</kbd>filter</span>
+					<span class="hint"><kbd>n</kbd>new</span>
+				</footer>
+			</article>
+
+			<article class="pane focused" aria-labelledby="activity-title">
+				<header class="pane-title">
+					<strong id="activity-title">Activity</strong>
+					<span>create preview</span>
+				</header>
+				<div class="pane-body">
+					<div class="section-title">Compose</div>
+					<div class="row selected"><span class="green">✓</span><span class="name">docker compose config</span><span class="suffix">ready</span></div>
+					<div class="row"><span class="blue">+</span><span class="name">service redis-cache</span><span class="suffix">new</span></div>
+					<div class="row"><span class="yellow">!</span><span class="name">published port 6379</span><span class="suffix">local</span></div>
+					<div class="section-title">Apply Plan</div>
+					<div class="field"><b>File</b><span>/srv/media/compose.yml</span><em>local</em></div>
+					<div class="field"><b>Action</b><span>up -d redis-cache</span><em>confirm</em></div>
+					<div class="field"><b>Refresh</b><span>Docker state after apply</span><em>manual</em></div>
+				</div>
+				<footer class="footer" aria-label="Activity pane keys">
+					<span class="hint"><kbd>ctrl+s</kbd>validate</span>
+					<span class="hint"><kbd>ctrl+enter</kbd>create</span>
+					<span class="hint"><kbd>esc</kbd>cancel</span>
+				</footer>
+			</article>
+
+			<article class="pane" aria-labelledby="inspector-title">
+				<header class="pane-title">
+					<strong id="inspector-title">redis-cache</strong>
+					<span>details</span>
+				</header>
+				<div class="pane-body">
+					<div class="section-title">Runtime</div>
+					<div class="field"><b>Status</b><span class="yellow">draft</span><em></em></div>
+					<div class="field"><b>Restart</b><span>unless-stopped</span><em></em></div>
+					<div class="section-title">Image</div>
+					<div class="field"><b>Image</b><span class="blue">redis:7-alpine</span><em></em></div>
+					<div class="section-title">Compose</div>
+					<div class="field"><b>Project</b><span class="green">media</span><em></em></div>
+					<div class="field"><b>Service</b><span class="green">redis-cache</span><em></em></div>
+					<div class="field"><b>Config</b><span>/srv/media/compose.yml</span><em></em></div>
+					<div class="section-title">Network</div>
+					<div class="field"><b>Ports</b><span class="yellow">6379:6379</span><em></em></div>
+					<div class="section-title">Files</div>
+					<div class="field"><b>Mounts</b><span class="violet">redis-data:/data</span><em></em></div>
+				</div>
+				<footer class="footer" aria-label="Inspector pane keys">
+					<span class="hint"><kbd>s</kbd>start/stop</span>
+					<span class="hint"><kbd>l</kbd>logs</span>
+					<span class="hint"><kbd>c</kbd>copy</span>
+					<span class="hint"><kbd>o</kbd>open</span>
+				</footer>
+			</article>
+		</section>
+
+		<footer class="status-bar" aria-label="Status">
+			<span><span class="status-host"> local </span> compose create ready</span>
+			<span class="status-message" id="status">edit draft, then validate with Ctrl+S</span>
+			<span class="status-right">WhatTheDock · prototype</span>
+		</footer>
+	</main>
+
+	<div class="overlay-backdrop">
+		<section class="modal" role="dialog" aria-modal="true" aria-labelledby="create-title">
+			<header class="modal-title">
+				<strong id="create-title">whatthedock · create</strong>
+				<span id="mode-summary">Compose service · local system</span>
+			</header>
+
+			<div class="modal-body">
+				<form class="form-panel" id="create-form">
+					<div class="mode-tabs" role="tablist" aria-label="Creation mode">
+						<button type="button" class="active" id="compose-tab" data-mode="compose" role="tab" aria-selected="true">Compose service</button>
+						<button type="button" id="standalone-tab" data-mode="standalone" role="tab" aria-selected="false">Standalone container</button>
+					</div>
+
+					<div class="form-grid" id="compose-fields">
+						<label>
+							<span>Project <em>existing</em></span>
+							<input name="project" value="media" autocomplete="off">
+						</label>
+						<label>
+							<span>Service name <em>required</em></span>
+							<input name="service" value="redis-cache" autocomplete="off">
+						</label>
+						<label>
+							<span>Image <em>required</em></span>
+							<input name="image" value="redis:7-alpine" autocomplete="off">
+						</label>
+						<label>
+							<span>Ports <em>one per line</em></span>
+							<textarea name="ports">6379:6379</textarea>
+						</label>
+						<label>
+							<span>Mounts <em>one per line</em></span>
+							<textarea name="mounts">redis-data:/data</textarea>
+						</label>
+						<label>
+							<span>Environment <em>KEY=value</em></span>
+							<textarea name="env">REDIS_APPENDONLY=yes</textarea>
+						</label>
+						<label>
+							<span>Restart policy</span>
+							<select name="restart">
+								<option selected>unless-stopped</option>
+								<option>always</option>
+								<option>on-failure</option>
+								<option>no</option>
+							</select>
+						</label>
+						<label>
+							<span>Compose file <em>local only</em></span>
+							<input name="composeFile" value="/srv/media/compose.yml" autocomplete="off">
+						</label>
+					</div>
+
+					<div class="form-grid" id="standalone-fields" hidden>
+						<label>
+							<span>Container name <em>required</em></span>
+							<input name="containerName" value="redis-cache" autocomplete="off">
+						</label>
+						<label>
+							<span>Image <em>required</em></span>
+							<input name="standaloneImage" value="redis:7-alpine" autocomplete="off">
+						</label>
+						<label>
+							<span>Command</span>
+							<input name="command" value="redis-server --appendonly yes" autocomplete="off">
+						</label>
+						<label>
+							<span>Ports <em>one per line</em></span>
+							<textarea name="standalonePorts">6379:6379</textarea>
+						</label>
+						<label>
+							<span>Mounts <em>one per line</em></span>
+							<textarea name="standaloneMounts">redis-data:/data</textarea>
+						</label>
+						<label>
+							<span>Environment <em>KEY=value</em></span>
+							<textarea name="standaloneEnv">REDIS_APPENDONLY=yes</textarea>
+						</label>
+						<label>
+							<span>Restart policy</span>
+							<select name="standaloneRestart">
+								<option selected>unless-stopped</option>
+								<option>always</option>
+								<option>on-failure</option>
+								<option>no</option>
+							</select>
+						</label>
+					</div>
+				</form>
+
+				<aside class="preview-panel" aria-labelledby="preview-title">
+					<div class="preview-head">
+						<strong id="preview-title">Generated preview</strong>
+						<span id="preview-kind">compose yaml</span>
+					</div>
+					<pre id="preview" tabindex="0"></pre>
+					<div class="validation" id="validation" role="status" aria-live="polite">
+						<span class="muted">No validation run yet.</span>
+					</div>
+				</aside>
+			</div>
+
+			<footer class="modal-footer">
+				<div class="hints" aria-label="Modal keys">
+					<span class="hint"><kbd>tab</kbd>next field</span>
+					<span class="hint"><kbd>shift+tab</kbd>previous field</span>
+					<span class="hint"><kbd>ctrl+s</kbd>validate</span>
+					<span class="hint"><kbd>ctrl+enter</kbd>create</span>
+					<span class="hint"><kbd>esc</kbd>cancel</span>
+				</div>
+				<div class="actions">
+					<button type="button" class="action-button" id="validate">Validate</button>
+					<button type="button" class="action-button primary" id="create">Create</button>
+				</div>
+			</footer>
+		</section>
+	</div>
+
+	<script>
+		const form = document.querySelector("#create-form");
+		const composeFields = document.querySelector("#compose-fields");
+		const standaloneFields = document.querySelector("#standalone-fields");
+		const preview = document.querySelector("#preview");
+		const previewKind = document.querySelector("#preview-kind");
+		const validation = document.querySelector("#validation");
+		const status = document.querySelector("#status");
+		const modeSummary = document.querySelector("#mode-summary");
+		const modeButtons = [...document.querySelectorAll("[data-mode]")];
+		let mode = "compose";
+
+		function lines(value) {
+			return value.split("\n").map((item) => item.trim()).filter(Boolean);
+		}
+
+		function field(name) {
+			return form.elements[name]?.value.trim() || "";
+		}
+
+		function yamlList(items, indent) {
+			if (!items.length) {
+				return "";
+			}
+			const space = " ".repeat(indent);
+			return items.map((item) => `${space}- ${item}`).join("\n") + "\n";
+		}
+
+		function renderCompose() {
+			const service = field("service") || "new-service";
+			const image = field("image") || "image:tag";
+			const ports = lines(field("ports"));
+			const mounts = lines(field("mounts"));
+			const env = lines(field("env"));
+			const restart = field("restart") || "unless-stopped";
+			return `services:
+  ${service}:
+    image: ${image}
+    restart: ${restart}
+${ports.length ? "    ports:\n" + yamlList(ports, 6) : ""}${mounts.length ? "    volumes:\n" + yamlList(mounts, 6) : ""}${env.length ? "    environment:\n" + yamlList(env, 6) : ""}`;
+		}
+
+		function renderStandalone() {
+			const args = [
+				"docker run -d",
+				`--name ${field("containerName") || "new-container"}`,
+				`--restart ${field("standaloneRestart") || "unless-stopped"}`,
+				...lines(field("standalonePorts")).map((port) => `-p ${port}`),
+				...lines(field("standaloneMounts")).map((mount) => `-v ${mount}`),
+				...lines(field("standaloneEnv")).map((env) => `-e ${env}`),
+				field("standaloneImage") || "image:tag",
+				field("command")
+			].filter(Boolean);
+			return args.join(" \\\n  ");
+		}
+
+		function updatePreview() {
+			if (mode === "compose") {
+				preview.textContent = renderCompose();
+				previewKind.textContent = "compose yaml";
+				modeSummary.textContent = "Compose service · local system";
+			} else {
+				preview.textContent = renderStandalone();
+				previewKind.textContent = "docker run summary";
+				modeSummary.textContent = "Standalone container · Docker API";
+			}
+		}
+
+		function setMode(nextMode) {
+			mode = nextMode;
+			composeFields.hidden = mode !== "compose";
+			standaloneFields.hidden = mode !== "standalone";
+			modeButtons.forEach((button) => {
+				const active = button.dataset.mode === mode;
+				button.classList.toggle("active", active);
+				button.setAttribute("aria-selected", String(active));
+			});
+			validation.innerHTML = '<span class="muted">No validation run yet.</span>';
+			status.textContent = mode === "compose" ? "compose service draft selected" : "standalone container draft selected";
+			updatePreview();
+			const firstInput = mode === "compose" ? composeFields.querySelector("input") : standaloneFields.querySelector("input");
+			firstInput?.focus();
+		}
+
+		function validateDraft() {
+			const name = mode === "compose" ? field("service") : field("containerName");
+			const image = mode === "compose" ? field("image") : field("standaloneImage");
+			if (!name || !image) {
+				validation.innerHTML = '<span class="red">Validation failed:</span> name and image are required.';
+				status.textContent = "validation failed";
+				return false;
+			}
+			if (mode === "compose") {
+				validation.innerHTML = `<span class="green">Validation passed:</span> docker compose -f ${field("composeFile") || "compose.yml"} config`;
+			} else {
+				validation.innerHTML = '<span class="green">Validation passed:</span> Docker create request is complete.';
+			}
+			status.textContent = "draft validated";
+			return true;
+		}
+
+		function createDraft() {
+			if (!validateDraft()) {
+				return;
+			}
+			const label = mode === "compose" ? field("service") : field("containerName");
+			validation.innerHTML = `<span class="green">Ready to create:</span> ${label}. Real app would ask for confirmation before applying.`;
+			status.textContent = mode === "compose" ? "compose apply confirmation pending" : "container create confirmation pending";
+		}
+
+		modeButtons.forEach((button) => {
+			button.addEventListener("click", () => setMode(button.dataset.mode));
+		});
+		form.addEventListener("input", () => {
+			updatePreview();
+			status.textContent = "draft changed";
+		});
+		form.addEventListener("change", updatePreview);
+		document.querySelector("#validate").addEventListener("click", validateDraft);
+		document.querySelector("#create").addEventListener("click", createDraft);
+		document.addEventListener("keydown", (event) => {
+			if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+				event.preventDefault();
+				validateDraft();
+			}
+			if (event.ctrlKey && event.key === "Enter") {
+				event.preventDefault();
+				createDraft();
+			}
+			if (event.key === "Escape") {
+				status.textContent = "cancel requested; unsaved draft would prompt";
+			}
+		});
+
+		updatePreview();
+		form.elements.service.focus();
+	</script>
+</body>
+</html>

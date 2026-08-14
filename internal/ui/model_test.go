@@ -34,6 +34,7 @@ type fakeProvider struct {
 	starts     int
 	stops      int
 	restarts   int
+	creates    []app.ContainerCreateSpec
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -64,6 +65,14 @@ func (f *fakeProvider) StopContainer(context.Context, domain.ResourceID) error {
 func (f *fakeProvider) RestartContainer(context.Context, domain.ResourceID) error {
 	f.restarts++
 	return nil
+}
+func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
+	f.creates = append(f.creates, spec)
+	id := domain.ResourceID{Host: f.host.ID, ID: "created-" + spec.Name}
+	ctr := domain.Container{ID: id, Name: spec.Name, Image: spec.Image, State: domain.StateRunning, Status: "Up 1 second", Labels: map[string]string{}}
+	f.containers[id.ID] = ctr
+	f.snapshot.Standalone = append(f.snapshot.Standalone, ctr)
+	return id, nil
 }
 func (f *fakeProvider) Close() error { return nil }
 
@@ -1487,6 +1496,56 @@ func TestSettingsSaveErrorShowsStatus(t *testing.T) {
 	}
 }
 
+func TestSettingsVimModeTogglePersistsAndAppliesToEditors(t *testing.T) {
+	t.Cleanup(func() { setEditorVimMode(false) })
+	path := filepath.Join(t.TempDir(), "settings.json")
+	model := testModel()
+	model.settingsPath = path
+	model.openSettingsOverlay()
+
+	rows := model.settingsRows()
+	cursor := -1
+	for i, row := range rows {
+		if row.label == "Vim mode" {
+			cursor = i
+			break
+		}
+	}
+	if cursor == -1 {
+		t.Fatal("settings rows missing Vim mode")
+	}
+	model.settingsCursor = cursor
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.settingsDraft.CreateVim {
+		t.Fatal("settingsDraft.CreateVim = false after toggle, want true")
+	}
+	if editorVimMode {
+		t.Fatal("editorVimMode applied before save, want unchanged until ctrl+s")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+	if !model.settings.CreateVim {
+		t.Fatal("settings.CreateVim = false after save, want true")
+	}
+	if !editorVimMode {
+		t.Fatal("editorVimMode = false after save, want true")
+	}
+	if !newEditorArea().vimMode() {
+		t.Fatal("editor created after save is not in vim mode")
+	}
+
+	saved, err := config.LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() err = %v", err)
+	}
+	if saved.CreateVim == nil || !*saved.CreateVim {
+		t.Fatalf("persisted CreateVim = %v, want true", saved.CreateVim)
+	}
+}
+
 func TestCommandPaletteCanOpenSettings(t *testing.T) {
 	model := testModel()
 	updated, cmd := model.executeCommand("open-settings")
@@ -2246,6 +2305,8 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 		{"systems", overlaySystems, "whatthedock · systems"},
 		{"copy", overlayCopy, "whatthedock · copy"},
 		{"open", overlayOpen, "whatthedock · open"},
+		{"create", overlayCreate, "whatthedock · create"},
+		{"about", overlayAbout, "whatthedock · about"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			model.overlay = tc.overlay
@@ -2263,10 +2324,181 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	model.overlay = overlayHelp
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"Ctrl+S         save settings/forms", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete"} {
+	for _, want := range []string{"Ctrl+S         save settings/forms", "n              create container or Compose service", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete", "A              about screen"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	model = updated.(Model)
+
+	if model.overlay != overlayAbout {
+		t.Fatalf("overlay = %v, want about", model.overlay)
+	}
+	if cmd == nil {
+		t.Fatal("about shortcut returned nil cmd, want animation tick")
+	}
+	firstRaw := model.View()
+	first := ansi.Strip(firstRaw)
+	if !strings.Contains(first, "whatthedock · about") {
+		t.Fatalf("about overlay missing expected copy:\n%s", first)
+	}
+
+	firstFrame := model.aboutFrame
+	updated, cmd = model.Update(aboutTickMsg{})
+	model = updated.(Model)
+	if model.aboutFrame != firstFrame+1 {
+		t.Fatalf("aboutFrame = %d, want %d", model.aboutFrame, firstFrame+1)
+	}
+	if cmd == nil {
+		t.Fatal("about tick returned nil cmd while overlay is open")
+	}
+	secondRaw := model.View()
+	if firstRaw == secondRaw {
+		t.Fatal("about view did not change after animation tick")
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay after esc = %v, want none", model.overlay)
+	}
+	if cmd != nil {
+		t.Fatalf("esc returned cmd %v, want nil", cmd)
+	}
+	updated, cmd = model.Update(aboutTickMsg{})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("about tick returned cmd after overlay closed")
+	}
+}
+
+func TestBurnRevealCentersMultilineWhatupdocAndBurnsFromCenter(t *testing.T) {
+	logo := aboutLogo()
+	if len(logo) < 4 {
+		t.Fatalf("about logo has %d rows, want multi-line title", len(logo))
+	}
+	joined := strings.Join(logo, "\n")
+	for _, want := range []string{"_` |", "__,_|", "___,'", "(_|", "(__|"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("about logo missing readable segment %q:\n%s", want, joined)
+		}
+	}
+
+	width := 80
+	line := logo[1]
+	delays := aboutIgnitionOrder(logo, width)
+	rowDelays := delays[1]
+
+	first := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, -1000))
+	if !strings.Contains(first, strings.TrimSpace(line)) {
+		t.Fatalf("unlit frame = %q, want centered logo row", first)
+	}
+
+	settled := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, 1000))
+	if !strings.Contains(settled, strings.TrimSpace(line)) {
+		t.Fatalf("settled frame = %q, want centered logo row", settled)
+	}
+}
+
+// TestAboutIgnitionOrderCoversEveryGlyphExactlyOnce checks that the
+// randomized connected-burn spread (see aboutIgnitionOrder) reaches every
+// non-space glyph in the logo exactly once, so nothing is ever left unlit
+// or double-counted.
+func TestAboutIgnitionOrderCoversEveryGlyphExactlyOnce(t *testing.T) {
+	logo := aboutLogo()
+	width := 80
+	delays := aboutIgnitionOrder(logo, width)
+
+	seen := map[int]bool{}
+	total := 0
+	for row, line := range logo {
+		padded := []rune(centerPlainText(line, width))
+		if len(delays[row]) != len(padded) {
+			t.Fatalf("row %d: delay row len = %d, want %d", row, len(delays[row]), len(padded))
+		}
+		for col, r := range padded {
+			if r == ' ' {
+				continue
+			}
+			total++
+			d := delays[row][col]
+			if d < 0 {
+				t.Fatalf("cell (%d,%d) never ignited", row, col)
+			}
+			if seen[d] {
+				t.Fatalf("ignition order %d assigned to more than one cell", d)
+			}
+			seen[d] = true
+		}
+	}
+	for i := 0; i < total; i++ {
+		if !seen[i] {
+			t.Fatalf("ignition order missing index %d of %d burnable cells", i, total)
+		}
+	}
+}
+
+// TestBurnRevealCellProgressesThroughIgnitionStages checks a single cell's
+// render at, just after, and long after its own ignition delay: unlit,
+// visibly mid-burn, then settled back to its original glyph.
+func TestBurnRevealCellProgressesThroughIgnitionStages(t *testing.T) {
+	logo := aboutLogo()
+	width := 80
+	delays := aboutIgnitionOrder(logo, width)
+	row := 1
+	line := logo[row]
+	rowDelays := delays[row]
+
+	padded := []rune(centerPlainText(line, width))
+	col := -1
+	for i, r := range padded {
+		if r != ' ' {
+			col = i
+			break
+		}
+	}
+	if col == -1 {
+		t.Fatal("expected a burnable column in row 1")
+	}
+	d := rowDelays[col]
+
+	unlit := burnRevealCells(line, row, len(logo), rowDelays, d-1)[col]
+	if unlit.color != "#837373" {
+		t.Fatalf("cell before ignition = %+v, want unlit gray", unlit)
+	}
+
+	burning := burnRevealCells(line, row, len(logo), rowDelays, d+2)[col]
+	if burning.color == "#837373" {
+		t.Fatalf("cell mid-burn still unlit: %+v", burning)
+	}
+	if burning == unlit {
+		t.Fatalf("mid-burn cell identical to unlit cell, want visible change")
+	}
+
+	settled := burnRevealCells(line, row, len(logo), rowDelays, d+10)[col]
+	if settled.r != padded[col] {
+		t.Fatalf("settled glyph = %q, want original %q", settled.r, padded[col])
+	}
+}
+
+func TestAboutCommandPaletteActionOpensOverlay(t *testing.T) {
+	model := testModel()
+
+	updated, cmd := model.executeCommand(actions.OpenAbout)
+	model = updated.(Model)
+
+	if model.overlay != overlayAbout {
+		t.Fatalf("overlay = %v, want about", model.overlay)
+	}
+	if cmd == nil {
+		t.Fatal("about command returned nil cmd, want animation tick")
 	}
 }
 

@@ -11,6 +11,7 @@ type ID string
 
 const (
 	Refresh        ID = "refresh"
+	Create         ID = "create-container"
 	StartStop      ID = "start-stop-container"
 	Restart        ID = "restart-container"
 	FocusLogs      ID = "focus-logs"
@@ -22,6 +23,7 @@ const (
 	OpenFilter     ID = "open-filter"
 	OpenLogFilter  ID = "open-log-filter"
 	OpenHelp       ID = "open-help"
+	OpenAbout      ID = "open-about"
 	OpenTheme      ID = "open-theme"
 	OpenSettings   ID = "open-settings"
 	OpenSystems    ID = "open-systems"
@@ -46,6 +48,7 @@ func Catalog(selected *domain.Container) []Command {
 	}
 	return []Command{
 		{ID: Refresh, Name: "Refresh Docker state", Shortcut: "r", Aliases: []string{"reload"}, Enabled: true},
+		{ID: Create, Name: "Create container or Compose service", Shortcut: "n", Aliases: []string{"new", "run", "compose service"}, Enabled: true},
 		{ID: StartStop, Name: "Start or stop selected container", Shortcut: "s", Aliases: []string{"start", "stop"}, Enabled: canStartStop, Run: startStop},
 		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Run: restart},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer},
@@ -57,6 +60,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: OpenFilter, Name: "Filter projects and containers", Shortcut: "/", Aliases: []string{"search"}, Enabled: true},
 		{ID: OpenLogFilter, Name: "Filter visible logs", Shortcut: "/", Aliases: []string{"logs search", "log search"}, Enabled: hasContainer},
 		{ID: OpenHelp, Name: "Show keyboard help", Shortcut: "?", Aliases: []string{"keys"}, Enabled: true},
+		{ID: OpenAbout, Name: "Show about screen", Shortcut: "A", Aliases: []string{"about", "splash", "credits"}, Enabled: true},
 		{ID: OpenTheme, Name: "Choose theme", Shortcut: "T", Aliases: []string{"themes", "palette", "colors"}, Enabled: true},
 		{ID: OpenSettings, Name: "Open settings", Shortcut: ",", Aliases: []string{"preferences", "options", "config"}, Enabled: true},
 		{ID: OpenSystems, Name: "Manage systems", Shortcut: "S", Aliases: []string{"hosts", "profiles", "docker hosts", "remote"}, Enabled: true},

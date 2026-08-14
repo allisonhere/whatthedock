@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -12,7 +13,9 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -127,6 +130,75 @@ func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options 
 		Tail:       tail,
 		Timestamps: true,
 	})
+}
+
+func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
+	exposedPorts, portBindings, err := createPortBindings(spec.Ports)
+	if err != nil {
+		return domain.ResourceID{}, err
+	}
+	resp, err := p.cli.ContainerCreate(ctx,
+		&container.Config{
+			Image:        spec.Image,
+			Cmd:          spec.Command,
+			Env:          spec.Env,
+			ExposedPorts: exposedPorts,
+		},
+		&container.HostConfig{
+			PortBindings:  portBindings,
+			Mounts:        createMounts(spec.Mounts),
+			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyMode(spec.RestartPolicy)},
+		},
+		nil,
+		nil,
+		spec.Name,
+	)
+	if err != nil {
+		return domain.ResourceID{}, err
+	}
+	id := domain.ResourceID{Host: p.host.ID, ID: resp.ID}
+	if spec.Start {
+		if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+			return id, err
+		}
+	}
+	return id, nil
+}
+
+func createPortBindings(bindings []app.PortBinding) (nat.PortSet, nat.PortMap, error) {
+	exposed := nat.PortSet{}
+	ports := nat.PortMap{}
+	for _, binding := range bindings {
+		protocol := strings.TrimSpace(binding.Protocol)
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		port := nat.Port(fmt.Sprintf("%d/%s", binding.ContainerPort, protocol))
+		exposed[port] = struct{}{}
+		host := nat.PortBinding{HostPort: fmt.Sprintf("%d", binding.HostPort)}
+		if strings.TrimSpace(binding.HostIP) != "" {
+			host.HostIP = strings.TrimSpace(binding.HostIP)
+		}
+		ports[port] = append(ports[port], host)
+	}
+	return exposed, ports, nil
+}
+
+func createMounts(bindings []app.MountBinding) []mount.Mount {
+	mounts := make([]mount.Mount, 0, len(bindings))
+	for _, binding := range bindings {
+		mountType := mount.TypeVolume
+		if filepath.IsAbs(binding.Source) {
+			mountType = mount.TypeBind
+		}
+		mounts = append(mounts, mount.Mount{
+			Type:     mountType,
+			Source:   binding.Source,
+			Target:   binding.Destination,
+			ReadOnly: binding.ReadOnly,
+		})
+	}
+	return mounts
 }
 
 func FromStats(host domain.HostID, containerID string, stats container.StatsResponse) domain.ContainerStats {

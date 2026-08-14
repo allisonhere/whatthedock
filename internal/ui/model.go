@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/allisonhere/ripple"
 	"github.com/allisonhere/tideui"
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	tea "github.com/charmbracelet/bubbletea"
@@ -55,6 +57,8 @@ const (
 	overlayCopy
 	overlayOpen
 	overlaySystems
+	overlayCreate
+	overlayAbout
 )
 
 type graphStyle int
@@ -105,6 +109,7 @@ type appSettings struct {
 	LogColor        logColorMode
 	LogHealthColor  bool
 	ShowDeltas      bool
+	CreateVim       bool
 	StatsRefresh    time.Duration
 	DefaultActivity activityMode
 }
@@ -274,10 +279,196 @@ type Model struct {
 
 	copyCursor int
 	openCursor int
+
+	createDraft  createDraft
+	createField  createField
+	createCursor int
+
+	createBrowsing   bool
+	createBrowseDir  string
+	createFiles      []createFileEntry
+	createFileCursor int
+	createFileErr    string
+
+	createEditingCompose bool
+	createEditor         editorArea
+
+	aboutFrame  int
+	aboutEmbers []aboutEmber
+	aboutIgnite [][]int
+}
+
+// aboutPoint is a (row, col) cell in the about-screen logo grid.
+type aboutPoint struct{ row, col int }
+
+// aboutIgnitionOrder grows a randomized connected fire through the logo's
+// non-space cells the way terminaltexteffects' "burn" effect does: pick a
+// seed glyph, then repeatedly ignite a random unburnt neighbor of an
+// already-burning cell. The result is one ragged, connected blob of flame
+// spreading through the text, instead of a uniform radial wipe. It returns
+// a per-row slice of ignition frame-offsets, indexed by column in the
+// width-padded row.
+func aboutIgnitionOrder(logo []string, width int) [][]int {
+	rows := len(logo)
+	grid := make([][]rune, rows)
+	delay := make([][]int, rows)
+	for r, line := range logo {
+		grid[r] = []rune(centerPlainText(line, width))
+		delay[r] = make([]int, len(grid[r]))
+		for c := range delay[r] {
+			delay[r][c] = -1
+		}
+	}
+	burnableAt := func(r, c int) bool {
+		return r >= 0 && r < rows && c >= 0 && c < len(grid[r]) && grid[r][c] != ' '
+	}
+
+	var burnable []aboutPoint
+	for r := range grid {
+		for c := range grid[r] {
+			if burnableAt(r, c) {
+				burnable = append(burnable, aboutPoint{r, c})
+			}
+		}
+	}
+	if len(burnable) == 0 {
+		return delay
+	}
+
+	dirs := []aboutPoint{{row: -1}, {row: 1}, {col: -1}, {col: 1}}
+	lit := func(p aboutPoint) bool { return delay[p.row][p.col] >= 0 }
+	order := 0
+	ignite := func(p aboutPoint) {
+		delay[p.row][p.col] = order
+		order++
+	}
+
+	seed := burnable[rand.Intn(len(burnable))]
+	ignite(seed)
+	frontier := []aboutPoint{seed}
+
+	for len(frontier) > 0 {
+		idx := rand.Intn(len(frontier))
+		cur := frontier[idx]
+
+		var candidates []aboutPoint
+		for _, d := range dirs {
+			next := aboutPoint{row: cur.row + d.row, col: cur.col + d.col}
+			if burnableAt(next.row, next.col) && !lit(next) {
+				candidates = append(candidates, next)
+			}
+		}
+		if len(candidates) == 0 {
+			frontier = append(frontier[:idx], frontier[idx+1:]...)
+			continue
+		}
+		pick := candidates[rand.Intn(len(candidates))]
+		ignite(pick)
+		frontier = append(frontier, pick)
+	}
+
+	// Glyphs with no 4-connected path to the seed (isolated punctuation)
+	// still need to catch fire eventually.
+	for _, p := range burnable {
+		if !lit(p) {
+			ignite(p)
+		}
+	}
+	return delay
+}
+
+// aboutEmber is a single spark/smoke particle drifting off the about-screen
+// logo while it burns and, at a low trickle, while it sits fully lit.
+type aboutEmber struct {
+	row, col float64
+	vy, vx   float64
+	glyph    rune
+	age      int
+	life     int
+}
+
+var aboutEmberGlyphs = []rune{'.', '\'', '`', ',', '*', '#'}
+
+func newAboutEmber(row, col int) aboutEmber {
+	return aboutEmber{
+		row:   float64(row),
+		col:   float64(col),
+		vy:    0.06 + rand.Float64()*0.08,
+		vx:    (rand.Float64() - 0.5) * 0.06,
+		glyph: aboutEmberGlyphs[rand.Intn(len(aboutEmberGlyphs))],
+		life:  16 + rand.Intn(18),
+	}
+}
+
+// tickAboutEmbers advances existing embers and spawns new ones: a burst of
+// sparks off glyphs that are actively igniting this frame, plus a slow
+// ambient trickle off glyphs that have already settled, so the logo keeps
+// smoldering for as long as the about screen stays open.
+// rowDelays returns the ignition-delay row for row/width, falling back to
+// "already lit" if the precomputed grid doesn't match (e.g. a resize
+// happened after the about screen opened) rather than panicking.
+func rowDelays(ignite [][]int, row int, width int) []int {
+	if row >= 0 && row < len(ignite) && len(ignite[row]) == width {
+		return ignite[row]
+	}
+	return make([]int, width)
+}
+
+func (m Model) tickAboutEmbers() Model {
+	width := aboutContentWidth(m.width)
+	if width <= 0 {
+		return m
+	}
+
+	live := m.aboutEmbers[:0]
+	for _, e := range m.aboutEmbers {
+		e.row -= e.vy
+		e.col += e.vx
+		e.age++
+		if e.age >= e.life || e.row < -float64(aboutEmberRows)-1 {
+			continue
+		}
+		live = append(live, e)
+	}
+	m.aboutEmbers = live
+	if len(m.aboutEmbers) >= aboutMaxEmbers {
+		return m
+	}
+
+	logo := aboutLogo()
+	for row, line := range logo {
+		padded := []rune(centerPlainText(line, width))
+		delays := rowDelays(m.aboutIgnite, row, len(padded))
+		for col, r := range padded {
+			if r == ' ' {
+				continue
+			}
+			progress := m.aboutFrame - delays[col]
+			var chance float64
+			switch {
+			case progress >= 0 && progress <= 2:
+				chance = 0.3
+			case progress >= 6:
+				chance = 0.008
+			default:
+				continue
+			}
+			if rand.Float64() >= chance {
+				continue
+			}
+			m.aboutEmbers = append(m.aboutEmbers, newAboutEmber(row, col))
+			if len(m.aboutEmbers) >= aboutMaxEmbers {
+				return m
+			}
+		}
+	}
+	return m
 }
 
 var clipboardWriter io.Writer = os.Stderr
 var openTarget = defaultOpenTarget
+var applyComposeCreate = defaultApplyComposeCreate
+var composeCommand = runDockerCompose
 
 type snapshotMsg struct {
 	snapshot domain.Snapshot
@@ -344,6 +535,8 @@ type eventRefreshTickMsg struct{}
 
 type logTickMsg struct{}
 
+type aboutTickMsg struct{}
+
 type openDoneMsg struct {
 	label string
 	err   error
@@ -366,6 +559,12 @@ type systemTestMsg struct {
 	err    error
 }
 
+type createDoneMsg struct {
+	name string
+	id   domain.ResourceID
+	err  error
+}
+
 func NewModel(provider app.Provider) Model {
 	return NewModelWithSettings(provider, config.Settings{}, "")
 }
@@ -379,6 +578,7 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
 	settings := defaultSettings()
 	settings.applyPersisted(persisted)
+	setEditorVimMode(settings.CreateVim)
 	persisted = config.NormalizeSystems(persisted)
 	return Model{
 		provider:      provider,
@@ -445,6 +645,9 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 	if persisted.ShowDeltas != nil {
 		s.ShowDeltas = *persisted.ShowDeltas
 	}
+	if persisted.CreateVim != nil {
+		s.CreateVim = *persisted.CreateVim
+	}
 	if persisted.StatsRefresh != "" {
 		if interval, err := time.ParseDuration(persisted.StatsRefresh); err == nil && interval > 0 {
 			s.StatsRefresh = interval
@@ -463,12 +666,14 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 func (s appSettings) persisted() config.Settings {
 	showDeltas := s.ShowDeltas
 	logHealthColor := s.LogHealthColor
+	createVim := s.CreateVim
 	return config.Settings{
 		GraphStyle:      s.GraphStyle.String(),
 		GraphColor:      s.GraphColor.String(),
 		LogColor:        s.LogColor.String(),
 		LogHealthColor:  &logHealthColor,
 		ShowDeltas:      &showDeltas,
+		CreateVim:       &createVim,
 		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
 		DefaultActivity: activityModeName(s.DefaultActivity),
 	}
@@ -624,6 +829,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, tickLogs()
+	case aboutTickMsg:
+		if m.overlay != overlayAbout {
+			return m, nil
+		}
+		m.aboutFrame++
+		m = m.tickAboutEmbers()
+		return m, tickAbout()
 	case statsMsg:
 		if msg.stats.ID != m.selectedID {
 			return m, nil
@@ -651,6 +863,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = msg.label+" complete", false
 		}
 		return m, m.refreshCmd()
+	case createDoneMsg:
+		m.overlay = overlayNone
+		if msg.err != nil {
+			m.status, m.statusErr = "create "+msg.name+": "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		if msg.id.ID != "" {
+			m.selectedID = msg.id
+			m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
+		}
+		m.status, m.statusErr = "created "+msg.name, false
+		return m, m.refreshCmd()
+	case ripple.SubmitMsg:
+		if m.createEditingCompose {
+			m.saveCreateEditor()
+		}
+		return m, nil
+	case ripple.CancelMsg:
+		if m.createEditingCompose {
+			m.cancelCreateEditor()
+		}
+		return m, nil
 	case openDoneMsg:
 		if msg.err != nil {
 			m.status, m.statusErr = "open "+msg.label+": "+msg.err.Error(), true
@@ -775,6 +1009,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.jumpLogMatch(1)
 			return m, nil
 		}
+		m.openCreateOverlay()
 	case "N":
 		if m.mode == activityLogs && strings.TrimSpace(m.logFilter) != "" {
 			m.focus = paneActivity
@@ -837,6 +1072,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "?":
 		m.overlay = overlayHelp
+	case "A":
+		return m.openAboutOverlay()
 	case "T":
 		m.openThemePicker()
 	case ",", "ctrl+,":
@@ -928,6 +1165,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "?" {
 			m.overlay = overlayNone
 		}
+	case overlayAbout:
+		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
+			m.overlay = overlayNone
+		}
 	case overlayCommandPalette:
 		return m.handleCommandPaletteKey(msg)
 	case overlayThemePicker:
@@ -950,6 +1191,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleCopyKey(msg)
 	case overlayOpen:
 		return m.handleOpenKey(msg)
+	case overlayCreate:
+		return m.handleCreateKey(msg)
 	}
 	return m, nil
 }
@@ -1578,6 +1821,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	switch id {
 	case actions.Refresh:
 		return m, m.refreshCmd()
+	case actions.Create:
+		m.openCreateOverlay()
 	case actions.StartStop:
 		return m, m.actionCmd(actions.StartStop, "start/stop")
 	case actions.Restart:
@@ -1619,6 +1864,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		}
 	case actions.OpenHelp:
 		m.overlay = overlayHelp
+	case actions.OpenAbout:
+		return m.openAboutOverlay()
 	case actions.OpenTheme:
 		m.openThemePicker()
 	case actions.OpenSettings:
@@ -1634,6 +1881,14 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
+	m.overlay = overlayAbout
+	m.aboutFrame = 24
+	m.aboutEmbers = nil
+	m.aboutIgnite = aboutIgnitionOrder(aboutLogo(), aboutContentWidth(m.width))
+	return m, tickAbout()
 }
 
 func (m *Model) openThemePicker() {
@@ -1873,6 +2128,8 @@ func (m Model) settingsRows() []settingsRow {
 		{label: "Log health color", value: onOff(settings.LogHealthColor)},
 		{label: "Behavior", kind: settingsRowSection},
 		{label: "Default pane", value: activityModeName(settings.DefaultActivity)},
+		{label: "Editor", kind: settingsRowSection},
+		{label: "Vim mode", value: onOff(settings.CreateVim)},
 		{label: "Maintenance", kind: settingsRowSection},
 		{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
 	}
@@ -1950,11 +2207,14 @@ func (m *Model) cycleSetting(index, direction int) {
 		m.settingsDraft.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
 	case "Default pane":
 		m.settingsDraft.DefaultActivity = activityMode(modIndex(int(m.settingsDraft.DefaultActivity)+direction, 3))
+	case "Vim mode":
+		m.settingsDraft.CreateVim = !m.settingsDraft.CreateVim
 	}
 }
 
 func (m *Model) saveSettingsDraft() {
 	m.settings = m.settingsDraft
+	setEditorVimMode(m.settings.CreateVim)
 	m.saveSettings()
 }
 
@@ -2750,6 +3010,10 @@ func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 
 func tickLogs() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return logTickMsg{} })
+}
+
+func tickAbout() tea.Cmd {
+	return tea.Tick(55*time.Millisecond, func(time.Time) tea.Msg { return aboutTickMsg{} })
 }
 
 func forwardLogs(in <-chan string, out chan<- string) {
