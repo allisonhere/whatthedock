@@ -292,19 +292,41 @@ func (p *LocalProvider) RemoveContainer(ctx context.Context, id domain.ResourceI
 	return p.cli.ContainerRemove(ctx, id.ID, container.RemoveOptions{Force: force})
 }
 
-// PullImage drains the pull's streamed JSON progress messages through
-// DisplayJSONMessagesStream (the same helper the docker CLI itself uses)
-// rather than io.Copy(io.Discard, ...) — a mid-stream failure (bad manifest,
-// layer checksum mismatch) shows up as an error field inside a JSON message,
-// not as a Go error from the reader, so a plain drain would silently report
-// success.
-func (p *LocalProvider) PullImage(ctx context.Context, image string) error {
+// PullImage decodes the pull's streamed JSON messages itself (rather than
+// delegating to jsonmessage.DisplayJSONMessagesStream, which formats them
+// for a human-readable io.Writer) so onProgress can drive a real status-bar
+// indicator instead of the messages being discarded. Error detection
+// mirrors DisplayJSONMessagesStream exactly (see JSONMessage.Display in the
+// vendored source): a message's Error field fails the pull; nothing else
+// does — in particular the deprecated ErrorMessage string field is never
+// checked, matching today's behavior.
+func (p *LocalProvider) PullImage(ctx context.Context, image string, onProgress func(app.PullProgress)) error {
 	rc, err := p.cli.ImagePull(ctx, image, imagetypes.PullOptions{})
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	return jsonmessage.DisplayJSONMessagesStream(rc, io.Discard, 0, false, nil)
+	dec := json.NewDecoder(rc)
+	for {
+		var msg jsonmessage.JSONMessage
+		if err := dec.Decode(&msg); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if msg.Error != nil {
+			return msg.Error
+		}
+		if onProgress != nil {
+			progress := app.PullProgress{Status: msg.Status, ID: msg.ID}
+			if msg.Progress != nil {
+				progress.Current = msg.Progress.Current
+				progress.Total = msg.Progress.Total
+			}
+			onProgress(progress)
+		}
+	}
 }
 
 func (p *LocalProvider) Close() error {

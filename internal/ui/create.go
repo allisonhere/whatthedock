@@ -312,6 +312,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.status, m.statusErr = "create: "+err.Error(), true
 					return m, nil
 				}
+				m.busy = true
 				m.status, m.statusErr = "applying compose service "+spec.Service, false
 				return m, m.createComposeCmd(spec)
 			}
@@ -321,6 +322,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.status, m.statusErr = "create: "+err.Error(), true
 				return m, nil
 			}
+			m.busy = true
 			m.status, m.statusErr = "creating "+spec.Name, false
 			return m, m.createContainerCmd(spec)
 		}

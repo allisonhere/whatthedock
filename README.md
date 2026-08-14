@@ -217,6 +217,11 @@ More detail:
   existing identity. Clone opens the create overlay prefilled with the
   original's full ports/mounts/env/restart/command under a new,
   `-clone`-suffixed name, producing an independent second container/service.
+  The status bar shows a spinner and phase text while Delete/Replicate/
+  Create are running, instead of going quiet until they finish — standalone
+  Replicate shows real per-layer pull progress (talking to the Docker API
+  directly), Compose operations show a phase label only (they shell out to
+  `docker compose`, which has no structured progress to surface).
 - Opens an interactive shell inside the selected running container (`e`),
   handing the real terminal to `docker exec -it` (preferring `bash`, falling
   back to `sh`) and resuming WhatTheDock when the session ends. Works against

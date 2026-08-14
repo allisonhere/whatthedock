@@ -20,13 +20,23 @@ type Provider interface {
 	StopContainer(context.Context, domain.ResourceID) error
 	RestartContainer(context.Context, domain.ResourceID) error
 	RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error
-	PullImage(ctx context.Context, image string) error
+	PullImage(ctx context.Context, image string, onProgress func(PullProgress)) error
 	Close() error
 }
 
 type LogOptions struct {
 	Tail   string
 	Follow bool
+}
+
+// PullProgress is one update from an in-progress image pull. Raw fields —
+// formatting into a display string is presentation logic and belongs in
+// internal/ui, not here.
+type PullProgress struct {
+	Status  string // e.g. "Downloading", "Extracting", "Pull complete"
+	ID      string // short layer/blob ID
+	Current int64  // bytes so far for this layer (0 if not byte-denominated)
+	Total   int64  // bytes total for this layer (0 if unknown)
 }
 
 type ContainerCreateSpec struct {

@@ -156,6 +156,20 @@ Done since this doc was first written:
   `tea.ExecProcess` terminal-handoff mechanism already used for the SSH
   password prompt, then resumes WhatTheDock. Works for SSH systems too, over
   the already-established socket tunnel (`systems.DockerHostFor`).
+- Delete/Replicate/Create-apply dispatch now sets `m.busy` and a status-bar
+  phase label immediately (previously Delete/Replicate showed nothing at
+  all until the final result, up to 2 minutes later for a slow pull). A
+  spinner animates from the shared `github.com/allisonhere/cli-spinners`
+  frame data, driven by the same tick that already animates the connected-
+  status dot (`m.statusPulseFrame`/`tickStatusPulse`). Standalone Replicate
+  additionally streams real Docker pull progress (`app.PullProgress`, via
+  `PullImage`'s `onProgress` callback) into `m.replicateProgress`, drained
+  one line per tick in the `statusPulseTickMsg` handler — Compose
+  Delete/Replicate/Create only get the spinner + a static phase label,
+  since `docker compose` is shelled out to and has no structured progress
+  to surface. If you touch dispatch for any of these actions again, keep
+  setting `m.busy`/the phase label there — it's easy to reintroduce a
+  silent fire-and-forget dispatch by accident.
 
 Remaining:
 

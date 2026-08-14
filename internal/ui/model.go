@@ -231,6 +231,7 @@ type Model struct {
 	filter          string
 	filterDraft     string
 	inspectorScroll int
+	helpScroll      int
 
 	logLines          []string
 	logFilter         string
@@ -299,6 +300,26 @@ type Model struct {
 	aboutFrame  int
 	aboutEmbers []aboutEmber
 	aboutIgnite [][]int
+
+	// statusPulseFrame drives the breathing green dot shown in the status
+	// bar in place of the "Docker connected" text once a system is up —
+	// ticks continuously for the life of the program (see tickStatusPulse),
+	// not scoped to any overlay.
+	statusPulseFrame int
+
+	// busy and replicateProgress drive the status-bar spinner. busy is set
+	// the moment a long-running action (compose apply/delete/replicate,
+	// standalone delete/replicate) dispatches and cleared when
+	// actionDoneMsg/createDoneMsg lands. replicateProgress carries real
+	// per-layer pull text for the one path with structured progress
+	// (standalone Replicate) — nil for every other busy action, which show
+	// the spinner with a static phase label only.
+	busy              bool
+	replicateProgress chan string
+
+	// eventsReconnecting mirrors the event-stream backoff loop so statusLeft
+	// can show it's happening instead of going silent for up to 30s.
+	eventsReconnecting bool
 }
 
 // aboutPoint is a (row, col) cell in the about-screen logo grid.
@@ -542,6 +563,8 @@ type logTickMsg struct{}
 
 type aboutTickMsg struct{}
 
+type statusPulseTickMsg struct{}
+
 type openDoneMsg struct {
 	label string
 	err   error
@@ -718,7 +741,7 @@ func whatthedockTheme() tideui.Theme {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshCmd(), m.startEventsCmd())
+	return tea.Batch(m.refreshCmd(), m.startEventsCmd(), tickStatusPulse())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -806,9 +829,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickLogs()
 	case eventsStartedMsg:
 		if msg.err != nil {
+			m.eventsReconnecting = true
 			m.advanceEventBackoff()
 			return m, m.eventsReconnectCmd()
 		}
+		m.eventsReconnecting = false
 		m.eventChan = msg.events
 		m.eventCancel = msg.cancel
 		m.eventBackoff = 0
@@ -826,6 +851,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.eventCancel()
 			m.eventCancel = nil
 		}
+		m.eventsReconnecting = true
 		m.advanceEventBackoff()
 		return m, m.eventsReconnectCmd()
 	case eventsReconnectTickMsg:
@@ -849,6 +875,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.aboutFrame++
 		m = m.tickAboutEmbers()
 		return m, tickAbout()
+	case statusPulseTickMsg:
+		m.statusPulseFrame++
+		m.drainReplicateProgress()
+		return m, tickStatusPulse()
 	case statsMsg:
 		if msg.stats.ID != m.selectedID {
 			return m, nil
@@ -870,6 +900,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statsErr = nil
 		return m, m.loadStatsCmd(msg.id)
 	case actionDoneMsg:
+		m.busy = false
+		m.replicateProgress = nil
 		if msg.err != nil {
 			m.status, m.statusErr = msg.label+": "+friendlyDockerError(msg.err), true
 		} else {
@@ -877,6 +909,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.refreshCmd()
 	case createDoneMsg:
+		m.busy = false
 		m.overlay = overlayNone
 		if msg.err != nil {
 			m.status, m.statusErr = "create "+msg.name+": "+friendlyDockerError(msg.err), true
@@ -1121,6 +1154,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "?":
 		m.overlay = overlayHelp
+		m.helpScroll = 0
 	case "A":
 		return m.openAboutOverlay()
 	case "T":
@@ -1223,8 +1257,21 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case overlayHelp:
-		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "?" {
+		switch msg.String() {
+		case "esc", "q", "?":
 			m.overlay = overlayNone
+		case "j", "down":
+			m.scrollHelp(1)
+		case "k", "up":
+			m.scrollHelp(-1)
+		case "pgdown":
+			m.scrollHelp(max(1, m.helpBodyBudget()-1))
+		case "pgup":
+			m.scrollHelp(-max(1, m.helpBodyBudget()-1))
+		case "g", "home":
+			m.scrollHelp(-len(helpLines))
+		case "G", "end":
+			m.scrollHelp(len(helpLines))
 		}
 	case overlayAbout:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
@@ -1301,11 +1348,15 @@ func (m Model) startDelete() (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "delete "+selected.Compose.Service+": "+err.Error(), true
 			return m, nil
 		}
+		m.busy = true
+		m.status, m.statusErr = "deleting "+selected.Compose.Service+"…", false
 		return m, m.deleteComposeCmd(spec)
 	}
 	provider := m.provider
 	id := selected.ID
 	label := "delete " + selected.DisplayName()
+	m.busy = true
+	m.status, m.statusErr = "deleting "+selected.DisplayName()+"…", false
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -1314,7 +1365,11 @@ func (m Model) startDelete() (tea.Model, tea.Cmd) {
 }
 
 // startReplicate dispatches to the Compose (pull + up -d) or standalone
-// (pull + remove + recreate with an identical spec) path.
+// (pull + remove + recreate with an identical spec) path. Standalone is the
+// only path with direct Docker API access to real pull progress, so it
+// wires PullImage's onProgress callback into m.replicateProgress (drained
+// each statusPulseTickMsg tick, see drainReplicateProgress) instead of just
+// a static phase label.
 func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -1326,6 +1381,8 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "replicate "+selected.Compose.Service+": "+err.Error(), true
 			return m, nil
 		}
+		m.busy = true
+		m.status, m.statusErr = "replicating "+selected.Compose.Service+"…", false
 		return m, m.replicateComposeCmd(spec)
 	}
 	spec, err := replicateContainerSpec(*selected)
@@ -1337,10 +1394,20 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	id := selected.ID
 	image := selected.Image
 	label := "replicate " + selected.DisplayName()
+	progress := make(chan string, 16)
+	m.busy = true
+	m.replicateProgress = progress
+	m.status, m.statusErr = "pulling "+image+"…", false
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
 		defer cancel()
-		if err := provider.PullImage(ctx, image); err != nil {
+		onProgress := func(p app.PullProgress) {
+			select {
+			case progress <- formatPullProgress(image, p):
+			default: // UI hasn't drained yet; drop, next tick catches up
+			}
+		}
+		if err := provider.PullImage(ctx, image, onProgress); err != nil {
 			return actionDoneMsg{label: label, err: err}
 		}
 		if err := provider.RemoveContainer(ctx, id, true); err != nil {
@@ -2060,6 +2127,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		}
 	case actions.OpenHelp:
 		m.overlay = overlayHelp
+		m.helpScroll = 0
 	case actions.OpenAbout:
 		return m.openAboutOverlay()
 	case actions.OpenTheme:
@@ -2745,6 +2813,11 @@ func (m *Model) scrollInspector(delta int) {
 	m.inspectorScroll = max(0, m.inspectorScroll+delta)
 }
 
+func (m *Model) scrollHelp(delta int) {
+	maxScroll := max(0, len(helpLines)-m.helpBodyBudget())
+	m.helpScroll = clamp(m.helpScroll+delta, 0, maxScroll)
+}
+
 func (m Model) inspectorVisibleRows() int {
 	return m.paneContentRows()
 }
@@ -3212,6 +3285,14 @@ func tickAbout() tea.Cmd {
 	return tea.Tick(55*time.Millisecond, func(time.Time) tea.Msg { return aboutTickMsg{} })
 }
 
+// tickStatusPulse drives the status bar's breathing connected-dot. Unlike
+// tickAbout it isn't scoped to an overlay — it reschedules itself
+// unconditionally for the life of the program, since the dot is part of
+// the persistent status bar, not a transient screen.
+func tickStatusPulse() tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return statusPulseTickMsg{} })
+}
+
 func forwardLogs(in <-chan string, out chan<- string) {
 	defer close(out)
 	for line := range in {
@@ -3236,6 +3317,25 @@ func cleanDockerLogLine(line string) string {
 		return line[8:]
 	}
 	return line
+}
+
+// drainReplicateProgress does a single non-blocking receive per call (not
+// drain-to-empty like drainLogs) — progress is a "latest wins" display, not
+// an append-only log, so grabbing at most one fresh line per
+// statusPulseTickMsg tick is correct and cheaper.
+func (m *Model) drainReplicateProgress() {
+	if m.replicateProgress == nil {
+		return
+	}
+	select {
+	case line, ok := <-m.replicateProgress:
+		if !ok {
+			m.replicateProgress = nil
+			return
+		}
+		m.status = line
+	default:
+	}
 }
 
 func (m *Model) drainLogs() {

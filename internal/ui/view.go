@@ -2,16 +2,19 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	sp "github.com/allisonhere/cli-spinners"
 	"github.com/allisonhere/tideui"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
@@ -451,8 +454,12 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 		stats = nil
 	}
 	history := m.statsHistory[ctr.ID]
+	header := renderer.Styles.DetailMeta.Render("")
+	if m.statsLoading {
+		header = renderer.Styles.DetailMeta.Render(spinnerGlyph(m.statusPulseFrame) + " loading stats…")
+	}
 	lines := []string{
-		renderer.Styles.DetailMeta.Render(""),
+		header,
 		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), "#7dcfff"),
 		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta), formatMemoryStats(stats), "#80c990"),
 		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
@@ -616,13 +623,38 @@ func staticStatGraph(value string, fallbackLevel int) statGraph {
 	return statGraph{static: value, fallbackLevel: fallbackLevel}
 }
 
+// renderStatRow builds the row's Text itself instead of leaving Prefix/
+// Text/Suffix alignment to RenderRow's alignRow: alignRow pads the gap
+// between Text and Suffix with bare, unstyled spaces baked directly into
+// the string, and RenderRow's own outer style only paints padding *it*
+// appends via Width(), not padding already present in the string it's
+// given — so that gap falls through to the raw terminal default the moment
+// anything before it (the meter or sparkline glyphs) has already emitted
+// its own background and reset. Computing the same budget alignRow would
+// (prefixWidth=9, one space before a non-empty suffix) and filling every
+// byte of it here, with an explicit background, leaves alignRow nothing
+// unstyled to pad.
 func renderStatRow(renderer tideui.Renderer, settings appSettings, width int, label string, graph statGraph, suffix string, color lipgloss.Color) string {
-	room := width - 9 - lipgloss.Width(suffix) - 2
-	if room < 8 {
-		return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Suffix: suffix}, width)
+	bg := renderer.Styles.Theme.Bg
+	const prefixWidth = 9
+	remaining := max(0, width-prefixWidth)
+	suffixWidth := lipgloss.Width(suffix)
+	gap := 0
+	if suffix != "" {
+		gap = 1
 	}
-	text := renderHybridGraph(renderer, settings, graph, color, room)
-	return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Text: text, Suffix: suffix}, width)
+	room := max(0, remaining-suffixWidth-gap)
+
+	var text string
+	if room >= 8 {
+		text = renderHybridGraph(renderer, settings, graph, color, room)
+	}
+	pad := lipgloss.NewStyle().Width(max(0, room-lipgloss.Width(text))).Background(bg).Render("")
+	line := text + pad
+	if suffix != "" {
+		line += lipgloss.NewStyle().Background(bg).Render(" ") + renderer.Styles.DetailBody.Render(suffix)
+	}
+	return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Text: line}, width)
 }
 
 func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph statGraph, color lipgloss.Color, width int) string {
@@ -650,7 +682,10 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	if delta != "" {
 		parts = append(parts, renderer.Styles.DetailMeta.Render(delta))
 	}
-	return strings.Join(parts, "  ")
+	// The gap between parts is otherwise a bare, unstyled string — same
+	// falls-through-to-default issue as the suffix above.
+	gap := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Render("  ")
+	return strings.Join(parts, gap)
 }
 
 func renderMeter(renderer tideui.Renderer, settings appSettings, level int, color lipgloss.Color) string {
@@ -1355,8 +1390,15 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	switch m.overlay {
 	case overlayHelp:
 		width := min(72, max(40, m.width-8))
-		content := renderer.RenderSoftBody(width, helpText()+"\n\n"+
-			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/?/q", Label: "close"}))
+		budget := m.helpBodyBudget()
+		scroll := clamp(m.helpScroll, 0, max(0, len(helpLines)-budget))
+		end := min(len(helpLines), scroll+budget)
+		hints := []tideui.SoftHint{{Key: "esc/?/q", Label: "close"}}
+		if len(helpLines) > budget {
+			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(helpLines))})
+		}
+		content := renderer.RenderSoftBody(width, strings.Join(helpLines[scroll:end], "\n")+"\n\n"+
+			renderer.RenderSoftHints(width-4, hints...))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
 		return &overlay
 	case overlayAbout:
@@ -1488,6 +1530,22 @@ func (m Model) openOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	return &overlay
 }
 
+// windowAroundCursor returns the [start, end) slice bounds into a total-item
+// list that keep cursor visible within a budget-sized window — the same
+// "viewport follows the selection" behavior a normal scrolling listbox has,
+// without needing separately persisted scroll state the way helpScroll does
+// (there's no cursor to follow in the plain-text help overlay).
+func windowAroundCursor(total, cursor, budget int) (start, end int) {
+	if total <= budget {
+		return 0, total
+	}
+	start = clamp(cursor-budget+1, 0, total-budget)
+	if cursor < start {
+		start = cursor
+	}
+	return start, start + budget
+}
+
 func (m Model) copyOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(82, max(46, m.width-8))
 	contentWidth := width - 4
@@ -1496,12 +1554,27 @@ func (m Model) copyOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if len(rows) == 0 {
 		lines = append(lines, renderer.Styles.DetailMeta.Render("No copyable details."))
 	} else {
-		for i, row := range rows {
+		budget := m.softOverlayBodyBudget()
+		rowBudget := budget
+		if len(rows) > budget {
+			// Reserve room for the "N more" indicator lines below so they
+			// can't themselves push the list past the overlay's budget.
+			rowBudget = max(1, budget-2)
+		}
+		start, end := windowAroundCursor(len(rows), m.copyCursor, rowBudget)
+		if start > 0 {
+			lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▲ %d more", start)))
+		}
+		for i := start; i < end; i++ {
+			row := rows[i]
 			lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{
 				Text:     row.label,
 				Suffix:   short(row.value, max(12, contentWidth-24)),
 				Selected: i == m.copyCursor,
 			}, contentWidth))
+		}
+		if end < len(rows) {
+			lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more", len(rows)-end)))
 		}
 	}
 	lines = append(lines, "", renderer.RenderSoftHints(contentWidth,
@@ -1695,6 +1768,21 @@ func (m Model) statusLeft(renderer tideui.Renderer) string {
 	if m.statusErr {
 		return renderer.Styles.StatusError.Render(prefix + m.status)
 	}
+	if m.busy {
+		// An in-flight action (delete/replicate/create-apply) is the most
+		// relevant thing to show right after an outright error, since the
+		// user just triggered it and previously saw nothing at all here for
+		// up to two minutes.
+		glyph := spinnerGlyph(m.statusPulseFrame)
+		color := pulseDotColor(m.statusPulseFrame, renderer.Styles.Theme.Unread)
+		spinner := lipgloss.NewStyle().Background(renderer.Styles.Theme.StatusBar).Foreground(lipgloss.Color(color)).Bold(true).Render(" " + glyph + " ")
+		return renderer.Styles.StatusSuccess.Render(prefix) + spinner + renderer.Styles.StatusBar.Render(m.status)
+	}
+	if m.eventsReconnecting {
+		// A dropped event stream is a real problem, but a quieter one than
+		// something the user is actively waiting on.
+		return renderer.Styles.StatusNotice.Render(prefix + spinnerGlyph(m.statusPulseFrame) + " reconnecting to Docker…")
+	}
 	if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
 		return renderer.Styles.StatusNotice.Render(prefix+"logs: "+filterStatus(m.logFilter, m.logLevel)) + renderer.Styles.StatusBar.Render(" "+m.status)
 	}
@@ -1704,40 +1792,101 @@ func (m Model) statusLeft(renderer tideui.Renderer) string {
 	if strings.TrimSpace(m.status) == "" {
 		return renderer.Styles.StatusBar.Render(prefix + m.status)
 	}
+	if m.status == "Docker connected" {
+		// A steady connection doesn't need to keep saying so in words — a
+		// breathing dot in place of the text is the same "all good" signal
+		// without permanently occupying the status line with static text.
+		dotColor := pulseDotColor(m.statusPulseFrame, renderer.Styles.Theme.Unread)
+		dot := lipgloss.NewStyle().Background(renderer.Styles.Theme.StatusBar).Foreground(lipgloss.Color(dotColor)).Bold(true).Render(" ● ")
+		return renderer.Styles.StatusSuccess.Render(prefix) + dot
+	}
 	return renderer.Styles.StatusSuccess.Render(prefix + m.status)
 }
 
+// pulseDotColor computes the connected-status dot's current color: a smooth
+// breathing fade between a dim base and the theme's own accent green, so
+// the pulse rides the same green every other "success" indicator uses
+// rather than a hardcoded color.
+func pulseDotColor(frame int, bright lipgloss.Color) string {
+	const period = 24.0 // ticks per full breathing cycle (150ms * 24 ≈ 3.6s)
+	t := (math.Sin(2*math.Pi*float64(frame)/period) + 1) / 2
+	return lerpHexColor("#16281c", string(bright), t)
+}
+
+// busySpinnerFrames sources its glyphs from the shared Tide-family
+// cli-spinners library rather than hand-rolling a frame set. Only the frame
+// data is used — the library's own Spinner/Start/Success machinery manages
+// the terminal cursor directly, which assumes it owns the terminal; inside
+// a Bubble Tea program the screen is already owned by the render loop, so
+// the frames are animated through that loop instead (see spinnerGlyph,
+// driven by the same m.statusPulseFrame tick as the connected-status dot).
+var busySpinnerFrames = sp.All["braille"].Frames
+
+func spinnerGlyph(frame int) string {
+	if len(busySpinnerFrames) == 0 {
+		return "•"
+	}
+	return busySpinnerFrames[frame%len(busySpinnerFrames)]
+}
+
+// helpLines is the full keyboard-help content. It's kept as a slice (not
+// just a joined string) so the help overlay can window it against the
+// terminal's actual height instead of relying on renderOverlay's silent
+// bottom-truncation, which drops any line past the terminal edge (see
+// placeBoxAt in tideui/layout.go: target >= totalHeight just skips the
+// line, with no indication anything was cut).
+var helpLines = []string{
+	"j / Down       next",
+	"k / Up         previous",
+	"Enter          select/open",
+	"Space          expand/collapse project",
+	"/              filter projects, services, containers",
+	"s              start/stop selected container",
+	"n              create container or Compose service",
+	"r              refresh",
+	"Alt+r          restart selected container",
+	"c              copy selected detail",
+	"o              open port, mount, or compose path",
+	"e              open shell in selected container",
+	"l              logs",
+	"/              filter logs while logs pane is focused",
+	"e / w / i / a  log errors, warnings, info, all",
+	"n / N          next/previous log search match",
+	"f / End        resume live log tail",
+	"x / Esc        clear active log filter",
+	"u              replicate: pull latest image, recreate",
+	"D              delete container or Compose override",
+	"C              clone under a new name",
+	"p              problems",
+	"g              stats graphs",
+	"T              theme picker",
+	",              settings",
+	"Ctrl+S         save settings/forms",
+	"S              systems",
+	"Systems: enter switch, t test, a add, e edit, d delete",
+	"Ctrl+K         command palette",
+	"?              keyboard help",
+	"A              about screen",
+	"q              quit",
+}
+
 func helpText() string {
-	return strings.Join([]string{
-		"j / Down       next",
-		"k / Up         previous",
-		"Enter          select/open",
-		"Space          expand/collapse project",
-		"/              filter projects, services, containers",
-		"s              start/stop selected container",
-		"n              create container or Compose service",
-		"r              refresh",
-		"Alt+r          restart selected container",
-		"c              copy selected detail",
-		"o              open port, mount, or compose path",
-		"l              logs",
-		"/              filter logs while logs pane is focused",
-		"e / w / i / a  log errors, warnings, info, all",
-		"n / N          next/previous log search match",
-		"f / End        resume live log tail",
-		"x / Esc        clear active log filter",
-		"p              problems",
-		"g              stats graphs",
-		"T              theme picker",
-		",              settings",
-		"Ctrl+S         save settings/forms",
-		"S              systems",
-		"Systems: enter switch, t test, a add, e edit, d delete",
-		"Ctrl+K         command palette",
-		"?              keyboard help",
-		"A              about screen",
-		"q              quit",
-	}, "\n")
+	return strings.Join(helpLines, "\n")
+}
+
+// softOverlayBodyBudget is how many body rows fit in a SoftPanelOverlay
+// before tideui's overlay compositor silently truncates the bottom (see
+// the comment on helpLines) — 4 lines of chrome outside the body content
+// (the title-bearing top border, RenderSoftBody's blank top/bottom pad,
+// and the bottom border) plus 2 more for the blank separator and hints
+// line every soft overlay in this file appends after its list/text body.
+func (m Model) softOverlayBodyBudget() int {
+	return max(3, (m.height-1)-6)
+}
+
+// helpBodyBudget is how many helpLines rows fit in the help overlay at once.
+func (m Model) helpBodyBudget() int {
+	return m.softOverlayBodyBudget()
 }
 
 // aboutContentWidth mirrors the panel-width math in renderOverlay so the
@@ -1748,6 +1897,12 @@ func aboutContentWidth(termWidth int) int {
 }
 
 func (m Model) aboutText(renderer tideui.Renderer, width int) string {
+	// Every cell — including blanks and the row's own right-padding — gets
+	// an explicit background matching the panel body. A Foreground-only
+	// style (or a bare unstyled space) falls through to whatever's behind
+	// it instead of the theme's own color, which looks fine by coincidence
+	// in a dark theme and glaringly wrong in a light one.
+	bg := renderer.Styles.OverlayBody.GetBackground()
 	logo := aboutLogo()
 	rows := len(logo)
 	grid := make([][]aboutCell, aboutEmberRows+rows)
@@ -1768,6 +1923,15 @@ func (m Model) aboutText(renderer tideui.Renderer, width int) string {
 		if gc < 0 || gc >= len(cells) {
 			continue
 		}
+		// Embers only render into empty space (the reserved rows above the
+		// logo, or gaps between glyphs) — never on top of a lit letter. An
+		// ember starts at its source glyph's own cell and only rises there
+		// slowly, so without this guard it spends many frames sitting
+		// directly over real text, replacing readable letters with spark
+		// punctuation instead of drifting past them.
+		if cells[gc].r != ' ' {
+			continue
+		}
 		t := float64(e.age) / float64(e.life)
 		if t > 1 {
 			t = 1
@@ -1777,7 +1941,7 @@ func (m Model) aboutText(renderer tideui.Renderer, width int) string {
 
 	lines := make([]string, 0, len(grid))
 	for _, cells := range grid {
-		lines = append(lines, lipgloss.NewStyle().Width(width).Render(renderCells(cells)))
+		lines = append(lines, lipgloss.NewStyle().Width(width).Background(bg).Render(renderCells(cells, bg)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1818,14 +1982,15 @@ func blankCells(width int) []aboutCell {
 	return cells
 }
 
-func renderCells(cells []aboutCell) string {
+func renderCells(cells []aboutCell, bg lipgloss.TerminalColor) string {
+	blank := lipgloss.NewStyle().Background(bg).Render(" ")
 	var out strings.Builder
 	for _, c := range cells {
 		if c.r == ' ' || c.color == "" {
-			out.WriteRune(' ')
+			out.WriteString(blank)
 			continue
 		}
-		out.WriteString(colorRune(c.r, c.color))
+		out.WriteString(colorRune(c.r, c.color, bg))
 	}
 	return out.String()
 }
@@ -1860,8 +2025,8 @@ func burnRevealCells(line string, row int, rows int, delays []int, frame int) []
 	return cells
 }
 
-func burnReveal(line string, row int, rows int, delays []int, frame int) string {
-	return renderCells(burnRevealCells(line, row, rows, delays, frame))
+func burnReveal(line string, row int, rows int, delays []int, frame int, bg lipgloss.TerminalColor) string {
+	return renderCells(burnRevealCells(line, row, rows, delays, frame), bg)
 }
 
 func centerPlainText(line string, width int) string {
@@ -1927,8 +2092,8 @@ func burnFinalColor(row int, rows int) string {
 	return lerpHexColor("#00c3ff", "#ffff1c", t)
 }
 
-func colorRune(r rune, color string) string {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(string(r))
+func colorRune(r rune, color string, bg lipgloss.TerminalColor) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Background(bg).Render(string(r))
 }
 
 func lerpHexColor(from string, to string, t float64) string {
@@ -2018,6 +2183,24 @@ func formatMap(values map[string]string, limit int) string {
 		lines = append(lines, key+"="+values[key])
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatPullProgress renders one PullProgress update as the single line
+// shown in the status bar, e.g. "pulling redis:7 — layer 3f4a2b1c downloading 45%".
+func formatPullProgress(image string, p app.PullProgress) string {
+	label := "pulling " + image
+	if p.ID == "" {
+		return label
+	}
+	id := p.ID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	if p.Total > 0 {
+		pct := int(100 * p.Current / p.Total)
+		return fmt.Sprintf("%s — layer %s %s %d%%", label, id, p.Status, pct)
+	}
+	return fmt.Sprintf("%s — layer %s %s", label, id, p.Status)
 }
 
 func formatBytes(value uint64) string {

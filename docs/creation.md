@@ -203,6 +203,13 @@ the existing container, then recreate it with an identical spec (same name,
 ports, mounts, env, restart policy, command). Confirm with `y`, cancel with
 `n`/`Esc`.
 
+The status bar reflects what's happening while Delete/Replicate/Create run,
+instead of going quiet until they finish. Standalone Replicate shows live
+per-layer pull progress (status and percentage) since it talks to the Docker
+API directly; Compose Delete/Replicate/Create show a spinner with a single
+phase label for the whole operation, since `docker compose` is shelled out
+to and doesn't expose structured progress the way the Docker API does.
+
 **Clone (`C`)** — duplicates the selected container/service under a *new*
 name. Opens the create overlay prefilled with the original's image, ports,
 mounts, env, restart policy, and command, with the identity field

@@ -2,6 +2,8 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/Microsoft/go-winio v0.4.21 h1:+6mVbXh4wPzUrl1COX9A+ZCvEpYsOBZ6/+kwDnvLyro=
 github.com/Microsoft/go-winio v0.4.21/go.mod h1:JPGBdM1cNvN/6ISo+n8V5iA4v8pBzdOpzfwIujj1a84=
+github.com/allisonhere/cli-spinners-GO-library v0.1.0 h1:IY+pCgU+YEjshLP82Bhe9F8Bd6ikWoYYJ8ibKOHmzgk=
+github.com/allisonhere/cli-spinners-GO-library v0.1.0/go.mod h1:BKYLH1Orh1vtvIlgd8s1bmsoZoU2c7ZR+lR+t8kOhHE=
 github.com/allisonhere/ripple v0.3.0 h1:0g/sPUnVhxl8rNEjnU8XJH6J0ri6iaUxd++p2PvzSpY=
 github.com/allisonhere/ripple v0.3.0/go.mod h1:tUOwwHoip07xZ2C+xDtwLFF5dkPCUliQ8OqL6FEbO+I=
 github.com/allisonhere/tideui v0.2.1-0.20260812021720-863c608d62dc h1:XsweRUBe+r/WD8BTpwAvC8uFUAanfY+VoaLjrlZGuXk=

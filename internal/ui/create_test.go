@@ -112,6 +112,9 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("confirm returned nil cmd, want create command")
 	}
+	if !model.busy {
+		t.Fatal("busy = false right after dispatching create, want true")
+	}
 	msg := runCmd(t, cmd).(createDoneMsg)
 	updated, cmd = model.Update(msg)
 	model = updated.(Model)
@@ -121,6 +124,9 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 	}
 	if model.overlay != overlayNone || model.statusErr || !strings.Contains(model.status, "created") {
 		t.Fatalf("overlay/status/statusErr = %v/%q/%v, want created and closed", model.overlay, model.status, model.statusErr)
+	}
+	if model.busy {
+		t.Fatal("busy = true after createDoneMsg, want false")
 	}
 	if cmd == nil {
 		t.Fatal("create completion returned nil cmd, want refresh")
@@ -221,6 +227,9 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("confirm returned nil cmd, want compose apply command")
 	}
+	if !model.busy {
+		t.Fatal("busy = false right after dispatching compose apply, want true")
+	}
 	msg := runCmd(t, cmd).(createDoneMsg)
 	updated, cmd = model.Update(msg)
 	model = updated.(Model)
@@ -230,6 +239,9 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	}
 	if model.overlay != overlayNone || model.statusErr || !strings.Contains(model.status, "created") {
 		t.Fatalf("overlay/status/statusErr = %v/%q/%v, want created and closed", model.overlay, model.status, model.statusErr)
+	}
+	if model.busy {
+		t.Fatal("busy = true after createDoneMsg, want false")
 	}
 	if cmd == nil {
 		t.Fatal("compose completion returned nil cmd, want refresh")

@@ -86,10 +86,24 @@ func TestProviderRemoveContainerUnknownID(t *testing.T) {
 	}
 }
 
-func TestProviderPullImageNoop(t *testing.T) {
+func TestProviderPullImageSynthesizesProgress(t *testing.T) {
 	provider := NewProvider()
-	if err := provider.PullImage(context.Background(), "anything:latest"); err != nil {
-		t.Fatalf("PullImage() err = %v, want nil (no-op in demo mode)", err)
+	var calls []app.PullProgress
+	err := provider.PullImage(context.Background(), "anything:latest", func(p app.PullProgress) {
+		calls = append(calls, p)
+	})
+	if err != nil {
+		t.Fatalf("PullImage() err = %v, want nil (no real registry in demo mode)", err)
+	}
+	if len(calls) == 0 {
+		t.Fatal("PullImage() called onProgress zero times, want at least one synthesized update")
+	}
+}
+
+func TestProviderPullImageNilCallbackDoesNotPanic(t *testing.T) {
+	provider := NewProvider()
+	if err := provider.PullImage(context.Background(), "anything:latest", nil); err != nil {
+		t.Fatalf("PullImage() with nil onProgress err = %v, want nil", err)
 	}
 }
 

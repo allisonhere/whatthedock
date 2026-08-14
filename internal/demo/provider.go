@@ -278,10 +278,24 @@ func (p *Provider) RemoveContainer(_ context.Context, id domain.ResourceID, _ bo
 	return nil
 }
 
-// PullImage is a no-op in demo mode — there's no real registry to pull from,
-// and Replicate's visible effect for a standalone container is carried
-// entirely by the remove+recreate step, not by a fabricated image change.
-func (p *Provider) PullImage(_ context.Context, _ string) error {
+// PullImage synthesizes a handful of progress callbacks so the status-bar
+// indicator is demoable without a real registry — there's no real registry
+// to pull from, so the "layers" and byte counts below are fabricated, but
+// calling onProgress with them exercises exactly the same status-bar path a
+// real pull does. No time.Sleep: no other demo action in this package fakes
+// wall-clock delay (demo mode is deliberately instant everywhere else), so
+// this doesn't become the one part of the package that blocks.
+func (p *Provider) PullImage(_ context.Context, _ string, onProgress func(app.PullProgress)) error {
+	if onProgress == nil {
+		return nil
+	}
+	layers := []string{"a1b2c3d4e5f6", "b2c3d4e5f6a1", "c3d4e5f6a1b2"}
+	for _, id := range layers {
+		const total = int64(42 * 1024 * 1024)
+		onProgress(app.PullProgress{Status: "Downloading", ID: id, Current: total / 2, Total: total})
+		onProgress(app.PullProgress{Status: "Downloading", ID: id, Current: total, Total: total})
+		onProgress(app.PullProgress{Status: "Pull complete", ID: id})
+	}
 	return nil
 }
 

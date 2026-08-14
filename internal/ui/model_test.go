@@ -26,20 +26,21 @@ import (
 )
 
 type fakeProvider struct {
-	host       domain.Host
-	snapshot   domain.Snapshot
-	containers map[string]domain.Container
-	stats      map[string]domain.ContainerStats
-	pingErr    error
-	starts     int
-	stops      int
-	restarts   int
-	creates    []app.ContainerCreateSpec
-	removed    []domain.ResourceID
-	forced     []bool
-	pulled     []string
-	removeErr  error
-	pullErr    error
+	host          domain.Host
+	snapshot      domain.Snapshot
+	containers    map[string]domain.Container
+	stats         map[string]domain.ContainerStats
+	pingErr       error
+	starts        int
+	stops         int
+	restarts      int
+	creates       []app.ContainerCreateSpec
+	removed       []domain.ResourceID
+	forced        []bool
+	pulled        []string
+	progressCalls []app.PullProgress
+	removeErr     error
+	pullErr       error
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -88,8 +89,13 @@ func (f *fakeProvider) RemoveContainer(_ context.Context, id domain.ResourceID, 
 	delete(f.containers, id.ID)
 	return nil
 }
-func (f *fakeProvider) PullImage(_ context.Context, image string) error {
+func (f *fakeProvider) PullImage(_ context.Context, image string, onProgress func(app.PullProgress)) error {
 	f.pulled = append(f.pulled, image)
+	if onProgress != nil {
+		p := app.PullProgress{Status: "Downloading", ID: "layer1", Current: 50, Total: 100}
+		f.progressCalls = append(f.progressCalls, p)
+		onProgress(p)
+	}
 	return f.pullErr
 }
 func (f *fakeProvider) Close() error { return nil }
@@ -1227,6 +1233,30 @@ func TestHeatSparklineStylesEachGlyph(t *testing.T) {
 	}
 }
 
+// TestRenderStatRowFillsGapWithThemedBackground guards against a real bug:
+// the space between the graph and its suffix value came from tideui's
+// RenderRow/alignRow, which pads with bare, unstyled characters baked
+// directly into the string — RenderRow's own outer style only paints
+// padding it appends itself via Width(), not padding already present in
+// the string it's given, so that gap fell through to the raw terminal
+// default the moment the meter/sparkline glyphs before it had already
+// emitted their own background and reset.
+func TestRenderStatRowFillsGapWithThemedBackground(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	graph := statGraph{values: []float64{1, 1}, maxValue: 100, fallbackLevel: 1}
+
+	row := renderStatRow(renderer, defaultSettings(), 60, "CPU", graph, "22.5%", lipgloss.Color("#7dcfff"))
+
+	stripped := ansi.Strip(row)
+	if !strings.Contains(stripped, "CPU") || !strings.Contains(stripped, "22.5%") {
+		t.Fatalf("row missing expected content: %q", stripped)
+	}
+	wantGap := lipgloss.NewStyle().Background(whatthedockTheme().Bg).Render(" ")
+	if !strings.Contains(row, wantGap) {
+		t.Fatalf("row has no themed-background space run; the gap before the suffix may be unstyled:\nrow=%q\nwant substring=%q", row, wantGap)
+	}
+}
+
 func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	for _, tc := range []struct {
@@ -1970,12 +2000,19 @@ func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) 
 	if cmd == nil {
 		t.Fatal("y on overlayReplicate returned a nil Cmd")
 	}
+	if !model.busy {
+		t.Fatal("busy = false right after dispatching replicate, want true")
+	}
 	done, ok := runCmd(t, cmd).(actionDoneMsg)
 	if !ok {
 		t.Fatalf("msg = %#v, want actionDoneMsg", done)
 	}
 	if done.err != nil {
 		t.Fatalf("actionDoneMsg.err = %v, want nil", done.err)
+	}
+	model.drainReplicateProgress()
+	if !strings.Contains(model.status, "grafana/grafana:latest") {
+		t.Fatalf("status after draining progress = %q, want it to reflect the pull progress", model.status)
 	}
 	fp := model.provider.(*fakeProvider)
 	if len(fp.pulled) != 1 || fp.pulled[0] != "grafana/grafana:latest" {
@@ -1993,6 +2030,46 @@ func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) 
 	}
 	if len(created.Ports) != 1 || created.Ports[0].ContainerPort != 3000 {
 		t.Fatalf("recreated ports = %#v, want the original 3000 binding carried over", created.Ports)
+	}
+}
+
+func TestBusySpinnerClearsOnActionDone(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.overlay = overlayDelete
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if !model.busy {
+		t.Fatal("busy = false right after dispatching delete, want true")
+	}
+	if cmd == nil {
+		t.Fatal("y on overlayDelete returned a nil Cmd")
+	}
+	msg := runCmd(t, cmd)
+
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if model.busy {
+		t.Fatal("busy = true after actionDoneMsg, want false")
+	}
+}
+
+func TestEventStreamReconnectSetsIndicator(t *testing.T) {
+	model := testModel()
+
+	updated, cmd := model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if !model.eventsReconnecting {
+		t.Fatal("eventsReconnecting = false after eventStreamClosedMsg, want true")
+	}
+	if cmd == nil {
+		t.Fatal("eventStreamClosedMsg returned a nil Cmd, want the reconnect scheduled")
+	}
+
+	updated, _ = model.Update(eventsStartedMsg{events: make(chan domain.ContainerEvent)})
+	model = updated.(Model)
+	if model.eventsReconnecting {
+		t.Fatal("eventsReconnecting = true after a successful eventsStartedMsg, want false")
 	}
 }
 
@@ -2218,6 +2295,59 @@ func hasMidRowReset(value string) bool {
 		}
 	}
 	return false
+}
+
+func TestWindowAroundCursor(t *testing.T) {
+	tests := []struct {
+		name               string
+		total, cursor, bu  int
+		wantStart, wantEnd int
+	}{
+		{"fits entirely", 5, 2, 10, 0, 5},
+		{"cursor at top", 20, 0, 5, 0, 5},
+		{"cursor scrolls window down", 20, 12, 5, 8, 13},
+		{"cursor near end clamps to tail", 20, 19, 5, 15, 20},
+		{"cursor jumps back up", 20, 0, 5, 0, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start, end := windowAroundCursor(tt.total, tt.cursor, tt.bu)
+			if start != tt.wantStart || end != tt.wantEnd {
+				t.Fatalf("windowAroundCursor(%d, %d, %d) = (%d, %d), want (%d, %d)", tt.total, tt.cursor, tt.bu, start, end, tt.wantStart, tt.wantEnd)
+			}
+			if tt.cursor < start || tt.cursor >= end {
+				t.Fatalf("window (%d, %d) does not contain cursor %d", start, end, tt.cursor)
+			}
+		})
+	}
+}
+
+func TestCopyOverlayScrollsWithManyRows(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 100, 16
+	ports := make([]domain.Port, 0, 30)
+	for i := 0; i < 30; i++ {
+		ports = append(ports, domain.Port{IP: "0.0.0.0", Private: uint16(8000 + i), Public: uint16(9000 + i), Type: "tcp"})
+	}
+	model.selected.Ports = ports
+	model.overlay = overlayCopy
+	model.copyCursor = 0
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "more") {
+		t.Fatalf("copy overlay with %d rows should show a scroll indicator:\n%s", len(model.copyRows()), view)
+	}
+
+	rows := model.copyRows()
+	target := len(rows) - 2
+	for i := 0; i < target; i++ {
+		model.moveCopyCursor(1)
+	}
+	view = ansi.Strip(model.View())
+	wantValue := rows[target].value
+	if !strings.Contains(view, wantValue) {
+		t.Fatalf("copy overlay did not scroll selected row %d (%q) into view:\n%s", target, wantValue, view)
+	}
 }
 
 func TestCopyOverlayCopiesSelectedRow(t *testing.T) {
@@ -2558,10 +2688,50 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	model.overlay = overlayHelp
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"Ctrl+S         save settings/forms", "n              create container or Compose service", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete", "A              about screen"} {
+	for _, want := range []string{"n              create container or Compose service", "e              open shell in selected container"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q:\n%s", want, view)
 		}
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	model = updated.(Model)
+	if model.helpScroll == 0 {
+		t.Fatal("helpScroll = 0 after G, want scrolled to bottom")
+	}
+	view = ansi.Strip(model.View())
+	for _, want := range []string{"Ctrl+S         save settings/forms", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete", "A              about screen"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("help view missing %q after scrolling to bottom:\n%s", want, view)
+		}
+	}
+}
+
+func TestHelpOverlayScrollsWithJK(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 20
+	model.overlay = overlayHelp
+
+	if budget := model.helpBodyBudget(); budget >= len(helpLines) {
+		t.Fatalf("helpBodyBudget() = %d, want < %d so this test actually exercises scrolling", budget, len(helpLines))
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = updated.(Model)
+	if model.helpScroll != 1 {
+		t.Fatalf("helpScroll after j = %d, want 1", model.helpScroll)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.helpScroll != 0 {
+		t.Fatalf("helpScroll after k = %d, want 0", model.helpScroll)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = updated.(Model)
+	if model.helpScroll != 0 {
+		t.Fatalf("helpScroll should not go below 0, got %d", model.helpScroll)
 	}
 }
 
@@ -2613,6 +2783,58 @@ func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
 	}
 }
 
+// TestAboutEmbersNeverOverwriteLitGlyphs guards against a real bug: embers
+// spawn at their source glyph's own cell and rise away slowly, so without a
+// blank-cell check they spend many frames sitting directly on top of real
+// logo text, replacing readable letters with spark punctuation instead of
+// drifting past them.
+func TestAboutEmbersNeverOverwriteLitGlyphs(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	width := 80
+	model.aboutIgnite = aboutIgnitionOrder(aboutLogo(), width)
+	model.aboutFrame = 1000 // long past every ignition delay: everything settled to its real glyph
+
+	logo := aboutLogo()
+	row0 := []rune(centerPlainText(logo[0], width))
+	col := -1
+	for i, r := range row0 {
+		if r != ' ' {
+			col = i
+			break
+		}
+	}
+	if col < 0 {
+		t.Fatal("logo row 0 has no non-space glyph to target")
+	}
+	want := row0[col]
+
+	model.aboutEmbers = []aboutEmber{{row: 0, col: float64(col), glyph: '#', life: 20}}
+	lines := strings.Split(ansi.Strip(model.aboutText(renderer, width)), "\n")
+	got := []rune(lines[aboutEmberRows])[col]
+	if got != want {
+		t.Fatalf("ember placed over a lit glyph rendered %q, want the real glyph %q preserved", got, want)
+	}
+}
+
+// TestAboutEmbersRenderOverBlankCells confirms embers do still show up once
+// they're over empty space — the fix above must not make them invisible
+// everywhere, just on top of real text.
+func TestAboutEmbersRenderOverBlankCells(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	width := 80
+	model.aboutIgnite = aboutIgnitionOrder(aboutLogo(), width)
+	model.aboutFrame = 1000
+
+	model.aboutEmbers = []aboutEmber{{row: -1, col: 5, glyph: '#', life: 20}}
+	lines := strings.Split(ansi.Strip(model.aboutText(renderer, width)), "\n")
+	got := []rune(lines[aboutEmberRows-1])[5]
+	if got != '#' {
+		t.Fatalf("ember over a blank cell rendered %q, want '#'", got)
+	}
+}
+
 func TestBurnRevealCentersMultilineWhatupdocAndBurnsFromCenter(t *testing.T) {
 	logo := aboutLogo()
 	if len(logo) < 4 {
@@ -2630,12 +2852,13 @@ func TestBurnRevealCentersMultilineWhatupdocAndBurnsFromCenter(t *testing.T) {
 	delays := aboutIgnitionOrder(logo, width)
 	rowDelays := delays[1]
 
-	first := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, -1000))
+	bg := lipgloss.Color("#171c22")
+	first := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, -1000, bg))
 	if !strings.Contains(first, strings.TrimSpace(line)) {
 		t.Fatalf("unlit frame = %q, want centered logo row", first)
 	}
 
-	settled := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, 1000))
+	settled := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, 1000, bg))
 	if !strings.Contains(settled, strings.TrimSpace(line)) {
 		t.Fatalf("settled frame = %q, want centered logo row", settled)
 	}
@@ -2857,8 +3080,84 @@ func TestInitStartsSnapshotAndEventSubscription(t *testing.T) {
 	if !ok {
 		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
 	}
-	if len(batch) != 2 {
-		t.Fatalf("Init() batch length = %d, want snapshot refresh and event subscription", len(batch))
+	if len(batch) != 3 {
+		t.Fatalf("Init() batch length = %d, want snapshot refresh, event subscription, and the status-bar pulse tick", len(batch))
+	}
+}
+
+func TestStatusPulseTickIncrementsFrameAndReschedules(t *testing.T) {
+	model := testModel()
+	firstFrame := model.statusPulseFrame
+
+	updated, cmd := model.Update(statusPulseTickMsg{})
+	model = updated.(Model)
+
+	if model.statusPulseFrame != firstFrame+1 {
+		t.Fatalf("statusPulseFrame = %d, want %d", model.statusPulseFrame, firstFrame+1)
+	}
+	if cmd == nil {
+		t.Fatal("statusPulseTickMsg returned a nil Cmd, want the pulse rescheduled")
+	}
+}
+
+func TestStatusLeftShowsPulsingDotWhenConnected(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	model.status, model.statusErr = "Docker connected", false
+
+	left := model.statusLeft(renderer)
+	stripped := ansi.Strip(left)
+	if strings.Contains(stripped, "Docker connected") {
+		t.Fatalf("statusLeft() = %q, want the static text replaced by a dot", stripped)
+	}
+	if !strings.Contains(stripped, "●") {
+		t.Fatalf("statusLeft() = %q, want a pulsing dot", stripped)
+	}
+}
+
+func TestStatusLeftShowsBusySpinnerWithPhaseText(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	model.busy = true
+	model.status, model.statusErr = "pulling redis:7…", false
+
+	left := ansi.Strip(model.statusLeft(renderer))
+	if !strings.Contains(left, "pulling redis:7…") {
+		t.Fatalf("statusLeft() = %q, want the busy phase text", left)
+	}
+	if !strings.Contains(left, spinnerGlyph(model.statusPulseFrame)) {
+		t.Fatalf("statusLeft() = %q, want the spinner glyph for frame %d", left, model.statusPulseFrame)
+	}
+}
+
+func TestStatusLeftShowsReconnectingIndicator(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	model.eventsReconnecting = true
+
+	left := ansi.Strip(model.statusLeft(renderer))
+	if !strings.Contains(left, "reconnecting to Docker") {
+		t.Fatalf("statusLeft() = %q, want a reconnecting indicator", left)
+	}
+}
+
+func TestStatusLeftShowsTextForNonConnectedStatuses(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	model.status, model.statusErr = "restart complete", false
+
+	left := ansi.Strip(model.statusLeft(renderer))
+	if !strings.Contains(left, "restart complete") {
+		t.Fatalf("statusLeft() = %q, want other status messages left as text, not replaced by the dot", left)
+	}
+}
+
+func TestPulseDotColorBreathesOverFrames(t *testing.T) {
+	bright := lipgloss.Color("#80c990")
+	start := pulseDotColor(0, bright)
+	quarterCycle := pulseDotColor(6, bright)
+	if start == quarterCycle {
+		t.Fatalf("pulseDotColor(0) = pulseDotColor(6) = %q, want the color to change over the cycle", start)
 	}
 }
 
