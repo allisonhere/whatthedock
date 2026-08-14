@@ -66,7 +66,8 @@ Untracked local files at handoff:
     live editor and the static form preview.
 - `internal/systems/factory.go`
   - Adds `RemoteCommand`/`ShellQuote` helpers used by every SSH-backed
-    Compose operation.
+    Compose operation, and `DockerHostFor` (resolves the DOCKER_HOST value
+    for an already-connected system, used by exec shell).
 - `internal/ui/create_test.go`, `internal/ui/editor_area_test.go`,
   `internal/ui/model_test.go`
   - Cover create overlay behavior, shortcut regressions, parsing, provider
@@ -150,6 +151,11 @@ Done since this doc was first written:
   create prefilled from the original under a new name. This is the delete-
   or-replace-an-existing-override capability this doc used to list as
   remaining work.
+- Added `e` (exec shell) — hands the real terminal to `docker exec -it` on
+  the selected running container (bash if present, else sh) via the same
+  `tea.ExecProcess` terminal-handoff mechanism already used for the SSH
+  password prompt, then resumes WhatTheDock. Works for SSH systems too, over
+  the already-established socket tunnel (`systems.DockerHostFor`).
 
 Remaining:
 

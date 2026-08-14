@@ -559,6 +559,14 @@ type systemTunnelMsg struct {
 	err    error
 }
 
+// execShellDoneMsg carries the result of an exec-shell session back into
+// Update once the terminal handoff (tea.ExecProcess) returns control to the
+// TUI.
+type execShellDoneMsg struct {
+	name string
+	err  error
+}
+
 type systemTestMsg struct {
 	system config.System
 	err    error
@@ -916,6 +924,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "open "+msg.label+": "+msg.err.Error(), true
 		}
 		return m, nil
+	case execShellDoneMsg:
+		// The user directly saw whatever docker printed on the real
+		// terminal during the handoff, so a non-nil err here (which could
+		// just as easily be the shell's own last-command exit status as a
+		// genuine launch failure — the two look identical to cmd.Run())
+		// is reported informationally, not as an alarming error.
+		if msg.err != nil {
+			m.status, m.statusErr = "shell in "+msg.name+" exited: "+msg.err.Error(), false
+		} else {
+			m.status, m.statusErr = "closed shell in "+msg.name, false
+		}
+		return m, m.refreshCmd()
 	case systemSwitchMsg:
 		if msg.err != nil {
 			m.status, m.statusErr = "system: "+msg.err.Error(), true
@@ -1085,6 +1105,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == paneActivity && m.mode == activityLogs {
 			m.setLogSeverityFilter(logSeverityErrors)
 			return m, nil
+		}
+		if selected := m.selectedContainer(); selected != nil && selected.IsRunning() {
+			return m, m.execShellCmd(*selected)
 		}
 	case "w":
 		if m.focus == paneActivity && m.mode == activityLogs {
@@ -1807,6 +1830,32 @@ func (m Model) testSystemCmd(system config.System) tea.Cmd {
 	return m.providerTestCmd(system)
 }
 
+// execShellCommand builds the docker exec subprocess for dropping into a
+// running container's shell. Prefers bash if present, falling back to sh,
+// since most images have one or the other but rarely lack both. An empty
+// DOCKER_HOST from systems.DockerHostFor means "use Docker's own default
+// resolution" — leave the subprocess env untouched rather than overriding
+// it with an empty value.
+func execShellCommand(system config.System, id domain.ResourceID) *exec.Cmd {
+	cmd := exec.Command("docker", "exec", "-it", id.ID, "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh")
+	if host := systems.DockerHostFor(system); host != "" {
+		cmd.Env = append(os.Environ(), "DOCKER_HOST="+host)
+	}
+	return cmd
+}
+
+// execShellCmd hands the real terminal over to docker exec for an
+// interactive session — the same tea.ExecProcess mechanism already used for
+// the SSH password prompt (see switchSystemCmd), just for a foreground
+// session the user directly controls instead of a backgrounded tunnel.
+func (m Model) execShellCmd(selected domain.Container) tea.Cmd {
+	cmd := execShellCommand(m.activeSystemConfig(), selected.ID)
+	name := selected.DisplayName()
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return execShellDoneMsg{name: name, err: err}
+	})
+}
+
 func (m Model) providerSwitchCmd(system config.System) tea.Cmd {
 	factory := m.providerFor
 	return func() tea.Msg {
@@ -1969,6 +2018,10 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.Clone:
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()
+		}
+	case actions.ExecShell:
+		if selected := m.selectedContainer(); selected != nil && selected.IsRunning() {
+			return m, m.execShellCmd(*selected)
 		}
 	case actions.FocusLogs:
 		m.focus = paneActivity

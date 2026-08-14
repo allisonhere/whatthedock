@@ -1341,6 +1341,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 			{key: "l", label: "logs"},
 			{key: "c", label: "copy"},
 			{key: "o", label: "open"},
+			{key: "e", label: "shell"},
 			{key: "u", label: "replicate"},
 			{key: "D", label: "delete"},
 			{key: "C", label: "clone"},

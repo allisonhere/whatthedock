@@ -75,6 +75,7 @@ Docker socket paths must be present.
 | `u` | Replicate: pull the latest image and recreate in place |
 | `D` | Delete (override + reconcile for a Compose service, `docker rm` for a standalone container) |
 | `C` | Clone under a new name via the create overlay |
+| `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
 | `l` | Focus logs |
@@ -216,6 +217,10 @@ More detail:
   existing identity. Clone opens the create overlay prefilled with the
   original's full ports/mounts/env/restart/command under a new,
   `-clone`-suffixed name, producing an independent second container/service.
+- Opens an interactive shell inside the selected running container (`e`),
+  handing the real terminal to `docker exec -it` (preferring `bash`, falling
+  back to `sh`) and resuming WhatTheDock when the session ends. Works against
+  SSH systems the same way, over the already-established socket tunnel.
 - Copies selected container IDs, images, Compose metadata, ports, mounts, and
   labels via terminal OSC52 clipboard escape sequences.
 - Opens published ports, bind mounts, and Compose config paths from the
@@ -242,7 +247,6 @@ WhatTheDock.
 - Docker event stream.
 - Merge-aware editing of the base Compose file itself, rather than only the
   generated override.
-- Exec shell workflow.
 - Open/copy actions for environment values.
 - Deeper problem detection for orphaned, stale, and resource-heavy Docker
   resources.

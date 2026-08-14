@@ -140,6 +140,21 @@ func runCommand(ctx context.Context, name string, args ...string) error {
 	return cmd.Run()
 }
 
+// DockerHostFor returns the DOCKER_HOST value for an already-connected
+// system — the same value Factory.Provider resolves internally — without
+// re-establishing an SSH tunnel, since callers (the exec-shell subprocess)
+// only need this after a provider is already active for the system. An
+// empty return means "use Docker's own default resolution" rather than a
+// value to set explicitly.
+func DockerHostFor(system config.System) string {
+	switch system.Kind {
+	case "ssh":
+		return "unix://" + system.LocalSocket
+	default:
+		return system.DockerHost
+	}
+}
+
 func DockerHostLabel(system config.System) string {
 	switch system.Kind {
 	case "ssh":

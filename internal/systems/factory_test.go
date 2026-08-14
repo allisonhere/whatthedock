@@ -78,6 +78,25 @@ func TestSSHTargetOmitsEmptyUser(t *testing.T) {
 	}
 }
 
+func TestDockerHostFor(t *testing.T) {
+	tests := []struct {
+		name   string
+		system config.System
+		want   string
+	}{
+		{name: "local default", system: config.System{Kind: "local"}, want: ""},
+		{name: "local host", system: config.System{Kind: "local", DockerHost: "tcp://host:2375"}, want: "tcp://host:2375"},
+		{name: "ssh", system: config.System{Kind: "ssh", LocalSocket: "/tmp/x.sock"}, want: "unix:///tmp/x.sock"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DockerHostFor(tt.system); got != tt.want {
+				t.Fatalf("DockerHostFor() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDockerHostLabel(t *testing.T) {
 	tests := []struct {
 		name   string

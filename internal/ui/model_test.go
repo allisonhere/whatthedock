@@ -2024,6 +2024,83 @@ func TestHandleReplicateKeyEscCancels(t *testing.T) {
 	}
 }
 
+func TestExecShellCommandUsesDockerHostForSSHSystem(t *testing.T) {
+	system := config.System{Kind: "ssh", LocalSocket: "/tmp/wtd-jarvis.sock"}
+	id := domain.ResourceID{Host: "jarvis", ID: "abc123"}
+
+	cmd := execShellCommand(system, id)
+
+	wantArgs := []string{"docker", "exec", "-it", "abc123", "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh"}
+	if len(cmd.Args) != len(wantArgs) {
+		t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if cmd.Args[i] != want {
+			t.Fatalf("Args[%d] = %q, want %q", i, cmd.Args[i], want)
+		}
+	}
+	found := false
+	for _, kv := range cmd.Env {
+		if kv == "DOCKER_HOST=unix:///tmp/wtd-jarvis.sock" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Env = %#v, want DOCKER_HOST pointing at the SSH tunnel socket", cmd.Env)
+	}
+}
+
+func TestExecShellCommandLeavesEnvUntouchedForDefaultLocalSystem(t *testing.T) {
+	system := config.System{Kind: "local"}
+	id := domain.ResourceID{Host: "local", ID: "abc123"}
+
+	cmd := execShellCommand(system, id)
+
+	if cmd.Env != nil {
+		t.Fatalf("Env = %#v, want nil (inherit the parent process env, no DOCKER_HOST override)", cmd.Env)
+	}
+}
+
+func TestPressEOpensShellForRunningContainer(t *testing.T) {
+	model := testModelWithSelectedContainer() // radarr-1 is StateRunning in the fixture
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if cmd == nil {
+		t.Fatal("e on a running selected container returned a nil Cmd, want the exec handoff")
+	}
+}
+
+func TestPressEDoesNothingForStoppedContainer(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana")
+	model.selected.State = domain.StateStopped
+
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if cmd != nil {
+		t.Fatal("e on a stopped container returned a non-nil Cmd, want no action taken")
+	}
+}
+
+func TestExecShellDoneMsgSetsStatus(t *testing.T) {
+	model := testModel()
+
+	updated, cmd := model.Update(execShellDoneMsg{name: "radarr-1", err: nil})
+	model = updated.(Model)
+	if model.statusErr || !strings.Contains(model.status, "closed shell in radarr-1") {
+		t.Fatalf("status/statusErr = %q/%v, want a clean-close confirmation", model.status, model.statusErr)
+	}
+	if cmd == nil {
+		t.Fatal("execShellDoneMsg returned a nil Cmd, want a refresh")
+	}
+
+	updated, _ = model.Update(execShellDoneMsg{name: "radarr-1", err: errors.New("exit status 1")})
+	model = updated.(Model)
+	if model.statusErr {
+		t.Fatalf("statusErr = true for a shell exit status, want false (informational, not an error banner)")
+	}
+	if !strings.Contains(model.status, "radarr-1") {
+		t.Fatalf("status = %q, want it to mention radarr-1", model.status)
+	}
+}
+
 func TestInspectorShowsContextualCopyOpenHints(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.width, model.height = 120, 30
