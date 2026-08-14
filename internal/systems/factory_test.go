@@ -2,6 +2,8 @@ package systems
 
 import (
 	"context"
+	"net"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -69,6 +71,37 @@ func TestFactoryBuildsSSHTunnelCommandWithSeparateUserAndPort(t *testing.T) {
 	wantArgs := []string{"-fN", "-p", "2222", "-L", "/tmp/whatthedock-test-jarvis.sock:/var/run/docker.sock", "allie@jarvis.lan"}
 	if gotName != "ssh" || !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("runner = %q %#v, want ssh %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
+func TestSSHCommandArgsRebuildsTunnelForStaleSocketFile(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "stale.sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen() err = %v", err)
+	}
+	unixLn, ok := ln.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type = %T, want *net.UnixListener", ln)
+	}
+	// Leave the socket file behind on Close, the way a killed/crashed SSH
+	// tunnel process would, instead of the default auto-unlink behavior.
+	unixLn.SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("Close() err = %v", err)
+	}
+
+	args, err := SSHCommandArgs(config.System{
+		SSHHost:      "jarvis",
+		RemoteSocket: "/var/run/docker.sock",
+		LocalSocket:  sockPath,
+	})
+	if err != nil {
+		t.Fatalf("SSHCommandArgs() err = %v", err)
+	}
+	if args == nil {
+		t.Fatal("SSHCommandArgs() = nil, want fresh tunnel args for a stale socket file")
 	}
 }
 

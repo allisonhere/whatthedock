@@ -3,11 +3,13 @@ package systems
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
@@ -82,7 +84,7 @@ func SSHCommandArgs(system config.System) ([]string, error) {
 	if system.RemoteSocket == "" {
 		return nil, fmt.Errorf("remote socket is required")
 	}
-	if isSocket(system.LocalSocket) {
+	if isLiveSocket(system.LocalSocket) {
 		return nil, nil
 	}
 	_ = os.Remove(system.LocalSocket)
@@ -133,6 +135,23 @@ func isSocket(path string) bool {
 		return false
 	}
 	return info.Mode()&os.ModeSocket != 0
+}
+
+// isLiveSocket reports whether path is a unix socket with something actually
+// listening on it. A dead SSH tunnel (killed process, network drop, machine
+// sleep/wake) leaves the socket file behind with its mode bit intact, so a
+// mode-only check like isSocket treats a stale file as an active tunnel and
+// SSHCommandArgs never re-establishes it. Dialing catches that case.
+func isLiveSocket(path string) bool {
+	if !isSocket(path) {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", path, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func runCommand(ctx context.Context, name string, args ...string) error {
