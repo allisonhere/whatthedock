@@ -6,6 +6,10 @@ github.com/allisonhere/ripple v0.3.0 h1:0g/sPUnVhxl8rNEjnU8XJH6J0ri6iaUxd++p2Pvz
 github.com/allisonhere/ripple v0.3.0/go.mod h1:tUOwwHoip07xZ2C+xDtwLFF5dkPCUliQ8OqL6FEbO+I=
 github.com/allisonhere/tideui v0.2.1-0.20260812021720-863c608d62dc h1:XsweRUBe+r/WD8BTpwAvC8uFUAanfY+VoaLjrlZGuXk=
 github.com/allisonhere/tideui v0.2.1-0.20260812021720-863c608d62dc/go.mod h1:5PuSjpG2GO1HN1yQZi1ZpEbJOqKYhaLY/Wkb+cj/mAQ=
+github.com/allisonhere/tideui v0.2.1 h1:gos5aqJov6nUZ0aDPZFCvwBt51MDqvLd7jcsE85Xoxc=
+github.com/allisonhere/tideui v0.2.1/go.mod h1:5PuSjpG2GO1HN1yQZi1ZpEbJOqKYhaLY/Wkb+cj/mAQ=
+github.com/allisonhere/tideui v0.2.2 h1:+YLMA1ZsnlPDtvNyIhMxuqvXVgKYvJuxNOHYQdDYZPs=
+github.com/allisonhere/tideui v0.2.2/go.mod h1:5PuSjpG2GO1HN1yQZi1ZpEbJOqKYhaLY/Wkb+cj/mAQ=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1 h1:HwpRHbFMcZLEVr42D4p7XBqjyuxQH5SMiErDT4WkJ2k=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1/go.mod h1:uYgXzlJ7ZpABp8OJ+exZzJJhRNQ2ASbcXHWsFqH8hp8=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=

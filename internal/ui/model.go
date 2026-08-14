@@ -284,11 +284,12 @@ type Model struct {
 	createField  createField
 	createCursor int
 
-	createBrowsing   bool
-	createBrowseDir  string
-	createFiles      []createFileEntry
-	createFileCursor int
-	createFileErr    string
+	createBrowsing    bool
+	createBrowseDir   string
+	createFiles       []createFileEntry
+	createFileCursor  int
+	createFileErr     string
+	createFileLoading bool
 
 	createEditingCompose bool
 	createEditor         editorArea
@@ -884,6 +885,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.createEditingCompose {
 			m.cancelCreateEditor()
 		}
+		return m, nil
+	case createFileBrowseMsg:
+		m.createFileLoading = false
+		m.createFileCursor = 0
+		if msg.err != nil {
+			m.createFileErr = msg.err.Error()
+			m.createFiles = nil
+			return m, nil
+		}
+		m.createBrowseDir = msg.dir
+		m.createFiles = msg.entries
+		m.createFileErr = ""
 		return m, nil
 	case openDoneMsg:
 		if msg.err != nil {

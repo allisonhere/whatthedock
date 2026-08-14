@@ -1641,7 +1641,10 @@ func (m Model) statusLeft(renderer tideui.Renderer) string {
 	if strings.TrimSpace(m.filter) != "" {
 		return renderer.Styles.StatusNotice.Render(prefix+"filter: "+m.filter) + renderer.Styles.StatusBar.Render(" "+m.status)
 	}
-	return renderer.Styles.StatusBar.Render(prefix + m.status)
+	if strings.TrimSpace(m.status) == "" {
+		return renderer.Styles.StatusBar.Render(prefix + m.status)
+	}
+	return renderer.Styles.StatusSuccess.Render(prefix + m.status)
 }
 
 func helpText() string {

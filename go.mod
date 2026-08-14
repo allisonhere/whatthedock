@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/allisonhere/ripple v0.3.0
-	github.com/allisonhere/tideui v0.2.1-0.20260812021720-863c608d62dc
+	github.com/allisonhere/tideui v0.2.2
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0

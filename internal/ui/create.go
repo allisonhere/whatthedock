@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
+	"github.com/allisonhere/whatthedock/internal/systems"
 )
 
 type createMode int
@@ -69,6 +71,7 @@ type composeCreateSpec struct {
 	BaseFile     string
 	OverrideFile string
 	Content      string
+	System       config.System
 }
 
 type createFileEntry struct {
@@ -131,7 +134,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "create cancelled", false
 		case "y":
 			if m.createDraft.Mode == createModeCompose {
-				spec, err := m.createDraft.ComposeSpec()
+				spec, err := m.createDraft.ComposeSpec(m.activeSystemConfig())
 				if err != nil {
 					m.createDraft.Confirming = false
 					m.status, m.statusErr = "create: "+err.Error(), true
@@ -202,20 +205,24 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.createField == createFieldComposeFile {
-			m.openCreateFileBrowser()
-			return m, nil
+			return m, m.openCreateFileBrowser()
 		}
 		m.moveCreateField(1)
 	case "ctrl+o":
 		m.createDraft.Mode = createModeCompose
 		m.createField = createFieldComposeFile
-		m.openCreateFileBrowser()
-		return m, nil
+		return m, m.openCreateFileBrowser()
 	case "o":
-		if m.createDraft.Mode == createModeCompose {
+		// Bare "o" is a browse shortcut only on a choice field (Mode/
+		// Restart), which ignores letters anyway. Every text field — the
+		// Compose file row included — must accept "o" as ordinary input:
+		// plenty of real values contain it ("postgres", "sonarr", and
+		// "compose.yml" itself), and the Compose file field is exactly
+		// where someone would want to type a path by hand. Enter or
+		// Ctrl+O still open the browser from the Compose file field.
+		if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
 			m.createField = createFieldComposeFile
-			m.openCreateFileBrowser()
-			return m, nil
+			return m, m.openCreateFileBrowser()
 		}
 		m.editCreateFieldString("o")
 	case "[", "]":
@@ -286,15 +293,18 @@ func (m Model) handleCreateFileBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "end":
 		m.createFileCursor = max(0, len(m.createFiles)-1)
 	case "backspace", "left", "h":
-		m.browseCreateDir(filepath.Dir(m.createBrowseDir))
+		parent := filepath.Dir(m.createBrowseDir)
+		if m.activeSystemConfig().Kind == "ssh" {
+			parent = path.Dir(m.createBrowseDir)
+		}
+		return m, m.browseCreateDir(parent)
 	case "enter", "right", "l":
 		if len(m.createFiles) == 0 {
 			return m, nil
 		}
 		entry := m.createFiles[clamp(m.createFileCursor, 0, len(m.createFiles)-1)]
 		if entry.Dir {
-			m.browseCreateDir(entry.Path)
-			return m, nil
+			return m, m.browseCreateDir(entry.Path)
 		}
 		m.createDraft.ComposeFile = entry.Path
 		m.createCursor = len([]rune(m.createDraft.ComposeFile))
@@ -365,27 +375,34 @@ func (m *Model) cancelCreateEditor() {
 	m.status, m.statusErr = "edit cancelled", false
 }
 
-func (m *Model) openCreateFileBrowser() {
-	if m.activeSystemConfig().Kind == "ssh" {
-		m.status, m.statusErr = "compose file browser is local-only for now", true
-		return
-	}
+func (m *Model) openCreateFileBrowser() tea.Cmd {
 	m.createBrowsing = true
-	m.browseCreateDir(createBrowserStartDir(m.createDraft.ComposeFile))
+	return m.browseCreateDir(createBrowserStartDir(m.createDraft.ComposeFile, m.activeSystemConfig()))
 }
 
-func createBrowserStartDir(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
+func createBrowserStartDir(target string, system config.System) string {
+	target = strings.TrimSpace(target)
+	if system.Kind == "ssh" {
+		// Existence is resolved remotely by the browse command itself (see
+		// remoteFileEntries); just take the parent of a file-shaped path.
+		if target == "" {
+			return "."
+		}
+		if strings.HasSuffix(target, "/") {
+			return target
+		}
+		return path.Dir(target)
+	}
+	if target == "" {
 		if cwd, err := os.Getwd(); err == nil {
 			return cwd
 		}
 		return "."
 	}
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		return path
+	if info, err := os.Stat(target); err == nil && info.IsDir() {
+		return target
 	}
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(target)
 	if dir == "." {
 		if cwd, err := os.Getwd(); err == nil {
 			return cwd
@@ -394,9 +411,28 @@ func createBrowserStartDir(path string) string {
 	return dir
 }
 
-func (m *Model) browseCreateDir(dir string) {
+// browseCreateDir lists dir for the file browser. For local systems this is
+// synchronous (fast filesystem access, matching the pre-existing behavior);
+// for SSH systems it returns a tea.Cmd that lists the directory over the
+// same ssh connection convention used for the Docker socket tunnel — a
+// network round trip, so it must not block Update. Set m.createFileLoading
+// so the browser overlay can show a loading state while that's in flight;
+// the result arrives via createFileBrowseMsg.
+func (m *Model) browseCreateDir(dir string) tea.Cmd {
 	if strings.TrimSpace(dir) == "" {
 		dir = "."
+	}
+	system := m.activeSystemConfig()
+	if system.Kind == "ssh" {
+		m.createFileLoading = true
+		m.createFileErr = ""
+		selected := m.createDraft.ComposeFile
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			entries, resolvedDir, err := remoteFileEntries(ctx, system, dir, selected)
+			return createFileBrowseMsg{dir: resolvedDir, entries: entries, err: err}
+		}
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -407,9 +443,88 @@ func (m *Model) browseCreateDir(dir string) {
 	m.createFileCursor = 0
 	m.createFiles = entries
 	m.createFileErr = ""
+	m.createFileLoading = false
 	if err != nil {
 		m.createFileErr = err.Error()
 	}
+	return nil
+}
+
+// createFileBrowseMsg carries the result of an SSH directory listing
+// (browseCreateDir) back into Update.
+type createFileBrowseMsg struct {
+	dir     string
+	entries []createFileEntry
+	err     error
+}
+
+// sshRun is the single seam all remote (SSH) Compose operations go through
+// — listing directories, writing the override file, and running `docker
+// compose` — so tests can substitute a fake instead of shelling out to a
+// real ssh binary. stdin, if non-empty, is piped to the remote command
+// (used for writing file content).
+var sshRun = defaultSSHRun
+
+func defaultSSHRun(ctx context.Context, system config.System, script string, stdin string) ([]byte, error) {
+	cmd, err := systems.RemoteCommand(ctx, system, script)
+	if err != nil {
+		return nil, err
+	}
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			text = err.Error()
+		}
+		return nil, errors.New(text)
+	}
+	return output, nil
+}
+
+// remoteFileEntries lists dir on system's remote host in one round trip: cd
+// into it (resolving "." and ".." the same way a local browse would) and ls
+// it, so a single ssh invocation both validates the directory and lists it.
+func remoteFileEntries(ctx context.Context, system config.System, dir string, selected string) ([]createFileEntry, string, error) {
+	script := "cd " + systems.ShellQuote(dir) + " 2>&1 && pwd && ls -1Ap"
+	output, err := sshRun(ctx, system, script, "")
+	if err != nil {
+		return nil, dir, err
+	}
+	lines := strings.Split(strings.TrimRight(string(output), "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return nil, dir, errors.New("empty response from remote host")
+	}
+	resolvedDir := strings.TrimSpace(lines[0])
+	names := lines[1:]
+
+	entries := []createFileEntry{}
+	if resolvedDir != "/" {
+		entries = append(entries, createFileEntry{Name: "..", Path: path.Dir(resolvedDir), Dir: true, Parent: true})
+	}
+	var dirs, files []createFileEntry
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		isDir := strings.HasSuffix(name, "/")
+		cleanName := strings.TrimSuffix(name, "/")
+		entryPath := path.Join(resolvedDir, cleanName)
+		if isDir {
+			dirs = append(dirs, createFileEntry{Name: cleanName, Path: entryPath, Dir: true})
+			continue
+		}
+		if isComposeFileCandidate(cleanName) {
+			files = append(files, createFileEntry{Name: cleanName, Path: entryPath, Selected: selected != "" && entryPath == selected})
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name) })
+	sort.Slice(files, func(i, j int) bool { return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name) })
+	entries = append(entries, dirs...)
+	entries = append(entries, files...)
+	return entries, resolvedDir, nil
 }
 
 func createFileEntries(dir, selected string) ([]createFileEntry, error) {
@@ -469,7 +584,7 @@ func (m Model) activeSystemConfig() config.System {
 }
 
 func (m *Model) validateCreateDraft() bool {
-	if err := m.createDraft.Validate(m.activeSystemConfig()); err != nil {
+	if err := m.createDraft.Validate(); err != nil {
 		m.status, m.statusErr = "create: "+err.Error(), true
 		return false
 	}
@@ -488,11 +603,8 @@ func lintComposeYAML(content string) error {
 	return yaml.Unmarshal([]byte(content), &doc)
 }
 
-func (d createDraft) Validate(system config.System) error {
+func (d createDraft) Validate() error {
 	if d.Mode == createModeCompose {
-		if system.Kind == "ssh" {
-			return errors.New("compose editing is local-only for now")
-		}
 		if strings.TrimSpace(d.Project) == "" {
 			return errors.New("project is required")
 		}
@@ -520,7 +632,7 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 	if d.Mode != createModeStandalone {
 		return app.ContainerCreateSpec{}, errors.New("compose create is not wired yet")
 	}
-	if err := d.Validate(config.DefaultSystem()); err != nil {
+	if err := d.Validate(); err != nil {
 		return app.ContainerCreateSpec{}, err
 	}
 	ports, err := parseCreatePorts(d.Ports)
@@ -547,11 +659,11 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 	}, nil
 }
 
-func (d createDraft) ComposeSpec() (composeCreateSpec, error) {
+func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error) {
 	if d.Mode != createModeCompose {
 		return composeCreateSpec{}, errors.New("compose spec requires compose mode")
 	}
-	if err := d.Validate(config.DefaultSystem()); err != nil {
+	if err := d.Validate(); err != nil {
 		return composeCreateSpec{}, err
 	}
 	if _, err := parseCreatePorts(d.Ports); err != nil {
@@ -565,7 +677,16 @@ func (d createDraft) ComposeSpec() (composeCreateSpec, error) {
 	}
 	base := strings.TrimSpace(d.ComposeFile)
 	service := strings.TrimSpace(d.Service)
-	override := filepath.Join(filepath.Dir(base), "compose.whatthedock."+safeComposeFilename(service)+".yml")
+	overrideName := "compose.whatthedock." + safeComposeFilename(service) + ".yml"
+	var override string
+	if system.Kind == "ssh" {
+		// The base file lives on the remote host, so its directory is a
+		// POSIX remote path regardless of what OS whatthedock itself runs
+		// on — use "path", not "filepath", for this join.
+		override = path.Join(path.Dir(base), overrideName)
+	} else {
+		override = filepath.Join(filepath.Dir(base), overrideName)
+	}
 	content := d.composeOverrideContent()
 	if d.OverrideRawSet {
 		content = d.OverrideRaw
@@ -576,6 +697,7 @@ func (d createDraft) ComposeSpec() (composeCreateSpec, error) {
 		BaseFile:     base,
 		OverrideFile: override,
 		Content:      content,
+		System:       system,
 	}, nil
 }
 
@@ -634,6 +756,9 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if strings.TrimSpace(spec.BaseFile) == "" {
 		return errors.New("compose file is required")
 	}
+	if spec.System.Kind == "ssh" {
+		return applyComposeCreateRemote(ctx, spec)
+	}
 	if _, err := os.Stat(spec.BaseFile); err != nil {
 		return err
 	}
@@ -656,6 +781,34 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	return composeCommand(ctx, spec, "up", "-d", spec.Service)
 }
 
+// applyComposeCreateRemote is defaultApplyComposeCreate's SSH-system
+// counterpart: every filesystem operation runs on the remote host over the
+// same ssh convention as the Docker socket tunnel (see sshRun), writing and
+// validating a temp override before promoting it, exactly like the local
+// path — just with `test`/`mkdir`/`cat >`/`mv` in place of the os package.
+func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error {
+	if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		return fmt.Errorf("compose file not found on %s: %w", spec.System.Name, err)
+	}
+	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.OverrideFile)), ""); err != nil {
+		return err
+	}
+	tempSpec := spec
+	tempSpec.OverrideFile = spec.OverrideFile + ".tmp"
+	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempSpec.OverrideFile), spec.Content); err != nil {
+		return err
+	}
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
+		return err
+	}
+	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempSpec.OverrideFile)+" "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
+		return err
+	}
+	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+}
+
 func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...string) error {
 	baseArgs := []string{"compose"}
 	if strings.TrimSpace(spec.Project) != "" {
@@ -663,6 +816,14 @@ func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...strin
 	}
 	baseArgs = append(baseArgs, "-f", spec.BaseFile, "-f", spec.OverrideFile)
 	baseArgs = append(baseArgs, args...)
+	if spec.System.Kind == "ssh" {
+		quoted := make([]string, len(baseArgs))
+		for i, a := range baseArgs {
+			quoted[i] = systems.ShellQuote(a)
+		}
+		_, err := sshRun(ctx, spec.System, "docker "+strings.Join(quoted, " "), "")
+		return err
+	}
 	cmd := exec.CommandContext(ctx, "docker", baseArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -784,15 +945,22 @@ func (m *Model) moveCreateField(delta int) {
 	m.createCursor = len([]rune(m.createFieldValue()))
 }
 
+// visibleCreateFields lists the fields Tab/Shift+Tab cycle through.
+// createFieldMode is always first: it isn't rendered as its own row (the
+// tab pills at the top of the panel represent it visually — see
+// renderCreateModeTabs), but it stays in the navigable field list so
+// landing on the wrong field never types a stray character while someone's
+// actually trying to reach mode-switching by mashing Tab; [/] also switches
+// modes directly from any field (see cycleCreateMode).
 func (m Model) visibleCreateFields() []createField {
 	if m.createDraft.Mode == createModeStandalone {
-		return []createField{createFieldContainerName, createFieldImage, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart}
+		return []createField{createFieldMode, createFieldContainerName, createFieldImage, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart}
 	}
-	return []createField{createFieldProject, createFieldService, createFieldImage, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart, createFieldComposeFile}
+	return []createField{createFieldMode, createFieldProject, createFieldService, createFieldImage, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart, createFieldComposeFile}
 }
 
 func (m Model) isCreateChoiceField() bool {
-	return m.createField == createFieldRestart
+	return m.createField == createFieldMode || m.createField == createFieldRestart
 }
 
 func (m *Model) cycleCreateChoice(direction int) {
@@ -800,6 +968,9 @@ func (m *Model) cycleCreateChoice(direction int) {
 		direction = 1
 	}
 	switch m.createField {
+	case createFieldMode:
+		m.cycleCreateMode()
+		return
 	case createFieldRestart:
 		options := []string{"unless-stopped", "always", "on-failure", "no"}
 		current := 0

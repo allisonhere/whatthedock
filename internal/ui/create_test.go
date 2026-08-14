@@ -51,6 +51,7 @@ func TestCreateCommandPaletteActionOpensOverlay(t *testing.T) {
 func TestCreateOverlayTextFieldsAcceptNavigationLetters(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
+	model.moveCreateField(1) // off the Mode tab pseudo-field, onto Project
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
 	model = updated.(Model)
@@ -62,17 +63,22 @@ func TestCreateOverlayTextFieldsAcceptNavigationLetters(t *testing.T) {
 	}
 }
 
-func TestCreateValidationRejectsRemoteComposeEditing(t *testing.T) {
+// TestCreateValidationAllowsRemoteComposeEditing guards against a
+// regression of the "compose editing is local-only" limitation: Compose
+// drafts against an SSH system must validate the same as local ones now
+// that browsing/writing/applying all have SSH-aware paths.
+func TestCreateValidationAllowsRemoteComposeEditing(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.systems = []config.System{{ID: "remote", Name: "remote", Kind: "ssh", SSHHost: "dock.example", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/whatthedock.sock"}}
 	model.activeSystem = "remote"
 	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 
-	if !model.statusErr || !strings.Contains(model.status, "local-only") {
-		t.Fatalf("status/statusErr = %q/%v, want local-only validation error", model.status, model.statusErr)
+	if model.statusErr || !strings.Contains(model.status, "validated") {
+		t.Fatalf("status/statusErr = %q/%v, want a successful validation", model.status, model.statusErr)
 	}
 }
 
@@ -166,7 +172,7 @@ func TestCreateComposeSpecWritesOverrideBesideBaseFile(t *testing.T) {
 		ComposeFile: "/srv/media/compose.yml",
 	}
 
-	spec, err := draft.ComposeSpec()
+	spec, err := draft.ComposeSpec(config.DefaultSystem())
 	if err != nil {
 		t.Fatalf("ComposeSpec() error = %v", err)
 	}
@@ -272,7 +278,7 @@ func TestCreateComposeFileBrowserSelectsFile(t *testing.T) {
 	model.createDraft.ComposeFile = filepath.Join(dir, "compose.yml")
 	model.createField = createFieldComposeFile
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if !model.createBrowsing {
 		t.Fatal("createBrowsing = false, want true")
@@ -312,21 +318,56 @@ func TestCreateComposeFileBrowserOpensWithCtrlOFromAnyCreateField(t *testing.T) 
 	}
 }
 
-func TestCreateComposeFileBrowserOpensWithOFromAnyCreateField(t *testing.T) {
+// TestCreateComposeFileBrowserOpensWithOFromChoiceField checks where bare
+// "o" is still a browse shortcut: choice fields (Mode/Restart) that have no
+// other use for a plain letter anyway. See
+// TestCreateOTypesNormallyOnTextFields, including the Compose file row
+// itself, for the fields where it must NOT hijack typing.
+func TestCreateComposeFileBrowserOpensWithOFromChoiceField(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	model := testModelWithSelectedContainer()
-	model.openCreateOverlay()
-	model.createDraft.ComposeFile = filepath.Join(dir, "compose.yml")
-	model.createField = createFieldProject
+	for _, field := range []createField{createFieldMode, createFieldRestart} {
+		t.Run(createFieldLabel(field), func(t *testing.T) {
+			model := testModelWithSelectedContainer()
+			model.openCreateOverlay()
+			model.createDraft.ComposeFile = filepath.Join(dir, "compose.yml")
+			model.createField = field
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
-	model = updated.(Model)
+			updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+			model = updated.(Model)
 
-	if !model.createBrowsing {
-		t.Fatal("createBrowsing = false after o, want true")
+			if !model.createBrowsing {
+				t.Fatalf("createBrowsing = false after o on %v, want true", field)
+			}
+		})
+	}
+}
+
+// TestCreateOTypesNormallyOnTextFields guards against the bug found while
+// testing remote browsing: bare "o" used to open the file browser from ANY
+// field in Compose mode, including plain text fields and the Compose file
+// row itself — meaning you could never type a value containing the letter
+// "o" (like "postgres", "sonarr", or "compose.yml" itself, which contains
+// two) without the browser popping open mid-keystroke. Only choice fields
+// (Mode/Restart) treat it as a shortcut now; Enter or Ctrl+O still open the
+// browser from the Compose file field.
+func TestCreateOTypesNormallyOnTextFields(t *testing.T) {
+	for _, field := range []createField{createFieldProject, createFieldService, createFieldImage, createFieldPorts, createFieldMounts, createFieldEnv, createFieldComposeFile} {
+		t.Run(createFieldLabel(field), func(t *testing.T) {
+			model := testModelWithSelectedContainer()
+			model.openCreateOverlay()
+			model.createDraft.Mode = createModeCompose
+			model.createField = field
+
+			updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+			model = updated.(Model)
+
+			if model.createBrowsing {
+				t.Fatalf("createBrowsing = true after typing o into %v, want the letter typed instead", field)
+			}
+		})
 	}
 }
 
@@ -493,6 +534,191 @@ func TestApplyComposeCreateRemovesTempOnValidationFailure(t *testing.T) {
 	}
 }
 
+// fakeSSHRun swaps in for sshRun so remote-Compose tests never shell out to a
+// real ssh binary. It records every script (and stdin) it was called with, in
+// order, and dispatches canned responses by exact script match.
+type fakeSSHRun struct {
+	calls     []string
+	responses map[string]struct {
+		output []byte
+		err    error
+	}
+}
+
+func (f *fakeSSHRun) run(_ context.Context, _ config.System, script string, stdin string) ([]byte, error) {
+	call := script
+	if stdin != "" {
+		call += "\x00stdin=" + stdin
+	}
+	f.calls = append(f.calls, call)
+	if resp, ok := f.responses[script]; ok {
+		return resp.output, resp.err
+	}
+	return nil, nil
+}
+
+func (f *fakeSSHRun) respond(script string, output string, err error) {
+	if f.responses == nil {
+		f.responses = map[string]struct {
+			output []byte
+			err    error
+		}{}
+	}
+	f.responses[script] = struct {
+		output []byte
+		err    error
+	}{[]byte(output), err}
+}
+
+func withFakeSSHRun(t *testing.T) *fakeSSHRun {
+	t.Helper()
+	fake := &fakeSSHRun{}
+	original := sshRun
+	sshRun = fake.run
+	t.Cleanup(func() { sshRun = original })
+	return fake
+}
+
+func TestRemoteFileEntriesParsesListing(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	fake.respond("cd '/srv/media-stack' 2>&1 && pwd && ls -1Ap",
+		"/srv/media-stack\ncompose.yml\ncompose.override.yml\nREADME.md\nsubdir/\n", nil)
+
+	entries, resolvedDir, err := remoteFileEntries(context.Background(), system, "/srv/media-stack", "/srv/media-stack/compose.override.yml")
+	if err != nil {
+		t.Fatalf("remoteFileEntries() error = %v", err)
+	}
+	if resolvedDir != "/srv/media-stack" {
+		t.Fatalf("resolvedDir = %q, want /srv/media-stack", resolvedDir)
+	}
+	if len(entries) != 4 { // .. , subdir/, compose.yml, compose.override.yml (README.md is filtered out)
+		t.Fatalf("entries = %#v, want 4 (parent, one dir, two compose files)", entries)
+	}
+	if entries[0].Name != ".." || !entries[0].Parent {
+		t.Fatalf("entries[0] = %#v, want parent entry", entries[0])
+	}
+	if entries[1].Name != "subdir" || !entries[1].Dir {
+		t.Fatalf("entries[1] = %#v, want subdir directory", entries[1])
+	}
+	names := []string{entries[2].Name, entries[3].Name}
+	if names[0] != "compose.override.yml" && names[1] != "compose.override.yml" {
+		t.Fatalf("compose files = %v, want compose.override.yml among them", names)
+	}
+	for _, e := range entries[2:] {
+		if e.Name == "compose.override.yml" && !e.Selected {
+			t.Fatalf("compose.override.yml not marked selected: %#v", e)
+		}
+	}
+}
+
+func TestRemoteFileEntriesReturnsErrorFromSSH(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	fake.respond("cd '/no/such/dir' 2>&1 && pwd && ls -1Ap", "", errors.New("no such file or directory"))
+
+	_, _, err := remoteFileEntries(context.Background(), system, "/no/such/dir", "")
+	if err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+		t.Fatalf("err = %v, want the remote error surfaced", err)
+	}
+}
+
+func TestBrowseCreateDirIsAsyncForSSHSystems(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	fake.respond("cd '/srv/media-stack' 2>&1 && pwd && ls -1Ap", "/srv/media-stack\ncompose.yml\n", nil)
+
+	model := testModelWithSelectedContainer()
+	model.systems = []config.System{{ID: "remote", Name: "jarvis", Kind: "ssh", SSHHost: "jarvis", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/whatthedock.sock"}}
+	model.activeSystem = "remote"
+
+	cmd := model.browseCreateDir("/srv/media-stack")
+	if cmd == nil {
+		t.Fatal("browseCreateDir() returned nil cmd for an SSH system, want an async listing command")
+	}
+	if !model.createFileLoading {
+		t.Fatal("createFileLoading = false immediately after starting an SSH browse, want true")
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("sshRun invoked synchronously (%d calls) — browsing must not block Update", len(fake.calls))
+	}
+
+	msg := runCmd(t, cmd).(createFileBrowseMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if model.createFileLoading {
+		t.Fatal("createFileLoading = true after the browse message landed, want false")
+	}
+	if model.createBrowseDir != "/srv/media-stack" || len(model.createFiles) != 2 { // ".." parent + compose.yml
+		t.Fatalf("browseDir/files = %q/%#v after remote listing", model.createBrowseDir, model.createFiles)
+	}
+}
+
+func TestApplyComposeCreateRemoteWritesAndAppliesOverSSH(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "media-stack",
+		Service:      "cache",
+		BaseFile:     "/srv/media-stack/compose.yml",
+		OverrideFile: "/srv/media-stack/compose.whatthedock.cache.yml",
+		Content:      "services:\n  cache:\n    image: redis:7\n",
+		System:       system,
+	}
+
+	if err := applyComposeCreateRemote(context.Background(), spec); err != nil {
+		t.Fatalf("applyComposeCreateRemote() error = %v", err)
+	}
+
+	wantScripts := []string{
+		"test -f '/srv/media-stack/compose.yml'",
+		"mkdir -p '/srv/media-stack'",
+		"cat > '/srv/media-stack/compose.whatthedock.cache.yml.tmp'\x00stdin=" + spec.Content,
+		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml.tmp' 'config'",
+		"mv '/srv/media-stack/compose.whatthedock.cache.yml.tmp' '/srv/media-stack/compose.whatthedock.cache.yml'",
+		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml' 'up' '-d' 'cache'",
+	}
+	if len(fake.calls) != len(wantScripts) {
+		t.Fatalf("calls = %#v, want %d calls matching %#v", fake.calls, len(wantScripts), wantScripts)
+	}
+	for i, want := range wantScripts {
+		if fake.calls[i] != want {
+			t.Fatalf("call %d = %q, want %q", i, fake.calls[i], want)
+		}
+	}
+}
+
+func TestApplyComposeCreateRemoteCleansUpTempOnValidationFailure(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "media-stack",
+		Service:      "cache",
+		BaseFile:     "/srv/media-stack/compose.yml",
+		OverrideFile: "/srv/media-stack/compose.whatthedock.cache.yml",
+		Content:      "services:\n  cache:\n    image: redis:7\n",
+		System:       system,
+	}
+	fake.respond(
+		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml.tmp' 'config'",
+		"", errors.New("invalid compose"),
+	)
+
+	err := applyComposeCreateRemote(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "invalid compose") {
+		t.Fatalf("error = %v, want invalid compose", err)
+	}
+	last := fake.calls[len(fake.calls)-1]
+	if last != "rm -f '/srv/media-stack/compose.whatthedock.cache.yml.tmp'" {
+		t.Fatalf("last call = %q, want the temp override cleaned up", last)
+	}
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "mv ") {
+			t.Fatalf("promoted the override despite failed validation: %#v", fake.calls)
+		}
+	}
+}
+
 func TestCreateEditorOpensPrefilledWithGeneratedYAML(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
@@ -549,7 +775,7 @@ func TestCreateEditorSaveSetsRawOverrideUsedByComposeSpec(t *testing.T) {
 		t.Fatalf("OverrideRaw = %q, want %q", model.createDraft.OverrideRaw, want)
 	}
 
-	spec, err := model.createDraft.ComposeSpec()
+	spec, err := model.createDraft.ComposeSpec(model.activeSystemConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,5 +921,45 @@ func TestCreateEditorOverlayShowsLiveLintStatus(t *testing.T) {
 	}
 	if !strings.Contains(view, "yaml:") {
 		t.Fatalf("editor overlay missing yaml error text for broken content:\n%s", view)
+	}
+}
+
+func TestCreateModeFieldIsFirstTabStopAndCyclesWithHL(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+
+	if model.createField != createFieldMode {
+		t.Fatalf("initial field = %v, want createFieldMode as the first tab stop", model.createField)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	model = updated.(Model)
+	if model.createDraft.Mode != createModeStandalone {
+		t.Fatalf("mode = %v after l on the Mode field, want standalone", model.createDraft.Mode)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	model = updated.(Model)
+	if model.createDraft.Mode != createModeCompose {
+		t.Fatalf("mode = %v after h on the Mode field, want compose", model.createDraft.Mode)
+	}
+}
+
+// TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere guards against the
+// bug being fixed here: landing on the wrong field (or the Mode field,
+// before it was Tab-reachable) and pressing a key that isn't a recognized
+// shortcut used to silently type that character into whatever field last
+// held focus, corrupting it. A key that isn't h/l/enter/[/] while focused on
+// Mode must now be a no-op, not a stray character typed anywhere.
+func TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	before := model.createDraft
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	model = updated.(Model)
+
+	if model.createDraft != before {
+		t.Fatalf("draft changed after a stray '/' on the Mode field: before=%#v after=%#v", before, model.createDraft)
 	}
 }

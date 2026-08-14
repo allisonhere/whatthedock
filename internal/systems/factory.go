@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
@@ -101,6 +102,29 @@ func SSHTarget(system config.System) string {
 		return system.SSHHost
 	}
 	return system.SSHUser + "@" + system.SSHHost
+}
+
+// RemoteCommand returns an *exec.Cmd that runs script on system's SSH host,
+// using the same ssh binary and host/port/user convention as the Docker
+// socket tunnel above. It's for one-shot remote operations outside the
+// tunnel — listing, reading, and writing Compose files, and running
+// `docker compose` — not for the persistent -fN port forward.
+func RemoteCommand(ctx context.Context, system config.System, script string) (*exec.Cmd, error) {
+	if system.SSHHost == "" {
+		return nil, fmt.Errorf("ssh host is required")
+	}
+	args := []string{}
+	if system.SSHPort != "" {
+		args = append(args, "-p", system.SSHPort)
+	}
+	args = append(args, SSHTarget(system), script)
+	return exec.CommandContext(ctx, "ssh", args...), nil
+}
+
+// ShellQuote wraps s in single quotes for safe inclusion in a remote shell
+// command, escaping any embedded single quotes POSIX-style.
+func ShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func isSocket(path string) bool {

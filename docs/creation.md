@@ -32,15 +32,21 @@ as you type, without needing to press `Ctrl+S`.
 
 ## Compose Service Flow
 
-Compose creation is local-only for now. SSH systems can still manage Docker
-containers through the SSH tunnel, but WhatTheDock does not yet edit or write
-remote Compose files.
+Compose creation works against both local and SSH systems. For an SSH
+system, browsing, writing the override file, and running `docker compose`
+all happen on the remote host, over the same `ssh` connection convention
+used for the Docker socket tunnel (see the system's SSH host/port/user in
+Settings → Systems) — nothing needs to exist locally.
 
 1. Press `n`.
 2. Make sure the `Compose service` tab is active (`[`/`]` to switch).
 3. Fill in `Project`, `Service`, `Image`, optional `Ports`, `Mounts`, `Env`,
    `Restart`, and `Compose file`.
-4. Use `o` or `Ctrl+O` to browse for a local Compose file.
+4. Use `Enter` or `Ctrl+O` on the `Compose file` field to browse for a file
+   (local or, for an SSH system, on the remote host). Plain `o` types the
+   letter into whatever field is focused — including `Compose file` itself,
+   so you can type a path by hand — rather than opening the browser; only
+   choice fields (`Mode`, `Restart`) treat bare `o` as a shortcut.
 5. Optionally press `Ctrl+Y` to hand-edit the generated override YAML
    directly (see Override YAML Editor below).
 6. Check the inline validation line, or press `Ctrl+S` to validate explicitly.
@@ -105,9 +111,19 @@ WhatTheDock runs:
 docker compose -p <project> -f <base-compose-file> -f <override-file> up -d <service>
 ```
 
+For an SSH system, every step above (the `test -f` base-file check, `mkdir
+-p`, writing the temp override, `docker compose config`, the rename, and
+`docker compose up -d`) runs on the remote host over `ssh` instead of the
+local filesystem/`docker` binary.
+
 ## Compose File Browser
 
-In Compose create mode, `o` or `Ctrl+O` opens the local file browser.
+In Compose create mode, `Ctrl+O` opens the file browser from any field;
+`Enter` opens it from the `Compose file` field specifically. For a local
+system this reads the local filesystem; for an SSH system it lists the
+remote host's filesystem instead (the panel title shows the system name,
+e.g. `Directory (jarvis)`), one `ssh` round trip per directory — while that's
+in flight the browser shows "Listing remote directory…".
 
 Browser keys:
 
@@ -156,7 +172,8 @@ container ID when Docker provides one.
 
 - Compose creation writes generated override files; it does not yet edit or
   merge into existing Compose YAML.
-- Compose creation is local-only.
-- The file browser is local-only.
-- Remote SSH Compose file read/write is a future design item.
+- Remote (SSH) Compose operations are one `ssh` invocation per step (listing
+  a directory, writing the override, each `docker compose` call) rather than
+  a shared multiplexed connection, so each has its own connection-setup
+  latency — noticeable but not prohibitive for typical use.
 - Standalone command parsing uses whitespace splitting, not full shell quoting.
