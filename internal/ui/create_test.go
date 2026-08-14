@@ -14,6 +14,7 @@ import (
 
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/config"
+	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
 func TestCreateOverlayOpensFromShortcutAndRendersPreview(t *testing.T) {
@@ -885,6 +886,140 @@ func TestCreateEditorOverlayRendersLargeAndVimStatus(t *testing.T) {
 	}
 }
 
+func TestApplyOverrideFieldsFromYAMLSyncsFields(t *testing.T) {
+	d := createDraft{Service: "radarr", Image: "stale:old", Ports: "stale"}
+	content := "services:\n" +
+		"  radarr:\n" +
+		"    image: \"radarr:custom\"\n" +
+		"    restart: \"always\"\n" +
+		"    command: \"run --flag\"\n" +
+		"    ports:\n" +
+		"      - \"7878:7878\"\n" +
+		"      - \"7879:7879\"\n" +
+		"    volumes:\n" +
+		"      - \"/data:/data\"\n" +
+		"    environment:\n" +
+		"      - \"PUID=1000\"\n"
+	d.applyOverrideFieldsFromYAML(content)
+
+	if d.Image != "radarr:custom" {
+		t.Fatalf("Image = %q, want radarr:custom", d.Image)
+	}
+	if d.Restart != "always" {
+		t.Fatalf("Restart = %q, want always", d.Restart)
+	}
+	if d.Command != "run --flag" {
+		t.Fatalf("Command = %q, want %q", d.Command, "run --flag")
+	}
+	if d.Ports != "7878:7878, 7879:7879" {
+		t.Fatalf("Ports = %q, want %q", d.Ports, "7878:7878, 7879:7879")
+	}
+	if d.Mounts != "/data:/data" {
+		t.Fatalf("Mounts = %q, want /data:/data", d.Mounts)
+	}
+	if d.Env != "PUID=1000" {
+		t.Fatalf("Env = %q, want PUID=1000", d.Env)
+	}
+}
+
+func TestApplyOverrideFieldsFromYAMLHandlesMapEnvironment(t *testing.T) {
+	d := createDraft{Service: "radarr"}
+	content := "services:\n  radarr:\n    image: radarr:custom\n    environment:\n      PUID: 1000\n      TZ: UTC\n"
+	d.applyOverrideFieldsFromYAML(content)
+
+	if d.Env != "PUID=1000, TZ=UTC" {
+		t.Fatalf("Env = %q, want sorted key=value pairs from map form", d.Env)
+	}
+}
+
+func TestApplyOverrideFieldsFromYAMLUsesSoleServiceWhenDraftServiceIsBlank(t *testing.T) {
+	d := createDraft{Service: ""}
+	content := "services:\n  radarr:\n    image: radarr:custom\n"
+	d.applyOverrideFieldsFromYAML(content)
+
+	if d.Service != "radarr" || d.Image != "radarr:custom" {
+		t.Fatalf("Service/Image = %q/%q, want radarr/radarr:custom", d.Service, d.Image)
+	}
+}
+
+func TestApplyOverrideFieldsFromYAMLLeavesDraftUnchangedOnParseError(t *testing.T) {
+	d := createDraft{Service: "radarr", Image: "kept:as-is"}
+	d.applyOverrideFieldsFromYAML("services: [unclosed")
+
+	if d.Image != "kept:as-is" {
+		t.Fatalf("Image = %q, want unchanged after a parse error", d.Image)
+	}
+}
+
+func TestApplyOverrideFieldsFromYAMLLeavesDraftUnchangedWhenServiceNameIsAmbiguous(t *testing.T) {
+	d := createDraft{Service: "radarr", Image: "kept:as-is"}
+	content := "services:\n  sonarr:\n    image: sonarr:latest\n  lidarr:\n    image: lidarr:latest\n"
+	d.applyOverrideFieldsFromYAML(content)
+
+	if d.Image != "kept:as-is" || d.Service != "radarr" {
+		t.Fatalf("Image/Service = %q/%q, want unchanged when no service matches and there's more than one", d.Image, d.Service)
+	}
+}
+
+func TestOpenCreateOverlayLoadedOverrideSyncsFormFields(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overrideContent := "services:\n  radarr:\n    image: \"radarr:custom\"\n    ports:\n      - \"7878:7878\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "compose.whatthedock.radarr.yml"), []byte(overrideContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCreateOverlay()
+
+	if model.createDraft.Image != "radarr:custom" {
+		t.Fatalf("Image = %q after loading an existing override, want radarr:custom", model.createDraft.Image)
+	}
+	if model.createDraft.Ports != "7878:7878" {
+		t.Fatalf("Ports = %q after loading an existing override, want 7878:7878", model.createDraft.Ports)
+	}
+}
+
+func TestSavingCreateEditorSyncsFormFieldsFromEditedYAML(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(Model)
+	model.createEditor.SetValue("services:\n  radarr:\n    image: \"radarr:edited\"\n")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+
+	if model.createDraft.Image != "radarr:edited" {
+		t.Fatalf("Image = %q after hand-editing and saving, want radarr:edited", model.createDraft.Image)
+	}
+}
+
+func TestCreateOverrideCheckMsgSyncsFormFields(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "radarr"
+
+	overrideContent := "services:\n  radarr:\n    image: \"radarr:custom\"\n"
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", content: overrideContent, found: true})
+	model = updated.(Model)
+
+	if model.createDraft.Image != "radarr:custom" {
+		t.Fatalf("Image = %q after an SSH override-check result, want radarr:custom", model.createDraft.Image)
+	}
+}
+
 func TestLintComposeYAML(t *testing.T) {
 	if err := lintComposeYAML("services:\n  demo:\n    image: demo:latest\n"); err != nil {
 		t.Fatalf("lintComposeYAML(valid) = %v, want nil", err)
@@ -961,5 +1096,147 @@ func TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere(t *testing.T) {
 
 	if model.createDraft != before {
 		t.Fatalf("draft changed after a stray '/' on the Mode field: before=%#v after=%#v", before, model.createDraft)
+	}
+}
+
+func TestDefaultCreateDraftPrefillsServiceFromSelectedContainer(t *testing.T) {
+	model := testModelWithSelectedContainer() // container "1": Compose.Service = "radarr"
+	draft := model.defaultCreateDraft()
+	if draft.Service != "radarr" {
+		t.Fatalf("Service = %q, want radarr prefilled from the selected container", draft.Service)
+	}
+}
+
+// modelSelecting builds a model whose "selected container" is a synthetic
+// fixture pointing at a real temp-dir Compose file, so override-detection
+// tests can control the exact path instead of the shared fixture's
+// hardcoded /srv/media/compose.yml.
+func modelSelecting(project, service, composeFile string) Model {
+	model := testModel()
+	id := domain.ResourceID{Host: "local", ID: "override-test"}
+	ctr := domain.Container{
+		ID:    id,
+		Name:  service + "-1",
+		Image: "image:tag",
+		Compose: domain.ComposeRef{
+			Project:     project,
+			Service:     service,
+			ConfigFiles: composeFile,
+		},
+	}
+	model.selected = &ctr
+	model.selectedID = id
+	return model
+}
+
+func TestOpenCreateOverlayLoadsExistingLocalOverride(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overridePath := filepath.Join(dir, "compose.whatthedock.radarr.yml")
+	overrideContent := "services:\n  radarr:\n    image: radarr:custom\n"
+	if err := os.WriteFile(overridePath, []byte(overrideContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	cmd := model.openCreateOverlay()
+	if cmd != nil {
+		t.Fatal("openCreateOverlay() returned a Cmd for a local system, want synchronous detection (nil)")
+	}
+
+	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideLoaded {
+		t.Fatalf("OverrideRawSet/OverrideLoaded = %v/%v, want both true", model.createDraft.OverrideRawSet, model.createDraft.OverrideLoaded)
+	}
+	if model.createDraft.OverrideRaw != overrideContent {
+		t.Fatalf("OverrideRaw = %q, want the existing file's content %q", model.createDraft.OverrideRaw, overrideContent)
+	}
+	if model.statusErr || !strings.Contains(model.status, "loaded existing override") {
+		t.Fatalf("status/statusErr = %q/%v, want a loaded-override confirmation", model.status, model.statusErr)
+	}
+
+	spec, err := model.createDraft.ComposeSpec(model.activeSystemConfig())
+	if err != nil {
+		t.Fatalf("ComposeSpec() error = %v", err)
+	}
+	if spec.Content != overrideContent {
+		t.Fatalf("ComposeSpec content = %q, want the loaded override content, not a regenerated one", spec.Content)
+	}
+}
+
+func TestOpenCreateOverlayLeavesDraftGeneratedWhenNoOverrideExists(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCreateOverlay()
+
+	if model.createDraft.OverrideRawSet || model.createDraft.OverrideLoaded {
+		t.Fatalf("OverrideRawSet/OverrideLoaded = %v/%v, want both false when no override file exists", model.createDraft.OverrideRawSet, model.createDraft.OverrideLoaded)
+	}
+}
+
+func TestSavingCreateEditorClearsOverrideLoadedFlag(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compose.whatthedock.radarr.yml"), []byte("services:\n  radarr:\n    image: radarr:custom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCreateOverlay()
+	if !model.createDraft.OverrideLoaded {
+		t.Fatal("OverrideLoaded = false after loading an existing override, want true")
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(Model)
+	model.createEditor.SetValue("services:\n  radarr:\n    image: radarr:edited\n")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+
+	if model.createDraft.OverrideLoaded {
+		t.Fatal("OverrideLoaded = true after hand-editing and saving, want false (it's edited now, not just loaded)")
+	}
+	if !model.createDraft.OverrideRawSet {
+		t.Fatal("OverrideRawSet = false after saving an edit, want true")
+	}
+}
+
+func TestCheckRemoteOverrideCmdFindsExistingOverride(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	overrideContent := "services:\n  radarr:\n    image: radarr:custom\n"
+	fake.respond("cat '/srv/media-stack/compose.whatthedock.radarr.yml'", overrideContent, nil)
+
+	cmd := checkRemoteOverrideCmd(system, "/srv/media-stack/compose.yml", "radarr")
+	if cmd == nil {
+		t.Fatal("checkRemoteOverrideCmd() = nil, want a Cmd")
+	}
+	msg := runCmd(t, cmd).(createOverrideCheckMsg)
+	if !msg.found || msg.content != overrideContent || msg.service != "radarr" {
+		t.Fatalf("msg = %#v, want found=true content=%q service=radarr", msg, overrideContent)
+	}
+}
+
+func TestCreateOverrideCheckMsgIgnoredIfServiceChangedBeforeItArrived(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "a-different-service" // user changed it before the ssh round trip landed
+
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", content: "stale content", found: true})
+	model = updated.(Model)
+
+	if model.createDraft.OverrideRawSet {
+		t.Fatal("a stale override-check result was applied after the draft's service changed")
 	}
 }

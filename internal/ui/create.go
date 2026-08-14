@@ -58,11 +58,15 @@ type createDraft struct {
 	Restart       string
 	ComposeFile   string
 
-	// OverrideRaw, when OverrideRawSet, is hand-edited override YAML (see the
-	// Ripple editor opened with ctrl+y) that takes precedence over the
-	// generated composeOverrideContent for this draft.
+	// OverrideRaw, when OverrideRawSet, is override YAML that takes
+	// precedence over the generated composeOverrideContent for this draft —
+	// either loaded from an existing compose.whatthedock.<service>.yml (see
+	// openCreateOverlay/checkRemoteOverrideCmd) or hand-edited via the
+	// Ripple editor opened with ctrl+y. OverrideLoaded distinguishes the
+	// two for the form's label; saving an edit in the editor clears it.
 	OverrideRaw    string
 	OverrideRawSet bool
+	OverrideLoaded bool
 }
 
 type composeCreateSpec struct {
@@ -82,13 +86,80 @@ type createFileEntry struct {
 	Selected bool
 }
 
-func (m *Model) openCreateOverlay() {
+// openCreateOverlay opens the create form. When the draft already targets a
+// Compose service that has a WhatTheDock-generated override on disk (the
+// common case: re-opening create for an already-selected, already-managed
+// service), it loads that override into the draft instead of silently
+// offering to regenerate — and overwrite — it on confirm. Local systems are
+// checked synchronously (a fast stat+read); SSH systems return a Cmd since
+// that's a network round trip (see checkRemoteOverrideCmd).
+func (m *Model) openCreateOverlay() tea.Cmd {
 	m.createDraft = m.defaultCreateDraft()
 	m.overlay = overlayCreate
 	m.createField = m.visibleCreateFields()[0]
 	m.createCursor = len([]rune(m.createFieldValue()))
 	m.createEditingCompose = false
 	m.status, m.statusErr = "create draft ready", false
+
+	if m.createDraft.Mode != createModeCompose {
+		return nil
+	}
+	system := m.activeSystemConfig()
+	if system.Kind == "ssh" {
+		return checkRemoteOverrideCmd(system, m.createDraft.ComposeFile, m.createDraft.Service)
+	}
+	if content, ok := existingOverrideContent(m.createDraft.ComposeFile, m.createDraft.Service); ok {
+		m.createDraft.OverrideRaw = content
+		m.createDraft.OverrideRawSet = true
+		m.createDraft.OverrideLoaded = true
+		m.createDraft.applyOverrideFieldsFromYAML(content)
+		m.status, m.statusErr = "loaded existing override for "+m.createDraft.Service, false
+	}
+	return nil
+}
+
+// existingOverrideContent reads a local compose.whatthedock.<service>.yml
+// beside base, if one exists.
+func existingOverrideContent(base, service string) (string, bool) {
+	base = strings.TrimSpace(base)
+	service = strings.TrimSpace(service)
+	if base == "" || service == "" {
+		return "", false
+	}
+	overridePath := filepath.Join(filepath.Dir(base), "compose.whatthedock."+safeComposeFilename(service)+".yml")
+	data, err := os.ReadFile(overridePath)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// createOverrideCheckMsg carries the result of checkRemoteOverrideCmd back
+// into Update. service guards against applying a stale result if the
+// draft's service changed (or the overlay closed) before the ssh round
+// trip finished.
+type createOverrideCheckMsg struct {
+	service string
+	content string
+	found   bool
+}
+
+func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd {
+	base = strings.TrimSpace(base)
+	service = strings.TrimSpace(service)
+	if base == "" || service == "" {
+		return nil
+	}
+	overridePath := path.Join(path.Dir(base), "compose.whatthedock."+safeComposeFilename(service)+".yml")
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		output, err := sshRun(ctx, system, "cat "+systems.ShellQuote(overridePath), "")
+		if err != nil {
+			return createOverrideCheckMsg{service: service, found: false}
+		}
+		return createOverrideCheckMsg{service: service, content: string(output), found: true}
+	}
 }
 
 func (m Model) defaultCreateDraft() createDraft {
@@ -109,6 +180,9 @@ func (m Model) defaultCreateDraft() createDraft {
 			draft.Project = selected.Compose.Project
 		} else {
 			draft.Mode = createModeStandalone
+		}
+		if selected.Compose.Service != "" {
+			draft.Service = selected.Compose.Service
 		}
 		if selected.Compose.ConfigFiles != "" {
 			files := splitComposeConfigFiles(selected.Compose.ConfigFiles)
@@ -361,8 +435,10 @@ func (m *Model) saveCreateEditor() {
 	value := strings.TrimSpace(m.createEditor.Value())
 	m.createDraft.OverrideRaw = value
 	m.createDraft.OverrideRawSet = value != ""
+	m.createDraft.OverrideLoaded = false // now hand-edited this session, not just loaded
 	m.createEditingCompose = false
 	if m.createDraft.OverrideRawSet {
+		m.createDraft.applyOverrideFieldsFromYAML(value)
 		m.status, m.statusErr = "override YAML edited", false
 	} else {
 		m.status, m.statusErr = "override YAML reset to generated", false
@@ -728,6 +804,94 @@ func appendQuotedYAMLList(lines []string, title string, values []string, prefix 
 		lines = append(lines, prefix+strconv.Quote(value))
 	}
 	return lines
+}
+
+// composeOverrideDoc/composeOverrideService are the subset of Compose YAML
+// shape applyOverrideFieldsFromYAML reads back out of override content — the
+// mirror image of composeOverrideContent's generation. Environment is typed
+// as interface{} because Compose allows it as either a list ("KEY=value"
+// entries) or a map (KEY: value); normalizeComposeEnvironment reconciles
+// both into the list form the Env field stores.
+type composeOverrideDoc struct {
+	Services map[string]composeOverrideService `yaml:"services"`
+}
+
+type composeOverrideService struct {
+	Image       string      `yaml:"image"`
+	Restart     string      `yaml:"restart"`
+	Command     string      `yaml:"command"`
+	Ports       []string    `yaml:"ports"`
+	Volumes     []string    `yaml:"volumes"`
+	Environment interface{} `yaml:"environment"`
+}
+
+// applyOverrideFieldsFromYAML parses content as Compose override YAML and,
+// if a service can be unambiguously identified (matching d.Service, or the
+// sole service present), updates d's structured fields to match it — so the
+// form reflects content that was loaded (override-detection) or hand-edited
+// (the Ripple editor) outside the fields themselves. Content that fails to
+// parse, or that names no service matching d.Service among several, leaves
+// d unchanged rather than guessing.
+func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
+	var doc composeOverrideDoc
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil || len(doc.Services) == 0 {
+		return
+	}
+	name, svc, ok := selectOverrideService(doc.Services, d.Service)
+	if !ok {
+		return
+	}
+	d.Service = name
+	d.Image = svc.Image
+	if strings.TrimSpace(svc.Restart) != "" {
+		d.Restart = svc.Restart
+	}
+	d.Command = svc.Command
+	d.Ports = strings.Join(svc.Ports, ", ")
+	d.Mounts = strings.Join(svc.Volumes, ", ")
+	d.Env = strings.Join(normalizeComposeEnvironment(svc.Environment), ", ")
+}
+
+// selectOverrideService picks which parsed service to sync fields from: the
+// one named preferredService if present, else the sole service when there's
+// exactly one. Multiple services with no name match is ambiguous, so callers
+// leave the draft untouched rather than guessing which one the user means.
+func selectOverrideService(services map[string]composeOverrideService, preferredService string) (string, composeOverrideService, bool) {
+	if svc, ok := services[strings.TrimSpace(preferredService)]; ok {
+		return strings.TrimSpace(preferredService), svc, true
+	}
+	if len(services) == 1 {
+		for name, svc := range services {
+			return name, svc, true
+		}
+	}
+	return "", composeOverrideService{}, false
+}
+
+// normalizeComposeEnvironment reconciles Compose's two allowed environment
+// shapes — a list of "KEY=value" strings, or a KEY: value map — into the
+// list form. Map form has no inherent order, so entries are sorted by key
+// for a stable, predictable Env field value.
+func normalizeComposeEnvironment(v interface{}) []string {
+	switch val := v.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case map[string]interface{}:
+		out := make([]string, 0, len(val))
+		for k, v := range val {
+			out = append(out, fmt.Sprintf("%s=%v", k, v))
+		}
+		sort.Strings(out)
+		return out
+	default:
+		return nil
+	}
 }
 
 func safeComposeFilename(value string) string {

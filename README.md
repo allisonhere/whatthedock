@@ -89,7 +89,11 @@ Docker socket paths must be present.
 | `S` | Manage local and remote Docker systems |
 | `,` / `Ctrl+,` | Settings |
 | `Ctrl+S` in settings/forms | Save changes |
-| `o` / `Ctrl+O` in Compose create form | Browse for local Compose files |
+| `[` / `]` in create form | Switch between Compose service and standalone container |
+| `o` / `Ctrl+O` in Compose create form | Browse for a Compose file, locally or on the active SSH system |
+| `Ctrl+Y` in Compose create form | Hand-edit the override YAML in a full-size editor |
+| `Ctrl+Enter` / `Alt+Enter` in create form | Review the confirmation step |
+| `y` / `n` in create confirmation | Confirm or cancel |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
 | `A` | About screen with Burn-style ANSI splash animation |
@@ -184,14 +188,23 @@ More detail:
   default activity pane.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
-  creation overlay with live generated previews and local-only validation.
-  Standalone drafts can be created and started after an explicit confirmation.
-  Compose drafts write a `compose.whatthedock.<service>.yml` override beside the
-  selected local Compose file after first validating a temporary override with
-  `docker compose config`, then run `docker compose up -d <service>` after
-  confirmation. The Compose file field includes a local file browser for finding
-  `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`, and
-  `docker-compose*.yaml` files.
+  creation overlay with live generated previews, syntax-highlighted YAML, and
+  inline validation as you type. Standalone drafts can be created and started
+  after an explicit confirmation. Compose drafts write a
+  `compose.whatthedock.<service>.yml` override beside the selected Compose
+  file after first validating a temporary override with `docker compose
+  config`, then run `docker compose up -d <service>` after confirmation. This
+  works against both local systems and SSH systems, running every step —
+  browsing, writing the override, and the `docker compose` calls — on the
+  remote host. Opening create for an already-managed service detects and
+  loads its existing override instead of silently regenerating it, and the
+  form's fields update to match whatever override content is actually loaded
+  or hand-edited. The Compose file field includes a file browser (local or
+  remote) for finding `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`,
+  and `docker-compose*.yaml` files. Press `Ctrl+Y` to hand-edit the generated
+  override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
+  editor, with real-time lint feedback and an optional persistent vim mode
+  (Settings → Editor).
 - Copies selected container IDs, images, Compose metadata, ports, mounts, and
   labels via terminal OSC52 clipboard escape sequences.
 - Opens published ports, bind mounts, and Compose config paths from the
@@ -216,7 +229,8 @@ WhatTheDock.
 ## Planned Features
 
 - Docker event stream.
-- Full Compose file editing and merge-aware service updates.
+- Merge-aware editing of the base Compose file itself, rather than only the
+  generated override.
 - Exec shell workflow.
 - Open/copy actions for environment values.
 - Deeper problem detection for orphaned, stale, and resource-heavy Docker

@@ -61,15 +61,28 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		}, formWidth))
 	}
 	previewLines := []string{renderer.Styles.DetailMeta.Render("Preview")}
-	for _, line := range strings.Split(m.createDraft.Preview(), "\n") {
-		previewLines = append(previewLines, renderer.Styles.DetailBody.Width(previewWidth).Render(line))
+	if m.createDraft.Mode == createModeCompose {
+		// Syntax-highlighted lines already carry their own color codes;
+		// wrapping them in another Foreground-bearing style would clobber
+		// the colors partway through (each highlighted span resets on its
+		// own end) — pad with a plain, color-less Width style instead.
+		for _, line := range highlightComposeYAML(m.createDraft.Preview()) {
+			previewLines = append(previewLines, lipgloss.NewStyle().Width(previewWidth).Render(line))
+		}
+	} else {
+		for _, line := range strings.Split(m.createDraft.Preview(), "\n") {
+			previewLines = append(previewLines, renderer.Styles.DetailBody.Width(previewWidth).Render(line))
+		}
 	}
 	if m.createDraft.Mode == createModeCompose {
 		composeFileLine := "Local compose file  " + short(m.createDraft.ComposeFile, max(12, previewWidth-20))
 		previewLines = append(previewLines, "", renderer.Styles.DetailMeta.Width(previewWidth).Render(composeFileLine))
-		if m.createDraft.OverrideRawSet {
+		switch {
+		case m.createDraft.OverrideLoaded:
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  existing file loaded (ctrl+y to edit)"))
+		case m.createDraft.OverrideRawSet:
 			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  hand-edited (ctrl+y to re-edit)"))
-		} else {
+		default:
 			previewLines = append(previewLines, renderer.Styles.DetailMeta.Width(previewWidth).Render("Override YAML  generated (ctrl+y to edit)"))
 		}
 	} else {

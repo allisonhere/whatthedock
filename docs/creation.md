@@ -38,6 +38,19 @@ all happen on the remote host, over the same `ssh` connection convention
 used for the Docker socket tunnel (see the system's SSH host/port/user in
 Settings → Systems) — nothing needs to exist locally.
 
+Opening create (`n`) for an already-selected, already-managed service
+checks whether it already has a WhatTheDock-generated
+`compose.whatthedock.<service>.yml` — locally this is checked immediately;
+for an SSH system it's one `ssh` round trip after the form opens. If found,
+that file's content is loaded as the draft's override (shown as `Override
+YAML  existing file loaded`) instead of silently offering to regenerate —
+and overwrite — it, and the structured fields (`Image`, `Ports`, `Mounts`,
+`Env`, `Restart`, `Command`) update to match what the loaded YAML actually
+contains. Hand-editing and saving via `Ctrl+Y` switches the label to
+`hand-edited` and syncs the fields the same way, from whatever you just
+saved. If the override defines more than one service and none matches the
+draft's `Service` field, the fields are left as-is rather than guessing.
+
 1. Press `n`.
 2. Make sure the `Compose service` tab is active (`[`/`]` to switch).
 3. Fill in `Project`, `Service`, `Image`, optional `Ports`, `Mounts`, `Env`,

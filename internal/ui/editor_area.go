@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"io"
+	"strings"
 
 	"github.com/allisonhere/ripple"
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
@@ -56,6 +57,15 @@ type editorArea struct {
 	CommentStyle     lipgloss.Style
 }
 
+// Compose YAML syntax colors, shared between the live Ripple editor and the
+// static preview shown on the create form before Ctrl+Y opens it, so a
+// draft looks the same whether or not you've opened the real editor yet.
+var (
+	composeKeyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7dcfff")).Bold(true)
+	composeStringStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#e0af68"))
+	composeCommentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89")).Italic(true)
+)
+
 func newEditorArea() editorArea {
 	ed := ripple.New()
 	ed.SetClipboard(editorClipboard)
@@ -67,9 +77,9 @@ func newEditorArea() editorArea {
 		CursorStyle:      lipgloss.NewStyle().Reverse(true),
 		SelectedStyle:    lipgloss.NewStyle().Reverse(true),
 		PlaceholderStyle: lipgloss.NewStyle().Faint(true),
-		KeyStyle:         lipgloss.NewStyle().Foreground(lipgloss.Color("#7dcfff")).Bold(true),
-		StringStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("#e0af68")),
-		CommentStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89")).Italic(true),
+		KeyStyle:         composeKeyStyle,
+		StringStyle:      composeStringStyle,
+		CommentStyle:     composeCommentStyle,
 	}
 }
 
@@ -181,6 +191,67 @@ func composeYAMLTokens(content string) []string {
 		lineStart = lineEnd + 1
 	}
 	return kinds
+}
+
+// highlightComposeYAML renders content with the same key/string/comment
+// coloring as the live Ripple editor (composeYAMLTokens), for contexts that
+// aren't a ripple.Model at all — the static preview on the create form,
+// shown before Ctrl+Y ever opens the real editor. Returns one already-
+// styled string per line; join with "\n" or feed each to further width
+// styling.
+func highlightComposeYAML(content string) []string {
+	kinds := composeYAMLTokens(content)
+	runes := []rune(content)
+
+	styleFor := func(kind string) *lipgloss.Style {
+		switch kind {
+		case "key":
+			return &composeKeyStyle
+		case "string":
+			return &composeStringStyle
+		case "comment":
+			return &composeCommentStyle
+		default:
+			return nil
+		}
+	}
+
+	lines := make([]string, 0, strings.Count(content, "\n")+1)
+	var out strings.Builder
+	var run []rune
+	runKind := ""
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		text := string(run)
+		if style := styleFor(runKind); style != nil {
+			out.WriteString(style.Render(text))
+		} else {
+			out.WriteString(text)
+		}
+		run = run[:0]
+	}
+	for i, r := range runes {
+		if r == '\n' {
+			flush()
+			lines = append(lines, out.String())
+			out.Reset()
+			continue
+		}
+		kind := ""
+		if i < len(kinds) {
+			kind = kinds[i]
+		}
+		if kind != runKind {
+			flush()
+			runKind = kind
+		}
+		run = append(run, r)
+	}
+	flush()
+	lines = append(lines, out.String())
+	return lines
 }
 
 func tokenizeComposeYAMLLine(runes []rune, kinds []string, start, end int) {

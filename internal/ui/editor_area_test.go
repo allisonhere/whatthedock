@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 )
 
@@ -126,5 +127,29 @@ func TestEditorAreaViewAppliesHighlighting(t *testing.T) {
 	view := e.View()
 	if !strings.Contains(view, "\x1b[") {
 		t.Fatalf("expected styled (ANSI) output for highlighted YAML, got plain: %q", view)
+	}
+}
+
+func TestHighlightComposeYAML(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	content := "services:\n  demo:\n    image: redis:7\n    # a note"
+	lines := highlightComposeYAML(content)
+
+	if len(lines) != 4 {
+		t.Fatalf("highlightComposeYAML() returned %d lines, want 4: %#v", len(lines), lines)
+	}
+	for i, want := range []string{"services", "demo", "image", "# a note"} {
+		if !strings.Contains(ansi.Strip(lines[i]), want) {
+			t.Fatalf("line %d = %q, want it to contain %q", i, lines[i], want)
+		}
+	}
+	if !strings.Contains(lines[0], "\x1b[") {
+		t.Fatalf("line 0 (a key) has no ANSI styling: %q", lines[0])
+	}
+	if !strings.Contains(lines[3], "\x1b[") {
+		t.Fatalf("line 3 (a comment) has no ANSI styling: %q", lines[3])
 	}
 }

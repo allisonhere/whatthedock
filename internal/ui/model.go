@@ -886,6 +886,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelCreateEditor()
 		}
 		return m, nil
+	case createOverrideCheckMsg:
+		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service && msg.found {
+			m.createDraft.OverrideRaw = msg.content
+			m.createDraft.OverrideRawSet = true
+			m.createDraft.OverrideLoaded = true
+			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+			m.status, m.statusErr = "loaded existing override for "+msg.service, false
+		}
+		return m, nil
 	case createFileBrowseMsg:
 		m.createFileLoading = false
 		m.createFileCursor = 0
@@ -1022,7 +1031,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.jumpLogMatch(1)
 			return m, nil
 		}
-		m.openCreateOverlay()
+		return m, m.openCreateOverlay()
 	case "N":
 		if m.mode == activityLogs && strings.TrimSpace(m.logFilter) != "" {
 			m.focus = paneActivity
@@ -1835,7 +1844,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.Refresh:
 		return m, m.refreshCmd()
 	case actions.Create:
-		m.openCreateOverlay()
+		return m, m.openCreateOverlay()
 	case actions.StartStop:
 		return m, m.actionCmd(actions.StartStop, "start/stop")
 	case actions.Restart:
