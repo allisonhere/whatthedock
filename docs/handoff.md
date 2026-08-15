@@ -170,6 +170,19 @@ Done since this doc was first written:
   to surface. If you touch dispatch for any of these actions again, keep
   setting `m.busy`/the phase label there — it's easy to reintroduce a
   silent fire-and-forget dispatch by accident.
+- Added `m` (edit) — opens the create overlay prefilled from the selected
+  container/service under its own identity (not renamed, unlike Clone), so
+  confirming replaces it in place. For Compose this is exactly
+  `openCreateOverlay`'s existing already-managed-service path, reused as-is
+  (`Model.openEditOverlay` in `create.go` just flags `createDraft.Editing`
+  after calling it). Standalone gets a dedicated `defaultEditDraft`
+  (`create.go`, full Ports/Mounts/Env/Restart/Command like `defaultCloneDraft`
+  but keeping the real name) and a new `editContainerCmd` (remove + recreate
+  under the edited spec, mirroring `startReplicate`'s standalone path minus
+  the image pull). Deliberately does *not* change `n`/Create's behavior for a
+  selected standalone container — that was the first design considered and
+  explicitly rejected: pressing Create must never silently overwrite what's
+  selected, only Edit should.
 
 Remaining:
 

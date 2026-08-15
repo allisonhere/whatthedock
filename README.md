@@ -75,6 +75,7 @@ Docker socket paths must be present.
 | `u` | Replicate: pull the latest image and recreate in place |
 | `D` | Delete (override + reconcile for a Compose service, `docker rm` for a standalone container) |
 | `C` | Clone under a new name via the create overlay |
+| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -239,19 +240,24 @@ More detail:
   override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
   editor, with real-time lint feedback and an optional persistent vim mode
   (Settings → Editor).
-- Deletes (`D`), replicates (`u`), and clones (`C`) the selected container or
-  Compose service. Delete removes just the generated override and reconciles
-  the service back to its base definition for a Compose service, or a real
-  `docker rm -f` for a standalone container. Replicate pulls a fresh copy of
-  the image and recreates the same container/service in place under its
-  existing identity. Clone opens the create overlay prefilled with the
-  original's full ports/mounts/env/restart/command under a new,
+- Deletes (`D`), replicates (`u`), clones (`C`), and edits (`m`) the selected
+  container or Compose service. Delete removes just the generated override
+  and reconciles the service back to its base definition for a Compose
+  service, or a real `docker rm -f` for a standalone container. Replicate
+  pulls a fresh copy of the image and recreates the same container/service in
+  place under its existing identity. Clone opens the create overlay prefilled
+  with the original's full ports/mounts/env/restart/command under a new,
   `-clone`-suffixed name, producing an independent second container/service.
-  The status bar shows a spinner and phase text while Delete/Replicate/
-  Create are running, instead of going quiet until they finish — standalone
-  Replicate shows real per-layer pull progress (talking to the Docker API
-  directly), Compose operations show a phase label only (they shell out to
-  `docker compose`, which has no structured progress to surface).
+  Edit opens the same overlay prefilled the same way but under the
+  container/service's own identity, so confirming replaces it in place
+  instead of creating something new — `n` (Create) is left alone and always
+  defaults to a fresh draft, so it never surprises you by overwriting a
+  selection the way Edit intentionally does. The status bar shows a spinner
+  and phase text while Delete/Replicate/Create/Edit are running, instead of
+  going quiet until they finish — standalone Replicate shows real per-layer
+  pull progress (talking to the Docker API directly), Compose operations show
+  a phase label only (they shell out to `docker compose`, which has no
+  structured progress to surface).
 - Opens an interactive shell inside the selected running container (`e`),
   handing the real terminal to `docker exec -it` (preferring `bash`, falling
   back to `sh`) and resuming WhatTheDock when the session ends. Works against

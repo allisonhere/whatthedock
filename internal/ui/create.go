@@ -46,8 +46,17 @@ const (
 )
 
 type createDraft struct {
-	Mode          createMode
-	Confirming    bool
+	Mode       createMode
+	Confirming bool
+
+	// Editing and EditingID, when set (by openEditOverlay), mean confirming
+	// this draft should replace the container/service currently identified
+	// by EditingID in place instead of creating a new one. A fresh Create
+	// draft (n) or a Clone draft (C) never set these — both are meant to
+	// produce something new, never to silently overwrite what's selected.
+	Editing   bool
+	EditingID domain.ResourceID
+
 	Project       string
 	Service       string
 	ContainerName string
@@ -122,6 +131,34 @@ func (m *Model) openCreateOverlay() tea.Cmd {
 func (m *Model) openCloneOverlay() {
 	m.openCreateOverlayWithDraft(m.defaultCloneDraft())
 	m.status, m.statusErr = "clone draft ready — rename before confirming", false
+}
+
+// openEditOverlay opens the create form pre-loaded with the selected
+// container/service's current configuration under its own identity, so
+// confirming replaces it in place instead of creating something new —
+// unlike n (openCreateOverlay), which must always default to a fresh
+// name/service so it never surprises the user by overwriting a selection,
+// and unlike C (openCloneOverlay), which deliberately renames to guarantee
+// an independent second copy. For a Compose service this is exactly
+// openCreateOverlay's existing already-managed-service behavior (it already
+// loads the on-disk override and replaces in place via `docker compose up
+// -d` on confirm) — reused as-is, just flagged as Editing so the overlay
+// can label itself "edit" instead of "create". A standalone container has
+// no such existing path, so it gets a dedicated defaultEditDraft prefill.
+func (m *Model) openEditOverlay() tea.Cmd {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return nil
+	}
+	if selected.Compose.Project != "" {
+		cmd := m.openCreateOverlay()
+		m.createDraft.Editing = true
+		return cmd
+	}
+	m.openCreateOverlayWithDraft(m.defaultEditDraft())
+	m.createDraft.Editing = true
+	m.status, m.statusErr = "edit draft ready for "+selected.DisplayName(), false
+	return nil
 }
 
 // openCreateOverlayWithDraft sets the create-overlay state shared by a fresh
@@ -238,6 +275,23 @@ func (m Model) defaultCloneDraft() createDraft {
 	return draft
 }
 
+// defaultEditDraft mirrors defaultCloneDraft's full-shape prefill (it starts
+// from the exact same base) but keeps the container's real name instead of
+// a "-clone" suffix, and records EditingID so confirm dispatch
+// (handleCreateKey) knows which container to replace. Standalone only —
+// openEditOverlay handles Compose services through openCreateOverlay's
+// existing already-managed-service path instead.
+func (m Model) defaultEditDraft() createDraft {
+	draft := m.defaultCloneDraft()
+	selected := m.selectedContainer()
+	if selected == nil {
+		return draft
+	}
+	draft.ContainerName = selected.DisplayName()
+	draft.EditingID = selected.ID
+	return draft
+}
+
 // replicateContainerSpec builds an app.ContainerCreateSpec identical to
 // selected's current shape (same name, image, ports, mounts, env, restart,
 // command) — used by Replicate's standalone path to recreate the container
@@ -323,6 +377,10 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.busy = true
+			if m.createDraft.Editing {
+				m.status, m.statusErr = "updating "+spec.Name, false
+				return m, m.editContainerCmd(m.createDraft.EditingID, spec)
+			}
 			m.status, m.statusErr = "creating "+spec.Name, false
 			return m, m.createContainerCmd(spec)
 		}
@@ -411,7 +469,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+enter", "alt+enter":
 		if m.validateCreateDraft() {
 			m.createDraft.Confirming = true
-			m.status, m.statusErr = "confirm create "+m.createDraft.TargetName(), false
+			m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
 		}
 	case "backspace":
 		m.editCreateFieldBackspace()
@@ -441,6 +499,24 @@ func (m Model) createContainerCmd(spec app.ContainerCreateSpec) tea.Cmd {
 		defer cancel()
 		id, err := provider.CreateContainer(ctx, spec)
 		return createDoneMsg{name: spec.Name, id: id, err: err}
+	}
+}
+
+// editContainerCmd replaces id in place with a fresh container built from
+// spec — remove the current one, then create the edited one under the same
+// name. Mirrors startReplicate's standalone remove+create path (model.go),
+// minus the image pull: editing changes fields the user just typed, not
+// the image tag, so there's nothing to pull.
+func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSpec) tea.Cmd {
+	provider := m.provider
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := provider.RemoveContainer(ctx, id, true); err != nil {
+			return createDoneMsg{name: spec.Name, edited: true, err: err}
+		}
+		newID, err := provider.CreateContainer(ctx, spec)
+		return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
 	}
 }
 

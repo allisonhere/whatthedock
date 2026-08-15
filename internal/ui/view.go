@@ -1380,6 +1380,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 			{key: "u", label: "replicate"},
 			{key: "D", label: "delete"},
 			{key: "C", label: "clone"},
+			{key: "m", label: "edit"},
 		}
 	default:
 		return nil
@@ -1857,6 +1858,7 @@ var helpLines = []string{
 	"u              replicate: pull latest image, recreate",
 	"D              delete container or Compose override",
 	"C              clone under a new name",
+	"m              edit in place",
 	"p              problems",
 	"g              stats graphs",
 	"T              theme picker",

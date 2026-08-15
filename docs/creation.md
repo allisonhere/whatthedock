@@ -181,7 +181,7 @@ Standalone creation supports:
 After creation, WhatTheDock refreshes Docker state and targets the returned
 container ID when Docker provides one.
 
-## Delete, Replicate, and Clone
+## Delete, Replicate, Clone, and Edit
 
 These act on the currently selected container/Compose service, from the
 inspector pane or the command palette.
@@ -217,6 +217,21 @@ mounts, env, restart policy, and command, with the identity field
 Unlike opening create for an already-managed service, Clone never loads an
 existing override — the original is left completely untouched, and
 confirming produces an independent second container/service.
+
+**Edit (`m`)** — opens the create overlay prefilled from the selected
+container/service under its *own* identity (not renamed), so confirming
+replaces it in place instead of creating something new. For a Compose
+service this is exactly what opening create (`n`) for an already-managed
+service already does — loads the existing override, lets you change any
+field, and re-applies via `docker compose up -d <service>` on confirm. For a
+standalone container, Edit prefills the full current shape (image, ports,
+mounts, env, restart policy, command) the same way Clone does, but confirming
+stops and removes the *existing* container and recreates it under the same
+name with your changes, instead of creating an independent second one.
+`n` (Create) is deliberately left alone by this — it always defaults to a
+fresh draft (or, for an already-managed Compose service, its own
+load-existing-override behavior) and never silently overwrites a selected
+standalone container the way Edit intentionally does.
 
 ## Current Limits
 

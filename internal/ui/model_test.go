@@ -2019,6 +2019,106 @@ func TestPressCOpensCloneOverlayPrefilled(t *testing.T) {
 	}
 }
 
+func TestPressMOpensEditOverlayComposePrefilled(t *testing.T) {
+	model := testModelWithSelectedContainer() // radarr-1, Compose service "radarr"
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate (edit reuses the create overlay)", model.overlay)
+	}
+	if !model.createDraft.Editing {
+		t.Fatal("createDraft.Editing = false, want true")
+	}
+	if model.createDraft.Service != "radarr" {
+		t.Fatalf("Service = %q, want radarr (edit keeps the real identity, unlike Clone's -clone suffix)", model.createDraft.Service)
+	}
+}
+
+func TestPressMOpensEditOverlayStandaloneFullShapePrefilled(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.selected.Ports = []domain.Port{{IP: "0.0.0.0", Private: 3000, Public: 3000, Type: "tcp"}}
+	model.selected.Env = []string{"FOO=bar"}
+	model.selected.RestartPolicy = "always"
+	wantID := model.selected.ID
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate", model.overlay)
+	}
+	if !model.createDraft.Editing {
+		t.Fatal("createDraft.Editing = false, want true")
+	}
+	if model.createDraft.EditingID != wantID {
+		t.Fatalf("EditingID = %v, want %v", model.createDraft.EditingID, wantID)
+	}
+	if model.createDraft.ContainerName != "grafana" {
+		t.Fatalf("ContainerName = %q, want grafana (edit keeps the real name, unlike Clone's -clone suffix)", model.createDraft.ContainerName)
+	}
+	if model.createDraft.Restart != "always" {
+		t.Fatalf("Restart = %q, want always (full shape should carry over like Clone)", model.createDraft.Restart)
+	}
+	if !strings.Contains(model.createDraft.Ports, "3000") || !strings.Contains(model.createDraft.Env, "FOO=bar") {
+		t.Fatalf("Ports/Env = %q/%q, want the selected container's real ports/env carried over", model.createDraft.Ports, model.createDraft.Env)
+	}
+}
+
+func TestPressMDoesNothingWithNoSelection(t *testing.T) {
+	model := testModel()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("m with no selection returned cmd = %#v, want nil", cmd)
+	}
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone", model.overlay)
+	}
+}
+
+func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.selected.RestartPolicy = "always"
+	oldID := model.selected.ID
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.Restart = "unless-stopped" // the actual edit
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if !model.busy {
+		t.Fatal("busy = false right after confirming edit, want true")
+	}
+	if cmd == nil {
+		t.Fatal("confirming edit returned a nil Cmd")
+	}
+	msg, ok := runCmd(t, cmd).(createDoneMsg)
+	if !ok {
+		t.Fatalf("msg = %#v, want createDoneMsg", msg)
+	}
+	if msg.err != nil {
+		t.Fatalf("createDoneMsg.err = %v, want nil", msg.err)
+	}
+	if !msg.edited {
+		t.Fatal("createDoneMsg.edited = false, want true")
+	}
+
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if !strings.Contains(model.status, "updated") {
+		t.Fatalf("status = %q, want it to say updated (not created)", model.status)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want a single call for %v", fp.removed, oldID)
+	}
+	if len(fp.creates) != 1 || fp.creates[0].Name != "grafana" || fp.creates[0].RestartPolicy != "unless-stopped" {
+		t.Fatalf("creates = %#v, want one create for grafana with the edited restart policy", fp.creates)
+	}
+}
+
 func TestHandleDeleteKeyStandaloneCallsRemoveContainer(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana")
 	model.overlay = overlayDelete

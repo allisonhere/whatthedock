@@ -12,23 +12,33 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	contentWidth := width - 4
 	if m.createDraft.Confirming {
 		name := m.createDraft.TargetName()
-		prompt := "Create and start standalone container " + name + "?"
-		if m.createDraft.Mode == createModeCompose {
+		editing := m.createDraft.Editing
+		var prompt string
+		switch {
+		case editing && m.createDraft.Mode != createModeCompose:
+			prompt = "Replace standalone container " + name + " with these changes?"
+		case m.createDraft.Mode == createModeCompose:
 			spec, err := m.createDraft.ComposeSpec(m.activeSystemConfig())
 			if err != nil {
 				prompt = "Create Compose service " + name + "?"
 			} else {
 				prompt = "Write " + short(spec.OverrideFile, max(12, contentWidth-10)) + " and run compose up for " + name + "?"
 			}
+		default:
+			prompt = "Create and start standalone container " + name + "?"
+		}
+		title := "confirm create"
+		if editing {
+			title = "confirm edit"
 		}
 		content := renderer.RenderSoftBody(width,
 			renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt)+"\n\n"+
 				renderer.Styles.DetailBody.Width(contentWidth).Render(m.createDraft.Preview())+"\n\n"+
 				renderer.RenderSoftHints(contentWidth,
-					tideui.SoftHint{Key: "y", Label: "create"},
+					tideui.SoftHint{Key: "y", Label: confirmStepLabel(editing)},
 					tideui.SoftHint{Key: "n/esc", Label: "cancel"},
 				))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "confirm create", Content: content, Width: width})
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
 		return &overlay
 	}
 	if m.createEditingCompose {
@@ -132,13 +142,24 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "ctrl+y", Label: "edit yaml"},
 			tideui.SoftHint{Key: "ctrl+s", Label: "validate"},
-			tideui.SoftHint{Key: "ctrl/alt+enter", Label: "create"},
+			tideui.SoftHint{Key: "ctrl/alt+enter", Label: confirmStepLabel(m.createDraft.Editing)},
 			tideui.SoftHint{Key: "esc", Label: "cancel"},
 		),
 	)
 	content := renderer.RenderSoftBody(width, tabs+"\n\n"+strings.Join(bodyRows, "\n"))
-	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "create", Content: content, Width: width})
+	title := "create"
+	if m.createDraft.Editing {
+		title = "edit"
+	}
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
 	return &overlay
+}
+
+func confirmStepLabel(editing bool) string {
+	if editing {
+		return "update"
+	}
+	return "create"
 }
 
 // createEditorOverlay renders the raw override-YAML editor. Unlike the rest

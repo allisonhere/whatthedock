@@ -597,9 +597,10 @@ type systemTestMsg struct {
 }
 
 type createDoneMsg struct {
-	name string
-	id   domain.ResourceID
-	err  error
+	name   string
+	id     domain.ResourceID
+	edited bool
+	err    error
 }
 
 func NewModel(provider app.Provider) Model {
@@ -918,15 +919,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case createDoneMsg:
 		m.busy = false
 		m.overlay = overlayNone
+		verb := "create"
+		if msg.edited {
+			verb = "update"
+		}
 		if msg.err != nil {
-			m.status, m.statusErr = "create "+msg.name+": "+friendlyDockerError(msg.err), true
+			m.status, m.statusErr = verb+" "+msg.name+": "+friendlyDockerError(msg.err), true
 			return m, nil
 		}
 		if msg.id.ID != "" {
 			m.selectedID = msg.id
 			m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
 		}
-		m.status, m.statusErr = "created "+msg.name, false
+		if msg.edited {
+			m.status, m.statusErr = "updated "+msg.name, false
+		} else {
+			m.status, m.statusErr = "created "+msg.name, false
+		}
 		return m, m.refreshCmd()
 	case ripple.SubmitMsg:
 		if m.createEditingCompose {
@@ -1215,6 +1224,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "C":
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()
+		}
+	case "m":
+		if selected := m.selectedContainer(); selected != nil {
+			return m, m.openEditOverlay()
 		}
 	}
 	return m, nil
