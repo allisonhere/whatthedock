@@ -208,6 +208,13 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.width, model.height = 120, 34
 	model.openCreateOverlay()
+	// The fake radarr fixture's ComposeFile ("/srv/media/compose.yml", see
+	// newFakeProvider) doesn't exist on the machine running this test, so
+	// openCreateOverlay's new BaseFileMissing check (added for the "adopt
+	// out of Portainer" flow) legitimately trips here — reset it so this
+	// test still exercises the normal, base-file-already-exists confirm
+	// path it's actually about; that new flow has its own dedicated tests.
+	model.createDraft.BaseFileMissing = false
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
 	model = updated.(Model)
@@ -245,6 +252,59 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("compose completion returned nil cmd, want refresh")
+	}
+}
+
+// TestCreateComposeAdoptConfirmDispatchesAdoptCmd checks the confirm step's
+// wording and dispatch when BaseFileMissing is set: the modal must show the
+// adopt-specific explanation (not the ordinary "Write ... and run compose
+// up" copy), and confirming with y must call adoptComposeCmd's underlying
+// apply (applyComposeAdopt), not the ordinary applyComposeCreate.
+func TestCreateComposeAdoptConfirmDispatchesAdoptCmd(t *testing.T) {
+	originalCreate, originalAdopt := applyComposeCreate, applyComposeAdopt
+	defer func() { applyComposeCreate, applyComposeAdopt = originalCreate, originalAdopt }()
+	var createCalls, adoptCalls int
+	applyComposeCreate = func(_ context.Context, _ composeCreateSpec) error {
+		createCalls++
+		return nil
+	}
+	applyComposeAdopt = func(_ context.Context, _ composeCreateSpec) error {
+		adoptCalls++
+		return nil
+	}
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.BaseFileMissing = true
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	if !model.createDraft.Confirming {
+		t.Fatal("confirming = false, want true")
+	}
+	if !strings.Contains(model.status, "adopt") {
+		t.Fatalf("status = %q, want it to mention adopt", model.status)
+	}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "doesn't exist on") || !strings.Contains(view, "create & adopt") {
+		t.Fatalf("confirm overlay missing adopt copy:\n%s", view)
+	}
+	if strings.Contains(view, "and run compose up for") {
+		t.Fatalf("confirm overlay still shows the ordinary compose-apply copy:\n%s", view)
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("confirm returned nil cmd, want adopt command")
+	}
+	if _, ok := runCmd(t, cmd).(createDoneMsg); !ok {
+		t.Fatal("adopt confirm did not return a createDoneMsg")
+	}
+	if adoptCalls != 1 || createCalls != 0 {
+		t.Fatalf("adoptCalls/createCalls = %d/%d, want 1/0", adoptCalls, createCalls)
 	}
 }
 
@@ -595,6 +655,80 @@ func TestApplyComposeCreateRemovesTempOnValidationFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(spec.OverrideFile + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temp override exists after failed validation or stat failed unexpectedly: %v", err)
+	}
+}
+
+// TestDefaultApplyComposeAdoptWritesFreshBaseFile covers the "adopt out of
+// Portainer" path: BaseFile doesn't exist yet, so spec.Content should be
+// written there directly (no merge, no override) and compose invoked with
+// just the one -f flag.
+func TestDefaultApplyComposeAdoptWritesFreshBaseFile(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.BaseFile+"|"+spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "docker-compose.yml")
+	overridePath := filepath.Join(dir, "compose.whatthedock.telegraf.yml") // must never be touched
+	content := "services:\n  telegraf:\n    image: telegraf:1.34\n    restart: \"unless-stopped\"\n"
+	spec := composeCreateSpec{
+		Project:      "tmp",
+		Service:      "telegraf",
+		BaseFile:     base,
+		OverrideFile: overridePath,
+		Content:      content,
+	}
+
+	if err := defaultApplyComposeAdopt(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeAdopt() error = %v", err)
+	}
+
+	written, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatalf("base file was not created: %v", err)
+	}
+	if string(written) != content {
+		t.Fatalf("base content = %q, want %q", written, content)
+	}
+	if _, err := os.Stat(overridePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an override file was written despite adopting into a fresh base: %v", err)
+	}
+	if _, err := os.Stat(base + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp base file left behind: %v", err)
+	}
+	if len(calls) != 2 || !strings.Contains(calls[0], "config") || !strings.Contains(calls[1], "up -d telegraf") {
+		t.Fatalf("compose calls = %#v, want a config validation then up -d", calls)
+	}
+	if strings.Contains(calls[0], overridePath) || strings.Contains(calls[1], overridePath) {
+		t.Fatalf("compose calls referenced the override file, want base only: %#v", calls)
+	}
+}
+
+func TestDefaultApplyComposeAdoptCleansUpTempOnValidationFailure(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	composeCommand = func(_ context.Context, _ composeCreateSpec, args ...string) error {
+		if len(args) == 1 && args[0] == "config" {
+			return errors.New("invalid compose")
+		}
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "docker-compose.yml")
+	spec := composeCreateSpec{Project: "tmp", Service: "telegraf", BaseFile: base, Content: "services:\n  telegraf:\n    image: telegraf:1.34\n"}
+
+	err := defaultApplyComposeAdopt(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "invalid compose") {
+		t.Fatalf("error = %v, want invalid compose", err)
+	}
+	if _, err := os.Stat(base); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("base file exists after failed validation or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(base + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp base file exists after failed validation or stat failed unexpectedly: %v", err)
 	}
 }
 
@@ -957,6 +1091,43 @@ func TestApplyComposeCreateRemoteWritesAndAppliesOverSSH(t *testing.T) {
 		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml.tmp' 'config'",
 		"mv '/srv/media-stack/compose.whatthedock.cache.yml.tmp' '/srv/media-stack/compose.whatthedock.cache.yml'",
 		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml' 'up' '-d' 'cache'",
+	}
+	if len(fake.calls) != len(wantScripts) {
+		t.Fatalf("calls = %#v, want %d calls matching %#v", fake.calls, len(wantScripts), wantScripts)
+	}
+	for i, want := range wantScripts {
+		if fake.calls[i] != want {
+			t.Fatalf("call %d = %q, want %q", i, fake.calls[i], want)
+		}
+	}
+}
+
+// TestApplyComposeAdoptRemoteWritesAndAppliesOverSSH covers the SSH
+// counterpart of the adopt path — writes BaseFile fresh over ssh with no
+// preceding read/test-f (the whole point is the file doesn't exist yet)
+// and no override flag anywhere in the compose invocations.
+func TestApplyComposeAdoptRemoteWritesAndAppliesOverSSH(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "tmp",
+		Service:      "telegraf",
+		BaseFile:     "/tmp/jarvis-portainer-stack.yml",
+		OverrideFile: "/tmp/compose.whatthedock.telegraf.yml",
+		Content:      "services:\n  telegraf:\n    image: telegraf:1.34\n",
+		System:       system,
+	}
+
+	if err := applyComposeAdoptRemote(context.Background(), spec); err != nil {
+		t.Fatalf("applyComposeAdoptRemote() error = %v", err)
+	}
+
+	wantScripts := []string{
+		"mkdir -p '/tmp'",
+		"cat > '/tmp/jarvis-portainer-stack.yml.tmp'\x00stdin=" + spec.Content,
+		"docker 'compose' '-p' 'tmp' '-f' '/tmp/jarvis-portainer-stack.yml.tmp' 'config'",
+		"mv '/tmp/jarvis-portainer-stack.yml.tmp' '/tmp/jarvis-portainer-stack.yml'",
+		"docker 'compose' '-p' 'tmp' '-f' '/tmp/jarvis-portainer-stack.yml' 'up' '-d' 'telegraf'",
 	}
 	if len(fake.calls) != len(wantScripts) {
 		t.Fatalf("calls = %#v, want %d calls matching %#v", fake.calls, len(wantScripts), wantScripts)
@@ -1618,6 +1789,26 @@ func TestOpenCreateOverlayLoadsExistingLocalOverride(t *testing.T) {
 	}
 }
 
+// TestCreateOverrideCheckMsgSetsBaseFileMissingEvenWhenOverrideNotFound
+// checks the model.go handler applies baseFileMissing unconditionally —
+// not gated behind msg.found the way the override-loading fields are.
+func TestCreateOverrideCheckMsgSetsBaseFileMissingEvenWhenOverrideNotFound(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "radarr"
+
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", found: false, baseFileMissing: true})
+	model = updated.(Model)
+
+	if !model.createDraft.BaseFileMissing {
+		t.Fatal("BaseFileMissing = false after a check reporting the base file missing, want true")
+	}
+	if model.createDraft.OverrideRawSet {
+		t.Fatal("OverrideRawSet = true despite found=false, want false")
+	}
+}
+
 func TestOpenCreateOverlayLeavesDraftGeneratedWhenNoOverrideExists(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "compose.yml")
@@ -1630,6 +1821,39 @@ func TestOpenCreateOverlayLeavesDraftGeneratedWhenNoOverrideExists(t *testing.T)
 
 	if model.createDraft.OverrideRawSet || model.createDraft.OverrideLoaded {
 		t.Fatalf("OverrideRawSet/OverrideLoaded = %v/%v, want both false when no override file exists", model.createDraft.OverrideRawSet, model.createDraft.OverrideLoaded)
+	}
+}
+
+// TestOpenCreateOverlayFlagsMissingBaseFileLocally checks the local half of
+// the "adopt out of Portainer" detection — a compose-mode draft whose
+// already-labeled ComposeFile doesn't exist on disk gets BaseFileMissing
+// set the moment the form opens, before the user does anything.
+func TestOpenCreateOverlayFlagsMissingBaseFileLocally(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "does-not-exist.yml") // deliberately never written
+
+	model := modelSelecting("tmp", "telegraf", base)
+	model.openCreateOverlay()
+
+	if !model.createDraft.BaseFileMissing {
+		t.Fatal("BaseFileMissing = false, want true for a nonexistent base file")
+	}
+}
+
+// TestOpenCreateOverlayDoesNotFlagExistingBaseFile guards the opposite: a
+// real, existing base file must never trip BaseFileMissing.
+func TestOpenCreateOverlayDoesNotFlagExistingBaseFile(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "radarr", base)
+	model.openCreateOverlay()
+
+	if model.createDraft.BaseFileMissing {
+		t.Fatal("BaseFileMissing = true for a base file that exists, want false")
 	}
 }
 
@@ -1676,6 +1900,38 @@ func TestCheckRemoteOverrideCmdFindsExistingOverride(t *testing.T) {
 	msg := runCmd(t, cmd).(createOverrideCheckMsg)
 	if !msg.found || msg.content != overrideContent || msg.service != "radarr" {
 		t.Fatalf("msg = %#v, want found=true content=%q service=radarr", msg, overrideContent)
+	}
+}
+
+// TestCheckRemoteOverrideCmdFlagsMissingBaseFile checks the "adopt" flag
+// this session added to checkRemoteOverrideCmd: when the ssh `test -f` on
+// the base file fails, baseFileMissing comes back true regardless of
+// whether an override was found.
+func TestCheckRemoteOverrideCmdFlagsMissingBaseFile(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	fake.respond("test -f '/tmp/jarvis-portainer-stack.yml'", "", errors.New("no such file or directory"))
+
+	cmd := checkRemoteOverrideCmd(system, "/tmp/jarvis-portainer-stack.yml", "telegraf")
+	msg := runCmd(t, cmd).(createOverrideCheckMsg)
+	if !msg.baseFileMissing {
+		t.Fatalf("msg = %#v, want baseFileMissing=true", msg)
+	}
+}
+
+// TestCheckRemoteOverrideCmdBaseFileNotMissingWhenPresent guards the
+// opposite: an unmocked `test -f` succeeds by default (withFakeSSHRun's
+// documented default), so an ordinary already-existing base file must not
+// get flagged.
+func TestCheckRemoteOverrideCmdBaseFileNotMissingWhenPresent(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	fake.respond("test -f '/srv/media-stack/compose.yml'", "", nil)
+
+	cmd := checkRemoteOverrideCmd(system, "/srv/media-stack/compose.yml", "radarr")
+	msg := runCmd(t, cmd).(createOverrideCheckMsg)
+	if msg.baseFileMissing {
+		t.Fatalf("msg = %#v, want baseFileMissing=false", msg)
 	}
 }
 

@@ -126,6 +126,15 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 			prefix += healthSpan(statusGlyph(*row.container), healthColor, baseFg) + " "
 			suffix = healthSpan(statusText(*row.container), healthColor, baseFg)
 			text = containerTitle(*row.container)
+			// Dead is the one state that's actually gone, not just
+			// stopped/unhealthy — coloring only the small glyph and the
+			// trailing status word (as every other state does) left it
+			// easy to miss in a scrolling list; the name itself needs to
+			// read as red too, the same way the log pane's own health
+			// header already colors a selected container's full title.
+			if row.container.State == domain.StateDead {
+				text = healthSpan(text, healthColor, baseFg)
+			}
 		case rowSection:
 			prefix += ""
 		}
@@ -184,7 +193,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 		return m.withPaneActionStrip(renderer, paneActivity, width, content)
 	}
 	if m.mode == activityProblems {
-		content, width := m.renderProblemsContent(renderer)
+		content, width := m.renderProblemsSplit(renderer)
 		return m.withPaneActionStrip(renderer, paneActivity, width, content)
 	}
 	width := m.centerPaneWidth() - 4
@@ -977,41 +986,11 @@ func uptimeLevel(created time.Time) int {
 }
 
 type problemRow struct {
-	id       domain.ResourceID
-	severity string
-	name     string
-	detail   string
-}
-
-func (m Model) renderProblemsContent(renderer tideui.Renderer) (string, int) {
-	problems := m.snapshotProblems()
-	width := m.centerPaneWidth() - 4
-	if width < 20 {
-		width = 20
-	}
-	if len(problems) == 0 {
-		return renderer.Styles.DetailMeta.Render("No container problems detected."), width
-	}
-	lines := make([]string, 0, len(problems)+1)
-	lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
-	for i, problem := range problems {
-		selected := m.problemSelected(i, problem)
-		muted := problem.severity == "warn"
-		color := severityColor(problem.severity)
-		baseFg := rowForeground(renderer, selected, muted)
-		lines = append(lines, renderer.RenderRow(tideui.Row{
-			Prefix:   healthSpan(problem.severity, color, baseFg) + "  ",
-			Text:     problem.name,
-			Suffix:   healthSpan(problem.detail, color, baseFg),
-			Selected: selected,
-			Muted:    muted,
-		}, width))
-	}
-	if m.focus == paneActivity {
-		limit := max(1, m.activityVisibleRows()-2)
-		lines = lines[:min(len(lines), limit)]
-	}
-	return strings.Join(lines, "\n"), width
+	id        domain.ResourceID
+	severity  string
+	name      string
+	detail    string
+	container domain.Container
 }
 
 func (m Model) problemSelected(index int, problem problemRow) bool {
@@ -1021,29 +1000,170 @@ func (m Model) problemSelected(index int, problem problemRow) bool {
 	return m.selectedID == problem.id
 }
 
+// renderProblemsSplit renders the Problems pane: the problem list on top,
+// plus a lower block showing problemInsight's
+// rule-based guidance for whichever row is currently selected — tracking
+// problemSelected's own notion of "current" exactly, so the insight always
+// matches the highlighted row.
+func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
+	problems := m.snapshotProblems()
+	width := m.centerPaneWidth() - 4
+	if width < 20 {
+		width = 20
+	}
+	if len(problems) == 0 {
+		return renderer.Styles.DetailMeta.Render("No container problems detected."), width
+	}
+
+	listLines := make([]string, 0, len(problems)+1)
+	listLines = append(listLines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
+	for i, problem := range problems {
+		selected := m.problemSelected(i, problem)
+		muted := problem.severity == "warn"
+		color := severityColor(problem.severity)
+		baseFg := rowForeground(renderer, selected, muted)
+		listLines = append(listLines, renderer.RenderRow(tideui.Row{
+			Prefix:   healthSpan(problem.severity, color, baseFg) + "  ",
+			Text:     problem.name,
+			Suffix:   healthSpan(problem.detail, color, baseFg),
+			Selected: selected,
+			Muted:    muted,
+		}, width))
+	}
+	if m.focus == paneActivity {
+		limit := max(1, m.problemsListRows())
+		listLines = listLines[:min(len(listLines), limit)]
+	}
+	list := strings.Join(listLines, "\n")
+
+	current := m.currentProblem(problems)
+	if current == nil {
+		return list, width
+	}
+
+	divider := renderer.Styles.DetailMeta.Render(strings.Repeat("─", width))
+	insight := m.renderProblemInsight(renderer, *current, width)
+
+	return lipgloss.JoinVertical(lipgloss.Left, list, divider, insight), width
+}
+
+// renderProblemInsight renders the insight block's body for row: the
+// AI result/error/in-flight state when one belongs to row specifically
+// (aiAnalysisFor == row.id — never a stale result left over from a row the
+// cursor has since moved away from), falling back to problemInsight's
+// plain rule-based text otherwise. An active AI state gets its own colored
+// heading line ("AI Analysis" in the theme's accent color, "AI analysis
+// failed" in its error color) so it reads as a distinct, deliberate result
+// rather than blending into the rule-based text.
+//
+// Color is applied with foregroundSpan only to the heading, and only after
+// wrapInsightText has already finished wrapping/truncating the body as
+// plain text — never embedded into text before it goes through wrapping.
+// wrapInsightText measures width in runes; ANSI escape sequences embedded
+// beforehand inflate that count and corrupt the wrap, the exact bug fixed
+// earlier in the About screen's ship animation (see about_ship.go).
+func (m Model) renderProblemInsight(renderer tideui.Renderer, row problemRow, width int) string {
+	if m.aiAnalysisFor != row.id {
+		lines := wrapInsightText(problemInsight(row), width, m.problemsInsightRows())
+		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+	}
+
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	switch {
+	case m.aiAnalyzing:
+		heading := foregroundSpan("Analyzing with AI…", renderer.Styles.Theme.Dimmed, baseFg, false)
+		return renderer.Styles.DetailBody.Render(heading)
+	case m.aiAnalysisErr != nil:
+		heading := foregroundSpan("AI analysis failed", renderer.Styles.Theme.Error, baseFg, true)
+		body := wrapInsightText(m.aiAnalysisErr.Error(), width, max(1, m.problemsInsightRows()-1))
+		lines := append([]string{heading}, body...)
+		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+	case m.aiAnalysis != "":
+		heading := foregroundSpan("AI Analysis", renderer.Styles.Theme.BorderFocus, baseFg, true)
+		body := wrapInsightText(m.aiAnalysis, width, max(1, m.problemsInsightRows()-1))
+		lines := append([]string{heading}, body...)
+		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+	default:
+		lines := wrapInsightText(problemInsight(row), width, m.problemsInsightRows())
+		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+	}
+}
+
+// currentProblem finds the problem row that renderProblemsSplit's insight
+// block should describe — problemSelected's own selection notion, just
+// returning the row itself instead of a per-index bool: the cursor when the
+// Problems pane is focused, otherwise whichever row matches the tree's own
+// selection, falling back to the top row so the insight block is never
+// blank just because nothing happens to be selected yet.
+func (m Model) currentProblem(problems []problemRow) *problemRow {
+	if len(problems) == 0 {
+		return nil
+	}
+	if m.focus == paneActivity && m.mode == activityProblems {
+		idx := clamp(m.problemCursor, 0, len(problems)-1)
+		return &problems[idx]
+	}
+	for i := range problems {
+		if problems[i].id == m.selectedID {
+			return &problems[i]
+		}
+	}
+	return &problems[0]
+}
+
+// wrapInsightText word-wraps text to width and, if that overflows
+// maxLines, truncates to exactly maxLines with a trailing ellipsis instead
+// of silently cutting a sentence off mid-word with no sign anything was
+// omitted — the truncation itself lands on a word boundary (dropping whole
+// trailing words from the last line until "<line> …" fits), not a hard
+// character cut, so a shortened suggestion still reads as a sentence
+// fragment rather than garbled text.
+func wrapInsightText(text string, width, maxLines int) []string {
+	lines := strings.Split(lipgloss.NewStyle().Width(width).Render(text), "\n")
+	if maxLines <= 0 || len(lines) <= maxLines {
+		return lines
+	}
+	lines = lines[:maxLines]
+	const ellipsis = "…"
+	last := strings.TrimRight(lines[maxLines-1], " ")
+	for len([]rune(last))+len([]rune(" "+ellipsis)) > width {
+		idx := strings.LastIndex(last, " ")
+		if idx < 0 {
+			break
+		}
+		last = strings.TrimRight(last[:idx], " ")
+	}
+	last += " " + ellipsis
+	if pad := width - len([]rune(last)); pad > 0 {
+		last += strings.Repeat(" ", pad)
+	}
+	lines[maxLines-1] = last
+	return lines
+}
+
 func (m Model) snapshotProblems() []problemRow {
 	var problems []problemRow
 	for _, ctr := range m.snapshotContainers() {
 		name := ctr.DisplayName()
 		switch {
 		case ctr.Health == domain.HealthUnhealthy:
-			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "unhealthy"})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "unhealthy", container: ctr})
 		case ctr.Restarting || ctr.State == domain.StateRestarting:
 			detail := "restarting"
 			if ctr.RestartCount > 0 {
 				detail = fmt.Sprintf("restarting (%d restarts)", ctr.RestartCount)
 			}
-			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: detail})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: detail, container: ctr})
 		case ctr.State == domain.StateDead:
-			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "dead"})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "crit", name: name, detail: "dead", container: ctr})
 		case ctr.RestartCount >= 5:
-			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: fmt.Sprintf("%d restarts", ctr.RestartCount)})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: fmt.Sprintf("%d restarts", ctr.RestartCount), container: ctr})
 		case ctr.State == domain.StateStopped || ctr.State == domain.StateExited:
-			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: string(ctr.State)})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: string(ctr.State), container: ctr})
 		case ctr.Health == domain.HealthUnknown:
-			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "health unknown"})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "health unknown", container: ctr})
 		case ctr.Compose.Project == "" && hasPublicPorts(ctr):
-			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "public ports"})
+			problems = append(problems, problemRow{id: ctr.ID, severity: "warn", name: name, detail: "public ports", container: ctr})
 		}
 	}
 	sort.SliceStable(problems, func(i, j int) bool {
@@ -1072,6 +1192,42 @@ func severityRank(severity string) int {
 		return 1
 	default:
 		return 2
+	}
+}
+
+// problemInsight is the rule-based, no-network baseline explanation for a
+// problem row — synthesized purely from data whatthedock already has about
+// the container (state, health, restart count, ports), so it updates
+// instantly as the selection moves with no latency or cost. Mirrors
+// snapshotProblems' own classification exactly so the insight text always
+// matches the reason the row is listed in the first place.
+func problemInsight(row problemRow) string {
+	ctr := row.container
+	name := row.name
+	switch {
+	case ctr.Health == domain.HealthUnhealthy:
+		return name + " is failing its Docker health check. The health check command itself usually reveals more than the container's own logs — check what it runs and try it manually inside the container."
+	case ctr.Restarting || ctr.State == domain.StateRestarting:
+		if ctr.RestartCount > 0 {
+			return fmt.Sprintf("%s has restarted %d times. This is almost always a crash loop — check its logs (l) for the error right before each restart, not just the latest one.", name, ctr.RestartCount)
+		}
+		return name + " is restarting. Check its logs (l) for the error that's causing it to exit."
+	case ctr.State == domain.StateDead:
+		return name + " is in Docker's \"dead\" state — the container failed to clean up properly, often after a host or daemon issue. Removing and recreating it is usually the only fix; check its logs first if you need to know why."
+	case ctr.RestartCount >= 5:
+		return fmt.Sprintf("%s has restarted %d times even though it's currently up. Worth checking its logs (l) for intermittent errors even though it looks healthy right now.", name, ctr.RestartCount)
+	case ctr.State == domain.StateStopped || ctr.State == domain.StateExited:
+		reason := "stopped"
+		if strings.TrimSpace(ctr.Status) != "" {
+			reason = ctr.Status
+		}
+		return fmt.Sprintf("%s is not running (%s). If this wasn't intentional, check its logs (l) for the exit reason, or its restart policy (%s) if you expected Docker to bring it back on its own.", name, reason, emptyAs(ctr.RestartPolicy, "no"))
+	case ctr.Health == domain.HealthUnknown:
+		return name + " has a health check configured but hasn't reported a status yet — usually just means it's still starting (the check's start period hasn't elapsed), but worth a second look if it stays this way."
+	case ctr.Compose.Project == "" && hasPublicPorts(ctr):
+		return name + " is a standalone container publishing ports to the host. Not necessarily wrong, but confirm this is intentional — standalone containers with public ports are easy to lose track of outside a Compose project."
+	default:
+		return "No specific guidance for this problem yet."
 	}
 }
 
@@ -1369,6 +1525,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 		case activityProblems:
 			return []paneAction{
 				{key: "enter", label: "inspect"},
+				{key: "a", label: "analyze with AI"},
 				{key: "r", label: "refresh"},
 				{key: "l", label: "logs"},
 				{key: "g", label: "stats"},
@@ -1421,8 +1578,26 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(helpLines))})
 		}
 		content := renderer.RenderSoftBody(width, strings.Join(helpLines[scroll:end], "\n")+"\n\n"+
+			strings.Join(statusLegendLines(renderer), "\n")+"\n\n"+
 			renderer.RenderSoftHints(width-4, hints...))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
+		return &overlay
+	case overlayAppLog:
+		width := min(96, max(40, m.width-8))
+		budget := m.appLogBodyBudget()
+		lines := m.appLogLines
+		if len(lines) == 0 {
+			lines = []string{"(nothing logged yet — turn on App log in Settings)"}
+		}
+		scroll := clamp(m.appLogScroll, 0, max(0, len(lines)-budget))
+		end := min(len(lines), scroll+budget)
+		hints := []tideui.SoftHint{{Key: "esc/q", Label: "close"}}
+		if len(lines) > budget {
+			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(lines))})
+		}
+		content := renderer.RenderSoftBody(width, strings.Join(lines[scroll:end], "\n")+"\n\n"+
+			renderer.RenderSoftHints(width-4, hints...))
+		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "app log", Content: content, Width: width})
 		return &overlay
 	case overlayAbout:
 		width := min(82, max(46, m.width-8))
@@ -1473,6 +1648,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.deleteOverlay(renderer)
 	case overlayReplicate:
 		return m.replicateOverlay(renderer)
+	case overlayUpdate:
+		return m.updateOverlay(renderer)
 	default:
 		return nil
 	}
@@ -1528,6 +1705,26 @@ func (m Model) replicateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		),
 	}, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "replicate", Content: content, Width: width})
+	return &overlay
+}
+
+// updateOverlay confirms installing an available update — see
+// Model.handleUpdateKey: y downloads and installs it in place, n/esc
+// dismisses and remembers this version as ignored (see
+// updateIgnoredVersion) so the automatic check won't prompt again for it.
+func (m Model) updateOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	prompt := fmt.Sprintf("whatthedock %s is available (you have %s). Download and install it now?", m.updateAvailableVersion, m.appVersion)
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: "update"},
+			tideui.SoftHint{Key: "n/esc", Label: "ignore"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "update available", Content: content, Width: width})
 	return &overlay
 }
 
@@ -1612,34 +1809,87 @@ func (m Model) copyOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	return &overlay
 }
 
+// settingsBodyBudget is softOverlayBodyBudget's usual list-content
+// allowance, minus 2 more when the Config path footer line is also going
+// to be appended below the scrollable row list (see settingsOverlay) — the
+// generic 6-line chrome reservation in softOverlayBodyBudget only accounts
+// for one blank+hints footer, not an extra Config block on top of it.
+func (m Model) settingsBodyBudget() int {
+	budget := m.softOverlayBodyBudget()
+	if m.settingsPath != "" {
+		budget -= 2
+	}
+	return max(3, budget)
+}
+
 func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(76, max(44, m.width-8))
 	contentWidth := width - 4
-	rows := make([]string, 0, len(m.settingsRows())+4)
-	for i, row := range m.settingsRows() {
+
+	settingsRows := m.settingsRows()
+	lines := make([]string, 0, len(settingsRows)+4)
+	cursorLine := 0
+	for i, row := range settingsRows {
 		if row.kind == settingsRowSection {
-			if len(rows) > 0 {
-				rows = append(rows, "")
+			if len(lines) > 0 {
+				lines = append(lines, "")
 			}
-			rows = append(rows, renderer.Styles.DetailMeta.Render(row.label))
+			lines = append(lines, renderer.Styles.DetailMeta.Render(row.label))
 			continue
 		}
 		suffix := row.value
-		if row.kind == settingsRowAction {
+		// Reset defaults has nothing dynamic to say, so it keeps the plain
+		// "enter" affordance — but Check for update's whole point is to
+		// show what the last check found (checking…/vX.Y.Z available/up to
+		// date/check failed), which "enter" was silently overwriting.
+		if row.kind == settingsRowAction && row.action != settingsActionCheckUpdate {
 			suffix = "enter"
 		}
-		rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{Text: row.label, Suffix: suffix, Selected: i == m.settingsCursor}, contentWidth))
+		if m.settingsEditingField == row.label {
+			suffix = m.settingsEditValueWithCaret(row)
+		}
+		lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{Text: row.label, Suffix: suffix, Selected: i == m.settingsCursor}, contentWidth))
+		if i == m.settingsCursor {
+			cursorLine = len(lines) - 1
+		}
 	}
+
+	// The row list — unlike Help/AppLog's plain scrolled text — is
+	// cursor-driven: up/down already moves the selection, so the viewport
+	// auto-follows the cursor (windowAroundCursor, the same convention the
+	// Copy overlay uses) instead of needing separate scroll keys/state.
+	budget := m.settingsBodyBudget()
+	rowBudget := budget
+	if len(lines) > budget {
+		rowBudget = max(1, budget-2)
+	}
+	start, end := windowAroundCursor(len(lines), cursorLine, rowBudget)
+	visible := make([]string, 0, end-start+6)
+	if start > 0 {
+		visible = append(visible, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▲ %d more", start)))
+	}
+	visible = append(visible, lines[start:end]...)
+	if end < len(lines) {
+		visible = append(visible, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more", len(lines)-end)))
+	}
+
 	if m.settingsPath != "" {
-		rows = append(rows, "", renderer.Styles.DetailMeta.Width(contentWidth).Render("Config  "+m.settingsPath))
+		visible = append(visible, "", renderer.Styles.DetailMeta.Width(contentWidth).Render("Config  "+m.settingsPath))
 	}
-	rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
-		tideui.SoftHint{Key: "enter/space", Label: "change"},
-		tideui.SoftHint{Key: "h/l", Label: "previous/next"},
-		tideui.SoftHint{Key: "ctrl+s", Label: "save"},
-		tideui.SoftHint{Key: "esc", Label: "cancel"},
-	))
-	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+	if m.settingsEditingField != "" {
+		visible = append(visible, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter", Label: "save"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+		))
+	} else {
+		visible = append(visible, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter/space", Label: "change"},
+			tideui.SoftHint{Key: "h/l", Label: "previous/next"},
+			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+		))
+	}
+	content := renderer.RenderSoftBody(width, strings.Join(visible, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "settings", Content: content, Width: width})
 	return &overlay
 }
@@ -1881,10 +2131,11 @@ var helpLines = []string{
 	"f / End        resume live log tail",
 	"x / Esc        clear active log filter",
 	"u              replicate: pull latest image, recreate",
-	"D              delete container or Compose override",
+	"D              delete: real, permanent removal",
 	"C              clone under a new name",
 	"m              edit in place",
 	"p              problems",
+	"a in problems  analyze the selected problem with AI",
 	"g              stats graphs",
 	"T              theme picker",
 	",              settings",
@@ -1901,6 +2152,51 @@ func helpText() string {
 	return strings.Join(helpLines, "\n")
 }
 
+// statusLegendEntries mirrors inspectorStatusColor/statusGlyph exactly —
+// same glyphs, same colors, same order a container could actually be
+// found in — so the legend never drifts out of sync with what the tree
+// and inspector panes actually show.
+var statusLegendEntries = []struct {
+	glyph string
+	color lipgloss.Color
+	label string
+}{
+	{"●", "#80c990", "healthy / running"},
+	{"▲", "#e5c07b", "restarting"},
+	{"○", "#9aa6b2", "stopped, exited cleanly"},
+	{"✖", "#e06c75", "dead"},
+	{"!", "#e06c75", "unhealthy"},
+}
+
+// statusLegendLineCount is statusLegendLines' fixed output size (1 header
+// + one row per statusLegendEntries entry) — helpBodyBudget needs this as
+// a plain count, without a renderer, to reserve room for it.
+var statusLegendLineCount = 1 + len(statusLegendEntries)
+
+// statusLegendLines renders the same container-status glyphs and colors
+// used in the tree/inspector panes as a small always-visible legend below
+// the scrollable keybinding list, so "what does red/grey/yellow mean" has
+// an answer right in Help instead of needing to be guessed at or asked.
+// Every segment gets the panel's own background and foreground explicitly,
+// the same way create_view.go's preview column does — RenderSoftBody skips
+// applying its own default styling to any line that already contains an
+// escape code (see its own source), so a line built from healthSpan
+// (foreground-only, by design — see healthSpan's doc comment) needs its
+// background supplied some other way, or the glyph and label would fall
+// through to the terminal's raw background instead of the panel's.
+func statusLegendLines(renderer tideui.Renderer) []string {
+	panelBG := renderer.Styles.OverlayBody.GetBackground()
+	textFg := styleForeground(renderer.Styles.OverlayBody, renderer.Styles.Theme.Fg)
+	panel := lipgloss.NewStyle().Background(panelBG).Foreground(textFg)
+	lines := make([]string, 0, statusLegendLineCount)
+	lines = append(lines, panel.Render("Status colors:"))
+	for _, entry := range statusLegendEntries {
+		raw := healthSpan(entry.glyph, entry.color, textFg) + "  " + entry.label
+		lines = append(lines, panel.Render(raw))
+	}
+	return lines
+}
+
 // softOverlayBodyBudget is how many body rows fit in a SoftPanelOverlay
 // before tideui's overlay compositor silently truncates the bottom (see
 // the comment on helpLines) — 4 lines of chrome outside the body content
@@ -1911,8 +2207,18 @@ func (m Model) softOverlayBodyBudget() int {
 	return max(3, (m.height-1)-6)
 }
 
-// helpBodyBudget is how many helpLines rows fit in the help overlay at once.
+// helpBodyBudget is how many helpLines rows fit in the help overlay at
+// once — softOverlayBodyBudget's usual allowance, minus the always-visible
+// status legend (statusLegendLineCount rows) and the blank line separating
+// it from the scrollable keybinding list above it.
 func (m Model) helpBodyBudget() int {
+	return max(3, m.softOverlayBodyBudget()-statusLegendLineCount-1)
+}
+
+// appLogBodyBudget is how many appLogLines rows fit in the app-log overlay
+// at once — no status legend to subtract for, unlike helpBodyBudget, so
+// it's just the plain softOverlayBodyBudget allowance.
+func (m Model) appLogBodyBudget() int {
 	return m.softOverlayBodyBudget()
 }
 
@@ -1944,24 +2250,10 @@ func (m Model) aboutText(renderer tideui.Renderer, width int) string {
 // of "ship": the container kind and the idiom.
 const aboutTagline = "Get Your Ship Together"
 
-// aboutBoat is a small ASCII tugboat, funnel first — deliberately short
-// rows of differing width so the silhouette actually reads as a hull
-// (narrower at the funnel, wider at the waterline) rather than a uniform
-// block; positionAt pads each row independently to the same left edge.
-var aboutBoat = []string{
-	`   [==]`,
-	` __|##|__`,
-	`/________\`,
-}
-
-// aboutBoatSlideFrames is how long the boat takes to slide in from off the
-// right edge to its resting spot once the logo finishes lighting up.
-const aboutBoatSlideFrames = 40
-
-// aboutExtras renders the tagline and the tugboat beneath the logo. The
-// boat starts sliding in only once spotlightRowCells' own reveal (search +
-// converge + expand) has finished, so it doesn't compete with the logo
-// animation for attention. Every style here carries its own explicit
+// aboutExtras renders the tagline and the sinking-ship storm animation
+// beneath the logo. The ship starts only once spotlightRowCells' own reveal
+// (search + converge + expand) has finished, so it doesn't compete with the
+// logo animation for attention. Every style here carries its own explicit
 // Background rather than relying on an outer wrap to fill the gaps — an
 // outer Width/Background only paints padding it appends itself, not the
 // interior of content that already carries its own embedded ANSI resets
@@ -1975,58 +2267,17 @@ func (m Model) aboutExtras(renderer tideui.Renderer, width int) string {
 		Render(centerPlainText(aboutTagline, width))
 
 	lines := []string{blank, tagline, blank}
-	lines = append(lines, aboutBoatRows(width, m.aboutFrame, bg)...)
+	lines = append(lines, aboutShipRows(width, m.aboutFrame, bg, m.aboutShipStatusText())...)
 	return strings.Join(lines, "\n")
 }
 
-// aboutBoatRows returns the boat's hull rows plus a waterline, each padded
-// to width with the boat positioned col columns from the left edge for
-// this frame — computed purely from frame, like spotlightRowCells' expand
-// phase, so no extra animation state needs to persist on Model.
-func aboutBoatRows(width, frame int, bg lipgloss.TerminalColor) []string {
-	if width <= 0 {
-		return nil
-	}
-	boatWidth := 0
-	for _, line := range aboutBoat {
-		boatWidth = max(boatWidth, len([]rune(line)))
-	}
-	restCol := max(0, (width-boatWidth)/2)
-	startFrame := aboutSearchFrames + aboutConvergeFrames + aboutExpandFrames
-	t := float64(frame-startFrame) / float64(aboutBoatSlideFrames)
-	if t < 0 {
-		t = 0
-	}
-	if t > 1 {
-		t = 1
-	}
-	col := int(float64(width) - t*float64(width-restCol) + 0.5)
-
-	hull := lipgloss.NewStyle().Width(width).Background(bg).Foreground(lipgloss.Color("#7dcfff"))
-	rows := make([]string, 0, len(aboutBoat)+1)
-	for _, line := range aboutBoat {
-		rows = append(rows, hull.Render(positionAt(line, col, width)))
-	}
-	water := lipgloss.NewStyle().Width(width).Background(bg).Foreground(lipgloss.Color("#4a90a4")).
-		Render(strings.Repeat("~", width))
-	rows = append(rows, water)
-	return rows
-}
-
-// positionAt left-pads text by col columns within a width-wide line,
-// truncating anything that would overflow past width. col >= width means
-// text is entirely past the right edge — a blank line, i.e. off-screen.
-func positionAt(text string, col, width int) string {
-	if col >= width {
-		return strings.Repeat(" ", width)
-	}
-	runes := []rune(text)
-	line := strings.Repeat(" ", max(0, col)) + string(runes)
-	lineRunes := []rune(line)
-	if len(lineRunes) > width {
-		return string(lineRunes[:width])
-	}
-	return line + strings.Repeat(" ", width-len(lineRunes))
+// aboutShipStatusText is the version line that fades into the ship
+// animation's final settled-ocean frame (see overlayAboutShipStatusCells in
+// about_ship.go). Update status is deliberately left out — it's already
+// checked automatically on startup and shown in Settings, so repeating it
+// here would just be stale-by-the-time-you-see-it duplication, not new info.
+func (m Model) aboutShipStatusText() string {
+	return "Version " + strings.TrimPrefix(m.appVersion, "v")
 }
 
 func aboutLogo() []string {

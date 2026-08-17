@@ -27,6 +27,7 @@ import (
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
+	"github.com/allisonhere/whatthedock/internal/update"
 )
 
 type pane int
@@ -62,6 +63,8 @@ const (
 	overlayAbout
 	overlayDelete
 	overlayReplicate
+	overlayUpdate
+	overlayAppLog
 )
 
 type graphStyle int
@@ -87,6 +90,36 @@ const (
 	logColorSeverity
 	logColorHTTP
 	logColorMono
+)
+
+// appLogMode controls how much of whatthedock's own internal status-bar
+// activity gets recorded into an in-memory buffer viewable via Settings >
+// View app log. Error status lines are always kept regardless of this
+// setting (see recordAppLog) — off just means routine info-level status
+// messages aren't also kept. on adds those info lines, buffer only, for
+// this session. save does the same but also appends every kept line to a
+// log file on disk (see appLogFilePath), so it survives past the session,
+// e.g. for reporting a bug that already scrolled off screen.
+type appLogMode int
+
+const (
+	appLogOff appLogMode = iota
+	appLogOn
+	appLogSave
+)
+
+// aiProvider identifies which AI service the Problems pane's "analyze with
+// AI" action calls (see internal/ai.Provider, which this maps directly
+// onto). Custom is a user-supplied OpenAI-compatible base URL, covering
+// anything else (a local Ollama server, OpenRouter, Azure OpenAI, ...)
+// without a hardcoded name for each one.
+type aiProvider int
+
+const (
+	aiProviderAnthropic aiProvider = iota
+	aiProviderOpenAI
+	aiProviderGemini
+	aiProviderCustom
 )
 
 type logSeverityFilter int
@@ -116,6 +149,15 @@ type appSettings struct {
 	ModalShadow     bool
 	StatsRefresh    time.Duration
 	DefaultActivity activityMode
+	AppLog          appLogMode
+
+	// AI* configure the Problems pane's opt-in "analyze with AI" action —
+	// see internal/ai and aiConfig. AIAPIKey is whatthedock's first
+	// persisted secret; config.SaveSettings writes 0600 because of it.
+	AIProvider aiProvider
+	AIModel    string
+	AIAPIKey   string
+	AIBaseURL  string
 }
 
 type rowKind int
@@ -178,6 +220,14 @@ const (
 	settingsRowSetting settingsRowKind = iota
 	settingsRowSection
 	settingsRowAction
+	// settingsRowText and settingsRowSecretText are free-text rows — every
+	// other settingsRowSetting row cycles through a fixed set of values
+	// (see cycleSetting), but AI model/base URL/API key need arbitrary
+	// typed text instead. Selecting one starts inline text editing (see
+	// settingsEditingField) rather than cycling. settingsRowSecretText
+	// additionally renders its value masked, never as plaintext.
+	settingsRowText
+	settingsRowSecretText
 )
 
 type settingsAction int
@@ -185,6 +235,8 @@ type settingsAction int
 const (
 	settingsActionNone settingsAction = iota
 	settingsActionResetDefaults
+	settingsActionCheckUpdate
+	settingsActionViewAppLog
 )
 
 type systemOverlayMode int
@@ -265,6 +317,15 @@ type Model struct {
 	statusErr bool
 	overlay   overlayMode
 
+	// appLogLines is every distinct status-bar message this session, kept
+	// when settings.AppLog is on or save (see recordAppLog) — viewable via
+	// Settings > View app log (overlayAppLog). appLogFile is the lazily
+	// opened handle used only in save mode; appLogScroll is that overlay's
+	// own scroll position, same role as helpScroll for the Help overlay.
+	appLogLines  []string
+	appLogFile   *os.File
+	appLogScroll int
+
 	// lastStatusErrText/statusErrSince back the minimum-hold guard in the
 	// snapshotMsg handler: an error status must stay legible for at least
 	// statusErrMinHold, not just until the next routine refresh happens to
@@ -280,15 +341,25 @@ type Model struct {
 	settingsDraft  appSettings
 	settingsCursor int
 	settingsPath   string
-	systems        []config.System
-	activeSystem   string
-	systemsCursor  int
-	systemMode     systemOverlayMode
-	systemDraft    config.System
-	systemDraftNew bool
-	systemField    systemField
-	systemCursor   int
-	providerFor    providerFactory
+
+	// settingsEditingField is "" when no settings row is being text-edited,
+	// otherwise the label of the settingsRowText/settingsRowSecretText row
+	// currently open for inline editing (AI model/API key/base URL — the
+	// only free-text rows in Settings). settingsEditDraft/settingsEditCursor
+	// back that in-progress edit the same way createCursor does for the
+	// Create form's text fields.
+	settingsEditingField string
+	settingsEditDraft    string
+	settingsEditCursor   int
+	systems              []config.System
+	activeSystem         string
+	systemsCursor        int
+	systemMode           systemOverlayMode
+	systemDraft          config.System
+	systemDraftNew       bool
+	systemField          systemField
+	systemCursor         int
+	providerFor          providerFactory
 
 	copyCursor int
 	openCursor int
@@ -329,6 +400,39 @@ type Model struct {
 	// eventsReconnecting mirrors the event-stream backoff loop so statusLeft
 	// can show it's happening instead of going silent for up to 30s.
 	eventsReconnecting bool
+
+	// appVersion is this build's version (set via WithVersion — a "dev"
+	// build never has anything to compare against, see update.IsNewer).
+	// updateIgnoredVersion/updateLastCheck mirror config.Settings'
+	// UpdateIgnoredVersion/UpdateLastCheck (see persistedSettings) rather
+	// than living in appSettings/settingsDraft: they're app state that
+	// happens to persist, not a user-editable preference with a settings
+	// row of its own the way GraphStyle etc. are. updateAvailableVersion
+	// is non-empty while the "update available" overlay (or its result) is
+	// live; restartExecPath is set once an install finishes — see
+	// RestartExecPath in update.go for why main(), not this package, acts
+	// on it.
+	appVersion             string
+	updateIgnoredVersion   string
+	updateLastCheck        time.Time
+	updateChecking         bool
+	updateAvailableVersion string
+	updateCheckErr         error
+	updateInstalling       bool
+	restartExecPath        string
+
+	// aiAnalyzing/aiAnalysis/aiAnalysisErr mirror the update-check pattern
+	// above (updateChecking/updateCheckErr) for the Problems pane's "a"
+	// (analyze with AI) action. aiAnalysisFor is the problem row's ID the
+	// current result/error/in-flight request actually belongs to — checked
+	// against whatever row is currently selected before ever rendering
+	// aiAnalysis/aiAnalysisErr, so moving the cursor to a different problem
+	// while a request is in flight (or after one finished) never shows a
+	// stale result attributed to the wrong container.
+	aiAnalyzing   bool
+	aiAnalysis    string
+	aiAnalysisErr error
+	aiAnalysisFor domain.ResourceID
 }
 
 // aboutSpotlight is one moving light in the About screen's animation
@@ -424,6 +528,7 @@ func (m Model) tickAboutSpotlights() Model {
 var clipboardWriter io.Writer = os.Stderr
 var openTarget = defaultOpenTarget
 var applyComposeCreate = defaultApplyComposeCreate
+var applyComposeAdopt = defaultApplyComposeAdopt
 var applyComposeDelete = defaultApplyComposeDelete
 var applyComposeReplicate = defaultApplyComposeReplicate
 var composeCommand = runDockerCompose
@@ -549,24 +654,41 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 	settings.applyPersisted(persisted)
 	setEditorVimMode(settings.CreateVim)
 	persisted = config.NormalizeSystems(persisted)
-	return Model{
-		provider:      provider,
-		theme:         theme,
-		themes:        tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
-		mode:          settings.DefaultActivity,
-		settings:      settings,
-		settingsDraft: settings,
-		settingsPath:  settingsPath,
-		systems:       persisted.Systems,
-		activeSystem:  persisted.ActiveSystem,
-		providerFor:   factory,
-		statsHistory:  map[domain.ResourceID]statsHistory{},
-		logViews:      map[domain.ResourceID]logViewState{},
-		logFollow:     true,
-		collapsed:     map[string]bool{},
-		loading:       true,
-		status:        "connecting to Docker",
+	var updateLastCheck time.Time
+	if persisted.UpdateLastCheck != "" {
+		updateLastCheck, _ = time.Parse(time.RFC3339, persisted.UpdateLastCheck)
 	}
+	return Model{
+		provider:             provider,
+		theme:                theme,
+		themes:               tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
+		mode:                 settings.DefaultActivity,
+		settings:             settings,
+		settingsDraft:        settings,
+		settingsPath:         settingsPath,
+		systems:              persisted.Systems,
+		activeSystem:         persisted.ActiveSystem,
+		providerFor:          factory,
+		statsHistory:         map[domain.ResourceID]statsHistory{},
+		logViews:             map[domain.ResourceID]logViewState{},
+		logFollow:            true,
+		collapsed:            map[string]bool{},
+		loading:              true,
+		status:               "connecting to Docker",
+		appVersion:           "dev",
+		updateIgnoredVersion: persisted.UpdateIgnoredVersion,
+		updateLastCheck:      updateLastCheck,
+	}
+}
+
+// WithVersion sets the running build's version (from cmd/whatthedock's
+// ldflags-injected main.version) — a separate step from construction so
+// every other caller (tests, the demo path) doesn't have to thread a
+// version string through just to get "dev", the correct default for a
+// non-release build (see update.IsNewer).
+func (m Model) WithVersion(version string) Model {
+	m.appVersion = version
+	return m
 }
 
 func defaultSettings() appSettings {
@@ -634,6 +756,27 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 	case "problems", "":
 		s.DefaultActivity = activityProblems
 	}
+	switch persisted.AppLog {
+	case "on":
+		s.AppLog = appLogOn
+	case "save":
+		s.AppLog = appLogSave
+	case "off", "":
+		s.AppLog = appLogOff
+	}
+	switch persisted.AIProvider {
+	case "openai":
+		s.AIProvider = aiProviderOpenAI
+	case "gemini":
+		s.AIProvider = aiProviderGemini
+	case "custom":
+		s.AIProvider = aiProviderCustom
+	case "anthropic", "":
+		s.AIProvider = aiProviderAnthropic
+	}
+	s.AIModel = persisted.AIModel
+	s.AIAPIKey = persisted.AIAPIKey
+	s.AIBaseURL = persisted.AIBaseURL
 }
 
 func (s appSettings) persisted() config.Settings {
@@ -651,6 +794,11 @@ func (s appSettings) persisted() config.Settings {
 		ModalShadow:     &modalShadow,
 		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
 		DefaultActivity: activityModeName(s.DefaultActivity),
+		AppLog:          s.AppLog.String(),
+		AIProvider:      s.AIProvider.String(),
+		AIModel:         s.AIModel,
+		AIAPIKey:        s.AIAPIKey,
+		AIBaseURL:       s.AIBaseURL,
 	}
 }
 
@@ -658,6 +806,10 @@ func (m Model) persistedSettings() config.Settings {
 	settings := m.settings.persisted()
 	settings.Systems = append([]config.System(nil), m.systems...)
 	settings.ActiveSystem = m.activeSystem
+	settings.UpdateIgnoredVersion = m.updateIgnoredVersion
+	if !m.updateLastCheck.IsZero() {
+		settings.UpdateLastCheck = m.updateLastCheck.Format(time.RFC3339)
+	}
 	return config.NormalizeSystems(settings)
 }
 
@@ -680,10 +832,28 @@ func whatthedockTheme() tideui.Theme {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshCmd(), m.startEventsCmd(), tickStatusPulse())
+	cmds := []tea.Cmd{m.refreshCmd(), m.startEventsCmd(), tickStatusPulse()}
+	if cmd := m.autoCheckForUpdateCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
+// Update is bubbletea's entry point — a thin wrapper around updateStep that
+// also records the status-bar transition into the app log (see appLogMode),
+// so every one of updateStep's ~70 existing m.status/m.statusErr call sites
+// gets logged for free instead of needing to be touched individually.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prevStatus, prevErr := m.status, m.statusErr
+	next, cmd := m.updateStep(msg)
+	if nm, ok := next.(Model); ok {
+		nm.recordAppLog(prevStatus, prevErr)
+		return nm, cmd
+	}
+	return next, cmd
+}
+
+func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -871,6 +1041,60 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = msg.label+" complete", false
 		}
 		return m, m.refreshCmd()
+	case updateCheckMsg:
+		m.updateChecking = false
+		m.updateLastCheck = time.Now()
+		m.saveSettings()
+		if msg.err != nil {
+			m.updateCheckErr = msg.err
+			if msg.manual {
+				m.status, m.statusErr = "check for update: "+friendlyDockerError(msg.err), true
+			}
+			return m, nil
+		}
+		m.updateCheckErr = nil
+		if !update.IsNewer(m.appVersion, msg.latest) {
+			if msg.manual {
+				m.status, m.statusErr = "whatthedock "+m.appVersion+" is up to date", false
+			}
+			return m, nil
+		}
+		// The automatic background check stays quiet about a version the
+		// user already said to ignore; a manual "Check for update" always
+		// shows it — you asked, so it answers, regardless of any earlier
+		// dismissal.
+		if !msg.manual && msg.latest == m.updateIgnoredVersion {
+			return m, nil
+		}
+		m.updateAvailableVersion = msg.latest
+		if m.overlay == overlayNone {
+			m.overlay = overlayUpdate
+		} else {
+			m.status, m.statusErr = "update "+msg.latest+" available (see Settings)", false
+		}
+		return m, nil
+	case updateInstalledMsg:
+		m.updateInstalling = false
+		if msg.err != nil {
+			m.status, m.statusErr = "update failed: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.restartExecPath = msg.exePath
+		return m, tea.Quit
+	case aiAnalysisDoneMsg:
+		if msg.id != m.aiAnalysisFor {
+			// A response for a row the user has since moved past (a newer
+			// "a" press advanced aiAnalysisFor) — discard rather than
+			// showing it under whatever's selected now.
+			return m, nil
+		}
+		m.aiAnalyzing = false
+		if msg.err != nil {
+			m.aiAnalysisErr = msg.err
+			return m, nil
+		}
+		m.aiAnalysis = msg.result
+		return m, nil
 	case createDoneMsg:
 		m.busy = false
 		m.overlay = overlayNone
@@ -903,12 +1127,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case createOverrideCheckMsg:
-		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service && msg.found {
-			m.createDraft.OverrideRaw = msg.content
-			m.createDraft.OverrideRawSet = true
-			m.createDraft.OverrideLoaded = true
-			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
-			m.status, m.statusErr = "loaded existing override for "+msg.service, false
+		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service {
+			m.createDraft.BaseFileMissing = msg.baseFileMissing
+			if msg.found {
+				m.createDraft.OverrideRaw = msg.content
+				m.createDraft.OverrideRawSet = true
+				m.createDraft.OverrideLoaded = true
+				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+				m.status, m.statusErr = "loaded existing override for "+msg.service, false
+			}
 		}
 		return m, nil
 	case createFileBrowseMsg:
@@ -1104,6 +1331,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setLogSeverityFilter(logSeverityAll)
 			return m, nil
 		}
+		if m.focus == paneActivity && m.mode == activityProblems {
+			return m.startAIAnalysis()
+		}
 	case "e":
 		if m.focus == paneActivity && m.mode == activityLogs {
 			m.setLogSeverityFilter(logSeverityErrors)
@@ -1247,6 +1477,23 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "G", "end":
 			m.scrollHelp(len(helpLines))
 		}
+	case overlayAppLog:
+		switch msg.String() {
+		case "esc", "q":
+			m.overlay = overlayNone
+		case "j", "down":
+			m.scrollAppLog(1)
+		case "k", "up":
+			m.scrollAppLog(-1)
+		case "pgdown":
+			m.scrollAppLog(max(1, m.appLogBodyBudget()-1))
+		case "pgup":
+			m.scrollAppLog(-max(1, m.appLogBodyBudget()-1))
+		case "g", "home":
+			m.scrollAppLog(-len(m.appLogLines))
+		case "G", "end":
+			m.scrollAppLog(len(m.appLogLines))
+		}
 	case overlayAbout:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
 			m.overlay = overlayNone
@@ -1279,6 +1526,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleDeleteKey(msg)
 	case overlayReplicate:
 		return m.handleReplicateKey(msg)
+	case overlayUpdate:
+		return m.handleUpdateKey(msg)
 	}
 	return m, nil
 }
@@ -1440,6 +1689,9 @@ func (m Model) handleOpenKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.settingsEditingField != "" {
+		return m.handleSettingsTextEditKey(msg)
+	}
 	switch msg.String() {
 	case "esc", "q", ",", "ctrl+,":
 		m.settingsDraft = m.settings
@@ -1451,11 +1703,132 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "left", "h":
 		m.cycleSetting(m.settingsCursor, -1)
 	case "right", "l", "enter", " ":
+		rows := m.settingsRows()
+		idx := clamp(m.settingsCursor, 0, len(rows)-1)
+		row := rows[idx]
+		switch row.action {
+		case settingsActionCheckUpdate:
+			m.updateChecking = true
+			m.updateCheckErr = nil
+			return m, m.checkForUpdateCmd(true)
+		case settingsActionViewAppLog:
+			m.overlay = overlayAppLog
+			m.appLogScroll = max(0, len(m.appLogLines)-m.appLogBodyBudget())
+			return m, nil
+		}
+		if row.kind == settingsRowText || row.kind == settingsRowSecretText {
+			m.startSettingsTextEdit(row.label)
+			return m, nil
+		}
 		m.cycleSetting(m.settingsCursor, 1)
 	case "ctrl+s":
 		m.saveSettingsDraft()
 	}
 	return m, nil
+}
+
+// startSettingsTextEdit opens inline editing for a settingsRowText/
+// settingsRowSecretText row — draft seeded from its current stored value
+// (including the actual secret for "AI API key", so backspacing edits it
+// rather than always starting from scratch) with the cursor at the end.
+func (m *Model) startSettingsTextEdit(label string) {
+	m.settingsEditingField = label
+	m.settingsEditDraft = m.settingsTextFieldValue(label)
+	m.settingsEditCursor = len([]rune(m.settingsEditDraft))
+}
+
+func (m Model) settingsTextFieldValue(label string) string {
+	switch label {
+	case "AI model":
+		return m.settingsDraft.AIModel
+	case "AI API key":
+		return m.settingsDraft.AIAPIKey
+	case "AI base URL":
+		return m.settingsDraft.AIBaseURL
+	default:
+		return ""
+	}
+}
+
+func (m *Model) setSettingsTextFieldValue(label, value string) {
+	switch label {
+	case "AI model":
+		m.settingsDraft.AIModel = value
+	case "AI API key":
+		m.settingsDraft.AIAPIKey = value
+	case "AI base URL":
+		m.settingsDraft.AIBaseURL = value
+	}
+}
+
+// handleSettingsTextEditKey handles keys while settingsEditingField is
+// set — a small text editor (typing, backspace/delete, left/right/home/end,
+// ctrl+u to clear) mirroring the Create form's field-editing keys, scoped
+// down to what a one-line settings value actually needs. Enter commits the
+// draft back into settingsDraft; Esc discards it.
+func (m Model) handleSettingsTextEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.settingsEditingField = ""
+		m.settingsEditDraft = ""
+		m.settingsEditCursor = 0
+	case "enter":
+		m.setSettingsTextFieldValue(m.settingsEditingField, m.settingsEditDraft)
+		m.settingsEditingField = ""
+		m.settingsEditDraft = ""
+		m.settingsEditCursor = 0
+	case "left":
+		m.settingsEditCursor = max(0, m.settingsEditCursor-1)
+	case "right":
+		m.settingsEditCursor = min(len([]rune(m.settingsEditDraft)), m.settingsEditCursor+1)
+	case "home", "ctrl+a":
+		m.settingsEditCursor = 0
+	case "end", "ctrl+e":
+		m.settingsEditCursor = len([]rune(m.settingsEditDraft))
+	case "backspace":
+		runes := []rune(m.settingsEditDraft)
+		if m.settingsEditCursor > 0 && m.settingsEditCursor <= len(runes) {
+			runes = append(runes[:m.settingsEditCursor-1], runes[m.settingsEditCursor:]...)
+			m.settingsEditDraft = string(runes)
+			m.settingsEditCursor--
+		}
+	case "delete":
+		runes := []rune(m.settingsEditDraft)
+		if m.settingsEditCursor < len(runes) {
+			runes = append(runes[:m.settingsEditCursor], runes[m.settingsEditCursor+1:]...)
+			m.settingsEditDraft = string(runes)
+		}
+	case "ctrl+u":
+		m.settingsEditDraft = ""
+		m.settingsEditCursor = 0
+	default:
+		if len(msg.Runes) > 0 {
+			runes := []rune(m.settingsEditDraft)
+			cursor := clamp(m.settingsEditCursor, 0, len(runes))
+			merged := append([]rune{}, runes[:cursor]...)
+			merged = append(merged, msg.Runes...)
+			merged = append(merged, runes[cursor:]...)
+			m.settingsEditDraft = string(merged)
+			m.settingsEditCursor = cursor + len(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
+// settingsEditValueWithCaret renders the in-progress edit for row with a
+// caret at the cursor position — masked as bullets for settingsRowSecretText
+// (a real password-style field, not just masked when idle), plain text
+// otherwise. Mirrors systemFieldValueWithCaret's caret convention.
+func (m Model) settingsEditValueWithCaret(row settingsRow) string {
+	runes := []rune(m.settingsEditDraft)
+	if row.kind == settingsRowSecretText {
+		runes = []rune(strings.Repeat("•", len(runes)))
+	}
+	cursor := clamp(m.settingsEditCursor, 0, len(runes))
+	withCaret := append([]rune{}, runes[:cursor]...)
+	withCaret = append(withCaret, '|')
+	withCaret = append(withCaret, runes[cursor:]...)
+	return string(withCaret)
 }
 
 func (m Model) handleSystemsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2189,6 +2562,16 @@ func (m Model) copyRows() []copyRow {
 		}
 	}
 
+	// AI analysis only shows up here once it actually belongs to ctr — the
+	// same aiAnalysisFor guard problemInsightText uses, so opening Copy
+	// right after Enter-selecting the problem row you just ran "a" on (the
+	// normal way to act on a highlighted problem with any general
+	// container action, same as l/g/D/etc.) surfaces it, but Copy on some
+	// other container never shows a mismatched result under the wrong one.
+	if m.aiAnalysisFor == ctr.ID {
+		add("AI analysis", m.aiAnalysis)
+	}
+
 	add("Container ID", ctr.ID.ID)
 	add("Name", ctr.DisplayName())
 	add("Image", ctr.Image)
@@ -2355,7 +2738,7 @@ func defaultOpenTarget(target string) error {
 
 func (m Model) settingsRows() []settingsRow {
 	settings := m.settingsForRows()
-	return []settingsRow{
+	rows := []settingsRow{
 		{label: "Stats", kind: settingsRowSection},
 		{label: "Graph style", value: settings.GraphStyle.String()},
 		{label: "Graph color", value: settings.GraphColor.String()},
@@ -2369,8 +2752,51 @@ func (m Model) settingsRows() []settingsRow {
 		{label: "Modal shadow", value: onOff(settings.ModalShadow)},
 		{label: "Editor", kind: settingsRowSection},
 		{label: "Vim mode", value: onOff(settings.CreateVim)},
-		{label: "Maintenance", kind: settingsRowSection},
-		{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
+		{label: "AI", kind: settingsRowSection},
+		{label: "AI provider", value: settings.AIProvider.String()},
+		{label: "AI model", value: emptyAs(short(settings.AIModel, 30), "(provider default)"), kind: settingsRowText},
+		{label: "AI API key", value: maskedSecret(settings.AIAPIKey), kind: settingsRowSecretText},
+	}
+	if settings.AIProvider == aiProviderCustom {
+		rows = append(rows, settingsRow{label: "AI base URL", value: emptyAs(short(settings.AIBaseURL, 30), "(not set)"), kind: settingsRowText})
+	}
+	rows = append(rows,
+		settingsRow{label: "Diagnostics", kind: settingsRowSection},
+		settingsRow{label: "App log", value: settings.AppLog.String()},
+		settingsRow{label: "View app log", value: "view", kind: settingsRowAction, action: settingsActionViewAppLog},
+		settingsRow{label: "Maintenance", kind: settingsRowSection},
+		settingsRow{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
+		settingsRow{label: "Check for update", value: m.updateCheckRowValue(), kind: settingsRowAction, action: settingsActionCheckUpdate},
+	)
+	return rows
+}
+
+// maskedSecret is the "AI API key" row's display value outside of active
+// editing — a fixed-length mask regardless of the real key's length, so
+// the settings overlay never leaks even how long the stored key is.
+func maskedSecret(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "(not set)"
+	}
+	return strings.Repeat("•", 8)
+}
+
+// updateCheckRowValue is the "Check for update" settings row's right-hand
+// value — reflects whatever the most recent check (automatic or manual)
+// found, or "check" as the idle prompt before any check has run this
+// session.
+func (m Model) updateCheckRowValue() string {
+	switch {
+	case m.updateChecking:
+		return "checking…"
+	case m.updateCheckErr != nil:
+		return "check failed"
+	case m.updateAvailableVersion != "":
+		return m.updateAvailableVersion + " available"
+	case !m.updateLastCheck.IsZero():
+		return "up to date"
+	default:
+		return "check"
 	}
 }
 
@@ -2450,6 +2876,10 @@ func (m *Model) cycleSetting(index, direction int) {
 		m.settingsDraft.ModalShadow = !m.settingsDraft.ModalShadow
 	case "Vim mode":
 		m.settingsDraft.CreateVim = !m.settingsDraft.CreateVim
+	case "App log":
+		m.settingsDraft.AppLog = appLogMode(modIndex(int(m.settingsDraft.AppLog)+direction, 3))
+	case "AI provider":
+		m.settingsDraft.AIProvider = aiProvider(modIndex(int(m.settingsDraft.AIProvider)+direction, 4))
 	}
 }
 
@@ -2457,6 +2887,73 @@ func (m *Model) saveSettingsDraft() {
 	m.settings = m.settingsDraft
 	setEditorVimMode(m.settings.CreateVim)
 	m.saveSettings()
+}
+
+// appLogMaxLines caps the in-memory buffer so a long session doesn't grow
+// it unbounded — oldest lines drop off first, same trim shape as other
+// ring buffers in this codebase (e.g. stats history).
+const appLogMaxLines = 500
+
+// recordAppLog appends a line to the app log when the status bar just
+// changed to a new, non-empty message — called once per Update from the
+// wrapper above with the *previous* status/statusErr, so it only fires on
+// an actual transition, not every tick the same status is held.
+//
+// Error status lines are captured in memory unconditionally, even with
+// AppLog off — you don't know you'll want the log until after the error
+// you're chasing has already happened, so gating errors behind an opt-in
+// setting would defeat the point. off/on/save instead control the routine
+// info-level noise (only kept once turned on) and disk persistence (save
+// only) — see appLogMode.
+func (m *Model) recordAppLog(prevStatus string, prevErr bool) {
+	if m.status == "" || (m.status == prevStatus && m.statusErr == prevErr) {
+		return
+	}
+	if !m.statusErr && m.settings.AppLog == appLogOff {
+		return
+	}
+	level := "INFO"
+	if m.statusErr {
+		level = "ERROR"
+	}
+	line := fmt.Sprintf("%s  %-5s  %s", time.Now().Format("15:04:05"), level, m.status)
+	m.appLogLines = append(m.appLogLines, line)
+	if len(m.appLogLines) > appLogMaxLines {
+		m.appLogLines = m.appLogLines[len(m.appLogLines)-appLogMaxLines:]
+	}
+	if m.settings.AppLog == appLogSave {
+		m.writeAppLogLine(line)
+	}
+}
+
+// writeAppLogLine appends one line to the on-disk app log, opening the file
+// (once, lazily) the first time save mode actually has something to write.
+// A failure to open it is silent rather than surfaced as a status error —
+// logging a logging failure would just be noise, and the in-memory buffer
+// (still populated regardless of save mode) remains available either way.
+func (m *Model) writeAppLogLine(line string) {
+	if m.appLogFile == nil {
+		path := m.appLogFilePath()
+		if path == "" {
+			return
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return
+		}
+		m.appLogFile = f
+	}
+	fmt.Fprintln(m.appLogFile, line)
+}
+
+// appLogFilePath is whatthedock.log next to settings.json — same directory
+// as everything else this app persists, rather than introducing a new
+// config location just for this.
+func (m Model) appLogFilePath() string {
+	if m.settingsPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(m.settingsPath), "whatthedock.log")
 }
 
 func (m *Model) saveSettings() {
@@ -2505,6 +3002,30 @@ func (m logColorMode) String() string {
 		return "mono"
 	default:
 		return "full"
+	}
+}
+
+func (a appLogMode) String() string {
+	switch a {
+	case appLogOn:
+		return "on"
+	case appLogSave:
+		return "save"
+	default:
+		return "off"
+	}
+}
+
+func (p aiProvider) String() string {
+	switch p {
+	case aiProviderOpenAI:
+		return "openai"
+	case aiProviderGemini:
+		return "gemini"
+	case aiProviderCustom:
+		return "custom"
+	default:
+		return "anthropic"
 	}
 }
 
@@ -2628,6 +3149,48 @@ func (m Model) treeVisibleRows() int {
 
 func (m Model) activityVisibleRows() int {
 	return max(1, m.paneContentRows()-m.paneActionStripRows(paneActivity))
+}
+
+// problemsInsightRows is the fixed row allowance for the rule-based insight
+// block beneath the Problems list — enough for a few sentences without
+// eating the whole pane, but never so much it leaves the list with nothing
+// on a short terminal, hence the total-1-for-divider floor shared with
+// problemsListRows below.
+func (m Model) problemsInsightRows() int {
+	total := m.activityVisibleRows()
+	want := 6
+	// A real AI response is meant to run several sentences (the prompt
+	// itself asks for 3-6) — the plain rule-based insight's small fixed
+	// budget was truncating it well before it naturally ended. Give it
+	// room to actually fit instead, still bounded by what's left after the
+	// list keeps its own minimum below.
+	if m.aiInsightActive() {
+		want = 40
+	}
+	if ceiling := total - 1 - 3; want > ceiling { // leave the list at least 3 rows
+		want = ceiling
+	}
+	return max(2, want)
+}
+
+// aiInsightActive reports whether the Problems pane's insight block should
+// currently be showing AI content (loading, a result, or an error) instead
+// of the plain rule-based text — true exactly when there's AI state that
+// actually belongs to whatever problem row is currently selected (see
+// currentProblem/aiAnalysisFor), same guard problemInsightText applies.
+func (m Model) aiInsightActive() bool {
+	current := m.currentProblem(m.snapshotProblems())
+	if current == nil || m.aiAnalysisFor != current.id {
+		return false
+	}
+	return m.aiAnalyzing || m.aiAnalysisErr != nil || m.aiAnalysis != ""
+}
+
+// problemsListRows is what's left of the Problems pane for the scrollable
+// problem list once the insight block and its divider are accounted for —
+// same subtract-from-activityVisibleRows shape as logVisibleRows above.
+func (m Model) problemsListRows() int {
+	return max(3, m.activityVisibleRows()-1-m.problemsInsightRows())
 }
 
 func (m Model) treeVisibleStart() int {
@@ -2793,6 +3356,11 @@ func (m *Model) scrollInspector(delta int) {
 func (m *Model) scrollHelp(delta int) {
 	maxScroll := max(0, len(helpLines)-m.helpBodyBudget())
 	m.helpScroll = clamp(m.helpScroll+delta, 0, maxScroll)
+}
+
+func (m *Model) scrollAppLog(delta int) {
+	maxScroll := max(0, len(m.appLogLines)-m.appLogBodyBudget())
+	m.appLogScroll = clamp(m.appLogScroll+delta, 0, maxScroll)
 }
 
 func (m Model) inspectorVisibleRows() int {
@@ -3424,6 +3992,8 @@ func statusGlyph(ctr domain.Container) string {
 		return "●"
 	case domain.StateStopped, domain.StateExited:
 		return "○"
+	case domain.StateDead:
+		return "✖"
 	default:
 		return "·"
 	}

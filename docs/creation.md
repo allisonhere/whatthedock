@@ -147,6 +147,31 @@ For an SSH system, every step above (the `test -f`/`cat` base-file check,
 config`, the rename, and `docker compose up -d`) runs on the remote host over
 `ssh` instead of the local filesystem/`docker` binary.
 
+**Base file doesn't exist at all — adopting an orphaned container** — an
+already-labeled container/service (opened via `m` edit, or `n` re-opened on
+an already-managed service) can have a Compose file path that doesn't
+actually exist on the host. This happens for stacks deployed by a tool that
+manages its own compose file elsewhere rather than leaving one at the path
+it stamps into the container's labels — Portainer is the common case.
+WhatTheDock checks for this the moment the form opens (alongside the
+existing-override check above — local: a `stat`; SSH: `test -f`, one more
+step in the same round trip) and, if the file is missing, the confirm step
+(`Ctrl+Enter`/`Alt+Enter`) shows a different prompt explaining exactly
+what's about to happen instead of the ordinary "write override and run
+compose up" copy: confirming (`y`, labeled `create & adopt`) writes the
+draft's current generated definition as a **brand-new base file** at that
+path (no merge, no override — the base file *is* the full definition) and
+starts the service from it, exactly the same validated
+write-temp/`docker compose config`/promote/`up -d` sequence used elsewhere
+in this document. From that point on the container is a normal, real
+Compose service under WhatTheDock's (and `docker compose`'s) direct
+management — the tool that deployed it originally no longer has a file to
+manage it from.
+
+This only ever triggers for an already-labeled container whose Compose file
+path was already set when the form opened — typing a brand-new, not-yet-
+existing path into a fresh `n` draft is unaffected and behaves as before.
+
 ## Compose File Browser
 
 In Compose create mode, `Ctrl+O` opens the file browser from any field;

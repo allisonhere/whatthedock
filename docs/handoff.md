@@ -62,6 +62,21 @@ Untracked local files at handoff:
     (`mergeComposeServiceFields`) and removing a service's block entirely
     (`removeComposeService`), used by Create/Edit and Delete respectively
     whenever the base compose file already defines the target service.
+- `internal/update/update.go`
+  - Pure, UI-independent logic for the self-update feature: fetching the
+    latest GitHub release tag (`LatestRelease`), comparing versions
+    (`IsNewer`), and downloading + atomically installing a release asset
+    over the running binary (`ReplaceRunningExecutable`). Never re-execs
+    itself — see `internal/ui/update.go` and `cmd/whatthedock/main.go` for
+    why that's deliberately left to `main()`.
+- `internal/ui/update.go`
+  - Wires `internal/update` into the Bubble Tea model: the once-a-day
+    auto-check on launch (`autoCheckForUpdateCmd`, gated by
+    `updateLastCheck`), the manual check from Settings, the "update
+    available" confirm overlay (`handleUpdateKey`) and its
+    persisted-per-version "ignore", and `RestartExecPath` — the seam
+    `cmd/whatthedock/main.go` polls after `program.Run()` returns to decide
+    whether to re-exec into a freshly installed binary.
 - `internal/ui/create_view.go`
   - Renders the create form, mode tabs, confirmation view, Compose file
     browser, and the syntax-highlighted override preview/editor.
@@ -217,6 +232,21 @@ Done since this doc was first written:
   against normal "Delete" expectations (e.g. Portainer-style stack service
   deletion) — this was reported and fixed in the same session the
   merge-aware editing above was added.
+- Added a self-update feature: `internal/update` (pure GitHub-release-check
+  and download/install logic) plus `internal/ui/update.go` (wiring it into
+  the model — an automatic once-a-day check on launch, throttled/cached via
+  a new `updateLastCheck` persisted setting; a "Check for update" row in
+  Settings that always bypasses the throttle; and an "update available"
+  confirm overlay whose "ignore" persists per-version via a new
+  `updateIgnoredVersion` setting, so a later release still prompts).
+  Confirming downloads the matching release asset, atomically replaces the
+  running binary, and re-execs into it. The re-exec is deliberately done in
+  `cmd/whatthedock/main.go`, not inside the Bubble Tea model — it checks
+  the new `ui.Model.RestartExecPath()` only after `program.Run()` returns,
+  so Bubble Tea has already restored the terminal before the process image
+  gets replaced. `cmd/whatthedock`'s `main.go` now also passes its
+  ldflags-injected `version` into the model via a new `Model.WithVersion`
+  method — the model previously had no idea what version it was running.
 
 Remaining:
 

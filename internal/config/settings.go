@@ -21,6 +21,35 @@ type Settings struct {
 	DefaultActivity string   `json:"defaultActivity,omitempty"`
 	ActiveSystem    string   `json:"activeSystem,omitempty"`
 	Systems         []System `json:"systems,omitempty"`
+
+	// AppLog controls whatthedock's own internal status-bar activity log —
+	// "off" (default), "on" (kept in memory for the session), or "save"
+	// (also appended to a log file on disk). See appLogMode in internal/ui.
+	AppLog string `json:"appLog,omitempty"`
+
+	// AI* configure the Problems pane's opt-in "analyze with AI" action
+	// (see internal/ai and internal/ui's aiProvider). AIProvider is one of
+	// "anthropic"/"openai"/"gemini"/"custom"; AIModel overrides that
+	// provider's own default when set; AIBaseURL only applies to "custom".
+	// AIAPIKey is the first secret whatthedock ever persists — SaveSettings
+	// writes this file 0600 (not the world-readable 0644 every other field
+	// here has lived with) because of it. The provider's own standard env
+	// var (ANTHROPIC_API_KEY/OPENAI_API_KEY/GEMINI_API_KEY) still takes
+	// precedence over this at call time, so storing a key here is opt-in,
+	// not the only path — see aiAPIKeyFor in internal/ui.
+	AIProvider string `json:"aiProvider,omitempty"`
+	AIModel    string `json:"aiModel,omitempty"`
+	AIAPIKey   string `json:"aiApiKey,omitempty"`
+	AIBaseURL  string `json:"aiBaseUrl,omitempty"`
+
+	// UpdateIgnoredVersion is the release tag (e.g. "v0.1.5") the user last
+	// dismissed an update prompt for — the automatic check won't prompt
+	// again for that same version, but a later release will since it's a
+	// different tag. UpdateLastCheck (RFC 3339) throttles the automatic
+	// on-launch check to once per day; "Check for update" in Settings
+	// always bypasses it.
+	UpdateIgnoredVersion string `json:"updateIgnoredVersion,omitempty"`
+	UpdateLastCheck      string `json:"updateLastCheck,omitempty"`
 }
 
 type System struct {
@@ -59,6 +88,13 @@ func LoadSettings(path string) (Settings, error) {
 	return settings, nil
 }
 
+// SaveSettings writes settings 0600 (owner read/write only) rather than the
+// more typical 0644 — this file now holds AIAPIKey, whatthedock's first
+// persisted secret. WriteFile's mode argument only takes effect when
+// creating a new file, not on an existing one (open(2) semantics), so an
+// older 0644 file left over from before AIAPIKey existed needs an explicit
+// Chmod to actually get tightened on its next save rather than silently
+// staying world-readable.
 func SaveSettings(path string, settings Settings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -68,7 +104,10 @@ func SaveSettings(path string, settings Settings) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 func DefaultSystem() System {

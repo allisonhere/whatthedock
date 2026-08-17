@@ -81,6 +81,7 @@ Docker socket paths must be present.
 | `o` | Open selected container ports, mounts, or Compose paths |
 | `l` | Focus logs |
 | `p` | Show problems |
+| `a` in problems | Analyze the selected problem with AI |
 | `g` | Show stats graphs |
 | `/` in logs | Filter visible log lines |
 | `e` / `w` / `i` / `a` in logs | Show errors, warnings, info, or all log lines |
@@ -215,12 +216,37 @@ More detail:
 - Supports log filtering, severity quick filters, match navigation, scrollback,
   follow-tail pause/resume, and per-container log view state.
 - Shows a problems view for unhealthy, restarting, stopped, dead, high-restart,
-  unknown-health, and public-port containers.
+  unknown-health, and public-port containers, split into the problem list plus
+  a lower panel with a rule-based, zero-network suggestion for whichever
+  problem is selected — synthesized from that container's own state (health,
+  restart count, exit status, restart policy), updating instantly as the
+  selection moves. Press `a` to go further: an opt-in "analyze with AI" call
+  that sends the container's state, that same rule-based read, and its recent
+  log tail to a configured AI provider (Anthropic, OpenAI, Gemini, or any
+  OpenAI-compatible custom endpoint, e.g. a local Ollama server) for a deeper,
+  colored explanation — never fired automatically, and never sent anywhere
+  without a provider configured in Settings. The finished analysis is also
+  copyable through the Copy overlay (`c`) once you've selected that container.
 - Shows polling stats graphs and sparklines for the selected container, with
   CPU, memory, network, disk I/O, restart, uptime, and PID readouts.
 - Includes a grouped settings panel with reset defaults, persisted graph style,
   graph colors, log color mode, log health color, deltas, refresh interval,
-  default activity pane, and a modal drop shadow toggle.
+  default activity pane, a modal drop shadow toggle, a "Check for update"
+  action, an AI provider/model/API key/base URL section for the Problems
+  pane's "analyze with AI" action (the provider's own standard environment
+  variable — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` — always
+  takes precedence over a stored key, so exporting one works with no Settings
+  change at all), and a Diagnostics section with an app-activity log
+  (off/on/save-to-disk) and a viewer for it. Settings are written with
+  owner-only (`0600`) file permissions, since the AI API key is the first
+  secret WhatTheDock persists.
+- Checks GitHub for a newer release once per day on launch (throttled and
+  cached — "Check for update" in Settings always forces a fresh check). A
+  newer version prompts "update now (`y`) or ignore (`n`/`Esc`)"; ignoring
+  is remembered per-version, so it won't ask again about that release, but
+  a later one prompts fresh. Confirming downloads the matching release
+  asset, atomically replaces the running binary, and re-execs into it —
+  same terminal, no manual restart.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and
@@ -245,7 +271,15 @@ More detail:
   `docker-compose*.yaml` files. Press `Ctrl+Y` to hand-edit the generated
   override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
   editor, with real-time lint feedback and an optional persistent vim mode
-  (Settings → Editor).
+  (Settings → Editor). An already-labeled container whose Compose file
+  doesn't actually exist on disk — the signature of a stack deployed by a
+  tool (Portainer is the common case) that manages its own copy of the
+  compose file elsewhere rather than leaving one at the path it stamps into
+  the container's labels — gets a distinct confirm step instead of a bare
+  failure: confirming writes a brand-new compose file there with the
+  service's current definition and adopts it out of that tool's management,
+  going forward a normal Compose service WhatTheDock (and `docker compose`
+  directly) controls.
 - Deletes (`D`), replicates (`u`), clones (`C`), and edits (`m`) the selected
   container or Compose service. Delete is a real, permanent removal for both
   kinds: it stops and removes the container, then deletes the service's

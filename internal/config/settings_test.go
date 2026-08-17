@@ -67,6 +67,66 @@ func TestSaveAndLoadSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveAndLoadSettingsRoundTripAIFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	want := Settings{
+		AIProvider: "openai",
+		AIModel:    "gpt-4o-mini",
+		AIAPIKey:   "sk-test-secret",
+		AIBaseURL:  "http://localhost:11434/v1",
+	}
+	if err := SaveSettings(path, want); err != nil {
+		t.Fatalf("SaveSettings() err = %v", err)
+	}
+	got, err := LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() err = %v", err)
+	}
+	if got.AIProvider != want.AIProvider || got.AIModel != want.AIModel ||
+		got.AIAPIKey != want.AIAPIKey || got.AIBaseURL != want.AIBaseURL {
+		t.Fatalf("AI fields = %#v, want %#v", got, want)
+	}
+}
+
+// TestSaveSettingsWritesOwnerOnlyPermissions is the regression test for
+// this session's fix: settings.json now holds AIAPIKey, the first secret
+// whatthedock ever persists, and must never be left world-readable.
+func TestSaveSettingsWritesOwnerOnlyPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := SaveSettings(path, Settings{AIAPIKey: "sk-secret"}); err != nil {
+		t.Fatalf("SaveSettings() err = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() err = %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("permissions = %o, want 0600", perm)
+	}
+}
+
+// TestSaveSettingsTightensExistingLoosePermissions guards the actual
+// mechanism the fix depends on: os.WriteFile's mode argument only applies
+// when a file is newly created, so a settings.json left over from before
+// AIAPIKey existed (0644, from every earlier session) needs its permissions
+// explicitly tightened on save, not just on files that don't exist yet.
+func TestSaveSettingsTightensExistingLoosePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSettings(path, Settings{}); err != nil {
+		t.Fatalf("SaveSettings() err = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() err = %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("permissions = %o after saving over a pre-existing 0644 file, want 0600", perm)
+	}
+}
+
 func TestNormalizeSystemsCreatesLocalDefault(t *testing.T) {
 	settings := NormalizeSystems(Settings{})
 	if len(settings.Systems) != 1 {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -43,10 +44,36 @@ func main() {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
 		os.Exit(1)
 	}
-	model := ui.NewModelWithProviderFactory(provider, settings, settingsPath, factory.Provider)
+	model := ui.NewModelWithProviderFactory(provider, settings, settingsPath, factory.Provider).WithVersion(version)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := program.Run(); err != nil {
+	finalModel, err := program.Run()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
+		os.Exit(1)
+	}
+	restartInto(finalModel)
+}
+
+// restartInto re-execs into the binary an in-app update just installed, if
+// any (ui.Model.RestartExecPath is empty otherwise). This runs only after
+// program.Run() has returned, so Bubble Tea has already restored the
+// terminal (alt screen, raw mode) — replacing the process image any
+// earlier would replace it out from under that cleanup. syscall.Exec
+// replaces the current process rather than spawning a child, so the
+// updated binary picks up right where this one left off: same PID, same
+// terminal, no visible restart.
+func restartInto(finalModel tea.Model) {
+	m, ok := finalModel.(ui.Model)
+	if !ok {
+		return
+	}
+	exe := m.RestartExecPath()
+	if exe == "" {
+		return
+	}
+	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "whatthedock: update installed but restart failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "whatthedock: run %s again to use it\n", exe)
 		os.Exit(1)
 	}
 }

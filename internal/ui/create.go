@@ -77,6 +77,18 @@ type createDraft struct {
 	OverrideRaw    string
 	OverrideRawSet bool
 	OverrideLoaded bool
+
+	// BaseFileMissing is set (see openCreateOverlay/checkRemoteOverrideCmd)
+	// when ComposeFile was already non-empty at form-open time — i.e. an
+	// already-labeled container — but doesn't actually exist on disk, the
+	// signature of a stack deployed by a tool (Portainer is the common
+	// case) that manages its own compose file elsewhere rather than
+	// leaving one at the path it stamps into the container's labels.
+	// Confirming in this state (see the confirm-prompt switch in
+	// create_view.go) takes the adopt path instead of the normal
+	// merge/override path: writes a brand-new base file with the draft's
+	// current definition instead of requiring one to already exist.
+	BaseFileMissing bool
 }
 
 type composeCreateSpec struct {
@@ -112,6 +124,11 @@ func (m *Model) openCreateOverlay() tea.Cmd {
 	system := m.activeSystemConfig()
 	if system.Kind == "ssh" {
 		return checkRemoteOverrideCmd(system, m.createDraft.ComposeFile, m.createDraft.Service)
+	}
+	if strings.TrimSpace(m.createDraft.ComposeFile) != "" {
+		if _, err := os.Stat(m.createDraft.ComposeFile); err != nil {
+			m.createDraft.BaseFileMissing = true
+		}
 	}
 	if content, ok := existingOverrideContent(m.createDraft.ComposeFile, m.createDraft.Service); ok {
 		m.createDraft.OverrideRaw = content
@@ -193,9 +210,10 @@ func existingOverrideContent(base, service string) (string, bool) {
 // draft's service changed (or the overlay closed) before the ssh round
 // trip finished.
 type createOverrideCheckMsg struct {
-	service string
-	content string
-	found   bool
+	service         string
+	content         string
+	found           bool
+	baseFileMissing bool
 }
 
 func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd {
@@ -208,11 +226,15 @@ func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		baseMissing := false
+		if _, err := sshRun(ctx, system, "test -f "+systems.ShellQuote(base), ""); err != nil {
+			baseMissing = true
+		}
 		output, err := sshRun(ctx, system, "cat "+systems.ShellQuote(overridePath), "")
 		if err != nil {
-			return createOverrideCheckMsg{service: service, found: false}
+			return createOverrideCheckMsg{service: service, found: false, baseFileMissing: baseMissing}
 		}
-		return createOverrideCheckMsg{service: service, content: string(output), found: true}
+		return createOverrideCheckMsg{service: service, content: string(output), found: true, baseFileMissing: baseMissing}
 	}
 }
 
@@ -367,6 +389,10 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.busy = true
+				if m.createDraft.BaseFileMissing {
+					m.status, m.statusErr = "creating compose file for "+spec.Service, false
+					return m, m.adoptComposeCmd(spec)
+				}
 				m.status, m.statusErr = "applying compose service "+spec.Service, false
 				return m, m.createComposeCmd(spec)
 			}
@@ -469,7 +495,11 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+enter", "alt+enter":
 		if m.validateCreateDraft() {
 			m.createDraft.Confirming = true
-			m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
+			if m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing {
+				m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
+			} else {
+				m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
+			}
 		}
 	case "backspace":
 		m.editCreateFieldBackspace()
@@ -522,6 +552,19 @@ func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSp
 
 func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
 	apply := applyComposeCreate
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		err := apply(ctx, spec)
+		return createDoneMsg{name: spec.Service, err: err}
+	}
+}
+
+// adoptComposeCmd is createComposeCmd's counterpart for a draft whose base
+// compose file doesn't exist yet (createDraft.BaseFileMissing) — see
+// applyComposeAdopt.
+func (m Model) adoptComposeCmd(spec composeCreateSpec) tea.Cmd {
+	apply := applyComposeAdopt
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -1141,6 +1184,73 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 		return err
 	}
 	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+}
+
+// defaultApplyComposeAdopt is defaultApplyComposeCreate's counterpart for a
+// draft whose base compose file doesn't exist at all — the "adopt this
+// container out of Portainer (or whatever else manages it)" path offered by
+// the confirm step when createDraft.BaseFileMissing is set. Unlike
+// defaultApplyComposeCreate, there's no existing base to read or merge
+// into: this writes spec.Content (the draft's own generated single-service
+// definition, already used for the override case) directly as a brand-new
+// base file, with no override layered on top, then starts the service from
+// it. Same write-temp/validate/rename/up shape as the override-write branch
+// above and mergeComposeCreateIntoBase below, just targeting BaseFile
+// instead of OverrideFile.
+func defaultApplyComposeAdopt(ctx context.Context, spec composeCreateSpec) error {
+	if strings.TrimSpace(spec.BaseFile) == "" {
+		return errors.New("compose file is required")
+	}
+	if spec.System.Kind == "ssh" {
+		return applyComposeAdoptRemote(ctx, spec)
+	}
+	if err := os.MkdirAll(filepath.Dir(spec.BaseFile), 0o755); err != nil {
+		return err
+	}
+	tempSpec := spec
+	tempSpec.BaseFile = spec.BaseFile + ".tmp"
+	tempSpec.OverrideFile = ""
+	if err := os.WriteFile(tempSpec.BaseFile, []byte(spec.Content), 0o644); err != nil {
+		return err
+	}
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_ = os.Remove(tempSpec.BaseFile)
+		return err
+	}
+	if err := os.Rename(tempSpec.BaseFile, spec.BaseFile); err != nil {
+		_ = os.Remove(tempSpec.BaseFile)
+		return err
+	}
+	finalSpec := spec
+	finalSpec.OverrideFile = ""
+	return composeCommand(ctx, finalSpec, "up", "-d", spec.Service)
+}
+
+// applyComposeAdoptRemote is defaultApplyComposeAdopt's SSH counterpart,
+// mirroring mergeComposeCreateIntoBaseRemote's shape (write temp, validate,
+// promote) but writing spec.Content fresh instead of a merge result, and
+// with no pre-existing base file to have read in the first place.
+func applyComposeAdoptRemote(ctx context.Context, spec composeCreateSpec) error {
+	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.BaseFile)), ""); err != nil {
+		return err
+	}
+	finalSpec := spec
+	finalSpec.OverrideFile = ""
+	tempBase := spec.BaseFile + ".tmp"
+	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
+		return err
+	}
+	tempSpec := finalSpec
+	tempSpec.BaseFile = tempBase
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	return composeCommand(ctx, finalSpec, "up", "-d", spec.Service)
 }
 
 // mergeComposeCreateIntoBase is defaultApplyComposeCreate's path for a

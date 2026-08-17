@@ -470,6 +470,188 @@ func TestProblemsModeFindsUnhealthyAndStoppedContainers(t *testing.T) {
 	}
 }
 
+// TestProblemInsight covers problemInsight's rule-based, no-network
+// baseline text: one fixture per snapshotProblems classification branch,
+// asserting the text is specific to that container (name, restart count,
+// etc.) rather than generic boilerplate.
+func TestProblemInsight(t *testing.T) {
+	tests := []struct {
+		name string
+		row  problemRow
+		want []string // substrings that must all appear
+	}{
+		{
+			name: "unhealthy",
+			row: problemRow{name: "radarr-1", container: domain.Container{
+				Name: "radarr-1", Health: domain.HealthUnhealthy,
+			}},
+			want: []string{"radarr-1", "health check"},
+		},
+		{
+			name: "restarting with count",
+			row: problemRow{name: "telegraf-agent", container: domain.Container{
+				Name: "telegraf-agent", Restarting: true, RestartCount: 7,
+			}},
+			want: []string{"telegraf-agent", "7 times", "crash loop"},
+		},
+		{
+			name: "restarting no count yet",
+			row: problemRow{name: "sonarr-1", container: domain.Container{
+				Name: "sonarr-1", State: domain.StateRestarting,
+			}},
+			want: []string{"sonarr-1", "restarting"},
+		},
+		{
+			name: "dead",
+			row: problemRow{name: "adguard-1", container: domain.Container{
+				Name: "adguard-1", State: domain.StateDead,
+			}},
+			want: []string{"adguard-1", "dead"},
+		},
+		{
+			name: "high restart count while running",
+			row: problemRow{name: "watchtower-1", container: domain.Container{
+				Name: "watchtower-1", State: domain.StateRunning, RestartCount: 9,
+			}},
+			want: []string{"watchtower-1", "9 times"},
+		},
+		{
+			name: "stopped with status",
+			row: problemRow{name: "grafana-1", container: domain.Container{
+				Name: "grafana-1", State: domain.StateExited, Status: "Exited (1) 3 hours ago", RestartPolicy: "no",
+			}},
+			want: []string{"grafana-1", "Exited (1) 3 hours ago"},
+		},
+		{
+			name: "health unknown",
+			row: problemRow{name: "postgres-1", container: domain.Container{
+				Name: "postgres-1", Health: domain.HealthUnknown,
+			}},
+			want: []string{"postgres-1", "start period"},
+		},
+		{
+			name: "public ports on a standalone container",
+			row: problemRow{name: "nginx-1", container: domain.Container{
+				Name: "nginx-1", Ports: []domain.Port{{Public: 80}},
+			}},
+			want: []string{"nginx-1", "public"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := problemInsight(tt.row)
+			for _, substr := range tt.want {
+				if !strings.Contains(got, substr) {
+					t.Fatalf("problemInsight() = %q, want it to contain %q", got, substr)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderProblemsSplitTracksCursorSelection checks the split-pane
+// render actually reflects the currently selected problem row — moving the
+// cursor changes which container's insight text is shown.
+func TestRenderProblemsSplitTracksCursorSelection(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.focus = paneActivity
+	model.mode = activityProblems
+	model.problemCursor = 0
+
+	first := ansi.Strip(model.View())
+	if !strings.Contains(first, "radarr-1") || !strings.Contains(first, "health check") {
+		t.Fatalf("view at cursor 0 missing radarr-1's insight:\n%s", first)
+	}
+
+	model.problemCursor = 1
+	second := ansi.Strip(model.View())
+	if !strings.Contains(second, "jellyfin-1") {
+		t.Fatalf("view at cursor 1 missing jellyfin-1's insight:\n%s", second)
+	}
+	if strings.Contains(second, "health check") {
+		t.Fatalf("view at cursor 1 still shows radarr-1's insight:\n%s", second)
+	}
+}
+
+// TestWrapInsightTextNoTruncationNeeded checks the common case — text that
+// already fits within maxLines is returned unchanged, no ellipsis added.
+func TestWrapInsightTextNoTruncationNeeded(t *testing.T) {
+	lines := wrapInsightText("short and sweet", 40, 6)
+	if len(lines) != 1 {
+		t.Fatalf("lines = %#v, want 1 line for text well under the budget", lines)
+	}
+	if strings.Contains(lines[0], "…") {
+		t.Fatalf("lines[0] = %q, want no ellipsis when nothing was truncated", lines[0])
+	}
+}
+
+// TestWrapInsightTextTruncatesAtWordBoundaryWithEllipsis is the regression
+// test for the bug reported live: a suggestion longer than the insight
+// panel's row budget was getting hard-cut mid-sentence with no indication
+// anything was omitted. Truncation must land on a word boundary and end
+// with an ellipsis, and every returned line — including the truncated one
+// — must never exceed width.
+func TestWrapInsightTextTruncatesAtWordBoundaryWithEllipsis(t *testing.T) {
+	text := "media-postgres-1 is not running (Exited (137) 2 days ago due to an out-of-memory " +
+		"condition triggered by the host's cgroup limits). If this wasn't intentional, check its " +
+		"logs (l) for the exit reason, or its restart policy (on-failure:5) if you expected Docker " +
+		"to bring it back on its own."
+	width, maxLines := 45, 6
+
+	lines := wrapInsightText(text, width, maxLines)
+	if len(lines) != maxLines {
+		t.Fatalf("len(lines) = %d, want exactly %d", len(lines), maxLines)
+	}
+	for i, line := range lines {
+		if got := len([]rune(line)); got > width {
+			t.Fatalf("line %d = %q, rendered width %d exceeds %d", i, line, got, width)
+		}
+	}
+	last := strings.TrimRight(lines[maxLines-1], " ")
+	if !strings.HasSuffix(last, "…") {
+		t.Fatalf("last line = %q, want it to end with an ellipsis to signal truncation", last)
+	}
+	beforeEllipsis := strings.TrimSuffix(last, "…")
+	if strings.HasSuffix(strings.TrimRight(beforeEllipsis, " "), "-") {
+		t.Fatalf("last line = %q, truncation landed mid-word instead of on a word boundary", last)
+	}
+}
+
+// TestWrapInsightTextEllipsisNeverExceedsWidth guards the truncation loop
+// itself: for a spread of widths, the truncated line (with its appended
+// ellipsis) must never overflow the requested width.
+func TestWrapInsightTextEllipsisNeverExceedsWidth(t *testing.T) {
+	text := strings.Repeat("word ", 60) + "final."
+	for _, width := range []int{20, 30, 45, 60, 80} {
+		lines := wrapInsightText(text, width, 3)
+		for i, line := range lines {
+			if got := len([]rune(line)); got > width {
+				t.Fatalf("width=%d line %d = %q, rendered width %d exceeds %d", width, i, line, got, width)
+			}
+		}
+	}
+}
+
+// TestRenderProblemsSplitDoesNotPanicOnShortTerminal guards
+// problemsListRows/problemsInsightRows' budget math against a terminal too
+// short to fit both the list and the insight block comfortably — must
+// degrade gracefully (clamped, non-negative row counts), never panic on a
+// negative slice bound.
+func TestRenderProblemsSplitDoesNotPanicOnShortTerminal(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 80, 9
+	model.focus = paneActivity
+	model.mode = activityProblems
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("View() panicked on a short terminal: %v", r)
+		}
+	}()
+	_ = model.View()
+}
+
 func TestProblemsKeySwitchesActivityMode(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 30
@@ -1420,7 +1602,10 @@ func TestCommandPaletteCanShowStats(t *testing.T) {
 
 func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 	model := testModel()
-	model.width, model.height = 100, 30
+	// Tall enough that every settings row (including the AI section) is
+	// visible without needing to scroll — this test's assertions span the
+	// whole list, from Graph style down to Reset defaults.
+	model.width, model.height = 100, 45
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{','}})
 	model = updated.(Model)
@@ -1468,7 +1653,12 @@ func TestSettingsResetDefaults(t *testing.T) {
 	model.settings.StatsRefresh = 5 * time.Second
 	model.settings.DefaultActivity = activityStats
 	model.openSettingsOverlay()
-	model.settingsCursor = len(model.settingsRows()) - 1
+	rows := model.settingsRows()
+	for i, row := range rows {
+		if row.label == "Reset defaults" {
+			model.settingsCursor = i
+		}
+	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
@@ -2960,6 +3150,44 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	}
 }
 
+func TestHelpOverlayShowsStatusLegend(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.overlay = overlayHelp
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{
+		"Status colors:",
+		"healthy / running",
+		"restarting",
+		"stopped, exited cleanly",
+		"dead",
+		"unhealthy",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("help view missing status legend entry %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestHelpOverlayLegendStaysVisibleWhileScrolled guards the "always
+// visible, not part of the scrollable list" property statusLegendLines is
+// meant to have: scrolling the keybinding list must never scroll the
+// legend out of view along with it.
+func TestHelpOverlayLegendStaysVisibleWhileScrolled(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 20
+	model.overlay = overlayHelp
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	model = updated.(Model)
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "Status colors:") {
+		t.Fatalf("legend missing after scrolling to bottom:\n%s", view)
+	}
+}
+
 func TestHelpOverlayScrollsWithJK(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 20
@@ -3174,67 +3402,6 @@ func TestTickAboutSpotlightsConvergesAfterSearchWindow(t *testing.T) {
 	}
 }
 
-// TestPositionAt checks the plain left-padding/truncation helper the boat
-// animation uses to place itself at a given column each frame.
-func TestPositionAt(t *testing.T) {
-	if got := positionAt("AB", 3, 10); got != "   AB     " {
-		t.Fatalf("positionAt(%q, 3, 10) = %q, want %q", "AB", got, "   AB     ")
-	}
-	if got := positionAt("hello", 8, 10); got != "        he" {
-		t.Fatalf("positionAt overflowing past width = %q, want truncated to %q", got, "        he")
-	}
-	if got := positionAt("anything", 10, 10); got != strings.Repeat(" ", 10) {
-		t.Fatalf("positionAt(col >= width) = %q, want a blank line (fully off-screen)", got)
-	}
-}
-
-// TestAboutBoatRowsStaysOffScreenDuringLogoReveal checks the boat doesn't
-// start sliding in until the logo's own search+converge+expand animation
-// has finished — it shouldn't compete with the logo for attention.
-func TestAboutBoatRowsStaysOffScreenDuringLogoReveal(t *testing.T) {
-	width := 60
-	bg := lipgloss.Color("#1e1e2e")
-	rows := aboutBoatRows(width, 0, bg)
-	// The waterline (the last row) spans the full width unconditionally —
-	// only the hull rows are checked here, since it's the boat itself that
-	// shouldn't be visible until it's slid in.
-	for i, row := range rows[:len(rows)-1] {
-		if strings.TrimSpace(ansi.Strip(row)) != "" {
-			t.Fatalf("boat hull row %d at frame 0 (still in logo reveal) = %q, want blank (off-screen)", i, row)
-		}
-	}
-}
-
-// TestAboutBoatRowsReachesRestPositionAfterSlide checks the boat actually
-// arrives — well past its slide-in window, it should render at the same,
-// centered resting column every frame rather than continuing to move or
-// snapping somewhere else.
-func TestAboutBoatRowsReachesRestPositionAfterSlide(t *testing.T) {
-	width := 60
-	bg := lipgloss.Color("#1e1e2e")
-	restFrame := aboutSearchFrames + aboutConvergeFrames + aboutExpandFrames + aboutBoatSlideFrames
-	atRest := aboutBoatRows(width, restFrame, bg)
-	muchLater := aboutBoatRows(width, restFrame+100, bg)
-	if len(atRest) == 0 {
-		t.Fatal("aboutBoatRows returned no rows")
-	}
-	for i := range atRest {
-		if atRest[i] != muchLater[i] {
-			t.Fatalf("boat row %d still differs 100 frames after its slide-in should have finished:\nat rest:    %q\nmuch later: %q", i, atRest[i], muchLater[i])
-		}
-	}
-	hasBoat := false
-	for _, row := range atRest {
-		if strings.TrimSpace(ansi.Strip(row)) != "" {
-			hasBoat = true
-			break
-		}
-	}
-	if !hasBoat {
-		t.Fatal("boat rows at rest are entirely blank, want the boat visible")
-	}
-}
-
 func TestAboutCommandPaletteActionOpensOverlay(t *testing.T) {
 	model := testModel()
 
@@ -3370,8 +3537,275 @@ func TestInitStartsSnapshotAndEventSubscription(t *testing.T) {
 	if !ok {
 		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
 	}
+	// snapshot refresh, event subscription, the status-bar pulse tick, and
+	// an update check — a fresh model has never checked before
+	// (updateLastCheck is zero), so the once-a-day throttle doesn't apply
+	// yet. See TestInitSkipsUpdateCheckWhenRecentlyChecked for the
+	// throttled case.
+	if len(batch) != 4 {
+		t.Fatalf("Init() batch length = %d, want 4", len(batch))
+	}
+}
+
+func TestInitSkipsUpdateCheckWhenRecentlyChecked(t *testing.T) {
+	model := testModel()
+	model.updateLastCheck = time.Now()
+
+	msg := runCmd(t, model.Init())
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
+	}
 	if len(batch) != 3 {
-		t.Fatalf("Init() batch length = %d, want snapshot refresh, event subscription, and the status-bar pulse tick", len(batch))
+		t.Fatalf("Init() batch length = %d, want 3 (no update check within the once-a-day throttle)", len(batch))
+	}
+}
+
+func TestUpdateCheckOpensOverlayForNewerVersion(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+
+	updated, _ := model.Update(updateCheckMsg{latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate", got.overlay)
+	}
+	if got.updateAvailableVersion != "v0.1.4" {
+		t.Fatalf("updateAvailableVersion = %q, want v0.1.4", got.updateAvailableVersion)
+	}
+	if got.updateLastCheck.IsZero() {
+		t.Fatal("updateLastCheck = zero, want recorded")
+	}
+}
+
+func TestUpdateCheckDoesNotStealAnAlreadyOpenOverlay(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+	model.overlay = overlaySettings
+
+	updated, _ := model.Update(updateCheckMsg{latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay != overlaySettings {
+		t.Fatalf("overlay = %v, want overlaySettings preserved", got.overlay)
+	}
+	if got.updateAvailableVersion != "v0.1.4" {
+		t.Fatalf("updateAvailableVersion = %q, want v0.1.4 (still recorded for Settings to show)", got.updateAvailableVersion)
+	}
+	if !strings.Contains(got.status, "v0.1.4") {
+		t.Fatalf("status = %q, want it to mention the available version", got.status)
+	}
+}
+
+func TestUpdateCheckAutoSkipsAnAlreadyIgnoredVersion(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+	model.updateIgnoredVersion = "v0.1.4"
+
+	updated, _ := model.Update(updateCheckMsg{manual: false, latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay == overlayUpdate {
+		t.Fatal("overlay = overlayUpdate, want no prompt for a version already dismissed")
+	}
+}
+
+func TestUpdateCheckManualAlwaysShowsAnIgnoredVersion(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+	model.updateIgnoredVersion = "v0.1.4"
+
+	updated, _ := model.Update(updateCheckMsg{manual: true, latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay != overlayUpdate {
+		t.Fatal("overlay != overlayUpdate, want a manual check to show the prompt even for a previously ignored version")
+	}
+}
+
+func TestUpdateCheckManualReportsUpToDate(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.4"
+
+	updated, _ := model.Update(updateCheckMsg{manual: true, latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay == overlayUpdate {
+		t.Fatal("overlay = overlayUpdate, want no prompt when already up to date")
+	}
+	if got.statusErr || !strings.Contains(got.status, "up to date") {
+		t.Fatalf("status/statusErr = %q/%v, want an up-to-date notice", got.status, got.statusErr)
+	}
+}
+
+func TestUpdateCheckManualErrorShowsStatus(t *testing.T) {
+	model := testModel()
+
+	updated, _ := model.Update(updateCheckMsg{manual: true, err: errors.New("network unreachable")})
+	got := updated.(Model)
+
+	if !got.statusErr || !strings.Contains(got.status, "network unreachable") {
+		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", got.status, got.statusErr)
+	}
+}
+
+func TestUpdateCheckAutoErrorStaysQuiet(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "unrelated status", false
+
+	updated, _ := model.Update(updateCheckMsg{manual: false, err: errors.New("network unreachable")})
+	got := updated.(Model)
+
+	if got.status != "unrelated status" || got.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want the background check to fail silently", got.status, got.statusErr)
+	}
+}
+
+func TestUpdateKeyYesInstalls(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	got := updated.(Model)
+
+	if got.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone", got.overlay)
+	}
+	if !got.updateInstalling {
+		t.Fatal("updateInstalling = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want the install command")
+	}
+}
+
+func TestUpdateKeyNoIgnoresVersion(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	got := updated.(Model)
+
+	if got.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone", got.overlay)
+	}
+	if got.updateIgnoredVersion != "v0.1.4" {
+		t.Fatalf("updateIgnoredVersion = %q, want v0.1.4", got.updateIgnoredVersion)
+	}
+	if got.updateAvailableVersion != "" {
+		t.Fatalf("updateAvailableVersion = %q, want cleared", got.updateAvailableVersion)
+	}
+}
+
+func TestUpdateInstalledSuccessQuits(t *testing.T) {
+	model := testModel()
+	model.updateInstalling = true
+
+	updated, cmd := model.Update(updateInstalledMsg{exePath: "/usr/local/bin/whatthedock"})
+	got := updated.(Model)
+
+	if got.updateInstalling {
+		t.Fatal("updateInstalling = true, want false")
+	}
+	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
+		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want tea.Quit")
+	}
+}
+
+func TestUpdateInstalledFailureShowsStatus(t *testing.T) {
+	model := testModel()
+	model.updateInstalling = true
+
+	updated, _ := model.Update(updateInstalledMsg{err: errors.New("disk full")})
+	got := updated.(Model)
+
+	if got.updateInstalling {
+		t.Fatal("updateInstalling = true, want false")
+	}
+	if !got.statusErr || !strings.Contains(got.status, "disk full") {
+		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", got.status, got.statusErr)
+	}
+	if got.RestartExecPath() != "" {
+		t.Fatalf("RestartExecPath() = %q, want empty on failure", got.RestartExecPath())
+	}
+}
+
+func TestSettingsCheckForUpdateRowDispatchesCheck(t *testing.T) {
+	model := testModel()
+	model.openSettingsOverlay()
+	rows := model.settingsRows()
+	for i, row := range rows {
+		if row.action == settingsActionCheckUpdate {
+			model.settingsCursor = i
+		}
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(Model)
+
+	if !got.updateChecking {
+		t.Fatal("updateChecking = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want the check command")
+	}
+}
+
+func TestUpdateOverlayRendersVersions(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.appVersion = "v0.1.3"
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{"v0.1.4", "v0.1.3", "update available", "y update", "n/esc ignore"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("update overlay missing %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestSettingsCheckForUpdateRowShowsStatus guards against the bug reported
+// live: settingsOverlay unconditionally overwrote every settingsRowAction
+// row's suffix with the literal "enter", silently discarding
+// updateCheckRowValue()'s actual status — so "Check for update" never
+// showed anything but "enter" no matter what the last check found,
+// leaving an available update visible only in the easy-to-miss main status
+// bar.
+func TestSettingsCheckForUpdateRowShowsStatus(t *testing.T) {
+	model := testModel()
+	// Tall enough that Check for update (near the bottom of the list) is
+	// visible without scrolling to it first.
+	model.width, model.height = 100, 45
+	model.updateAvailableVersion = "v0.1.4"
+	model.openSettingsOverlay()
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "v0.1.4 available") {
+		t.Fatalf("settings view missing update status:\n%s", view)
+	}
+}
+
+// TestSettingsResetDefaultsRowStillShowsEnter is
+// TestSettingsCheckForUpdateRowShowsStatus's complement: only Check for
+// update's suffix should change, not every settingsRowAction row.
+func TestSettingsResetDefaultsRowStillShowsEnter(t *testing.T) {
+	model := testModel()
+	// Tall enough that Reset defaults (near the bottom of the list) is
+	// visible without scrolling to it first.
+	model.width, model.height = 100, 45
+	model.openSettingsOverlay()
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "Reset defaults") || !strings.Contains(view, "enter") {
+		t.Fatalf("settings view missing Reset defaults' enter hint:\n%s", view)
 	}
 }
 
@@ -3584,5 +4018,340 @@ func TestEventsStartedErrorAdvancesBackoff(t *testing.T) {
 	}
 	if model.eventBackoff != 2*time.Second {
 		t.Fatalf("eventBackoff = %v after second error, want 2s", model.eventBackoff)
+	}
+}
+
+func TestAppLogModeString(t *testing.T) {
+	cases := map[appLogMode]string{appLogOff: "off", appLogOn: "on", appLogSave: "save"}
+	for mode, want := range cases {
+		if got := mode.String(); got != want {
+			t.Fatalf("appLogMode(%d).String() = %q, want %q", mode, got, want)
+		}
+	}
+}
+
+func TestAppLogSettingsRoundTrip(t *testing.T) {
+	for _, mode := range []appLogMode{appLogOff, appLogOn, appLogSave} {
+		var s appSettings
+		s.AppLog = mode
+		var restored appSettings
+		restored.applyPersisted(s.persisted())
+		if restored.AppLog != mode {
+			t.Fatalf("mode %v: round-tripped to %v", mode, restored.AppLog)
+		}
+	}
+}
+
+func TestAIProviderSettingsRoundTrip(t *testing.T) {
+	for _, provider := range []aiProvider{aiProviderAnthropic, aiProviderOpenAI, aiProviderGemini, aiProviderCustom} {
+		var s appSettings
+		s.AIProvider = provider
+		s.AIModel = "some-model"
+		s.AIAPIKey = "sk-test-secret"
+		s.AIBaseURL = "http://localhost:11434/v1"
+		var restored appSettings
+		restored.applyPersisted(s.persisted())
+		if restored.AIProvider != provider {
+			t.Fatalf("provider %v: round-tripped to %v", provider, restored.AIProvider)
+		}
+		if restored.AIModel != s.AIModel || restored.AIAPIKey != s.AIAPIKey || restored.AIBaseURL != s.AIBaseURL {
+			t.Fatalf("provider %v: fields = %#v, want %#v", provider, restored, s)
+		}
+	}
+}
+
+func TestAIProviderStringAndDefault(t *testing.T) {
+	if got := aiProviderAnthropic.String(); got != "anthropic" {
+		t.Fatalf("aiProviderAnthropic.String() = %q, want anthropic", got)
+	}
+	// An unrecognized/empty persisted provider must default to anthropic,
+	// not silently become the zero-value-that-happens-to-be-anthropic by
+	// accident — applyPersisted's switch has an explicit "anthropic", ""
+	// case, this locks that in.
+	var s appSettings
+	s.applyPersisted(config.Settings{AIProvider: ""})
+	if s.AIProvider != aiProviderAnthropic {
+		t.Fatalf("AIProvider after empty persisted value = %v, want aiProviderAnthropic", s.AIProvider)
+	}
+}
+
+func TestCycleSettingAIProviderWrapsThroughAllFour(t *testing.T) {
+	model := testModel()
+	rows := model.settingsRows()
+	index := -1
+	for i, row := range rows {
+		if row.label == "AI provider" {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatal("settingsRows() has no \"AI provider\" row")
+	}
+	want := []aiProvider{aiProviderOpenAI, aiProviderGemini, aiProviderCustom, aiProviderAnthropic}
+	for _, w := range want {
+		model.cycleSetting(index, 1)
+		if model.settingsDraft.AIProvider != w {
+			t.Fatalf("after cycling, AIProvider = %v, want %v", model.settingsDraft.AIProvider, w)
+		}
+	}
+}
+
+// TestSettingsRowsShowsAIBaseURLOnlyForCustomProvider checks the
+// conditional row: "AI base URL" only makes sense (and only appears) once
+// the provider is set to custom.
+func TestSettingsRowsShowsAIBaseURLOnlyForCustomProvider(t *testing.T) {
+	model := testModel()
+	model.settings.AIProvider = aiProviderAnthropic
+	if hasSettingsRow(model.settingsRows(), "AI base URL") {
+		t.Fatal("AI base URL row present for provider anthropic, want it hidden")
+	}
+	model.settings.AIProvider = aiProviderCustom
+	if !hasSettingsRow(model.settingsRows(), "AI base URL") {
+		t.Fatal("AI base URL row missing for provider custom, want it shown")
+	}
+}
+
+func hasSettingsRow(rows []settingsRow, label string) bool {
+	for _, row := range rows {
+		if row.label == label {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSettingsTextEditRoundTrip covers the new inline text-editing flow for
+// the AI model/API key/base URL rows: entering edit mode, typing, and
+// committing with enter actually updates settingsDraft; esc discards.
+func TestSettingsTextEditRoundTrip(t *testing.T) {
+	model := testModel()
+	model.overlay = overlaySettings
+	rows := model.settingsRows()
+	for i, row := range rows {
+		if row.label == "AI API key" {
+			model.settingsCursor = i
+			break
+		}
+	}
+
+	updated, _ := model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.settingsEditingField != "AI API key" {
+		t.Fatalf("settingsEditingField = %q, want \"AI API key\"", model.settingsEditingField)
+	}
+
+	for _, r := range "sk-typed" {
+		updated, _ = model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		model = updated.(Model)
+	}
+	if model.settingsEditDraft != "sk-typed" {
+		t.Fatalf("settingsEditDraft = %q, want sk-typed", model.settingsEditDraft)
+	}
+
+	updated, _ = model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.settingsEditingField != "" {
+		t.Fatalf("settingsEditingField = %q after enter, want empty (edit committed)", model.settingsEditingField)
+	}
+	if model.settingsDraft.AIAPIKey != "sk-typed" {
+		t.Fatalf("settingsDraft.AIAPIKey = %q, want sk-typed", model.settingsDraft.AIAPIKey)
+	}
+
+	// Esc during a second edit must discard, not commit.
+	model.settingsEditingField = "AI API key"
+	model.settingsEditDraft = "sk-typed"
+	model.settingsEditCursor = len("sk-typed")
+	updated, _ = model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'X'}})
+	model = updated.(Model)
+	updated, _ = model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.settingsEditingField != "" {
+		t.Fatalf("settingsEditingField = %q after esc, want empty", model.settingsEditingField)
+	}
+	if model.settingsDraft.AIAPIKey != "sk-typed" {
+		t.Fatalf("settingsDraft.AIAPIKey = %q after esc, want unchanged sk-typed (edit discarded)", model.settingsDraft.AIAPIKey)
+	}
+}
+
+// TestSettingsAPIKeyRowIsMaskedNotPlaintext guards the whole point of
+// settingsRowSecretText: the stored key must never appear verbatim in the
+// rendered Settings overlay, only as a fixed-length mask.
+func TestSettingsAPIKeyRowIsMaskedNotPlaintext(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 45
+	model.settings.AIAPIKey = "sk-super-secret-value"
+	model.openSettingsOverlay()
+
+	view := ansi.Strip(model.View())
+	if strings.Contains(view, "sk-super-secret-value") {
+		t.Fatalf("settings view leaked the raw API key:\n%s", view)
+	}
+	if !strings.Contains(view, "••••••••") {
+		t.Fatalf("settings view missing the masked API key indicator:\n%s", view)
+	}
+}
+
+func TestRecordAppLogOffSkipsInfoLines(t *testing.T) {
+	model := testModel()
+	model.settings.AppLog = appLogOff
+	model.status, model.statusErr = "something happened", false
+	model.recordAppLog("", false)
+	if len(model.appLogLines) != 0 {
+		t.Fatalf("appLogLines = %v, want no info-level lines recorded while AppLog is off", model.appLogLines)
+	}
+}
+
+// TestRecordAppLogOffStillRecordsErrors guards the bug report this fixed:
+// an error the user saw on the status page wasn't in the log because AppLog
+// was off — you can't turn logging on ahead of an error you don't know is
+// coming. Errors must be captured in memory regardless of the setting; off
+// only opts out of routine info-level noise, not errors.
+func TestRecordAppLogOffStillRecordsErrors(t *testing.T) {
+	model := testModel()
+	model.settings.AppLog = appLogOff
+	model.status, model.statusErr = "create failed: boom", true
+	model.recordAppLog("", false)
+	if len(model.appLogLines) != 1 {
+		t.Fatalf("appLogLines = %v, want the error recorded even while AppLog is off", model.appLogLines)
+	}
+	if !strings.Contains(model.appLogLines[0], "ERROR") || !strings.Contains(model.appLogLines[0], "boom") {
+		t.Fatalf("appLogLines[0] = %q, want it tagged ERROR and containing the message", model.appLogLines[0])
+	}
+	// Still off, so it must not have been written to disk.
+	if model.appLogFile != nil {
+		t.Fatal("appLogFile opened while AppLog is off, want save-only")
+	}
+}
+
+// TestRecordAppLogOnRecordsTransitionsOnly checks a line is appended only
+// when the status bar actually changes — not on every call with the same
+// status/statusErr repeated (which would otherwise spam a line per tick
+// while an error is held on screen).
+func TestRecordAppLogOnRecordsTransitionsOnly(t *testing.T) {
+	model := testModel()
+	model.settings.AppLog = appLogOn
+
+	model.status, model.statusErr = "creating foo", false
+	model.recordAppLog("", false)
+	if len(model.appLogLines) != 1 {
+		t.Fatalf("appLogLines = %v, want exactly 1 entry after the first transition", model.appLogLines)
+	}
+	if !strings.Contains(model.appLogLines[0], "INFO") || !strings.Contains(model.appLogLines[0], "creating foo") {
+		t.Fatalf("appLogLines[0] = %q, want it to contain INFO and the status text", model.appLogLines[0])
+	}
+
+	// Same status/statusErr repeated (as if the same message were held
+	// across several routine Update calls) must not append again.
+	model.recordAppLog(model.status, model.statusErr)
+	if len(model.appLogLines) != 1 {
+		t.Fatalf("appLogLines grew to %v after a repeated identical status, want still 1", model.appLogLines)
+	}
+
+	prevStatus, prevErr := model.status, model.statusErr
+	model.status, model.statusErr = "create failed: boom", true
+	model.recordAppLog(prevStatus, prevErr)
+	if len(model.appLogLines) != 2 {
+		t.Fatalf("appLogLines = %v, want a second entry after a real transition", model.appLogLines)
+	}
+	if !strings.Contains(model.appLogLines[1], "ERROR") {
+		t.Fatalf("appLogLines[1] = %q, want it tagged ERROR for an error status", model.appLogLines[1])
+	}
+}
+
+// TestRecordAppLogSaveWritesFile checks save mode both keeps the in-memory
+// buffer (same as on) and appends to whatthedock.log next to settings.json.
+func TestRecordAppLogSaveWritesFile(t *testing.T) {
+	dir := t.TempDir()
+	model := testModel()
+	model.settingsPath = filepath.Join(dir, "settings.json")
+	model.settings.AppLog = appLogSave
+
+	model.status, model.statusErr = "applying compose service web", false
+	model.recordAppLog("", false)
+
+	if len(model.appLogLines) != 1 {
+		t.Fatalf("appLogLines = %v, want 1 entry in save mode too", model.appLogLines)
+	}
+	if model.appLogFile != nil {
+		defer model.appLogFile.Close()
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "whatthedock.log"))
+	if err != nil {
+		t.Fatalf("reading whatthedock.log: %v", err)
+	}
+	if !strings.Contains(string(data), "applying compose service web") {
+		t.Fatalf("whatthedock.log content = %q, want it to contain the logged status", data)
+	}
+}
+
+// TestUpdateWrapperRecordsAppLog checks the real Update entry point (not
+// recordAppLog called directly) records a line when a message sets an error
+// status — this is what every one of Update's existing status-setting call
+// sites gets for free from the thin wrapper, without having been touched
+// individually.
+func TestUpdateWrapperRecordsAppLog(t *testing.T) {
+	model := testModel()
+	model.settings.AppLog = appLogOn
+
+	updated, _ := model.Update(snapshotMsg{err: errors.New("docker daemon unreachable")})
+	next := updated.(Model)
+	if len(next.appLogLines) == 0 {
+		t.Fatal("appLogLines empty after an error-producing message, want it recorded")
+	}
+	last := next.appLogLines[len(next.appLogLines)-1]
+	if !strings.Contains(last, "ERROR") {
+		t.Fatalf("last appLogLines entry = %q, want it tagged ERROR", last)
+	}
+}
+
+func TestCycleSettingAppLog(t *testing.T) {
+	model := testModel()
+	rows := model.settingsRows()
+	index := -1
+	for i, row := range rows {
+		if row.label == "App log" {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatal("settingsRows() has no \"App log\" row")
+	}
+	if model.settingsDraft.AppLog != appLogOff {
+		t.Fatalf("initial AppLog = %v, want appLogOff", model.settingsDraft.AppLog)
+	}
+	model.cycleSetting(index, 1)
+	if model.settingsDraft.AppLog != appLogOn {
+		t.Fatalf("after one cycle, AppLog = %v, want appLogOn", model.settingsDraft.AppLog)
+	}
+	model.cycleSetting(index, 1)
+	if model.settingsDraft.AppLog != appLogSave {
+		t.Fatalf("after two cycles, AppLog = %v, want appLogSave", model.settingsDraft.AppLog)
+	}
+	model.cycleSetting(index, 1)
+	if model.settingsDraft.AppLog != appLogOff {
+		t.Fatalf("after three cycles, AppLog = %v, want it wrapping back to appLogOff", model.settingsDraft.AppLog)
+	}
+}
+
+// TestSettingsViewAppLogOpensOverlay checks selecting the "View app log"
+// action row opens overlayAppLog instead of cycling a value (it's an
+// action row, not a setting).
+func TestSettingsViewAppLogOpensOverlay(t *testing.T) {
+	model := testModel()
+	model.overlay = overlaySettings
+	rows := model.settingsRows()
+	for i, row := range rows {
+		if row.label == "View app log" {
+			model.settingsCursor = i
+			break
+		}
+	}
+	updated, _ := model.handleSettingsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(Model)
+	if next.overlay != overlayAppLog {
+		t.Fatalf("overlay = %v after selecting View app log, want overlayAppLog", next.overlay)
 	}
 }

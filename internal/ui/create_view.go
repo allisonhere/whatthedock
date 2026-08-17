@@ -14,9 +14,21 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		name := m.createDraft.TargetName()
 		editing := m.createDraft.Editing
 		var prompt string
+		confirmLabel := confirmStepLabel(editing)
 		switch {
 		case editing && m.createDraft.Mode != createModeCompose:
 			prompt = "Replace standalone container " + name + " with these changes?"
+		case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
+			host := "the local filesystem"
+			if sys := m.activeSystemConfig(); sys.Kind == "ssh" {
+				host = sys.Name
+			}
+			prompt = "Compose file " + short(m.createDraft.ComposeFile, max(12, contentWidth-10)) +
+				" doesn't exist on " + host + " (likely deployed via Portainer or another tool " +
+				"that manages its own copy elsewhere).\n\nCreate a NEW compose file here with " +
+				name + "'s current configuration? " + name + " will be adopted out of that tool's " +
+				"management — future changes go through this file and docker compose directly."
+			confirmLabel = "create & adopt"
 		case m.createDraft.Mode == createModeCompose:
 			spec, err := m.createDraft.ComposeSpec(m.activeSystemConfig())
 			if err != nil {
@@ -35,7 +47,7 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt)+"\n\n"+
 				renderer.Styles.DetailBody.Width(contentWidth).Render(m.createDraft.Preview())+"\n\n"+
 				renderer.RenderSoftHints(contentWidth,
-					tideui.SoftHint{Key: "y", Label: confirmStepLabel(editing)},
+					tideui.SoftHint{Key: "y", Label: confirmLabel},
 					tideui.SoftHint{Key: "n/esc", Label: "cancel"},
 				))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
