@@ -1358,6 +1358,32 @@ func TestStatsPollTickReloadsWhileStatsModeActive(t *testing.T) {
 	}
 }
 
+// TestStatsPollTickDoesNotRearmLoadingWhenStatsKeepFailing guards against
+// the bug reported live: a container whose stats fetch keeps failing (so
+// m.stats stays nil across every poll) had statsTickMsg set statsLoading
+// back to true on every single tick, flipping the "loading stats…" header
+// on the poll interval indefinitely — visible as text flashing too fast to
+// read rather than a one-time spinner.
+func TestStatsPollTickDoesNotRearmLoadingWhenStatsKeepFailing(t *testing.T) {
+	model := testModel()
+	id := domain.ResourceID{Host: "local", ID: "1"}
+	model.selectedID = id
+	model.mode = activityStats
+	model.focus = paneActivity
+	model.statsLoading = false
+	model.stats = nil // every fetch so far has failed
+	model.statsErr = errors.New("stats unavailable")
+
+	updated, cmd := model.Update(statsTickMsg{id: id})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("statsTickMsg returned nil cmd, want stats reload")
+	}
+	if model.statsLoading {
+		t.Fatal("statsLoading = true after a poll tick with no cached stats, want it to stay false (only the genuine first load should show the spinner)")
+	}
+}
+
 func TestStatsPollTickStopsOutsideStatsMode(t *testing.T) {
 	model := testModel()
 	model.selectedID = domain.ResourceID{Host: "local", ID: "1"}
@@ -2836,6 +2862,25 @@ func TestSuccessfulSnapshotStillUpdatesRoutineStatus(t *testing.T) {
 
 	if got.statusErr || got.status != "Docker connected" {
 		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false when nothing was blocking it", got.status, got.statusErr)
+	}
+}
+
+// TestSuccessfulSnapshotClearsAStaleErrorAfterTheHoldWindow guards against
+// overcorrecting TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError: an
+// error must stay legible for a while, but not forever if nothing ever
+// triggers a new explicit action to replace it — reported live as "error
+// isn't going away" once the hold-forever version of this guard shipped.
+func TestSuccessfulSnapshotClearsAStaleErrorAfterTheHoldWindow(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "delete telegraf: compose file not found on jarvis", true
+	model.lastStatusErrText = model.status
+	model.statusErrSince = time.Now().Add(-statusErrMinHold - time.Second)
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+
+	if got.statusErr || got.status != "Docker connected" {
+		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false once the hold window has passed", got.status, got.statusErr)
 	}
 }
 

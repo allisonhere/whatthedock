@@ -469,6 +469,13 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 		stats = nil
 	}
 	history := m.statsHistory[ctr.ID]
+	// statsLoading only shows the spinner for a genuine first load (see
+	// statsTickMsg in model.go — background polls never re-arm it), so this
+	// stays a one-time animation, not a flash that repeats every poll. A
+	// stats fetch that keeps failing keeps this a quiet blank spacer row
+	// rather than surfacing statsErr as text (see
+	// TestStatsViewOmitsSampledNoticeAfterStatsLoad) — deliberate, not an
+	// oversight.
 	header := renderer.Styles.DetailMeta.Render("")
 	if m.statsLoading {
 		header = renderer.Styles.DetailMeta.Render(spinnerGlyph(m.statusPulseFrame) + " loading stats…")

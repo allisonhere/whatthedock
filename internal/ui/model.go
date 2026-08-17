@@ -265,6 +265,14 @@ type Model struct {
 	statusErr bool
 	overlay   overlayMode
 
+	// lastStatusErrText/statusErrSince back the minimum-hold guard in the
+	// snapshotMsg handler: an error status must stay legible for at least
+	// statusErrMinHold, not just until the next routine refresh happens to
+	// land, but it also must not stick around forever once that window has
+	// passed — see the snapshotMsg case for how these get used.
+	lastStatusErrText string
+	statusErrSince    time.Time
+
 	commandFilter string
 	commandCursor int
 
@@ -693,12 +701,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A routine refresh (the 250ms-debounced re-snapshot after any
 		// Docker event — see eventRefreshTickCmd) fires after almost every
 		// action, including the action that just set an error status the
-		// user hasn't had a chance to read yet. Only stomp it with "Docker
-		// connected" while nothing more specific — in particular no
-		// unacknowledged error — is already showing; an explicit action
-		// always overwrites m.status directly regardless of this guard, so
-		// the error clears itself the moment something new actually happens.
-		if !m.statusErr {
+		// user hasn't had a chance to read yet. Hold an error on screen for
+		// at least statusErrMinHold — long enough to actually read — instead
+		// of letting the very next routine refresh stomp it; an explicit
+		// action still overwrites m.status directly regardless of the hold,
+		// so a genuinely new event (retrying, a different action) always
+		// takes over immediately. Once the hold has passed, routine refreshes
+		// resume clearing it on their own — an error that's simply gone
+		// stale (the underlying problem was fixed some other way) doesn't
+		// stay pinned forever with no explicit action to clear it.
+		if m.statusErr && m.status != m.lastStatusErrText {
+			m.lastStatusErrText = m.status
+			m.statusErrSince = time.Now()
+		}
+		if !m.statusErr || time.Since(m.statusErrSince) >= statusErrMinHold {
 			m.status, m.statusErr = "Docker connected", false
 		}
 		if !m.focusedTreeKey.valid {
@@ -837,8 +853,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode != activityStats || msg.id != m.selectedID || m.statsLoading {
 			return m, nil
 		}
-		m.statsLoading = m.stats == nil || m.stats.ID != msg.id
-		m.statsErr = nil
+		// Deliberately does NOT re-arm statsLoading here: it should only be
+		// true for the genuine first load of a newly selected container
+		// (set directly wherever selection changes — see detailMsg,
+		// actions.ShowStats, and "g"), never on a routine background poll.
+		// A stats fetch that keeps failing leaves m.stats nil forever, so
+		// re-arming it on every tick here used to flip the "loading
+		// stats…" header on and off once per poll interval indefinitely —
+		// reported live as text flashing too fast to read.
 		return m, m.loadStatsCmd(msg.id)
 	case actionDoneMsg:
 		m.busy = false
@@ -3239,6 +3261,11 @@ func tickLogs() tea.Cmd {
 func tickAbout() tea.Cmd {
 	return tea.Tick(55*time.Millisecond, func(time.Time) tea.Msg { return aboutTickMsg{} })
 }
+
+// statusErrMinHold is how long an error status is guaranteed to stay on
+// screen before a routine refresh (see the snapshotMsg case) is allowed to
+// clear it back to "Docker connected" on its own.
+const statusErrMinHold = 6 * time.Second
 
 // tickStatusPulse drives the status bar's breathing connected-dot. Unlike
 // tickAbout it isn't scoped to an overlay — it reschedules itself
