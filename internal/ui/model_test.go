@@ -879,7 +879,7 @@ func TestXClearsActiveLogFilterFromAnyFocus(t *testing.T) {
 func TestLogSearchNOpensFilterWhenNoTextFilter(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 12
-	model.focus = paneTree
+	model.focus = paneActivity
 	model.mode = activityLogs
 	ctr := model.provider.(*fakeProvider).containers["1"]
 	model.selected = &ctr
@@ -888,6 +888,21 @@ func TestLogSearchNOpensFilterWhenNoTextFilter(t *testing.T) {
 	model = updated.(Model)
 	if model.focus != paneActivity || model.overlay != overlayLogFilter {
 		t.Fatalf("focus/overlay = %v/%v, want activity/log filter", model.focus, model.overlay)
+	}
+}
+
+func TestNOpensCreateOverlayWhenNotFocusedOnLogs(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 12
+	model.focus = paneTree
+	model.mode = activityLogs
+	ctr := model.provider.(*fakeProvider).containers["1"]
+	model.selected = &ctr
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate ('n' should create when the tree, not the logs pane, is focused)", model.overlay)
 	}
 }
 
@@ -2788,6 +2803,42 @@ func TestSnapshotErrorShowsDockerUnavailableState(t *testing.T) {
 	}
 }
 
+// TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError guards against the
+// bug reported live: an action's error status (e.g. Delete failing) was
+// visible for well under a second because the routine refresh every action
+// triggers (directly via refreshCmd, and again ~250ms later from the
+// resulting Docker event — see eventRefreshTickCmd) unconditionally stomped
+// it with "Docker connected" the moment the next snapshot came back, often
+// faster than a person can read the error.
+func TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "delete telegraf: compose file not found on jarvis", true
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+
+	if !got.statusErr || got.status != "delete telegraf: compose file not found on jarvis" {
+		t.Fatalf("status/statusErr = %q/%v, want the error preserved across a routine refresh", got.status, got.statusErr)
+	}
+}
+
+// TestSuccessfulSnapshotStillUpdatesRoutineStatus is
+// TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError's complement: the
+// guard must only hold back an active error, not freeze the status line
+// forever — a routine refresh with no error showing still updates it as
+// before.
+func TestSuccessfulSnapshotStillUpdatesRoutineStatus(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "some earlier notice", false
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+
+	if got.statusErr || got.status != "Docker connected" {
+		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false when nothing was blocking it", got.status, got.statusErr)
+	}
+}
+
 func TestThemePickerPreviewsAndCancels(t *testing.T) {
 	model := testModel()
 	original := model.theme.Name
@@ -2893,6 +2944,14 @@ func TestHelpOverlayScrollsWithJK(t *testing.T) {
 }
 
 func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
+	// Spotlights only changes cell color, never the rune itself (unlike the
+	// old Burn effect, which changed the glyph during ignition) — under the
+	// default no-color test profile every brightness level would render
+	// identical plain text, making the animation invisible to this test.
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
 	model := testModel()
 	model.width, model.height = 100, 30
 
@@ -2920,9 +2979,16 @@ func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("about tick returned nil cmd while overlay is open")
 	}
-	secondRaw := model.View()
-	if firstRaw == secondRaw {
-		t.Fatal("about view did not change after animation tick")
+	// Spotlights move at a fraction of a grid cell per frame, so a single
+	// tick isn't guaranteed to cross a brightness threshold anywhere on
+	// screen — advance several frames instead of asserting on exactly one.
+	for range 8 {
+		updated, _ = model.Update(aboutTickMsg{})
+		model = updated.(Model)
+	}
+	laterRaw := model.View()
+	if firstRaw == laterRaw {
+		t.Fatal("about view did not change after several animation ticks")
 	}
 
 	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -2940,136 +3006,37 @@ func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
 	}
 }
 
-// TestAboutEmbersNeverOverwriteLitGlyphs guards against a real bug: embers
-// spawn at their source glyph's own cell and rise away slowly, so without a
-// blank-cell check they spend many frames sitting directly on top of real
-// logo text, replacing readable letters with spark punctuation instead of
-// drifting past them.
-func TestAboutEmbersNeverOverwriteLitGlyphs(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	model := testModel()
-	width := 80
-	model.aboutIgnite = aboutIgnitionOrder(aboutLogo(), width)
-	model.aboutFrame = 1000 // long past every ignition delay: everything settled to its real glyph
-
-	logo := aboutLogo()
-	row0 := []rune(centerPlainText(logo[0], width))
-	col := -1
-	for i, r := range row0 {
-		if r != ' ' {
-			col = i
-			break
-		}
+// TestSpotlightBrightnessFalloff checks the beam's shape: full brightness
+// at the center, zero at and past the radius, and a monotonically
+// decreasing value in between rather than an abrupt cutoff.
+func TestSpotlightBrightnessFalloff(t *testing.T) {
+	if got := spotlightBrightness(0, 2.4, 0.6); got != 1 {
+		t.Fatalf("brightness at center = %v, want 1", got)
 	}
-	if col < 0 {
-		t.Fatal("logo row 0 has no non-space glyph to target")
+	if got := spotlightBrightness(2.4, 2.4, 0.6); got != 0 {
+		t.Fatalf("brightness at radius = %v, want 0", got)
 	}
-	want := row0[col]
-
-	model.aboutEmbers = []aboutEmber{{row: 0, col: float64(col), glyph: '#', life: 20}}
-	lines := strings.Split(ansi.Strip(model.aboutText(renderer, width)), "\n")
-	got := []rune(lines[aboutEmberRows])[col]
-	if got != want {
-		t.Fatalf("ember placed over a lit glyph rendered %q, want the real glyph %q preserved", got, want)
+	if got := spotlightBrightness(3, 2.4, 0.6); got != 0 {
+		t.Fatalf("brightness past radius = %v, want 0", got)
+	}
+	mid := spotlightBrightness(1.8, 2.4, 0.6)
+	if mid <= 0 || mid >= 1 {
+		t.Fatalf("brightness inside the falloff band = %v, want strictly between 0 and 1", mid)
+	}
+	closer := spotlightBrightness(1.2, 2.4, 0.6)
+	if closer <= mid {
+		t.Fatalf("brightness closer to center = %v, want > brightness at 1.8 (%v): falloff should be monotonic", closer, mid)
 	}
 }
 
-// TestAboutEmbersRenderOverBlankCells confirms embers do still show up once
-// they're over empty space — the fix above must not make them invisible
-// everywhere, just on top of real text.
-func TestAboutEmbersRenderOverBlankCells(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	model := testModel()
-	width := 80
-	model.aboutIgnite = aboutIgnitionOrder(aboutLogo(), width)
-	model.aboutFrame = 1000
-
-	model.aboutEmbers = []aboutEmber{{row: -1, col: 5, glyph: '#', life: 20}}
-	lines := strings.Split(ansi.Strip(model.aboutText(renderer, width)), "\n")
-	got := []rune(lines[aboutEmberRows-1])[5]
-	if got != '#' {
-		t.Fatalf("ember over a blank cell rendered %q, want '#'", got)
-	}
-}
-
-func TestBurnRevealCentersMultilineWhatupdocAndBurnsFromCenter(t *testing.T) {
-	logo := aboutLogo()
-	if len(logo) < 4 {
-		t.Fatalf("about logo has %d rows, want multi-line title", len(logo))
-	}
-	joined := strings.Join(logo, "\n")
-	for _, want := range []string{"_` |", "__,_|", "___,'", "(_|", "(__|"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("about logo missing readable segment %q:\n%s", want, joined)
-		}
-	}
-
-	width := 80
-	line := logo[1]
-	delays := aboutIgnitionOrder(logo, width)
-	rowDelays := delays[1]
-
-	bg := lipgloss.Color("#171c22")
-	first := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, -1000, bg))
-	if !strings.Contains(first, strings.TrimSpace(line)) {
-		t.Fatalf("unlit frame = %q, want centered logo row", first)
-	}
-
-	settled := ansi.Strip(burnReveal(line, 1, len(logo), rowDelays, 1000, bg))
-	if !strings.Contains(settled, strings.TrimSpace(line)) {
-		t.Fatalf("settled frame = %q, want centered logo row", settled)
-	}
-}
-
-// TestAboutIgnitionOrderCoversEveryGlyphExactlyOnce checks that the
-// randomized connected-burn spread (see aboutIgnitionOrder) reaches every
-// non-space glyph in the logo exactly once, so nothing is ever left unlit
-// or double-counted.
-func TestAboutIgnitionOrderCoversEveryGlyphExactlyOnce(t *testing.T) {
+// TestSpotlightRowCellsIlluminatesNearSpotlight checks that a glyph gets a
+// lit color when a spotlight sits on top of it during the search phase,
+// and an unlit color when no spotlight is anywhere nearby.
+func TestSpotlightRowCellsIlluminatesNearSpotlight(t *testing.T) {
 	logo := aboutLogo()
 	width := 80
-	delays := aboutIgnitionOrder(logo, width)
-
-	seen := map[int]bool{}
-	total := 0
-	for row, line := range logo {
-		padded := []rune(centerPlainText(line, width))
-		if len(delays[row]) != len(padded) {
-			t.Fatalf("row %d: delay row len = %d, want %d", row, len(delays[row]), len(padded))
-		}
-		for col, r := range padded {
-			if r == ' ' {
-				continue
-			}
-			total++
-			d := delays[row][col]
-			if d < 0 {
-				t.Fatalf("cell (%d,%d) never ignited", row, col)
-			}
-			if seen[d] {
-				t.Fatalf("ignition order %d assigned to more than one cell", d)
-			}
-			seen[d] = true
-		}
-	}
-	for i := 0; i < total; i++ {
-		if !seen[i] {
-			t.Fatalf("ignition order missing index %d of %d burnable cells", i, total)
-		}
-	}
-}
-
-// TestBurnRevealCellProgressesThroughIgnitionStages checks a single cell's
-// render at, just after, and long after its own ignition delay: unlit,
-// visibly mid-burn, then settled back to its original glyph.
-func TestBurnRevealCellProgressesThroughIgnitionStages(t *testing.T) {
-	logo := aboutLogo()
-	width := 80
-	delays := aboutIgnitionOrder(logo, width)
 	row := 1
 	line := logo[row]
-	rowDelays := delays[row]
-
 	padded := []rune(centerPlainText(line, width))
 	col := -1
 	for i, r := range padded {
@@ -3079,26 +3046,147 @@ func TestBurnRevealCellProgressesThroughIgnitionStages(t *testing.T) {
 		}
 	}
 	if col == -1 {
-		t.Fatal("expected a burnable column in row 1")
-	}
-	d := rowDelays[col]
-
-	unlit := burnRevealCells(line, row, len(logo), rowDelays, d-1)[col]
-	if unlit.color != "#837373" {
-		t.Fatalf("cell before ignition = %+v, want unlit gray", unlit)
+		t.Fatal("expected a non-space column in row 1")
 	}
 
-	burning := burnRevealCells(line, row, len(logo), rowDelays, d+2)[col]
-	if burning.color == "#837373" {
-		t.Fatalf("cell mid-burn still unlit: %+v", burning)
-	}
-	if burning == unlit {
-		t.Fatalf("mid-burn cell identical to unlit cell, want visible change")
+	const unlit = "#4a4550"
+	noSpotlights := spotlightRowCells(line, row, len(logo), width, nil, 0)[col]
+	if noSpotlights.color != unlit {
+		t.Fatalf("cell with no spotlights nearby = %+v, want unlit gray %q", noSpotlights, unlit)
 	}
 
-	settled := burnRevealCells(line, row, len(logo), rowDelays, d+10)[col]
-	if settled.r != padded[col] {
-		t.Fatalf("settled glyph = %q, want original %q", settled.r, padded[col])
+	onTarget := []aboutSpotlight{{row: float64(row), col: float64(col)}}
+	lit := spotlightRowCells(line, row, len(logo), width, onTarget, 0)[col]
+	if lit.color == unlit {
+		t.Fatalf("cell directly under a spotlight still unlit: %+v", lit)
+	}
+	if lit.r != padded[col] {
+		t.Fatalf("lit cell rune = %q, want original glyph %q (spotlights illuminate, they don't replace the glyph)", lit.r, padded[col])
+	}
+}
+
+// TestSpotlightRowCellsFullyLitAfterExpand checks that, well past the
+// search+converge+expand window, every glyph settles at full brightness —
+// the reference effect's "converging in the center and expanding" ends
+// with the whole text revealed, not just the area near a spotlight.
+func TestSpotlightRowCellsFullyLitAfterExpand(t *testing.T) {
+	logo := aboutLogo()
+	width := 80
+	row := 1
+	line := logo[row]
+	padded := []rune(centerPlainText(line, width))
+
+	doneFrame := aboutSearchFrames + aboutConvergeFrames + aboutExpandFrames + 10
+	cells := spotlightRowCells(line, row, len(logo), width, nil, doneFrame)
+	for col, want := range padded {
+		if want == ' ' {
+			continue
+		}
+		got := cells[col]
+		wantColor := spotlightFinalColor(row, len(logo))
+		if got.color != wantColor {
+			t.Fatalf("cell (%d,%d) after expand = %+v, want fully lit color %q", row, col, got, wantColor)
+		}
+	}
+}
+
+// TestNewAboutSpotlightsSpawnsRequestedCount is a basic sanity check on the
+// spawn helper: the right number of spotlights, each starting somewhere
+// within the grid and already aimed at a (possibly different) target.
+func TestNewAboutSpotlightsSpawnsRequestedCount(t *testing.T) {
+	spotlights := newAboutSpotlights(aboutSpotlightCount, 6, 80)
+	if len(spotlights) != aboutSpotlightCount {
+		t.Fatalf("len(spotlights) = %d, want %d", len(spotlights), aboutSpotlightCount)
+	}
+	for i, sp := range spotlights {
+		if sp.row < 0 || sp.row > 5 || sp.col < 0 || sp.col > 79 {
+			t.Fatalf("spotlight %d position = (%v,%v), want within the 6x80 grid", i, sp.row, sp.col)
+		}
+		if sp.speed <= 0 {
+			t.Fatalf("spotlight %d speed = %v, want > 0", i, sp.speed)
+		}
+	}
+}
+
+// TestTickAboutSpotlightsConvergesAfterSearchWindow checks the phase
+// transition itself: once the frame count passes aboutSearchFrames, every
+// spotlight's target should snap to the grid center rather than another
+// random point.
+func TestTickAboutSpotlightsConvergesAfterSearchWindow(t *testing.T) {
+	model := testModel()
+	model.width = 100
+	model.aboutFrame = aboutSearchFrames
+	model.aboutSpotlights = newAboutSpotlights(aboutSpotlightCount, len(aboutLogo()), aboutContentWidth(model.width))
+
+	model = model.tickAboutSpotlights()
+
+	wantRow := float64(len(aboutLogo())-1) / 2
+	wantCol := float64(aboutContentWidth(model.width)-1) / 2
+	for i, sp := range model.aboutSpotlights {
+		if sp.targetRow != wantRow || sp.targetCol != wantCol {
+			t.Fatalf("spotlight %d target = (%v,%v), want center (%v,%v)", i, sp.targetRow, sp.targetCol, wantRow, wantCol)
+		}
+	}
+}
+
+// TestPositionAt checks the plain left-padding/truncation helper the boat
+// animation uses to place itself at a given column each frame.
+func TestPositionAt(t *testing.T) {
+	if got := positionAt("AB", 3, 10); got != "   AB     " {
+		t.Fatalf("positionAt(%q, 3, 10) = %q, want %q", "AB", got, "   AB     ")
+	}
+	if got := positionAt("hello", 8, 10); got != "        he" {
+		t.Fatalf("positionAt overflowing past width = %q, want truncated to %q", got, "        he")
+	}
+	if got := positionAt("anything", 10, 10); got != strings.Repeat(" ", 10) {
+		t.Fatalf("positionAt(col >= width) = %q, want a blank line (fully off-screen)", got)
+	}
+}
+
+// TestAboutBoatRowsStaysOffScreenDuringLogoReveal checks the boat doesn't
+// start sliding in until the logo's own search+converge+expand animation
+// has finished — it shouldn't compete with the logo for attention.
+func TestAboutBoatRowsStaysOffScreenDuringLogoReveal(t *testing.T) {
+	width := 60
+	bg := lipgloss.Color("#1e1e2e")
+	rows := aboutBoatRows(width, 0, bg)
+	// The waterline (the last row) spans the full width unconditionally —
+	// only the hull rows are checked here, since it's the boat itself that
+	// shouldn't be visible until it's slid in.
+	for i, row := range rows[:len(rows)-1] {
+		if strings.TrimSpace(ansi.Strip(row)) != "" {
+			t.Fatalf("boat hull row %d at frame 0 (still in logo reveal) = %q, want blank (off-screen)", i, row)
+		}
+	}
+}
+
+// TestAboutBoatRowsReachesRestPositionAfterSlide checks the boat actually
+// arrives — well past its slide-in window, it should render at the same,
+// centered resting column every frame rather than continuing to move or
+// snapping somewhere else.
+func TestAboutBoatRowsReachesRestPositionAfterSlide(t *testing.T) {
+	width := 60
+	bg := lipgloss.Color("#1e1e2e")
+	restFrame := aboutSearchFrames + aboutConvergeFrames + aboutExpandFrames + aboutBoatSlideFrames
+	atRest := aboutBoatRows(width, restFrame, bg)
+	muchLater := aboutBoatRows(width, restFrame+100, bg)
+	if len(atRest) == 0 {
+		t.Fatal("aboutBoatRows returned no rows")
+	}
+	for i := range atRest {
+		if atRest[i] != muchLater[i] {
+			t.Fatalf("boat row %d still differs 100 frames after its slide-in should have finished:\nat rest:    %q\nmuch later: %q", i, atRest[i], muchLater[i])
+		}
+	}
+	hasBoat := false
+	for _, row := range atRest {
+		if strings.TrimSpace(ansi.Strip(row)) != "" {
+			hasBoat = true
+			break
+		}
+	}
+	if !hasBoat {
+		t.Fatal("boat rows at rest are entirely blank, want the boat visible")
 	}
 }
 

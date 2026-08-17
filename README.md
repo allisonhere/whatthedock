@@ -73,7 +73,7 @@ Docker socket paths must be present.
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
 | `u` | Replicate: pull the latest image and recreate in place |
-| `D` | Delete (override + reconcile for a Compose service, `docker rm` for a standalone container) |
+| `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file) |
 | `C` | Clone under a new name via the create overlay |
 | `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm |
 | `e` | Open a shell inside the selected running container |
@@ -101,7 +101,7 @@ Docker socket paths must be present.
 | `y` / `n` in create confirmation | Confirm or cancel |
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
-| `A` | About screen with Burn-style ANSI splash animation |
+| `A` | About screen with Spotlights-style ANSI splash animation |
 | `q` | Quit |
 
 Mouse row selection and wheel navigation are enabled where the terminal and
@@ -225,25 +225,34 @@ More detail:
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and
   inline validation as you type. Standalone drafts can be created and started
-  after an explicit confirmation. Compose drafts write a
-  `compose.whatthedock.<service>.yml` override beside the selected Compose
-  file after first validating a temporary override with `docker compose
-  config`, then run `docker compose up -d <service>` after confirmation. This
-  works against both local systems and SSH systems, running every step —
-  browsing, writing the override, and the `docker compose` calls — on the
-  remote host. Opening create for an already-managed service detects and
-  loads its existing override instead of silently regenerating it, and the
-  form's fields update to match whatever override content is actually loaded
-  or hand-edited. The Compose file field includes a file browser (local or
-  remote) for finding `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`,
-  and `docker-compose*.yaml` files. Press `Ctrl+Y` to hand-edit the generated
+  after an explicit confirmation. For a Compose service the base compose file
+  already defines, confirming merges the draft's fields directly into that
+  service's existing block in the base file — comment- and formatting-
+  preserving, touching only the fields that changed — instead of layering a
+  separate override on top, and drops any override left over from before the
+  service existed in base. For a brand-new service the base file doesn't
+  define yet, WhatTheDock still writes a `compose.whatthedock.<service>.yml`
+  override beside the selected Compose file, validating a temporary copy with
+  `docker compose config` first. Either way, `docker compose up -d <service>`
+  runs after confirmation. This works against both local systems and SSH
+  systems, running every step — reading/writing the compose file, and the
+  `docker compose` calls — on the remote host. Opening create for an
+  already-managed service detects and loads its existing override (if any)
+  instead of silently regenerating it, and the form's fields update to match
+  whatever override content is actually loaded or hand-edited. The Compose
+  file field includes a file browser (local or remote) for finding
+  `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`, and
+  `docker-compose*.yaml` files. Press `Ctrl+Y` to hand-edit the generated
   override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
   editor, with real-time lint feedback and an optional persistent vim mode
   (Settings → Editor).
 - Deletes (`D`), replicates (`u`), clones (`C`), and edits (`m`) the selected
-  container or Compose service. Delete removes just the generated override
-  and reconciles the service back to its base definition for a Compose
-  service, or a real `docker rm -f` for a standalone container. Replicate
+  container or Compose service. Delete is a real, permanent removal for both
+  kinds: it stops and removes the container, then deletes the service's
+  definition everywhere WhatTheDock knows about it — the generated override,
+  if any, and its block in the base compose file if the base file defines it
+  (comment-preserving) — or a real `docker rm -f` for a standalone container.
+  Replicate
   pulls a fresh copy of the image and recreates the same container/service in
   place under its existing identity. Clone opens the create overlay prefilled
   with the original's full ports/mounts/env/restart/command under a new,
@@ -286,8 +295,6 @@ WhatTheDock.
 ## Planned Features
 
 - Docker event stream.
-- Merge-aware editing of the base Compose file itself, rather than only the
-  generated override.
 - Open/copy actions for environment values.
 - Deeper problem detection for orphaned, stale, and resource-heavy Docker
   resources.

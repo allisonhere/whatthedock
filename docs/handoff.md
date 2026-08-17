@@ -52,10 +52,16 @@ Untracked local files at handoff:
     form's fields back from loaded or hand-edited override YAML), local and
     remote (SSH) file browser state, override-detection on open, and
     confirmation handling and command execution for both local and SSH
-    systems. Also owns Delete's override-removal-and-reconcile and
-    Replicate's pull-then-up-d functions (both local/SSH), and Clone's
-    extended prefill (`defaultCloneDraft`, carrying Ports/Mounts/Env/
-    Restart/Command that a fresh Create draft doesn't need).
+    systems. Also owns Delete's real removal (stop/remove container + delete
+    its definition) and Replicate's pull-then-up-d functions (both
+    local/SSH), and Clone's extended prefill (`defaultCloneDraft`, carrying
+    Ports/Mounts/Env/Restart/Command that a fresh Create draft doesn't need).
+- `internal/ui/compose_merge.go`
+  - Comment- and format-preserving edits to Compose YAML via `yaml.v3`
+    `Node`s: merging structured fields into an existing service's block
+    (`mergeComposeServiceFields`) and removing a service's block entirely
+    (`removeComposeService`), used by Create/Edit and Delete respectively
+    whenever the base compose file already defines the target service.
 - `internal/ui/create_view.go`
   - Renders the create form, mode tabs, confirmation view, Compose file
     browser, and the syntax-highlighted override preview/editor.
@@ -184,19 +190,53 @@ Done since this doc was first written:
   explicitly rejected: pressing Create must never silently overwrite what's
   selected, only Edit should.
 
+- Added merge-aware base-compose-file editing (`internal/ui/compose_merge.go`)
+  and made it Create/Edit's default for any service the base compose file
+  already defines: `defaultApplyComposeCreate`/`applyComposeCreateRemote`
+  read the base file first, and if it already has the service, merge the
+  draft's fields (`Image`, `Restart`, `Command`, `Ports`, `Mounts`, `Env`)
+  directly into that service's existing block via `mergeComposeServiceFields`
+  — a `yaml.v3` `Node`-level edit that only touches the keys being replaced,
+  leaving every other key, every other service, comments, and key order
+  exactly as they were — instead of writing a `compose.whatthedock.<service>.yml`
+  override on top. Any override left over from before the service existed in
+  base gets deleted as part of the merge, so there's exactly one place the
+  service is defined afterward. Brand-new services the base file doesn't
+  define yet are unaffected — they still go through the original
+  generated-override path. This closes the "Remaining" item below about
+  override-forever vs. merge-aware edits.
+- Redesigned Delete for Compose services
+  (`defaultApplyComposeDelete`/`applyComposeDeleteRemote`) to be a real,
+  permanent removal instead of override-removal-and-reconcile-to-base: it now
+  runs `docker compose rm -sf <service>` to actually stop and remove the
+  container, then deletes the service's definition everywhere WhatTheDock
+  knows about it — the override, if any, and the service's block in the base
+  file (`removeComposeService`, same comment-preserving `yaml.v3` approach) if
+  base defines it. The previous behavior silently left the container running
+  under its base definition instead of removing it, which read as a bug
+  against normal "Delete" expectations (e.g. Portainer-style stack service
+  deletion) — this was reported and fixed in the same session the
+  merge-aware editing above was added.
+
 Remaining:
 
 - Improve standalone command parsing if quoted arguments become important.
-- Decide whether Compose service creation should default to generated override
-  files forever or become a stepping stone toward merge-aware YAML edits.
+- Base-file merge editing only touches the structured fields the create form
+  has (`Image`, `Restart`, `Command`, `Ports`, `Mounts`, `Env`); keys the form
+  doesn't expose (`networks`, `depends_on`, `labels`, `build`, ...) pass
+  through untouched on both merge and removal, by design — extending the form
+  itself would be a separate, larger change.
 - Remote (SSH) Compose operations are one `ssh` invocation per step rather
   than a shared multiplexed connection — noticeable latency, not correctness,
   but worth revisiting if it becomes annoying in practice.
 
 ## Known Constraints
 
-- Compose generated YAML is intentionally simple and quoted. It is not a
-  merge-aware YAML editor.
+- Compose generated YAML (the override path, for services not yet in base) is
+  intentionally simple and quoted — that generation step is still not
+  merge-aware. Base-file edits (for services already in base) do go through
+  the merge-aware `yaml.v3` `Node` path in `compose_merge.go`, but only for
+  the fields the create form exposes; see Remaining above.
 - Compose override files are named:
 
 ```text

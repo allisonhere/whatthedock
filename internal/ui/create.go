@@ -1117,8 +1117,12 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if spec.System.Kind == "ssh" {
 		return applyComposeCreateRemote(ctx, spec)
 	}
-	if _, err := os.Stat(spec.BaseFile); err != nil {
-		return err
+	baseContent, err := os.ReadFile(spec.BaseFile)
+	if err != nil {
+		return friendlyComposeBaseFileError(err, spec)
+	}
+	if baseComposeDefinesService(baseContent, spec.Service) {
+		return mergeComposeCreateIntoBase(ctx, spec, baseContent)
 	}
 	if err := os.MkdirAll(filepath.Dir(spec.OverrideFile), 0o755); err != nil {
 		return err
@@ -1139,6 +1143,45 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	return composeCommand(ctx, spec, "up", "-d", spec.Service)
 }
 
+// mergeComposeCreateIntoBase is defaultApplyComposeCreate's path for a
+// service the base compose file already defines: rather than layering a
+// generated compose.whatthedock.<service>.yml override on top — WhatTheDock's
+// original behavior, still used for brand-new services the base file doesn't
+// know about yet — it merges the draft's fields directly into that service's
+// existing block in base (comment-preserving, see mergeComposeServiceFields)
+// and drops any override left over from before this service existed in
+// base, so there's exactly one place the service is defined going forward.
+func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
+	if !ok {
+		return fmt.Errorf("could not read fields for service %q", spec.Service)
+	}
+	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields)
+	if err != nil {
+		return err
+	}
+	baseOnly := spec
+	baseOnly.OverrideFile = ""
+	tempBase := spec.BaseFile + ".tmp"
+	if err := os.WriteFile(tempBase, merged, 0o644); err != nil {
+		return err
+	}
+	tempSpec := baseOnly
+	tempSpec.BaseFile = tempBase
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_ = os.Remove(tempBase)
+		return err
+	}
+	if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+		_ = os.Remove(tempBase)
+		return err
+	}
+	if strings.TrimSpace(spec.OverrideFile) != "" {
+		_ = os.Remove(spec.OverrideFile)
+	}
+	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+}
+
 // applyComposeCreateRemote is defaultApplyComposeCreate's SSH-system
 // counterpart: every filesystem operation runs on the remote host over the
 // same ssh convention as the Docker socket tunnel (see sshRun), writing and
@@ -1146,7 +1189,14 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 // path — just with `test`/`mkdir`/`cat >`/`mv` in place of the os package.
 func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error {
 	if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
-		return fmt.Errorf("compose file not found on %s: %w", spec.System.Name, err)
+		return fmt.Errorf("compose file %s not found on %s (deployed via Portainer or another tool that manages it elsewhere?): %w", spec.BaseFile, spec.System.Name, err)
+	}
+	baseContent, err := sshRun(ctx, spec.System, "cat "+systems.ShellQuote(spec.BaseFile), "")
+	if err != nil {
+		return err
+	}
+	if baseComposeDefinesService(baseContent, spec.Service) {
+		return mergeComposeCreateIntoBaseRemote(ctx, spec, baseContent)
 	}
 	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.OverrideFile)), ""); err != nil {
 		return err
@@ -1165,6 +1215,40 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 		return err
 	}
 	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+}
+
+// mergeComposeCreateIntoBaseRemote is mergeComposeCreateIntoBase's SSH
+// counterpart — every filesystem step runs remotely over sshRun instead of
+// the os package.
+func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
+	if !ok {
+		return fmt.Errorf("could not read fields for service %q", spec.Service)
+	}
+	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields)
+	if err != nil {
+		return err
+	}
+	baseOnly := spec
+	baseOnly.OverrideFile = ""
+	tempBase := spec.BaseFile + ".tmp"
+	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), string(merged)); err != nil {
+		return err
+	}
+	tempSpec := baseOnly
+	tempSpec.BaseFile = tempBase
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	if strings.TrimSpace(spec.OverrideFile) != "" {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), "")
+	}
+	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
 }
 
 // composeSpecForSelected builds a composeCreateSpec targeting selected's
@@ -1189,10 +1273,9 @@ func composeSpecForSelected(selected *domain.Container, system config.System) (c
 
 // withExistingOverrideOnly clears spec.OverrideFile if no WhatTheDock
 // override actually exists on disk, so a plain, never-customized Compose
-// service can still be replicated without docker compose failing on a
-// missing -f target. Delete already handles this explicitly for its own
-// reconcile-to-base step; Replicate needs the same check since, unlike
-// Create, it's never about to write one.
+// service can still be replicated or deleted without docker compose failing
+// on a missing -f target. Delete and Replicate both need this since,
+// unlike Create, neither is ever about to write one.
 func withExistingOverrideOnly(ctx context.Context, spec composeCreateSpec) composeCreateSpec {
 	if spec.System.Kind == "ssh" {
 		if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
@@ -1206,30 +1289,60 @@ func withExistingOverrideOnly(ctx context.Context, spec composeCreateSpec) compo
 	return spec
 }
 
-// defaultApplyComposeDelete removes the WhatTheDock-generated override and
-// reconciles the service back to its base definition — the inverse of
-// defaultApplyComposeCreate's write/promote, without touching the base
-// compose file itself.
+// defaultApplyComposeDelete permanently removes service: it stops and
+// removes its container (docker compose rm -sf), then deletes its
+// definition everywhere WhatTheDock knows about it — the generated
+// override, if any, and the service's own block in the base compose file if
+// the base file defines it (comment-preserving, see removeComposeService).
+// This is a real deletion, matching what "Delete" means for a stack service
+// in tools like Portainer, not the override-removal-and-reconcile-to-base
+// behavior earlier versions of Delete used, which left the container
+// running under its base definition instead of actually removing it.
 func defaultApplyComposeDelete(ctx context.Context, spec composeCreateSpec) error {
 	if spec.System.Kind == "ssh" {
 		return applyComposeDeleteRemote(ctx, spec)
 	}
-	if err := os.Remove(spec.OverrideFile); err != nil && !os.IsNotExist(err) {
+	spec = withExistingOverrideOnly(ctx, spec)
+	if err := composeCommand(ctx, spec, "rm", "-sf", spec.Service); err != nil {
 		return err
 	}
-	baseOnly := spec
-	baseOnly.OverrideFile = ""
-	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	if strings.TrimSpace(spec.OverrideFile) != "" {
+		if err := os.Remove(spec.OverrideFile); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	baseContent, err := os.ReadFile(spec.BaseFile)
+	if err != nil || !baseComposeDefinesService(baseContent, spec.Service) {
+		return nil
+	}
+	updated, err := removeComposeService(baseContent, spec.Service)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(spec.BaseFile, updated, 0o644)
 }
 
 // applyComposeDeleteRemote is defaultApplyComposeDelete's SSH counterpart.
 func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error {
-	if _, err := sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+	spec = withExistingOverrideOnly(ctx, spec)
+	if err := composeCommand(ctx, spec, "rm", "-sf", spec.Service); err != nil {
 		return err
 	}
-	baseOnly := spec
-	baseOnly.OverrideFile = ""
-	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	if strings.TrimSpace(spec.OverrideFile) != "" {
+		if _, err := sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+			return err
+		}
+	}
+	baseContent, err := sshRun(ctx, spec.System, "cat "+systems.ShellQuote(spec.BaseFile), "")
+	if err != nil || !baseComposeDefinesService(baseContent, spec.Service) {
+		return nil
+	}
+	updated, err := removeComposeService(baseContent, spec.Service)
+	if err != nil {
+		return err
+	}
+	_, err = sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(spec.BaseFile), string(updated))
+	return err
 }
 
 // defaultApplyComposeReplicate pulls a fresh copy of the image and
@@ -1260,7 +1373,7 @@ func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...strin
 			quoted[i] = systems.ShellQuote(a)
 		}
 		_, err := sshRun(ctx, spec.System, "docker "+strings.Join(quoted, " "), "")
-		return err
+		return friendlyComposeBaseFileError(err, spec)
 	}
 	cmd := exec.CommandContext(ctx, "docker", baseArgs...)
 	output, err := cmd.CombinedOutput()
@@ -1269,9 +1382,37 @@ func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...strin
 		if text == "" {
 			text = err.Error()
 		}
-		return errors.New(text)
+		return friendlyComposeBaseFileError(errors.New(text), spec)
 	}
 	return nil
+}
+
+// friendlyComposeBaseFileError catches the one error every Compose action
+// (Create/Edit, Delete, Replicate; local or SSH) can hit before it even gets
+// to do anything: spec.BaseFile — the path recorded on the container's own
+// com.docker.compose.project.config_files label — doesn't actually exist on
+// disk. That happens for stacks deployed by a tool (Portainer is the common
+// case) that manages its compose files internally rather than leaving them
+// at that path on the host, so `docker compose -f <path>` fails immediately
+// with a raw "open <path>: no such file or directory" that gives no hint
+// why. This is the single choke point every compose invocation runs
+// through, so it's the one place that needs to catch it and say so plainly
+// instead of leaving the raw error to be puzzled over — or, worse, missed
+// in the status bar, leaving whatever the action was trying to do looking
+// like it silently did nothing.
+func friendlyComposeBaseFileError(err error, spec composeCreateSpec) error {
+	if err == nil {
+		return nil
+	}
+	text := err.Error()
+	if strings.Contains(text, spec.BaseFile) && strings.Contains(text, "no such file or directory") {
+		host := "the local filesystem"
+		if spec.System.Kind == "ssh" {
+			host = spec.System.Name
+		}
+		return fmt.Errorf("compose file %s not found on %s (deployed via Portainer or another tool that manages it elsewhere?): %s", spec.BaseFile, host, text)
+	}
+	return err
 }
 
 func parseCreatePorts(value string) ([]app.PortBinding, error) {

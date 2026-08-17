@@ -513,6 +513,57 @@ func TestApplyComposeCreateValidatesTempBeforePromote(t *testing.T) {
 	}
 }
 
+func TestDefaultApplyComposeCreateMergesIntoBaseWhenServiceAlreadyDefined(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	baseContent := "services:\n  cache:\n    image: redis:6 # old\n  web:\n    image: nginx:latest\n"
+	if err := os.WriteFile(base, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overridePath := filepath.Join(dir, "compose.whatthedock.cache.yml")
+	if err := os.WriteFile(overridePath, []byte("services:\n  cache:\n    image: redis:6\n"), 0o644); err != nil {
+		t.Fatal(err) // a stale override from before "cache" was added to base
+	}
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     base,
+		OverrideFile: overridePath,
+		Content:      "services:\n  cache:\n    image: redis:7\n    restart: \"unless-stopped\"\n",
+	}
+
+	if err := defaultApplyComposeCreate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeCreate() error = %v", err)
+	}
+	updated, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(updated)
+	if !strings.Contains(out, "redis:7") || strings.Contains(out, "redis:6") {
+		t.Fatalf("base was not merged with the new image:\n%s", out)
+	}
+	if !strings.Contains(out, "nginx:latest") {
+		t.Fatalf("base lost the unrelated service:\n%s", out)
+	}
+	if _, err := os.Stat(overridePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale override still exists or stat failed unexpectedly: %v", err)
+	}
+	if len(calls) != 2 || !strings.Contains(calls[0], "config") || !strings.Contains(calls[1], "up -d cache") {
+		t.Fatalf("compose calls = %#v, want a base-only config validation then up -d", calls)
+	}
+	if strings.Contains(calls[1], overridePath) {
+		t.Fatalf("final up -d call still references the removed override: %#v", calls)
+	}
+}
+
 func TestApplyComposeCreateRemovesTempOnValidationFailure(t *testing.T) {
 	original := composeCommand
 	defer func() { composeCommand = original }()
@@ -547,7 +598,7 @@ func TestApplyComposeCreateRemovesTempOnValidationFailure(t *testing.T) {
 	}
 }
 
-func TestDefaultApplyComposeDeleteRemovesOverrideAndRunsUp(t *testing.T) {
+func TestDefaultApplyComposeDeleteStopsContainerAndRemovesOverride(t *testing.T) {
 	original := composeCommand
 	defer func() { composeCommand = original }()
 	var calls []string
@@ -563,7 +614,7 @@ func TestDefaultApplyComposeDeleteRemovesOverrideAndRunsUp(t *testing.T) {
 	spec := composeCreateSpec{
 		Project:      "media",
 		Service:      "cache",
-		BaseFile:     filepath.Join(dir, "compose.yml"),
+		BaseFile:     filepath.Join(dir, "compose.yml"), // never written: not defined in base
 		OverrideFile: overridePath,
 	}
 
@@ -573,15 +624,19 @@ func TestDefaultApplyComposeDeleteRemovesOverrideAndRunsUp(t *testing.T) {
 	if _, err := os.Stat(overridePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("override still exists or stat failed unexpectedly: %v", err)
 	}
-	if len(calls) != 1 || calls[0] != " up -d cache" {
-		t.Fatalf("compose calls = %#v, want a single base-only up -d call", calls)
+	if len(calls) != 1 || calls[0] != overridePath+" rm -sf cache" {
+		t.Fatalf("compose calls = %#v, want a single stop+remove call against the override", calls)
 	}
 }
 
 func TestDefaultApplyComposeDeleteIsIdempotentWhenOverrideAlreadyGone(t *testing.T) {
 	original := composeCommand
 	defer func() { composeCommand = original }()
-	composeCommand = func(context.Context, composeCreateSpec, ...string) error { return nil }
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
 	dir := t.TempDir()
 	spec := composeCreateSpec{
 		Project:      "media",
@@ -592,6 +647,42 @@ func TestDefaultApplyComposeDeleteIsIdempotentWhenOverrideAlreadyGone(t *testing
 
 	if err := defaultApplyComposeDelete(context.Background(), spec); err != nil {
 		t.Fatalf("defaultApplyComposeDelete() with no existing override, error = %v, want nil", err)
+	}
+	if len(calls) != 1 || calls[0] != " rm -sf cache" {
+		t.Fatalf("compose calls = %#v, want a single stop+remove call with OverrideFile cleared", calls)
+	}
+}
+
+func TestDefaultApplyComposeDeleteRemovesServiceFromBaseWhenDefined(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	composeCommand = func(context.Context, composeCreateSpec, ...string) error { return nil }
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	baseContent := "services:\n  cache:\n    image: redis:7 # keep siblings\n  web:\n    image: nginx:latest\n"
+	if err := os.WriteFile(base, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     base,
+		OverrideFile: filepath.Join(dir, "compose.whatthedock.cache.yml"), // none written
+	}
+
+	if err := defaultApplyComposeDelete(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeDelete() error = %v", err)
+	}
+	updated, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(updated)
+	if strings.Contains(out, "redis:7") {
+		t.Fatalf("base still defines the deleted service:\n%s", out)
+	}
+	if !strings.Contains(out, "nginx:latest") {
+		t.Fatalf("base lost an unrelated service:\n%s", out)
 	}
 }
 
@@ -663,6 +754,59 @@ func TestRunDockerComposeOmitsMissingOverrideFile(t *testing.T) {
 	want := "docker 'compose' '-p' 'media' '-f' '/srv/media/compose.yml' 'pull' 'cache'"
 	if len(fake.calls) != 1 || fake.calls[0] != want {
 		t.Fatalf("calls = %#v, want a single call with exactly one -f: %q", fake.calls, want)
+	}
+}
+
+// TestRunDockerComposeExplainsMissingBaseFile guards against the bug
+// reported live: a Compose action (Delete, here) against a container whose
+// recorded compose file doesn't actually exist on the host — the common
+// case for a stack deployed through Portainer, which manages its compose
+// file internally rather than leaving it at the path recorded on the
+// container's own labels — silently failed with a raw, easy-to-miss "open
+// ...: no such file or directory", leaving the container looking like
+// Delete had simply done nothing.
+func TestRunDockerComposeExplainsMissingBaseFile(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:  "tmp",
+		Service:  "telegraf",
+		BaseFile: "/tmp/jarvis-portainer-stack.yml",
+		System:   system,
+	}
+	fake.respond(
+		"docker 'compose' '-p' 'tmp' '-f' '/tmp/jarvis-portainer-stack.yml' 'rm' '-sf' 'telegraf'",
+		"", errors.New("open /tmp/jarvis-portainer-stack.yml: no such file or directory"),
+	)
+
+	err := runDockerCompose(context.Background(), spec, "rm", "-sf", "telegraf")
+	if err == nil {
+		t.Fatal("runDockerCompose() error = nil, want an error explaining the missing base file")
+	}
+	for _, want := range []string{spec.BaseFile, "jarvis", "Portainer"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRunDockerComposePassesThroughUnrelatedErrors(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:  "media",
+		Service:  "cache",
+		BaseFile: "/srv/media/compose.yml",
+		System:   system,
+	}
+	fake.respond(
+		"docker 'compose' '-p' 'media' '-f' '/srv/media/compose.yml' 'rm' '-sf' 'cache'",
+		"", errors.New("service \"cache\" is not running"),
+	)
+
+	err := runDockerCompose(context.Background(), spec, "rm", "-sf", "cache")
+	if err == nil || err.Error() != "service \"cache\" is not running" {
+		t.Fatalf("error = %v, want the original unrelated error passed through unchanged", err)
 	}
 }
 
@@ -804,6 +948,10 @@ func TestApplyComposeCreateRemoteWritesAndAppliesOverSSH(t *testing.T) {
 
 	wantScripts := []string{
 		"test -f '/srv/media-stack/compose.yml'",
+		// The fake reports this unmocked "cat" as success with empty output,
+		// so the base file appears not to already define "cache" and the
+		// override path below runs unchanged.
+		"cat '/srv/media-stack/compose.yml'",
 		"mkdir -p '/srv/media-stack'",
 		"cat > '/srv/media-stack/compose.whatthedock.cache.yml.tmp'\x00stdin=" + spec.Content,
 		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml.tmp' 'config'",
@@ -817,6 +965,53 @@ func TestApplyComposeCreateRemoteWritesAndAppliesOverSSH(t *testing.T) {
 		if fake.calls[i] != want {
 			t.Fatalf("call %d = %q, want %q", i, fake.calls[i], want)
 		}
+	}
+}
+
+func TestApplyComposeCreateRemoteMergesIntoBaseWhenServiceAlreadyDefined(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "media-stack",
+		Service:      "cache",
+		BaseFile:     "/srv/media-stack/compose.yml",
+		OverrideFile: "/srv/media-stack/compose.whatthedock.cache.yml",
+		Content:      "services:\n  cache:\n    image: redis:7\n    restart: \"unless-stopped\"\n",
+		System:       system,
+	}
+	fake.respond("test -f '/srv/media-stack/compose.yml'", "", nil)
+	fake.respond("cat '/srv/media-stack/compose.yml'", "services:\n  cache:\n    image: redis:6 # old\n  web:\n    image: nginx:latest\n", nil)
+
+	if err := applyComposeCreateRemote(context.Background(), spec); err != nil {
+		t.Fatalf("applyComposeCreateRemote() error = %v", err)
+	}
+
+	var wroteTemp, promoted, removedOverride, ranUp bool
+	for _, call := range fake.calls {
+		switch {
+		case strings.HasPrefix(call, "cat > '/srv/media-stack/compose.yml.tmp'"):
+			wroteTemp = true
+			if !strings.Contains(call, "redis:7") || strings.Contains(call, "redis:6") {
+				t.Fatalf("merged temp base has wrong image: %q", call)
+			}
+			if !strings.Contains(call, "nginx:latest") {
+				t.Fatalf("merged temp base lost the unrelated service: %q", call)
+			}
+		case call == "mv '/srv/media-stack/compose.yml.tmp' '/srv/media-stack/compose.yml'":
+			promoted = true
+		case call == "rm -f '/srv/media-stack/compose.whatthedock.cache.yml'":
+			removedOverride = true
+		case strings.Contains(call, "'up' '-d' 'cache'"):
+			ranUp = true
+			if strings.Contains(call, "compose.whatthedock.cache.yml") {
+				t.Fatalf("up -d still references the stale override: %q", call)
+			}
+		case strings.HasPrefix(call, "cat > '/srv/media-stack/compose.whatthedock.cache.yml"):
+			t.Fatalf("wrote an override despite the service already being defined in base: %q", call)
+		}
+	}
+	if !wroteTemp || !promoted || !removedOverride || !ranUp {
+		t.Fatalf("calls = %#v, missing one of write-temp/promote/remove-override/up", fake.calls)
 	}
 }
 
@@ -851,7 +1046,7 @@ func TestApplyComposeCreateRemoteCleansUpTempOnValidationFailure(t *testing.T) {
 	}
 }
 
-func TestApplyComposeDeleteRemoteRunsRmAndUp(t *testing.T) {
+func TestApplyComposeDeleteRemoteStopsContainerAndRemovesOverride(t *testing.T) {
 	fake := withFakeSSHRun(t)
 	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
 	spec := composeCreateSpec{
@@ -866,9 +1061,14 @@ func TestApplyComposeDeleteRemoteRunsRmAndUp(t *testing.T) {
 		t.Fatalf("applyComposeDeleteRemote() error = %v", err)
 	}
 
+	// The fake reports every unmocked script as success with empty output,
+	// so "test -f" (override exists) and "cat" (base file, empty -> doesn't
+	// define the service) both resolve without a registered response.
 	wantScripts := []string{
+		"test -f '/srv/media-stack/compose.whatthedock.cache.yml'",
+		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml' 'rm' '-sf' 'cache'",
 		"rm -f '/srv/media-stack/compose.whatthedock.cache.yml'",
-		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' 'up' '-d' 'cache'",
+		"cat '/srv/media-stack/compose.yml'",
 	}
 	if len(fake.calls) != len(wantScripts) {
 		t.Fatalf("calls = %#v, want %#v", fake.calls, wantScripts)
@@ -877,6 +1077,35 @@ func TestApplyComposeDeleteRemoteRunsRmAndUp(t *testing.T) {
 		if fake.calls[i] != want {
 			t.Fatalf("call %d = %q, want %q", i, fake.calls[i], want)
 		}
+	}
+}
+
+func TestApplyComposeDeleteRemoteRemovesServiceFromBaseWhenDefined(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	system := config.System{Kind: "ssh", SSHHost: "jarvis", Name: "jarvis"}
+	spec := composeCreateSpec{
+		Project:      "media-stack",
+		Service:      "cache",
+		BaseFile:     "/srv/media-stack/compose.yml",
+		OverrideFile: "/srv/media-stack/compose.whatthedock.cache.yml",
+		System:       system,
+	}
+	fake.respond("test -f '/srv/media-stack/compose.whatthedock.cache.yml'", "", errors.New("no such file"))
+	fake.respond("cat '/srv/media-stack/compose.yml'", "services:\n  cache:\n    image: redis:7\n  web:\n    image: nginx:latest\n", nil)
+
+	if err := applyComposeDeleteRemote(context.Background(), spec); err != nil {
+		t.Fatalf("applyComposeDeleteRemote() error = %v", err)
+	}
+
+	last := fake.calls[len(fake.calls)-1]
+	if !strings.HasPrefix(last, "cat > '/srv/media-stack/compose.yml'\x00stdin=") {
+		t.Fatalf("last call = %q, want the rewritten base file written back", last)
+	}
+	if strings.Contains(last, "redis:7") {
+		t.Fatalf("rewritten base still defines the deleted service: %q", last)
+	}
+	if !strings.Contains(last, "nginx:latest") {
+		t.Fatalf("rewritten base lost an unrelated service: %q", last)
 	}
 }
 

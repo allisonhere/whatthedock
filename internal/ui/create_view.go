@@ -129,7 +129,7 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		if i < len(previewText) {
 			right = previewText[i]
 		}
-		bodyRows = append(bodyRows, lipgloss.NewStyle().Width(formWidth).Background(panelBG).Render(left)+" "+renderer.Styles.DetailMeta.Render("│")+lipgloss.NewStyle().Background(previewBG).Render(" ")+lipgloss.NewStyle().Width(previewWidth).Render(right))
+		bodyRows = append(bodyRows, lipgloss.NewStyle().Width(formWidth).Background(panelBG).Render(left)+lipgloss.NewStyle().Background(panelBG).Render(" ")+renderer.Styles.DetailMeta.Background(panelBG).Render("│")+lipgloss.NewStyle().Background(previewBG).Render(" ")+lipgloss.NewStyle().Width(previewWidth).Render(right))
 	}
 	bodyRows = append(bodyRows,
 		lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(""),

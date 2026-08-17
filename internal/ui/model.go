@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -298,9 +299,8 @@ type Model struct {
 	createEditingCompose bool
 	createEditor         editorArea
 
-	aboutFrame  int
-	aboutEmbers []aboutEmber
-	aboutIgnite [][]int
+	aboutFrame      int
+	aboutSpotlights []aboutSpotlight
 
 	// statusPulseFrame drives the breathing green dot shown in the status
 	// bar in place of the "Docker connected" text once a system is up —
@@ -323,169 +323,92 @@ type Model struct {
 	eventsReconnecting bool
 }
 
-// aboutPoint is a (row, col) cell in the about-screen logo grid.
-type aboutPoint struct{ row, col int }
-
-// aboutIgnitionOrder grows a randomized connected fire through the logo's
-// non-space cells the way terminaltexteffects' "burn" effect does: pick a
-// seed glyph, then repeatedly ignite a random unburnt neighbor of an
-// already-burning cell. The result is one ragged, connected blob of flame
-// spreading through the text, instead of a uniform radial wipe. It returns
-// a per-row slice of ignition frame-offsets, indexed by column in the
-// width-padded row.
-func aboutIgnitionOrder(logo []string, width int) [][]int {
-	rows := len(logo)
-	grid := make([][]rune, rows)
-	delay := make([][]int, rows)
-	for r, line := range logo {
-		grid[r] = []rune(centerPlainText(line, width))
-		delay[r] = make([]int, len(grid[r]))
-		for c := range delay[r] {
-			delay[r][c] = -1
-		}
-	}
-	burnableAt := func(r, c int) bool {
-		return r >= 0 && r < rows && c >= 0 && c < len(grid[r]) && grid[r][c] != ' '
-	}
-
-	var burnable []aboutPoint
-	for r := range grid {
-		for c := range grid[r] {
-			if burnableAt(r, c) {
-				burnable = append(burnable, aboutPoint{r, c})
-			}
-		}
-	}
-	if len(burnable) == 0 {
-		return delay
-	}
-
-	dirs := []aboutPoint{{row: -1}, {row: 1}, {col: -1}, {col: 1}}
-	lit := func(p aboutPoint) bool { return delay[p.row][p.col] >= 0 }
-	order := 0
-	ignite := func(p aboutPoint) {
-		delay[p.row][p.col] = order
-		order++
-	}
-
-	seed := burnable[rand.Intn(len(burnable))]
-	ignite(seed)
-	frontier := []aboutPoint{seed}
-
-	for len(frontier) > 0 {
-		idx := rand.Intn(len(frontier))
-		cur := frontier[idx]
-
-		var candidates []aboutPoint
-		for _, d := range dirs {
-			next := aboutPoint{row: cur.row + d.row, col: cur.col + d.col}
-			if burnableAt(next.row, next.col) && !lit(next) {
-				candidates = append(candidates, next)
-			}
-		}
-		if len(candidates) == 0 {
-			frontier = append(frontier[:idx], frontier[idx+1:]...)
-			continue
-		}
-		pick := candidates[rand.Intn(len(candidates))]
-		ignite(pick)
-		frontier = append(frontier, pick)
-	}
-
-	// Glyphs with no 4-connected path to the seed (isolated punctuation)
-	// still need to catch fire eventually.
-	for _, p := range burnable {
-		if !lit(p) {
-			ignite(p)
-		}
-	}
-	return delay
+// aboutSpotlight is one moving light in the About screen's animation
+// (a port of terminaltexteffects' "spotlights" effect): it wanders to
+// random points within the logo grid during the search phase, illuminating
+// whatever glyphs it passes near, then converges on the grid's center once
+// the search window ends so the reveal can expand outward from there.
+type aboutSpotlight struct {
+	row, col             float64 // current position, in grid coordinates
+	targetRow, targetCol float64
+	speed                float64 // grid cells covered per frame
 }
 
-// aboutEmber is a single spark/smoke particle drifting off the about-screen
-// logo while it burns and, at a low trickle, while it sits fully lit.
-type aboutEmber struct {
-	row, col float64
-	vy, vx   float64
-	glyph    rune
-	age      int
-	life     int
-}
+const (
+	aboutSpotlightCount = 3
+	// aboutSearchFrames, aboutConvergeFrames, and aboutExpandFrames are the
+	// three phases in sequence: wander randomly, snap targets to center and
+	// converge, then grow a reveal radius from center until every glyph is
+	// lit. Once frame passes the sum of all three the render is a stable,
+	// fully-lit final state — no separate "done" flag needed.
+	aboutSearchFrames   = 70
+	aboutConvergeFrames = 20
+	aboutExpandFrames   = 18
+	// aboutBeamRadius and aboutBeamFalloff shape each spotlight's beam: a
+	// hard-lit core out to radius*(1-falloff), then a soft linear fade to
+	// unlit at the full radius, rather than a hard-edged circle.
+	aboutBeamRadius  = 2.4
+	aboutBeamFalloff = 0.6
+)
 
-var aboutEmberGlyphs = []rune{'.', '\'', '`', ',', '*', '#'}
-
-func newAboutEmber(row, col int) aboutEmber {
-	return aboutEmber{
-		row:   float64(row),
-		col:   float64(col),
-		vy:    0.06 + rand.Float64()*0.08,
-		vx:    (rand.Float64() - 0.5) * 0.06,
-		glyph: aboutEmberGlyphs[rand.Intn(len(aboutEmberGlyphs))],
-		life:  16 + rand.Intn(18),
+// newAboutSpotlights spawns count spotlights at random positions within a
+// rows x cols grid, each already wandering toward its own random target.
+func newAboutSpotlights(count, rows, cols int) []aboutSpotlight {
+	spotlights := make([]aboutSpotlight, count)
+	for i := range spotlights {
+		row, col := randomAboutTarget(rows, cols)
+		targetRow, targetCol := randomAboutTarget(rows, cols)
+		spotlights[i] = aboutSpotlight{
+			row: row, col: col,
+			targetRow: targetRow, targetCol: targetCol,
+			speed: 0.35 + rand.Float64()*0.4,
+		}
 	}
+	return spotlights
 }
 
-// tickAboutEmbers advances existing embers and spawns new ones: a burst of
-// sparks off glyphs that are actively igniting this frame, plus a slow
-// ambient trickle off glyphs that have already settled, so the logo keeps
-// smoldering for as long as the about screen stays open.
-// rowDelays returns the ignition-delay row for row/width, falling back to
-// "already lit" if the precomputed grid doesn't match (e.g. a resize
-// happened after the about screen opened) rather than panicking.
-func rowDelays(ignite [][]int, row int, width int) []int {
-	if row >= 0 && row < len(ignite) && len(ignite[row]) == width {
-		return ignite[row]
+func randomAboutTarget(rows, cols int) (float64, float64) {
+	if rows <= 1 {
+		rows = 2
 	}
-	return make([]int, width)
+	if cols <= 1 {
+		cols = 2
+	}
+	return rand.Float64() * float64(rows-1), rand.Float64() * float64(cols-1)
 }
 
-func (m Model) tickAboutEmbers() Model {
-	width := aboutContentWidth(m.width)
-	if width <= 0 {
+// tickAboutSpotlights advances the About screen's animation one frame.
+// During the search window each spotlight wanders toward its own random
+// target, picking a new one on arrival; once the window ends, every
+// spotlight's target snaps to the grid center so they visibly converge —
+// matching the reference effect's "search, then converge" behavior. The
+// expand phase that follows needs no per-spotlight state; it's computed
+// purely from frame count in spotlightRowCells.
+func (m Model) tickAboutSpotlights() Model {
+	rows := len(aboutLogo())
+	cols := aboutContentWidth(m.width)
+	if cols <= 0 {
 		return m
 	}
+	converging := m.aboutFrame >= aboutSearchFrames
+	centerRow, centerCol := float64(rows-1)/2, float64(cols-1)/2
 
-	live := m.aboutEmbers[:0]
-	for _, e := range m.aboutEmbers {
-		e.row -= e.vy
-		e.col += e.vx
-		e.age++
-		if e.age >= e.life || e.row < -float64(aboutEmberRows)-1 {
+	for i := range m.aboutSpotlights {
+		sp := &m.aboutSpotlights[i]
+		if converging {
+			sp.targetRow, sp.targetCol = centerRow, centerCol
+		}
+		dRow, dCol := sp.targetRow-sp.row, sp.targetCol-sp.col
+		dist := math.Hypot(dRow, dCol)
+		if dist <= sp.speed {
+			sp.row, sp.col = sp.targetRow, sp.targetCol
+			if !converging {
+				sp.targetRow, sp.targetCol = randomAboutTarget(rows, cols)
+			}
 			continue
 		}
-		live = append(live, e)
-	}
-	m.aboutEmbers = live
-	if len(m.aboutEmbers) >= aboutMaxEmbers {
-		return m
-	}
-
-	logo := aboutLogo()
-	for row, line := range logo {
-		padded := []rune(centerPlainText(line, width))
-		delays := rowDelays(m.aboutIgnite, row, len(padded))
-		for col, r := range padded {
-			if r == ' ' {
-				continue
-			}
-			progress := m.aboutFrame - delays[col]
-			var chance float64
-			switch {
-			case progress >= 0 && progress <= 2:
-				chance = 0.3
-			case progress >= 6:
-				chance = 0.008
-			default:
-				continue
-			}
-			if rand.Float64() >= chance {
-				continue
-			}
-			m.aboutEmbers = append(m.aboutEmbers, newAboutEmber(row, col))
-			if len(m.aboutEmbers) >= aboutMaxEmbers {
-				return m
-			}
-		}
+		sp.row += dRow / dist * sp.speed
+		sp.col += dCol / dist * sp.speed
 	}
 	return m
 }
@@ -767,7 +690,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clearSelectedContainer()
 			return m, nil
 		}
-		m.status, m.statusErr = "Docker connected", false
+		// A routine refresh (the 250ms-debounced re-snapshot after any
+		// Docker event — see eventRefreshTickCmd) fires after almost every
+		// action, including the action that just set an error status the
+		// user hasn't had a chance to read yet. Only stomp it with "Docker
+		// connected" while nothing more specific — in particular no
+		// unacknowledged error — is already showing; an explicit action
+		// always overwrites m.status directly regardless of this guard, so
+		// the error clears itself the moment something new actually happens.
+		if !m.statusErr {
+			m.status, m.statusErr = "Docker connected", false
+		}
 		if !m.focusedTreeKey.valid {
 			m.syncFocusedTreeKey()
 		}
@@ -881,7 +814,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.aboutFrame++
-		m = m.tickAboutEmbers()
+		m = m.tickAboutSpotlights()
 		return m, tickAbout()
 	case statusPulseTickMsg:
 		m.statusPulseFrame++
@@ -1095,8 +1028,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "n":
-		if m.mode == activityLogs {
-			m.focus = paneActivity
+		if m.focus == paneActivity && m.mode == activityLogs {
 			if strings.TrimSpace(m.logFilter) == "" {
 				m.openLogFilter()
 				return m, nil
@@ -1353,10 +1285,11 @@ func (m Model) handleReplicateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// startDelete dispatches to the Compose (override removal + reconcile) or
-// standalone (real container removal) path depending on the selected
-// container, mirroring the same Compose-vs-standalone test defaultCreateDraft
-// already uses.
+// startDelete dispatches to the Compose (real removal: stop/remove the
+// container, delete the service's definition — override and/or base file
+// block) or standalone (real container removal) path depending on the
+// selected container, mirroring the same Compose-vs-standalone test
+// defaultCreateDraft already uses.
 func (m Model) startDelete() (tea.Model, tea.Cmd) {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -2169,9 +2102,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 
 func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayAbout
-	m.aboutFrame = 24
-	m.aboutEmbers = nil
-	m.aboutIgnite = aboutIgnitionOrder(aboutLogo(), aboutContentWidth(m.width))
+	m.aboutFrame = 0
+	m.aboutSpotlights = newAboutSpotlights(aboutSpotlightCount, len(aboutLogo()), aboutContentWidth(m.width))
 	return m, tickAbout()
 }
 

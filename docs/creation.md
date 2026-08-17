@@ -102,8 +102,26 @@ paste as unsupported depending on your terminal; your terminal's own
 bracketed-paste (e.g. a middle-click or terminal-menu paste) still works
 independently of that.
 
-When confirmed, WhatTheDock writes a generated override file beside the selected
-Compose file:
+When confirmed, WhatTheDock checks whether the base compose file already
+defines the service (i.e. it's a real, already-running service, not a
+brand-new one WhatTheDock is about to introduce). The two cases apply the
+draft differently:
+
+**Service already defined in base** — the draft's fields (`Image`,
+`Restart`, `Command`, `Ports`, `Mounts`/`volumes`, `Env`/`environment`) are
+merged directly into that service's existing block in the base compose
+file, using a comment- and key-order-preserving YAML edit: only the fields
+that changed are touched, everything else on the service (`networks`,
+`depends_on`, `labels`, `build`, ...), every other service, and the rest of
+the document is left exactly as it was. Any override left over from before
+the service existed in base is deleted, so there's exactly one place the
+service is defined going forward. The rewritten base file is validated the
+same way an override is (written to a `.tmp` file, checked with `docker
+compose config`, then promoted) before `docker compose up -d <service>`
+runs.
+
+**Brand-new service, not yet in base** — WhatTheDock writes a generated
+override file beside the selected Compose file instead:
 
 ```text
 compose.whatthedock.<service>.yml
@@ -124,10 +142,10 @@ WhatTheDock runs:
 docker compose -p <project> -f <base-compose-file> -f <override-file> up -d <service>
 ```
 
-For an SSH system, every step above (the `test -f` base-file check, `mkdir
--p`, writing the temp override, `docker compose config`, the rename, and
-`docker compose up -d`) runs on the remote host over `ssh` instead of the
-local filesystem/`docker` binary.
+For an SSH system, every step above (the `test -f`/`cat` base-file check,
+`mkdir -p`, writing the temp override or temp base file, `docker compose
+config`, the rename, and `docker compose up -d`) runs on the remote host over
+`ssh` instead of the local filesystem/`docker` binary.
 
 ## Compose File Browser
 
@@ -186,13 +204,16 @@ container ID when Docker provides one.
 These act on the currently selected container/Compose service, from the
 inspector pane or the command palette.
 
-**Delete (`D`)** — undoes whatever create/replicate produced. For a Compose
-service, this removes only the generated `compose.whatthedock.<service>.yml`
-override and re-runs `docker compose up -d <service>` against the base file
-alone, so the service falls back to its base definition — the base compose
-file itself is never touched. For a standalone container, there's no
-override to fall back to, so Delete is a real `docker rm -f` (stop-if-running
-+ remove). Confirm with `y`, cancel with `n`/`Esc`.
+**Delete (`D`)** — a real, permanent removal, the same for either kind of
+service: stop and remove the container, then delete its definition. For a
+Compose service that's `docker compose rm -sf <service>` to stop/remove the
+container, followed by removing the generated
+`compose.whatthedock.<service>.yml` override (if one exists) and, if the base
+compose file itself defines the service, removing that service's block from
+base too (comment-preserving, the same style of edit Create's merge-into-base
+path uses) — the service is gone, not reconciled back to a base definition
+that recreates it. For a standalone container, Delete is a real `docker rm
+-f` (stop-if-running + remove). Confirm with `y`, cancel with `n`/`Esc`.
 
 **Replicate (`u`)** — pulls a fresh copy of the image and recreates the same
 container/service in place, under its existing identity (name stays the
@@ -235,12 +256,18 @@ standalone container the way Edit intentionally does.
 
 ## Current Limits
 
-- Compose creation writes generated override files; it does not yet edit or
-  merge into existing Compose YAML.
+- Base-file merge editing only touches the structured fields the create form
+  itself exposes (`Image`, `Restart`, `Command`, `Ports`, `Mounts`, `Env`); it
+  can't add or edit keys the form doesn't have a field for (`networks`,
+  `depends_on`, `labels`, `build`, ...) — those pass through untouched, but
+  changing them still requires editing the compose file outside WhatTheDock.
+- Environment is always written back as a YAML list of `KEY=value` strings on
+  a base-file merge, even if it was previously a `KEY: value` map — both are
+  valid Compose syntax, so this is a formatting change, not a semantic one.
 - Remote (SSH) Compose operations are one `ssh` invocation per step (listing
-  a directory, writing the override, each `docker compose` call) rather than
-  a shared multiplexed connection, so each has its own connection-setup
-  latency — noticeable but not prohibitive for typical use.
+  a directory, writing the override or base file, each `docker compose` call)
+  rather than a shared multiplexed connection, so each has its own
+  connection-setup latency — noticeable but not prohibitive for typical use.
 - Standalone command parsing uses whitespace splitting, not full shell quoting.
 - Replicate only has a visible effect on mutable tags (`:latest`-style);
   pulling an image pinned to a fixed tag or digest is a no-op.

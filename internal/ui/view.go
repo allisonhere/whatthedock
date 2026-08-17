@@ -241,9 +241,24 @@ func (m Model) logPositionIndicator(total, visible int) string {
 	end := min(total, start+visible)
 	chips := m.logFilterChips()
 	if m.logFollow {
-		return strings.Join(append([]string{fmt.Sprintf("tail %d/%d", total, total)}, chips...), " · ")
+		position := fmt.Sprintf("tail %d/%d", total, total)
+		if total > visible {
+			position = "▲ " + position + " · bottom"
+		}
+		return strings.Join(append([]string{position}, chips...), " · ")
 	}
-	return strings.Join(append([]string{fmt.Sprintf("paused %d-%d/%d", start+1, end, total)}, chips...), " · ")
+	position := fmt.Sprintf("paused %d-%d/%d", start+1, end, total)
+	switch {
+	case start == 0 && end == total:
+		// Everything fits on screen; nothing to scroll.
+	case start == 0:
+		position = "▼ " + position + " · top"
+	case end == total:
+		position = "▲ " + position + " · bottom"
+	default:
+		position = "▲▼ " + position
+	}
+	return strings.Join(append([]string{position}, chips...), " · ")
 }
 
 func (m Model) logFilterChips() []string {
@@ -1404,7 +1419,9 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return &overlay
 	case overlayAbout:
 		width := min(82, max(46, m.width-8))
-		content := renderer.RenderSoftBody(width, m.aboutText(renderer, aboutContentWidth(m.width))+"\n\n"+
+		contentWidth := aboutContentWidth(m.width)
+		content := renderer.RenderSoftBody(width, m.aboutText(renderer, contentWidth)+"\n"+
+			m.aboutExtras(renderer, contentWidth)+"\n\n"+
 			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/A/q", Label: "close"}))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "about", Content: content, Width: width})
 		return &overlay
@@ -1454,17 +1471,18 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	}
 }
 
-// deleteOverlay confirms Delete — its prompt branches on Compose vs
-// standalone since the two paths do genuinely different things (see
-// Model.startDelete): removing just the generated override and reconciling
-// to base, versus a real docker rm.
+// deleteOverlay confirms Delete. The prompt reads the same for Compose
+// services and standalone containers — both are a real, permanent removal
+// (see Model.startDelete) — even though the Compose path additionally has
+// to delete the service's definition (override and/or base file block),
+// not just its container.
 func (m Model) deleteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
 	prompt := "No container selected."
 	if selected := m.selectedContainer(); selected != nil {
 		if selected.Compose.Project != "" {
-			prompt = "Delete the generated override for " + selected.Compose.Service + " and reconcile it to its base definition?"
+			prompt = "Delete service " + selected.Compose.Service + "? This stops and removes its container."
 		} else {
 			prompt = "Remove container " + selected.DisplayName() + "?"
 		}
@@ -1907,45 +1925,101 @@ func (m Model) aboutText(renderer tideui.Renderer, width int) string {
 	bg := renderer.Styles.OverlayBody.GetBackground()
 	logo := aboutLogo()
 	rows := len(logo)
-	grid := make([][]aboutCell, aboutEmberRows+rows)
-	for i := 0; i < aboutEmberRows; i++ {
-		grid[i] = blankCells(width)
-	}
+	lines := make([]string, 0, rows)
 	for row, line := range logo {
-		delays := rowDelays(m.aboutIgnite, row, width)
-		grid[aboutEmberRows+row] = burnRevealCells(line, row, rows, delays, m.aboutFrame)
-	}
-	for _, e := range m.aboutEmbers {
-		gr := aboutEmberRows + roundToInt(e.row)
-		if gr < 0 || gr >= len(grid) {
-			continue
-		}
-		cells := grid[gr]
-		gc := roundToInt(e.col)
-		if gc < 0 || gc >= len(cells) {
-			continue
-		}
-		// Embers only render into empty space (the reserved rows above the
-		// logo, or gaps between glyphs) — never on top of a lit letter. An
-		// ember starts at its source glyph's own cell and only rises there
-		// slowly, so without this guard it spends many frames sitting
-		// directly over real text, replacing readable letters with spark
-		// punctuation instead of drifting past them.
-		if cells[gc].r != ' ' {
-			continue
-		}
-		t := float64(e.age) / float64(e.life)
-		if t > 1 {
-			t = 1
-		}
-		cells[gc] = aboutCell{r: e.glyph, color: lerpHexColor("#ffcc66", "#3a2a20", t)}
-	}
-
-	lines := make([]string, 0, len(grid))
-	for _, cells := range grid {
+		cells := spotlightRowCells(line, row, rows, width, m.aboutSpotlights, m.aboutFrame)
 		lines = append(lines, lipgloss.NewStyle().Width(width).Background(bg).Render(renderCells(cells, bg)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// aboutTagline is the slogan shown under the logo — a play on both meanings
+// of "ship": the container kind and the idiom.
+const aboutTagline = "Get Your Ship Together"
+
+// aboutBoat is a small ASCII tugboat, funnel first — deliberately short
+// rows of differing width so the silhouette actually reads as a hull
+// (narrower at the funnel, wider at the waterline) rather than a uniform
+// block; positionAt pads each row independently to the same left edge.
+var aboutBoat = []string{
+	`   [==]`,
+	` __|##|__`,
+	`/________\`,
+}
+
+// aboutBoatSlideFrames is how long the boat takes to slide in from off the
+// right edge to its resting spot once the logo finishes lighting up.
+const aboutBoatSlideFrames = 40
+
+// aboutExtras renders the tagline and the tugboat beneath the logo. The
+// boat starts sliding in only once spotlightRowCells' own reveal (search +
+// converge + expand) has finished, so it doesn't compete with the logo
+// animation for attention. Every style here carries its own explicit
+// Background rather than relying on an outer wrap to fill the gaps — an
+// outer Width/Background only paints padding it appends itself, not the
+// interior of content that already carries its own embedded ANSI resets
+// (the same bug this session already hit and fixed in the ember/burn
+// reveal, the stats graphs, and the Ripple editor).
+func (m Model) aboutExtras(renderer tideui.Renderer, width int) string {
+	bg := renderer.Styles.OverlayBody.GetBackground()
+	blank := lipgloss.NewStyle().Width(width).Background(bg).Render("")
+
+	tagline := lipgloss.NewStyle().Width(width).Background(bg).Bold(true).Foreground(lipgloss.Color("#e7b2b2")).
+		Render(centerPlainText(aboutTagline, width))
+
+	lines := []string{blank, tagline, blank}
+	lines = append(lines, aboutBoatRows(width, m.aboutFrame, bg)...)
+	return strings.Join(lines, "\n")
+}
+
+// aboutBoatRows returns the boat's hull rows plus a waterline, each padded
+// to width with the boat positioned col columns from the left edge for
+// this frame — computed purely from frame, like spotlightRowCells' expand
+// phase, so no extra animation state needs to persist on Model.
+func aboutBoatRows(width, frame int, bg lipgloss.TerminalColor) []string {
+	if width <= 0 {
+		return nil
+	}
+	boatWidth := 0
+	for _, line := range aboutBoat {
+		boatWidth = max(boatWidth, len([]rune(line)))
+	}
+	restCol := max(0, (width-boatWidth)/2)
+	startFrame := aboutSearchFrames + aboutConvergeFrames + aboutExpandFrames
+	t := float64(frame-startFrame) / float64(aboutBoatSlideFrames)
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	col := int(float64(width) - t*float64(width-restCol) + 0.5)
+
+	hull := lipgloss.NewStyle().Width(width).Background(bg).Foreground(lipgloss.Color("#7dcfff"))
+	rows := make([]string, 0, len(aboutBoat)+1)
+	for _, line := range aboutBoat {
+		rows = append(rows, hull.Render(positionAt(line, col, width)))
+	}
+	water := lipgloss.NewStyle().Width(width).Background(bg).Foreground(lipgloss.Color("#4a90a4")).
+		Render(strings.Repeat("~", width))
+	rows = append(rows, water)
+	return rows
+}
+
+// positionAt left-pads text by col columns within a width-wide line,
+// truncating anything that would overflow past width. col >= width means
+// text is entirely past the right edge — a blank line, i.e. off-screen.
+func positionAt(text string, col, width int) string {
+	if col >= width {
+		return strings.Repeat(" ", width)
+	}
+	runes := []rune(text)
+	line := strings.Repeat(" ", max(0, col)) + string(runes)
+	lineRunes := []rune(line)
+	if len(lineRunes) > width {
+		return string(lineRunes[:width])
+	}
+	return line + strings.Repeat(" ", width-len(lineRunes))
 }
 
 func aboutLogo() []string {
@@ -1959,29 +2033,12 @@ func aboutLogo() []string {
 	}
 }
 
-const (
-	// aboutEmberRows reserves blank rows above the logo for embers to rise
-	// into once they detach from a burning glyph.
-	aboutEmberRows = 3
-	// aboutMaxEmbers caps live particles so the about screen stays cheap to
-	// render even if it's left open for a while.
-	aboutMaxEmbers = 48
-)
-
 // aboutCell is one rune of the about-screen render grid: a glyph plus the
-// hex color it should be painted, so embers can be composited on top of the
-// burn-reveal text without re-parsing ANSI output.
+// hex color it should be painted, computed fresh each frame from that
+// cell's spotlight illumination.
 type aboutCell struct {
 	r     rune
 	color string
-}
-
-func blankCells(width int) []aboutCell {
-	cells := make([]aboutCell, width)
-	for i := range cells {
-		cells[i] = aboutCell{r: ' '}
-	}
-	return cells
 }
 
 func renderCells(cells []aboutCell, bg lipgloss.TerminalColor) string {
@@ -2000,35 +2057,88 @@ func renderCells(cells []aboutCell, bg lipgloss.TerminalColor) string {
 // burnRevealCells renders one logo row at a given frame, using a
 // precomputed per-column ignition delay (see aboutIgnitionOrder) rather
 // than a formula, so the flame front follows the randomized connected burn
-// order instead of a uniform radial wipe.
-func burnRevealCells(line string, row int, rows int, delays []int, frame int) []aboutCell {
-	width := len(delays)
+// spotlightRowCells renders one logo row at the given frame: characters
+// lit by a nearby spotlight (search/converge phases) or by the expanding
+// reveal from center (expand phase) show a bright highlight color with a
+// soft falloff near the beam edge; everything else shows a dim, barely-lit
+// base color — echoing the reference effect's "search the text area,
+// illuminating characters, before converging... and expanding."
+func spotlightRowCells(line string, row, rows, width int, spotlights []aboutSpotlight, frame int) []aboutCell {
 	runes := []rune(centerPlainText(line, width))
 	cells := make([]aboutCell, len(runes))
+	expandStart := aboutSearchFrames + aboutConvergeFrames
+	centerRow, centerCol := float64(rows-1)/2, float64(width-1)/2
 	for col, r := range runes {
 		if r == ' ' {
 			cells[col] = aboutCell{r: ' '}
 			continue
 		}
-		delay := 0
-		if col < len(delays) {
-			delay = delays[col]
+		var brightness float64
+		if frame >= expandStart {
+			progress := float64(frame-expandStart) / float64(aboutExpandFrames)
+			if progress > 1 {
+				progress = 1
+			}
+			if progress >= 1 {
+				brightness = 1
+			} else {
+				maxRadius := math.Hypot(float64(rows), float64(width)) / 2
+				distance := math.Hypot(float64(row)-centerRow, float64(col)-centerCol)
+				brightness = spotlightBrightness(distance, progress*maxRadius, aboutBeamFalloff)
+			}
+		} else {
+			for _, sp := range spotlights {
+				distance := math.Hypot(float64(row)-sp.row, float64(col)-sp.col)
+				if b := spotlightBrightness(distance, aboutBeamRadius, aboutBeamFalloff); b > brightness {
+					brightness = b
+				}
+			}
 		}
-		progress := frame - delay
-		switch {
-		case progress < 0:
-			cells[col] = aboutCell{r: r, color: "#837373"}
-		case progress < 6:
-			cells[col] = aboutCell{r: burnGlyph(r, row, col, progress), color: burnColor(progress)}
-		default:
-			cells[col] = aboutCell{r: r, color: burnFinalColor(row, rows)}
-		}
+		cells[col] = aboutCell{r: r, color: spotlightColor(row, rows, brightness)}
 	}
 	return cells
 }
 
-func burnReveal(line string, row int, rows int, delays []int, frame int, bg lipgloss.TerminalColor) string {
-	return renderCells(burnRevealCells(line, row, rows, delays, frame), bg)
+// spotlightBrightness returns 0 (unlit) to 1 (beam center) for a point at
+// distance from a beam's center, given the beam's radius and the fraction
+// of that radius (falloff) over which brightness fades from full to zero
+// near the edge, instead of an abrupt cutoff.
+func spotlightBrightness(distance, radius, falloff float64) float64 {
+	if distance >= radius || radius <= 0 {
+		return 0
+	}
+	fadeStart := radius * (1 - falloff)
+	if distance <= fadeStart || fadeStart <= 0 {
+		return 1
+	}
+	return 1 - (distance-fadeStart)/(radius-fadeStart)
+}
+
+// spotlightColor blends a dim unlit base toward spotlightFinalColor's
+// row-based highlight by brightness.
+func spotlightColor(row, rows int, brightness float64) string {
+	const unlit = "#4a4550"
+	if brightness <= 0 {
+		return unlit
+	}
+	lit := spotlightFinalColor(row, rows)
+	if brightness >= 1 {
+		return lit
+	}
+	return lerpHexColor(unlit, lit, brightness)
+}
+
+// spotlightFinalColor mirrors the reference effect's default final
+// gradient (purple -> pink -> cream) across the logo's rows, top to bottom.
+func spotlightFinalColor(row, rows int) string {
+	if rows <= 1 {
+		return "#e7b2b2"
+	}
+	t := float64(row) / float64(rows-1)
+	if t <= 0.5 {
+		return lerpHexColor("#ab48ff", "#e7b2b2", t*2)
+	}
+	return lerpHexColor("#e7b2b2", "#fffebd", (t-0.5)*2)
 }
 
 func centerPlainText(line string, width int) string {
@@ -2039,59 +2149,6 @@ func centerPlainText(line string, width int) string {
 	left := (width - len(runes)) / 2
 	right := width - len(runes) - left
 	return strings.Repeat(" ", left) + line + strings.Repeat(" ", right)
-}
-
-func absInt(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
-}
-
-// burnGlyph textures the ignition instant so the burn looks like flame
-// licking across the glyph rather than a flat color wipe: full block
-// characters at the white-hot instant (progress 0), cooling through half
-// blocks and quarter blocks, down to a fading ember, before settling on the
-// original character.
-func burnGlyph(original rune, row int, col int, progress int) rune {
-	switch progress {
-	case 0:
-		return flameChar(row, col, []rune{'█', '▓', '▉'})
-	case 1:
-		return flameChar(row, col, []rune{'▀', '▄', '█'})
-	case 2:
-		return flameChar(row, col, []rune{'▙', '▟', '▛', '▜'})
-	case 3:
-		return flameChar(row, col, []rune{'▖', '▗', '▘', '▝'})
-	case 4:
-		return '.'
-	default:
-		return original
-	}
-}
-
-func flameChar(row int, col int, options []rune) rune {
-	return options[(row*11+col*7)%len(options)]
-}
-
-func roundToInt(v float64) int {
-	if v >= 0 {
-		return int(v + 0.5)
-	}
-	return -int(-v + 0.5)
-}
-
-func burnColor(progress int) string {
-	colors := []string{"#ffffff", "#fff75d", "#fe650d", "#8a003c", "#510100", "#510100"}
-	return colors[clamp(progress, 0, len(colors)-1)]
-}
-
-func burnFinalColor(row int, rows int) string {
-	if rows <= 1 {
-		return "#ffff1c"
-	}
-	t := float64(row) / float64(rows-1)
-	return lerpHexColor("#00c3ff", "#ffff1c", t)
 }
 
 func colorRune(r rune, color string, bg lipgloss.TerminalColor) string {
