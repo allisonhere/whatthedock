@@ -136,7 +136,8 @@ Docker socket paths must be present.
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
 | `A` | About screen with Spotlights-style ANSI splash animation |
-| `d` | Full-screen fleet dashboard: host summary plus every running container's CPU/memory/network |
+| `d` | Full-screen fleet dashboard: host summary plus every running container's CPU/memory/network, with row selection |
+| `j` / `k` / click in dashboard | Select a container row; `Enter` or click opens it in the Inspector |
 | `q` | Quit |
 
 Mouse row selection and wheel navigation are enabled where the terminal and
@@ -263,25 +264,37 @@ More detail:
   copyable through the Copy overlay (`c`) once you've selected that container.
 - Shows polling stats graphs and sparklines for the selected container, with
   CPU, memory, network, disk I/O, restart, uptime, and PID readouts.
-- Press `d` for a full-screen fleet Dashboard: a summary line (counts by
-  status, aggregate CPU/memory/network across every running container) plus
-  one row per running container with a mini CPU/memory/network sparkline
-  each, sized to use as much of the terminal as this app's presentation
-  style allows rather than the narrower single-pane Stats view. Polls
-  independently of whichever container is selected elsewhere, at the same
-  configurable refresh interval as Stats; columns drop their sparklines
-  (keeping the numbers) on a narrow terminal instead of overlapping.
+- Press `d` for a full-screen fleet Dashboard, or turn on Settings → Behavior
+  → "Start in dashboard" to open straight into it on launch instead. A
+  compact header line separates fleet status counts (running/stopped/
+  restarting/dead/unhealthy, colored the same as everywhere else in the app)
+  from aggregate CPU/RAM and network throughput; CPU and RAM only pick up a
+  warning or critical color once they actually cross a threshold, instead of
+  looking alarming at any level of ordinary activity. Each running container
+  gets a row with a CPU trend sparkline and a memory meter, both colored the
+  same absolute-threshold way — a container quietly sitting at 0.4% memory
+  never renders the same as one actually near its limit — plus a network
+  trend for both directions (`↓`/`↑`) on wide terminals, collapsing
+  gracefully to bare numbers on narrow ones without corrupting the layout.
+  Rows are keyboard- (`j`/`k`/arrows) and mouse-navigable; selecting one and
+  pressing `Enter` (or clicking it) opens that container in the Inspector,
+  reusing the same selection path the tree uses. A dedicated bottom row
+  surfaces stopped/dead/unhealthy counts with a clickable "View problems"
+  (`p`) action only when something actually needs attention, and stays quiet
+  otherwise. Honors the same Graph style and refresh interval configured in
+  Settings, and polls independently of whichever container is selected
+  elsewhere.
 - Includes a grouped settings panel with reset defaults, persisted graph style,
   graph colors, log color mode, log health color, deltas, refresh interval,
-  default activity pane, a modal drop shadow toggle, a "Check for update"
-  action, an AI provider/model/API key/base URL section for the Problems
-  pane's "analyze with AI" action (the provider's own standard environment
-  variable — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` — always
-  takes precedence over a stored key, so exporting one works with no Settings
-  change at all), and a Diagnostics section with an app-activity log
-  (off/on/save-to-disk) and a viewer for it. Settings are written with
-  owner-only (`0600`) file permissions, since the AI API key is the first
-  secret WhatTheDock persists.
+  default activity pane, whether to start in the fleet Dashboard, a modal
+  drop shadow toggle, a "Check for update" action, an AI provider/model/API
+  key/base URL section for the Problems pane's "analyze with AI" action (the
+  provider's own standard environment variable — `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GEMINI_API_KEY` — always takes precedence over a stored
+  key, so exporting one works with no Settings change at all), and a
+  Diagnostics section with an app-activity log (off/on/save-to-disk) and a
+  viewer for it. Settings are written with owner-only (`0600`) file
+  permissions, since the AI API key is the first secret WhatTheDock persists.
 - Checks GitHub for a newer release once per day on launch (throttled and
   cached — "Check for update" in Settings always forces a fresh check). A
   newer version prompts "update now (`y`) or ignore (`n`/`Esc`)"; ignoring
