@@ -16,14 +16,6 @@ presentation primitives.
 
 <table>
 <tr>
-<td colspan="2">
-
-**Dashboard: fleet summary and every container's CPU/memory/network**
-![Full-screen dashboard with a fleet summary line and a CPU/memory/network sparkline row per running container](screenshots/dashboard.png)
-
-</td>
-</tr>
-<tr>
 <td width="50%">
 
 **Problems, with AI analysis**
@@ -40,8 +32,8 @@ presentation primitives.
 <tr>
 <td width="50%">
 
-**Stats**
-![Live CPU, memory, network, and disk sparklines](screenshots/stats.png)
+**Dashboard: fleet summary and every container's CPU/memory/network**
+![Full-screen dashboard with a fleet summary line and a CPU/memory/network sparkline row per running container](screenshots/dashboard.png)
 
 </td>
 <td width="50%">
