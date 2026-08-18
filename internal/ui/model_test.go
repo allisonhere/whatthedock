@@ -3923,6 +3923,31 @@ func TestUpdateCheckOpensOverlayForNewerVersion(t *testing.T) {
 	}
 }
 
+// TestUpdateCheckOpensOverlayOverDashboard is the regression test for a
+// bug reported live: Settings > Start in dashboard opens the Dashboard
+// overlay from the very first frame (see NewModelWithProviderFactory),
+// before Init's own autoCheckForUpdateCmd has had a chance to respond —
+// so by the time updateCheckMsg arrived, the pre-existing "only open the
+// update overlay when nothing else is" check silently downgraded a real
+// update to a status-bar hint instead of the interactive install/ignore
+// prompt, with no interactive prompt ever shown unless the user happened
+// to notice the hint and open Settings themselves.
+func TestUpdateCheckOpensOverlayOverDashboard(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+	model.overlay = overlayDashboard
+
+	updated, _ := model.Update(updateCheckMsg{latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate to take over from overlayDashboard", got.overlay)
+	}
+	if got.updateAvailableVersion != "v0.1.4" {
+		t.Fatalf("updateAvailableVersion = %q, want v0.1.4", got.updateAvailableVersion)
+	}
+}
+
 func TestUpdateCheckDoesNotStealAnAlreadyOpenOverlay(t *testing.T) {
 	model := testModel()
 	model.appVersion = "v0.1.3"

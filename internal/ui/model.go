@@ -1141,7 +1141,17 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.updateAvailableVersion = msg.latest
-		if m.overlay == overlayNone {
+		// overlayDashboard is included alongside overlayNone here because
+		// Settings > Start in dashboard can already have it open by the
+		// time this message arrives (it's set at construction, before
+		// Init's autoCheckForUpdateCmd has had a chance to respond) — the
+		// update prompt should still interrupt that opening state the same
+		// way it would an empty screen, rather than silently downgrading
+		// to a status-bar hint the user has to go looking for in Settings.
+		// Every other overlay (Settings, Create, a delete confirmation...)
+		// still defers to the status-bar hint, since those really are
+		// active work the update prompt shouldn't barge in on.
+		if m.overlay == overlayNone || m.overlay == overlayDashboard {
 			m.overlay = overlayUpdate
 		} else {
 			m.status, m.statusErr = "update "+msg.latest+" available (see Settings)", false
