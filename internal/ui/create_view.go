@@ -91,10 +91,13 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	blankPreviewLine := lipgloss.NewStyle().Width(previewWidth).Background(previewBG).Render("")
 	previewLines := []string{renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Preview")}
 	if m.createDraft.Mode == createModeCompose {
-		// Syntax-highlighted lines already carry their own foreground color
-		// codes, never a background, so wrapping them in a Background-only
-		// style paints the black surface behind them without clobbering the
-		// highlight colors.
+		// Syntax-highlighted lines carry their own foreground color codes
+		// via foregroundSpanDefault, never a background (see
+		// highlightComposeYAML's own doc comment for why that specifically
+		// matters here) — so wrapping them in a Background-only style below
+		// paints the black surface behind them, including the plain
+		// punctuation/whitespace runs between highlighted tokens, without
+		// clobbering the highlight colors.
 		for _, line := range highlightComposeYAML(m.createDraft.Preview()) {
 			previewLines = append(previewLines, lipgloss.NewStyle().Width(previewWidth).Background(previewBG).Render(line))
 		}

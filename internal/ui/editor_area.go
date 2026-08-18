@@ -233,13 +233,29 @@ func highlightComposeYAML(content string) []string {
 	var out strings.Builder
 	var run []rune
 	runKind := ""
+	// flush colors each token via foregroundSpanDefault instead of
+	// style.Render(text) — the regression fix for a background bug
+	// reported live: a self-contained Style.Render() call emits an
+	// absolute reset at its end, and this function's own output mixes
+	// those with plain, unstyled runs of punctuation/whitespace on the
+	// same line (create_view.go's preview column wraps each full line in
+	// one outer Background-only style afterward). The reset wiped out
+	// that outer wrap's background for every plain character following a
+	// key/string/comment token, until the next colored token
+	// re-established one — exactly the bug already fixed once for
+	// renderLogLine (see its own doc comment), just for the Compose YAML
+	// preview instead of log lines. foregroundSpanDefault only changes
+	// foreground/bold/italic and restores to the terminal's own default
+	// foreground afterward, never touching background, so nothing here
+	// needs to inherit anything from a wrap a reset could kill.
 	flush := func() {
 		if len(run) == 0 {
 			return
 		}
 		text := string(run)
 		if style := styleFor(runKind); style != nil {
-			out.WriteString(style.Render(text))
+			fg, _ := style.GetForeground().(lipgloss.Color)
+			out.WriteString(foregroundSpanDefault(text, fg, style.GetBold(), style.GetItalic()))
 		} else {
 			out.WriteString(text)
 		}

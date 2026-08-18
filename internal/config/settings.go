@@ -10,17 +10,19 @@ import (
 const settingsFileName = "settings.json"
 
 type Settings struct {
-	GraphStyle      string   `json:"graphStyle,omitempty"`
-	GraphColor      string   `json:"graphColor,omitempty"`
-	LogColor        string   `json:"logColor,omitempty"`
-	LogHealthColor  *bool    `json:"logHealthColor,omitempty"`
-	ShowDeltas      *bool    `json:"showDeltas,omitempty"`
-	CreateVim       *bool    `json:"createVim,omitempty"`
-	ModalShadow     *bool    `json:"modalShadow,omitempty"`
-	StatsRefresh    string   `json:"statsRefresh,omitempty"`
-	DefaultActivity string   `json:"defaultActivity,omitempty"`
-	ActiveSystem    string   `json:"activeSystem,omitempty"`
-	Systems         []System `json:"systems,omitempty"`
+	Theme            string   `json:"theme,omitempty"`
+	GraphStyle       string   `json:"graphStyle,omitempty"`
+	GraphColor       string   `json:"graphColor,omitempty"`
+	LogColor         string   `json:"logColor,omitempty"`
+	LogHealthColor   *bool    `json:"logHealthColor,omitempty"`
+	ShowDeltas       *bool    `json:"showDeltas,omitempty"`
+	CreateVim        *bool    `json:"createVim,omitempty"`
+	ModalShadow      *bool    `json:"modalShadow,omitempty"`
+	StatsRefresh     string   `json:"statsRefresh,omitempty"`
+	DefaultActivity  string   `json:"defaultActivity,omitempty"`
+	StartInDashboard *bool    `json:"startInDashboard,omitempty"`
+	ActiveSystem     string   `json:"activeSystem,omitempty"`
+	Systems          []System `json:"systems,omitempty"`
 
 	// AppLog controls whatthedock's own internal status-bar activity log —
 	// "off" (default), "on" (kept in memory for the session), or "save"

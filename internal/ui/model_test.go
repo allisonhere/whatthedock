@@ -652,6 +652,93 @@ func TestRenderProblemsSplitDoesNotPanicOnShortTerminal(t *testing.T) {
 	_ = model.View()
 }
 
+// TestRenderProblemsSplitSummaryLineFillsFullWidth is the regression test
+// for a background bug reported live: the "N problem(s) found" summary
+// line was built without Width(width). renderProblemsSplit's final step —
+// lipgloss.JoinVertical(lipgloss.Left, list, divider, insight) — re-pads
+// every line across all three blocks to the widest line among them using
+// its own plain, unstyled spaces; a line that already reached that width
+// on its own (every problem row, via RenderRow) is untouched, but a
+// shorter one gets JoinVertical's own unstyled padding baked in before it
+// ever reaches the pane's normal background-aware compositor, which by
+// then just sees an already-"full-width" line with nothing to fix. That
+// unstyled tail showed up as a stray colored box (picking up whatever
+// happened to render on top of raw terminal default) sitting half over
+// the header. This is specifically about JoinVertical — see
+// TestRenderProblemInsightFillsFullWidth for the same fix applied to the
+// AI-heading lines, which pass through the same JoinVertical call via
+// insight; ordinary standalone or plainly strings.Join'd short lines
+// elsewhere in the app (e.g. the Logs pane's placeholder messages, or
+// this same pane's "No container problems detected." empty state) are
+// NOT affected, since they never pass through JoinVertical, and adding
+// Width(width) to those was confirmed unnecessary — worse, it can
+// silently word-wrap or truncate what's meant to stay a single line.
+func TestRenderProblemsSplitSummaryLineFillsFullWidth(t *testing.T) {
+	model := testModel()
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	content, width := model.renderProblemsSplit(renderer)
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		t.Fatal("renderProblemsSplit content has no lines")
+	}
+	summary := ansi.Strip(lines[0])
+	if got := len([]rune(summary)); got != width {
+		t.Fatalf("summary line visible width = %d (%q), want exactly %d", got, summary, width)
+	}
+}
+
+// TestRenderProblemInsightFillsFullWidth is
+// TestRenderProblemsSplitSummaryLineFillsFullWidth's counterpart for
+// renderProblemInsight's own four return paths: each builds its heading
+// line via foregroundSpan (short, not itself padded to width) and used to
+// hand that off to a bare DetailBody.Render(...) with no Width(width).
+// renderProblemsSplit then stacks this insight block against the
+// full-width list/divider blocks via lipgloss.JoinVertical, whose own
+// plain, unstyled padding stretched the short heading line out — the same
+// stray-background-box bug as the summary line, just on "Analyzing with
+// AI…"/"AI Analysis"/"AI analysis failed" instead of the problem count.
+func TestRenderProblemInsightFillsFullWidth(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	row := problemRow{id: domain.ResourceID{Host: "local", ID: "1"}, severity: "crit", name: "radarr-1", detail: "unhealthy"}
+	const width = 46
+
+	checkLines := func(t *testing.T, label, content string) {
+		t.Helper()
+		for i, line := range strings.Split(content, "\n") {
+			if got := len([]rune(ansi.Strip(line))); got != width {
+				t.Fatalf("%s line %d visible width = %d (%q), want exactly %d", label, i, got, ansi.Strip(line), width)
+			}
+		}
+	}
+
+	t.Run("rule-based (no AI)", func(t *testing.T) {
+		model := testModel()
+		checkLines(t, "rule-based", model.renderProblemInsight(renderer, row, width))
+	})
+
+	t.Run("analyzing", func(t *testing.T) {
+		model := testModel()
+		model.aiAnalysisFor = row.id
+		model.aiAnalyzing = true
+		checkLines(t, "analyzing", model.renderProblemInsight(renderer, row, width))
+	})
+
+	t.Run("analysis failed", func(t *testing.T) {
+		model := testModel()
+		model.aiAnalysisFor = row.id
+		model.aiAnalysisErr = errBoom
+		checkLines(t, "failed", model.renderProblemInsight(renderer, row, width))
+	})
+
+	t.Run("analysis succeeded", func(t *testing.T) {
+		model := testModel()
+		model.aiAnalysisFor = row.id
+		model.aiAnalysis = "Restart the container and check its logs for the underlying cause."
+		checkLines(t, "succeeded", model.renderProblemInsight(renderer, row, width))
+	})
+}
+
 func TestProblemsKeySwitchesActivityMode(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 30
@@ -1307,6 +1394,70 @@ func TestLogTokenColors(t *testing.T) {
 	}
 }
 
+// TestRenderLogLineNeverEmitsAbsoluteReset is the regression test for a
+// background bug reported live: renderLogLine's colored tokens (via
+// renderLogToken/renderLogMatch) used to be built through independent,
+// self-contained lipgloss.NewStyle()...Render() calls, each emitting an
+// absolute "\x1b[0m"/"\x1b[m" reset at its own end. Since renderLogLine's
+// whole output is always embedded inside ONE outer, already-open
+// background style (renderActivity's DetailBody.Width(width).Render(...)),
+// any reset partway through wiped out that outer background for every
+// character after it, until the next colored token re-established one —
+// visible as broken/patchy line backgrounds on any log line containing a
+// timestamp, HTTP method/status, severity keyword, or search-match
+// highlight, which is the common case under the default "full" log color
+// mode. renderLogLine's own output must never contain an absolute
+// reset — every colored span restores via foregroundSpan/backgroundSpan
+// instead, which only ever change foreground/background explicitly and
+// never reset (see their own doc comments).
+func TestRenderLogLineNeverEmitsAbsoluteReset(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	line := `2024-01-01T12:00:00Z GET /api/v3/queue 200 [ERROR] something failed`
+
+	out := renderLogLine(renderer, logColorFull, "", line)
+	if strings.Contains(out, "\x1b[0m") || strings.Contains(out, "\x1b[m") {
+		t.Fatalf("renderLogLine output contains an absolute reset, want none:\n%q", out)
+	}
+
+	matched := renderLogLine(renderer, logColorFull, "queue", line)
+	if strings.Contains(matched, "\x1b[0m") || strings.Contains(matched, "\x1b[m") {
+		t.Fatalf("renderLogLine output (with a search-match highlight) contains an absolute reset, want none:\n%q", matched)
+	}
+}
+
+// TestRenderLogLineKeepsBackgroundAfterColoredToken renders a log line
+// through the real activity pane (so it's wrapped in its actual outer
+// DetailBody background style) and checks the text following a colored
+// token still carries an explicit background SGR rather than falling
+// through to whatever the terminal defaults to.
+func TestRenderLogLineKeepsBackgroundAfterColoredToken(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.mode = activityLogs
+	model.logLines = []string{"2024-01-01T12:00:00Z GET /api/v3/queue 200 trailing text after the status code"}
+
+	view := model.View()
+	if !strings.Contains(view, "trailing text after the status code") {
+		t.Fatalf("view missing the log line:\n%s", ansi.Strip(view))
+	}
+	idx := strings.Index(view, "trailing")
+	if idx < 0 {
+		t.Fatal("could not locate \"trailing\" in the view")
+	}
+	lastBG := strings.LastIndex(view[:idx], "\x1b[48;2;")
+	if lastBG < 0 {
+		t.Fatal("no explicit background SGR found anywhere before \"trailing\"")
+	}
+	between := view[lastBG:idx]
+	if strings.Contains(between, "\x1b[0m") || strings.Contains(between, "\x1b[m") {
+		t.Fatalf("an absolute reset appears between the last background SGR and the text following the status code token — it falls through to the terminal default instead of the pane's own background:\n%q", between)
+	}
+}
+
 func numberedLogLines(count int) []string {
 	lines := make([]string, 0, count)
 	for i := 1; i <= count; i++ {
@@ -1726,6 +1877,199 @@ func TestSettingsLoadPersistedValues(t *testing.T) {
 		model.settings.StatsRefresh != 5*time.Second ||
 		model.mode != activityStats {
 		t.Fatalf("settings = %#v mode=%v, want persisted values", model.settings, model.mode)
+	}
+}
+
+// TestNewModelStartsInDashboardWhenSettingEnabled checks Settings > Start
+// in dashboard: enabling it must open the Dashboard overlay from the very
+// first frame, not just after pressing "d".
+func TestNewModelStartsInDashboardWhenSettingEnabled(t *testing.T) {
+	enabled := true
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{StartInDashboard: &enabled}, "")
+	if !model.settings.StartInDashboard {
+		t.Fatal("settings.StartInDashboard = false, want true")
+	}
+	if model.overlay != overlayDashboard {
+		t.Fatalf("overlay = %v, want overlayDashboard", model.overlay)
+	}
+}
+
+// TestNewModelDoesNotStartInDashboardByDefault checks the setting is
+// opt-in — an empty/default config must preserve the existing startup
+// behavior (no overlay open) rather than surprising an existing user.
+func TestNewModelDoesNotStartInDashboardByDefault(t *testing.T) {
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{}, "")
+	if model.settings.StartInDashboard {
+		t.Fatal("settings.StartInDashboard = true, want false by default")
+	}
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone", model.overlay)
+	}
+}
+
+// TestInitStartsDashboardStatsPollWhenStartingInDashboard checks that
+// opening the Dashboard overlay from Start in dashboard also kicks off
+// its stats-polling loop immediately (dashboardRefreshCmd, the same
+// command the 'd' key dispatches via openDashboardOverlay) rather than
+// showing an empty dashboard until the next unrelated tick.
+func TestInitStartsDashboardStatsPollWhenStartingInDashboard(t *testing.T) {
+	enabled := true
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{StartInDashboard: &enabled}, "")
+	model.snapshot = model.provider.(*fakeProvider).snapshot
+	model.settings.StatsRefresh = time.Millisecond // keep the re-arm tick's own timer out of this test's runtime
+
+	if !collectMsgTypes(t, model.Init())[dashboardTickMsg{}] {
+		t.Fatal("Init()'s batch is missing dashboardRefreshCmd's re-arm tick despite starting in dashboard mode")
+	}
+}
+
+// TestInitSkipsDashboardStatsPollByDefault is
+// TestInitStartsDashboardStatsPollWhenStartingInDashboard's counterpart:
+// with the setting off, Init() must not start the Dashboard's polling
+// loop for a screen nobody's looking at.
+func TestInitSkipsDashboardStatsPollByDefault(t *testing.T) {
+	model := testModel()
+	if collectMsgTypes(t, model.Init())[dashboardTickMsg{}] {
+		t.Fatal("Init()'s batch contains dashboardRefreshCmd's re-arm tick despite not starting in dashboard mode")
+	}
+}
+
+// collectMsgTypes runs cmd and, recursively for any tea.BatchMsg it
+// produces (tea.Batch's own sub-commands are only reachable by invoking
+// each of them in turn — dashboardRefreshCmd itself returns tea.Batch(...),
+// so a batch built from it nests one level deep inside Init()'s own outer
+// batch), returns which dashboardTickMsg{}-shaped messages were seen.
+// Keyed by the zero value since dashboardTickMsg carries no fields —
+// callers only care whether one showed up at all.
+func collectMsgTypes(t *testing.T, cmd tea.Cmd) map[dashboardTickMsg]bool {
+	t.Helper()
+	seen := map[dashboardTickMsg]bool{}
+	var walk func(tea.Cmd)
+	walk = func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		switch msg := c().(type) {
+		case tea.BatchMsg:
+			for _, sub := range msg {
+				walk(sub)
+			}
+		case dashboardTickMsg:
+			seen[msg] = true
+		}
+	}
+	walk(cmd)
+	return seen
+}
+
+// TestSettingsStartInDashboardTogglePersists mirrors
+// TestSettingsModalShadowTogglePersistsAndAppliesToView's shape for the
+// new Start in dashboard row: toggling it in Settings and saving must
+// persist to disk.
+func TestSettingsStartInDashboardTogglePersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	model := testModel()
+	model.settingsPath = path
+	if model.settings.StartInDashboard {
+		t.Fatal("StartInDashboard should default to false")
+	}
+
+	model.openSettingsOverlay()
+	rows := model.settingsRows()
+	cursor := -1
+	for i, row := range rows {
+		if row.label == "Start in dashboard" {
+			cursor = i
+			break
+		}
+	}
+	if cursor == -1 {
+		t.Fatal("settings rows missing \"Start in dashboard\"")
+	}
+	model.settingsCursor = cursor
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.settingsDraft.StartInDashboard {
+		t.Fatal("settingsDraft.StartInDashboard = false after toggle, want true")
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+	if !model.settings.StartInDashboard {
+		t.Fatal("settings.StartInDashboard = false after save, want true")
+	}
+
+	saved, err := config.LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() err = %v", err)
+	}
+	if saved.StartInDashboard == nil || !*saved.StartInDashboard {
+		t.Fatalf("persisted StartInDashboard = %v, want true", saved.StartInDashboard)
+	}
+}
+
+// TestNewModelLoadsPersistedTheme is the regression test for themes not
+// persisting across restarts: NewModelWithProviderFactory always seeded
+// m.theme from whatthedockTheme() regardless of what was saved, so a
+// confirmed theme picker choice was silently dropped on the next launch.
+func TestNewModelLoadsPersistedTheme(t *testing.T) {
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{Theme: "nord"}, "")
+	if model.theme.Name != "nord" {
+		t.Fatalf("model.theme.Name = %q, want nord", model.theme.Name)
+	}
+	if got := model.themes.ConfirmedTheme().Name; got != "nord" {
+		t.Fatalf("themes.ConfirmedTheme().Name = %q, want nord", got)
+	}
+}
+
+func TestNewModelDefaultThemeWhenNothingPersisted(t *testing.T) {
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{}, "")
+	if model.theme.Name != "whatthedock" {
+		t.Fatalf("model.theme.Name = %q, want whatthedock default", model.theme.Name)
+	}
+}
+
+// TestThemePickerConfirmSavesTheme is the other half of the persistence
+// regression: confirming a theme in the picker must write it to disk
+// immediately (mirroring saveSystemDraft's convention), not just update
+// m.theme in memory and wait for a Settings-overlay ctrl+s that theme
+// picking never goes through.
+func TestThemePickerConfirmSavesTheme(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	model := testModel()
+	model.settingsPath = path
+	model.openThemePicker()
+	if model.overlay != overlayThemePicker {
+		t.Fatalf("overlay = %v, want theme picker", model.overlay)
+	}
+	startName := model.theme.Name
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	wantName := model.themes.PreviewTheme().Name
+	if wantName == startName {
+		t.Fatalf("preview theme = %q after moving down, want it to differ from the starting theme %q", wantName, startName)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want none after confirm", model.overlay)
+	}
+	if model.theme.Name != wantName {
+		t.Fatalf("model.theme.Name = %q, want %q", model.theme.Name, wantName)
+	}
+	if model.status != "theme: "+wantName || model.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want \"theme: %s\"/false", model.status, model.statusErr, wantName)
+	}
+
+	saved, err := config.LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() err = %v", err)
+	}
+	if saved.Theme != wantName {
+		t.Fatalf("saved.Theme = %q, want %q", saved.Theme, wantName)
 	}
 }
 

@@ -208,7 +208,7 @@ func TestDashboardOverlayShowsSummaryAndRunningContainer(t *testing.T) {
 	if !strings.Contains(view, "radarr-1") {
 		t.Fatalf("view missing the running container's row:\n%s", view)
 	}
-	if !strings.Contains(view, "1 !") {
+	if !strings.Contains(view, "! 1 UNHEALTHY") {
 		t.Fatalf("view missing the unhealthy-count summary:\n%s", view)
 	}
 }
@@ -289,7 +289,7 @@ func TestDashboardHeaderRowAlignsWithRowNumbers(t *testing.T) {
 	var row string
 	for _, ctr := range model.snapshotContainers() {
 		if ctr.IsRunning() {
-			row = ansi.Strip(model.dashboardRow(renderer, ctr, width))
+			row = ansi.Strip(model.dashboardRow(renderer, ctr, width, false))
 			break
 		}
 	}
@@ -344,12 +344,12 @@ func TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth(t *testing.T) {
 			if !ctr.IsRunning() {
 				continue
 			}
-			row := dashboardPadLine(renderer, model.dashboardRow(renderer, ctr, width), width)
+			row := dashboardPadLine(renderer, model.dashboardRow(renderer, ctr, width, false), width)
 			if got := len([]rune(ansi.Strip(row))); got != width {
 				t.Fatalf("width=%d: padded row visible width = %d, want exactly %d\nrow: %q", width, got, width, ansi.Strip(row))
 			}
 		}
-		summary := dashboardPadLine(renderer, model.dashboardSummaryLine(renderer, model.fleetSummary()), width)
+		summary := dashboardPadLine(renderer, model.dashboardSummaryLine(renderer, model.fleetSummary(), width), width)
 		if got := len([]rune(ansi.Strip(summary))); got != width {
 			t.Fatalf("width=%d: padded summary line visible width = %d, want exactly %d", width, got, width)
 		}
@@ -381,7 +381,7 @@ func TestDashboardGlyphsCarryExplicitBackground(t *testing.T) {
 	var row string
 	for _, ctr := range model.snapshotContainers() {
 		if ctr.IsRunning() {
-			row = model.dashboardRow(renderer, ctr, 120)
+			row = model.dashboardRow(renderer, ctr, 120, false)
 			break
 		}
 	}
@@ -392,8 +392,486 @@ func TestDashboardGlyphsCarryExplicitBackground(t *testing.T) {
 		t.Fatalf("dashboardRow's status glyph has no explicit background SGR immediately preceding its foreground SGR — it's relying on a neighboring segment's background to carry over, which it doesn't:\n%q", row)
 	}
 
-	summary := model.dashboardSummaryLine(renderer, dashboardSummary{counts: map[string]int{"●": 3}})
+	summary := model.dashboardSummaryLine(renderer, dashboardSummary{counts: map[string]int{"●": 3}}, 80)
 	if !dashboardBgThenFgSGR.MatchString(summary) {
 		t.Fatalf("dashboardSummaryLine's count+glyph has no explicit background SGR immediately preceding its foreground SGR:\n%q", summary)
+	}
+}
+
+// TestDashboardThresholdColorBoundaries checks dashboardThresholdColor's
+// three bands land exactly on dashboardWarnPct/dashboardCritPct — the
+// whole redesign hinges on these being absolute cutoffs rather than a
+// per-container relative scale (see dashboardWarnPct's own doc comment).
+func TestDashboardThresholdColorBoundaries(t *testing.T) {
+	neutral := lipgloss.Color("#7dcfff")
+	cases := []struct {
+		pct  float64
+		want lipgloss.Color
+	}{
+		{0, neutral},
+		{0.4, neutral},
+		{69.9, neutral},
+		{70, "#e5c07b"},
+		{89.9, "#e5c07b"},
+		{90, "#e06c75"},
+		{100, "#e06c75"},
+	}
+	for _, c := range cases {
+		if got := dashboardThresholdColor(c.pct, neutral); got != c.want {
+			t.Fatalf("dashboardThresholdColor(%v) = %v, want %v", c.pct, got, c.want)
+		}
+	}
+}
+
+// TestDashboardMemMeterSqrtScaling is the regression test for the
+// redesign's own worked examples: 0.4% and 2.7% utilization must land on
+// 1 and 2 filled cells of a 10-wide meter respectively — a plain linear
+// pct/100 scale would round both down to 0, indistinguishable from true
+// zero usage and useless for comparing healthy containers against each
+// other (see dashboardMemMeter's doc comment).
+func TestDashboardMemMeterSqrtScaling(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	cases := []struct {
+		pct    float64
+		filled int
+	}{
+		{0, 0},
+		{0.4, 1},
+		{2.7, 2},
+		{100, 10},
+	}
+	for _, c := range cases {
+		out := ansi.Strip(dashboardMemMeter(renderer, defaultSettings(), c.pct, true, 10, "#000000"))
+		if got := strings.Count(out, "█"); got != c.filled {
+			t.Fatalf("dashboardMemMeter(%v%%) filled = %d (%q), want %d", c.pct, got, out, c.filled)
+		}
+		if got := len([]rune(out)); got != 10 {
+			t.Fatalf("dashboardMemMeter(%v%%) width = %d, want 10", c.pct, got)
+		}
+	}
+}
+
+// TestDashboardMemMeterNoLimitIsDashedNotRed checks the "unknown, not
+// necessarily bad" fallback: a container with no reported memory limit
+// gets a dim dashed meter, never a threshold color guessed from nothing.
+func TestDashboardMemMeterNoLimitIsDashedNotRed(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	out := ansi.Strip(dashboardMemMeter(renderer, defaultSettings(), 0, false, 10, "#000000"))
+	if out != strings.Repeat("─", 10) {
+		t.Fatalf("dashboardMemMeter(hasLimit=false) = %q, want 10 dashes", out)
+	}
+}
+
+// TestDashboardMemMeterGaugeStyleUsesGaugeBar checks that choosing the
+// Gauge Graph style in Settings actually changes the Dashboard's memory
+// meter shape — a single proportional "━"/"╸"/"─" bar, the same look
+// graphStyleGauge gives every stat row in the single-container Stats pane
+// — rather than the block meter's "█"/"░" cells.
+func TestDashboardMemMeterGaugeStyleUsesGaugeBar(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	settings := defaultSettings()
+	settings.GraphStyle = graphStyleGauge
+
+	out := ansi.Strip(dashboardMemMeter(renderer, settings, 50, true, 10, "#000000"))
+	if strings.ContainsAny(out, "█░") {
+		t.Fatalf("dashboardMemMeter(gauge style) = %q, want the gauge bar's ━/╸/─ glyphs, not the block meter's █/░", out)
+	}
+	if !strings.ContainsAny(out, "━╸") {
+		t.Fatalf("dashboardMemMeter(gauge style) = %q, want at least one ━ or ╸ gauge glyph", out)
+	}
+}
+
+// TestDashboardSparkGaugeStyleUsesGaugeBar is TestDashboardMemMeterGaugeStyleUsesGaugeBar's
+// counterpart for the CPU/network sparkline shape.
+func TestDashboardSparkGaugeStyleUsesGaugeBar(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	settings := defaultSettings()
+	settings.GraphStyle = graphStyleGauge
+
+	graph := statGraph{values: []float64{10, 20, 50}, maxValue: 100}
+	out := ansi.Strip(dashboardSpark(renderer, settings, graph, "#7dcfff", 10, "#000000"))
+	if strings.ContainsAny(out, "▁▂▃▄▅▆▇█") {
+		t.Fatalf("dashboardSpark(gauge style) = %q, want the gauge bar's ━/╸/─ glyphs, not per-sample block glyphs", out)
+	}
+	if !strings.ContainsAny(out, "━╸") {
+		t.Fatalf("dashboardSpark(gauge style) = %q, want at least one ━ or ╸ gauge glyph for a nonzero value", out)
+	}
+}
+
+// TestDashboardSparkHonorsGraphStyleGlyphSet checks that non-gauge Graph
+// styles change the sparkline's glyph set the same way they do for the
+// single-container Stats pane's own sparkline (graphGlyphs is the exact
+// function both paths call) — Braille's glyphs are a completely disjoint
+// Unicode block from Blocks/Bars/the default Wave, so this is an
+// unambiguous signal the setting is actually being consulted.
+func TestDashboardSparkHonorsGraphStyleGlyphSet(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	graph := statGraph{values: []float64{10, 90}, maxValue: 100}
+
+	blocks := defaultSettings()
+	blocks.GraphStyle = graphStyleBlocks
+	braille := defaultSettings()
+	braille.GraphStyle = graphStyleBraille
+
+	blocksOut := ansi.Strip(dashboardSpark(renderer, blocks, graph, "#7dcfff", 10, "#000000"))
+	brailleOut := ansi.Strip(dashboardSpark(renderer, braille, graph, "#7dcfff", 10, "#000000"))
+	if strings.ContainsAny(blocksOut, "⣀⣤⣶⣿") {
+		t.Fatalf("dashboardSpark(blocks style) = %q, want block glyphs (▁-█), not Braille", blocksOut)
+	}
+	if !strings.ContainsAny(brailleOut, "⣀⣤⣶⣿") {
+		t.Fatalf("dashboardSpark(braille style) = %q, want at least one Braille glyph (⣀⣤⣶⣿)", brailleOut)
+	}
+}
+
+// TestDashboardGraphColorSettingDoesNotAffectDashboardColors is the
+// regression test for the whole point of dashboardThresholdColor:
+// changing settings.GraphColor (which switches the single-container Stats
+// pane between its relative heat gradient, a flat per-metric color, and
+// monochrome) must not change what color the Dashboard's memory meter
+// picks for a given percentage — that color comes from the absolute
+// dashboardWarnPct/dashboardCritPct cutoffs only.
+func TestDashboardGraphColorSettingDoesNotAffectDashboardColors(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	var outputs []string
+	for _, mode := range []graphColorMode{graphColorGradient, graphColorMetric, graphColorMono} {
+		settings := defaultSettings()
+		settings.GraphColor = mode
+		outputs = append(outputs, dashboardMemMeter(renderer, settings, 2.7, true, 10, "#000000"))
+	}
+	for i := 1; i < len(outputs); i++ {
+		if outputs[i] != outputs[0] {
+			t.Fatalf("dashboardMemMeter output changed across GraphColor modes: %q vs %q — want it independent of that setting", outputs[0], outputs[i])
+		}
+	}
+}
+
+// TestDashboardNetSparkQuietWhenZero is the regression test for goal #4's
+// "zero traffic should appear visually quiet": a container with no
+// network history, or whose latest sample is exactly zero, must render a
+// flat dashed line rather than a row of "▁" glyphs indistinguishable from
+// genuinely tiny (but nonzero) traffic.
+func TestDashboardNetSparkQuietWhenZero(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	empty := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{}, 6, "#000000"))
+	if empty != strings.Repeat("─", 6) {
+		t.Fatalf("dashboardNetSpark(no history) = %q, want 6 dashes", empty)
+	}
+
+	zeroLatest := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{40, 0}, maxValue: 100}, 6, "#000000"))
+	if zeroLatest != strings.Repeat("─", 6) {
+		t.Fatalf("dashboardNetSpark(latest=0) = %q, want 6 dashes", zeroLatest)
+	}
+
+	active := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{10, 40}, maxValue: 100}, 6, "#000000"))
+	if active == strings.Repeat("─", 6) {
+		t.Fatalf("dashboardNetSpark(latest=40) = %q, want real sparkline glyphs, not dashes", active)
+	}
+}
+
+// TestTruncateEllipsisShortensLongNames checks the ellipsis truncation
+// dashboardRow uses for container names — short() elsewhere in this file
+// truncates silently, which reads as a rendering bug when applied to a
+// human-readable name rather than a compact ID.
+func TestTruncateEllipsisShortensLongNames(t *testing.T) {
+	if got := truncateEllipsis("short", 10); got != "short" {
+		t.Fatalf("truncateEllipsis(short name) = %q, want unchanged", got)
+	}
+	if got := truncateEllipsis("a-very-long-container-name", 10); got != "a-very-lo…" {
+		t.Fatalf("truncateEllipsis(long name) = %q, want \"a-very-lo…\"", got)
+	}
+	if got := len([]rune(truncateEllipsis("a-very-long-container-name", 10))); got != 10 {
+		t.Fatalf("truncateEllipsis width = %d, want 10", got)
+	}
+}
+
+// TestDashboardColumnsForTiers checks dashboardTierFor's breakpoints and
+// that each tier drops exactly the visualizations the redesign's own
+// narrow/medium/wide fallbacks describe: narrow shows bare numbers only,
+// medium adds a CPU sparkline and memory meter but keeps network
+// combined, wide additionally splits network into two trended columns.
+func TestDashboardColumnsForTiers(t *testing.T) {
+	model := testModel()
+	cases := []struct {
+		width        int
+		wantTier     dashboardTier
+		wantSpark    bool
+		wantMeter    bool
+		wantSplitNet bool
+	}{
+		{66, dashboardTierNarrow, false, false, false},
+		{82, dashboardTierNarrow, false, false, false},
+		{102, dashboardTierMedium, true, true, false},
+		{132, dashboardTierWide, true, true, true},
+		{172, dashboardTierWide, true, true, true},
+	}
+	for _, c := range cases {
+		cols := model.dashboardColumnsFor(c.width)
+		if cols.tier != c.wantTier {
+			t.Fatalf("width=%d: tier = %v, want %v", c.width, cols.tier, c.wantTier)
+		}
+		if (cols.cpuSparkW > 0) != c.wantSpark {
+			t.Fatalf("width=%d: cpuSparkW=%d, want spark=%v", c.width, cols.cpuSparkW, c.wantSpark)
+		}
+		if (cols.memMeterW > 0) != c.wantMeter {
+			t.Fatalf("width=%d: memMeterW=%d, want meter=%v", c.width, cols.memMeterW, c.wantMeter)
+		}
+		if cols.splitNet != c.wantSplitNet {
+			t.Fatalf("width=%d: splitNet=%v, want %v", c.width, cols.splitNet, c.wantSplitNet)
+		}
+	}
+}
+
+// TestDashboardRowNeverExceedsWidth renders real rows (selected and not)
+// across the tier breakpoints and a range of realistic terminal widths
+// and checks the unpadded row never exceeds its budget — dashboardPadLine
+// only ever adds columns, so an overrun here would corrupt the panel's
+// right border on a real terminal. Complements
+// TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth, which only
+// checks the padded (never-shrinks) side of the same invariant.
+func TestDashboardRowNeverExceedsWidth(t *testing.T) {
+	model := testModel()
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "1"}, CPUPercent: 100, MemoryUsage: 999, MemoryLimit: 1000, NetworkRx: 999999999, NetworkTx: 999999999})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	for _, width := range []int{66, 82, 90, 102, 110, 132, 140, 172, 180, 300} {
+		for _, selected := range []bool{false, true} {
+			for _, ctr := range model.snapshotContainers() {
+				if !ctr.IsRunning() {
+					continue
+				}
+				row := model.dashboardRow(renderer, ctr, width, selected)
+				if got := len([]rune(ansi.Strip(row))); got > width {
+					t.Fatalf("width=%d selected=%v: row visible width = %d, want <= %d\nrow: %q", width, selected, got, width, ansi.Strip(row))
+				}
+			}
+			header := model.dashboardHeaderRow(renderer, width)
+			if got := len([]rune(ansi.Strip(header))); got > width {
+				t.Fatalf("width=%d: header visible width = %d, want <= %d", width, got, width)
+			}
+		}
+	}
+}
+
+// TestDashboardSummaryLineNeverExceedsWidthWhenNarrow checks the header's
+// graceful-degradation path: on a very narrow panel it drops CPU/RAM/
+// network before overflowing, and status counts (goal #1's top priority)
+// are always present.
+func TestDashboardSummaryLineNeverExceedsWidthWhenNarrow(t *testing.T) {
+	model := testModel()
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "1"}, CPUPercent: 41.5, MemoryUsage: 100, MemoryLimit: 200})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	summary := model.fleetSummary()
+
+	for _, width := range []int{20, 40, 66} {
+		line := ansi.Strip(model.dashboardSummaryLine(renderer, summary, width))
+		if got := len([]rune(line)); got > width {
+			t.Fatalf("width=%d: summary line width = %d, want <= %d\nline: %q", width, got, width, line)
+		}
+	}
+
+	full := ansi.Strip(model.dashboardSummaryLine(renderer, summary, 66))
+	if !strings.Contains(full, "RUNNING") {
+		t.Fatalf("summary at width=66 missing the always-shown running count:\n%s", full)
+	}
+}
+
+// TestDashboardProblemsRowWarnsOnlyWhenStopped checks goal #7: a warning
+// row with the "p" action only appears when something's actually stopped,
+// and a healthy fleet gets a quiet all-clear line instead.
+func TestDashboardProblemsRowWarnsOnlyWhenStopped(t *testing.T) {
+	model := testModel()
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	warn := ansi.Strip(model.dashboardProblemsRow(renderer, 3, 80))
+	if !strings.Contains(warn, "⚠ 3 containers need attention") || !strings.Contains(warn, "View problems") {
+		t.Fatalf("dashboardProblemsRow(3) = %q, want a warning naming the count plus the View problems action", warn)
+	}
+
+	singular := ansi.Strip(model.dashboardProblemsRow(renderer, 1, 80))
+	if !strings.Contains(singular, "1 container needs attention") {
+		t.Fatalf("dashboardProblemsRow(1) = %q, want singular \"container needs\"", singular)
+	}
+
+	healthy := ansi.Strip(model.dashboardProblemsRow(renderer, 0, 80))
+	if !strings.Contains(healthy, "All monitored containers healthy") || strings.Contains(healthy, "⚠") {
+		t.Fatalf("dashboardProblemsRow(0) = %q, want a quiet all-clear line with no warning glyph", healthy)
+	}
+}
+
+// TestDashboardKeyboardSelectionMovesAndOpens checks goal #6's keyboard
+// navigation end to end: j/k move the highlighted row within the
+// Dashboard's own visible list, and enter closes the overlay and focuses
+// the inspector on that row's container via the same moveTreeCursorTo/
+// loadSelectedCmd path selectProblem already uses.
+func TestDashboardKeyboardSelectionMovesAndOpens(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.rows = model.buildRows()
+	model.overlay = overlayDashboard
+	model.dashboardCursor = 0
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	next := updated.(Model)
+	// testModel's fixture has exactly one running container (radarr-1), so
+	// moving down must clamp at 0 rather than going out of bounds.
+	if next.dashboardCursor != 0 {
+		t.Fatalf("dashboardCursor after j with 1 running container = %d, want clamped to 0", next.dashboardCursor)
+	}
+
+	updated, cmd := next.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next = updated.(Model)
+	if next.overlay != overlayNone {
+		t.Fatalf("overlay after enter = %v, want overlayNone", next.overlay)
+	}
+	if next.focus != paneInspector {
+		t.Fatalf("focus after enter = %v, want paneInspector", next.focus)
+	}
+	if next.selectedID.ID != "1" {
+		t.Fatalf("selectedID after enter = %+v, want container 1 (radarr-1)", next.selectedID)
+	}
+	if cmd == nil {
+		t.Fatal("enter on a dashboard row returned a nil cmd, want loadSelectedCmd's fetch")
+	}
+}
+
+// TestDashboardPKeyOpensProblems checks goal #7: "p" continues to open
+// Problems even while the Dashboard overlay has focus.
+func TestDashboardPKeyOpensProblems(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayDashboard
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	next := updated.(Model)
+	if next.overlay != overlayNone {
+		t.Fatalf("overlay after p = %v, want overlayNone", next.overlay)
+	}
+	if next.focus != paneActivity || next.mode != activityProblems {
+		t.Fatalf("focus/mode after p = %v/%v, want paneActivity/activityProblems", next.focus, next.mode)
+	}
+}
+
+// dashboardFindRowLine returns the screen line index (0-based, matching
+// tea.MouseMsg.Y) of the first line containing needle *inside the
+// Dashboard overlay's own box* — the underlying Problems/tree panes the
+// overlay is drawn on top of can contain the same text (e.g. a container
+// name also appears in the Problems list behind the overlay), so the
+// search starts at the box's own top border rather than the top of the
+// whole screen.
+func dashboardFindRowLine(t *testing.T, view, needle string) int {
+	t.Helper()
+	lines := strings.Split(view, "\n")
+	boxTop := -1
+	for i, line := range lines {
+		if strings.Contains(ansi.Strip(line), "whatthedock · dashboard") {
+			boxTop = i
+			break
+		}
+	}
+	if boxTop < 0 {
+		t.Fatal("rendered view missing the dashboard overlay's own box")
+	}
+	for i := boxTop; i < len(lines); i++ {
+		if strings.Contains(ansi.Strip(lines[i]), needle) {
+			return i
+		}
+	}
+	t.Fatalf("rendered view missing %q inside the dashboard overlay", needle)
+	return -1
+}
+
+// TestDashboardResizeDoesNotPanicWithStaleCursor checks goal #12's
+// "terminal resizing does not panic": a cursor pointing well past what a
+// shrunken terminal can show must not index out of range — dashboardRow
+// selection highlighting and the mouse hit-test both key off the
+// overlay's own currently-visible list (dashboardBodyPlan), not a fixed
+// index, so a resize that shrinks the visible budget just changes what
+// "visible" means rather than leaving a dangling reference.
+func TestDashboardResizeDoesNotPanicWithStaleCursor(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 180, 50
+	model.overlay = overlayDashboard
+	for i := 0; i < 30; i++ {
+		id := "extra-" + string(rune('a'+i))
+		model.snapshot.Standalone = append(model.snapshot.Standalone, domain.Container{
+			ID: domain.ResourceID{Host: "local", ID: id}, Name: "extra-" + id, State: domain.StateRunning,
+		})
+	}
+	model.dashboardCursor = 29
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("resize with a stale dashboardCursor panicked: %v", r)
+		}
+	}()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 90, Height: 10})
+	next := updated.(Model)
+	_ = next.View()
+	next.dashboardMoveCursor(1)
+}
+
+// TestDashboardHitTestMatchesRenderedRow renders a real Dashboard overlay
+// and clicks the screen coordinates its own View() output puts a known
+// container's row at, rather than hand-deriving expected coordinates —
+// see dashboardHitTest's doc comment for why this is the regression test
+// that actually matters if tideui's soft-panel chrome ever changes shape.
+func TestDashboardHitTestMatchesRenderedRow(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.overlay = overlayDashboard
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "1"}, CPUPercent: 41.5})
+
+	targetY := dashboardFindRowLine(t, model.View(), "radarr-1")
+
+	row, isStatusRow, ok := model.dashboardHitTest(tea.MouseMsg{X: model.width / 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if !ok || isStatusRow || row != 0 {
+		t.Fatalf("dashboardHitTest(Y=%d) = (row=%d, isStatusRow=%v, ok=%v), want (0, false, true)", targetY, row, isStatusRow, ok)
+	}
+}
+
+// TestDashboardMouseClickRowSelectsAndOpens is the mouse counterpart to
+// TestDashboardKeyboardSelectionMovesAndOpens: a left click on a
+// container's rendered row selects and opens it in one action, the same
+// as pressing enter after navigating there with the keyboard.
+func TestDashboardMouseClickRowSelectsAndOpens(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.rows = model.buildRows()
+	model.overlay = overlayDashboard
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "1"}, CPUPercent: 41.5})
+
+	targetY := dashboardFindRowLine(t, model.View(), "radarr-1")
+
+	updated, cmd := model.Update(tea.MouseMsg{X: model.width / 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	next := updated.(Model)
+	if next.overlay != overlayNone {
+		t.Fatalf("overlay after clicking a row = %v, want overlayNone", next.overlay)
+	}
+	if next.selectedID.ID != "1" {
+		t.Fatalf("selectedID after clicking radarr-1's row = %+v, want container 1", next.selectedID)
+	}
+	if cmd == nil {
+		t.Fatal("clicking a dashboard row returned a nil cmd, want loadSelectedCmd's fetch")
+	}
+}
+
+// TestDashboardMouseClickStatusRowOpensProblems checks the bottom status
+// row is clickable when it's a warning (goal #7) — clicking it takes the
+// same path as pressing "p".
+func TestDashboardMouseClickStatusRowOpensProblems(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.overlay = overlayDashboard
+
+	targetY := dashboardFindRowLine(t, model.View(), "View problems")
+
+	updated, _ := model.Update(tea.MouseMsg{X: model.width / 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	next := updated.(Model)
+	if next.overlay != overlayNone {
+		t.Fatalf("overlay after clicking the status row = %v, want overlayNone", next.overlay)
+	}
+	if next.focus != paneActivity || next.mode != activityProblems {
+		t.Fatalf("focus/mode after clicking status row = %v/%v, want paneActivity/activityProblems", next.focus, next.mode)
 	}
 }

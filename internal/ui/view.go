@@ -11,6 +11,7 @@ import (
 
 	sp "github.com/allisonhere/cli-spinners"
 	"github.com/allisonhere/tideui"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
@@ -76,10 +77,36 @@ func containerTitle(ctr domain.Container) string {
 	return ctr.DisplayName()
 }
 
+// renderTopbar's left segment used to be built from two independent,
+// self-contained Style.Render() calls (StatusNotice for the "WHAT THE
+// DOCK?!" badge, StatusBar for the host name) concatenated together, with
+// the WHOLE aligned left+gap+right string then wrapped in one more outer
+// StatusBar.Width(width).Render() call. Each independent Render() emits
+// its own absolute reset at its end — so the notice badge's reset (or the
+// host-name segment's own) wiped out that outer wrap's background for
+// everything after it, leaving the gap and the "Docker connected..."
+// status text on the right with no background at all. Confirmed present
+// on every screen and every theme (light themes make it starkly visible —
+// a black gap in an otherwise light-colored bar). backgroundSpan restores
+// explicitly back to StatusBar's own colors instead of resetting, so
+// nothing after it needs to inherit anything from a wrap a reset could
+// kill — the rest of the line can go back to being plain, unstyled text
+// exactly as it was, now safely inside the one outer wrap all the way
+// through.
 func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	width := max(1, m.width)
-	left := renderer.Styles.StatusNotice.Render(" WHAT THE DOCK?! ") +
-		renderer.Styles.StatusBar.Render(" "+m.provider.Host().Name)
+	statusBarBG, _ := renderer.Styles.StatusBar.GetBackground().(lipgloss.Color)
+	statusBarFG := styleForeground(renderer.Styles.StatusBar, renderer.Styles.Theme.Fg)
+	noticeBG, _ := renderer.Styles.StatusNotice.GetBackground().(lipgloss.Color)
+	noticeFG := styleForeground(renderer.Styles.StatusNotice, renderer.Styles.Theme.Fg)
+	// The extra leading/trailing spaces folded into these two strings
+	// (beyond " WHAT THE DOCK?! " and " "+hostname's own literal spaces)
+	// replicate StatusNotice/StatusBar's own Padding(0,1) by hand —
+	// backgroundSpan colors exactly the text it's given and doesn't apply
+	// a Style's Padding, unlike the two independent Style.Render() calls
+	// this used to be built from.
+	left := backgroundSpan("  WHAT THE DOCK?!  ", noticeBG, noticeFG, statusBarBG, statusBarFG, true) +
+		"  " + m.provider.Host().Name + " "
 	right := fmt.Sprintf("Docker connected · %d projects · %d standalone · %d problems",
 		len(m.snapshot.Projects), len(m.snapshot.Standalone), len(m.snapshotProblems()))
 	if m.statusErr {
@@ -185,6 +212,22 @@ func styleForeground(style lipgloss.Style, fallback lipgloss.Color) lipgloss.Col
 func healthSpan(text string, color, restore lipgloss.Color) string {
 	return ansi.NewStyle().ForegroundColor(color).String() + text +
 		ansi.NewStyle().ForegroundColor(restore).String()
+}
+
+// padPlainLine truncates plain (no embedded ANSI) text to width and
+// renders it through style so the result is always exactly one line at
+// exactly width, with style's own background covering every cell. A bare
+// style.Width(width).Render(text) would word-wrap onto multiple lines
+// once text exceeds width — fine for the AI-insight/problem-detail text
+// this app deliberately wraps via wrapInsightText, but wrong for the
+// short single-line status/placeholder messages this helper is for
+// ("Select a container...", "No logs match...", etc.), which are meant
+// to stay one line no matter how narrow the pane gets. Still fills the
+// full width with style's background, which a bare style.Render(text)
+// (no Width at all) does not — see this codebase's several "stray
+// colored box" bug reports for what happens without it.
+func padPlainLine(style lipgloss.Style, text string, width int) string {
+	return style.Width(width).Render(ansi.Truncate(text, width, "…"))
 }
 
 func (m Model) renderActivity(renderer tideui.Renderer) string {
@@ -389,50 +432,65 @@ func renderLogLine(renderer tideui.Renderer, mode logColorMode, query, line stri
 	return out.String()
 }
 
+// renderLogToken colors one token via foregroundSpan rather than a
+// self-contained lipgloss.NewStyle().Background(...).Render(...) call —
+// the regression fix for a background bug reported live: renderLogLine
+// concatenates many independently-built pieces (colored tokens, plain
+// words, raw whitespace runs) into one line that's only ever wrapped in
+// an outer background style ONCE, by its caller (renderActivity's
+// DetailBody.Width(width).Render(...)). A self-contained Style.Render()
+// call emits its own *absolute* reset at the end — not a "restore the
+// outer style" reset — so every colored token (a timestamp, an HTTP
+// method/status, a severity keyword) was wiping out that outer
+// background for every character after it, until the next colored token
+// re-established a background of its own. On any log line with at least
+// one colored token — the common case under the default "full" log
+// color mode — everything after the first one lost its background,
+// showing raw terminal default instead of the theme's own. foregroundSpan
+// only ever changes foreground/bold (see its own doc comment), so nesting
+// it inside the one continuous outer Render call here can never touch
+// that call's own background.
 func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, first bool) string {
 	if mode == logColorMono {
 		return token
 	}
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
 	trimmed := strings.Trim(token, `[](),;:"'`)
 	switch {
 	case first && logTimestampPattern.MatchString(token) && (mode == logColorFull || mode == logColorHTTP || mode == logColorSeverity):
-		return logStyle(renderer, "#8aadf4", false).Render(token)
+		return foregroundSpan(token, "#8aadf4", baseFg, false)
 	case logHTTPMethodPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
-		return logStyle(renderer, "#7dcfff", true).Render(token)
+		return foregroundSpan(token, "#7dcfff", baseFg, true)
 	case logHTTPStatusPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
-		return logStyle(renderer, httpStatusColor(trimmed), true).Render(token)
+		return foregroundSpan(token, httpStatusColor(trimmed), baseFg, true)
 	case logSeverityPattern.MatchString(token) && (mode == logColorFull || mode == logColorSeverity):
-		return logStyle(renderer, logSeverityColor(token), true).Render(token)
+		return foregroundSpan(token, logSeverityColor(token), baseFg, true)
 	default:
 		return token
 	}
 }
 
+// renderLogMatch highlights a filter-matched token via backgroundSpan
+// instead of a self-contained Style.Render() call — same fix, same
+// reasoning as renderLogToken's own doc comment, just for a span that
+// genuinely needs to change background (the match highlight), not only
+// foreground: backgroundSpan explicitly restores to the surrounding
+// line's own background/foreground afterward instead of emitting an
+// absolute reset. Any per-token color rendered already carried (from
+// renderLogToken) is deliberately dropped here — highlighting a token
+// that's also, say, an HTTP status code just shows it plain-highlighted,
+// not fighting two colors for the same characters.
 func renderLogMatch(renderer tideui.Renderer, query, token, rendered string) string {
 	query = strings.TrimSpace(query)
 	if query == "" || !strings.Contains(strings.ToLower(token), strings.ToLower(query)) {
 		return rendered
 	}
-	if ansi.Strip(rendered) != token {
-		return lipgloss.NewStyle().
-			Background(renderer.Styles.Theme.Selected).
-			Foreground(renderer.Styles.Theme.Fg).
-			Bold(true).
-			Render(token)
-	}
-	return lipgloss.NewStyle().
-		Background(renderer.Styles.Theme.Selected).
-		Foreground(renderer.Styles.Theme.Fg).
-		Bold(true).
-		Render(rendered)
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	return backgroundSpan(token, renderer.Styles.Theme.Selected, renderer.Styles.Theme.Fg, renderer.Styles.Theme.Bg, baseFg, true)
 }
 
 func isLogSpace(char byte) bool {
 	return char == ' ' || char == '\t'
-}
-
-func logStyle(renderer tideui.Renderer, color lipgloss.Color, bold bool) lipgloss.Style {
-	return lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(color).Bold(bold)
 }
 
 func httpStatusColor(status string) lipgloss.Color {
@@ -1095,8 +1153,18 @@ func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
 		return renderer.Styles.DetailMeta.Render("No container problems detected."), width
 	}
 
+	// The summary line must be padded to width itself (not left to whatever
+	// composites this pane's content): every problem row below it goes
+	// through RenderRow, which fills the full width internally, but this
+	// line previously didn't — leaving it short. Composited against a full-
+	// width neighbor (namely the first/selected row's own ItemSelected
+	// background), the short line's unpadded tail picked up that
+	// neighboring row's background color instead of its own, showing up as
+	// a stray colored box sitting half over the header line. Width(width)
+	// makes this line self-contained the same way every RenderRow-built
+	// line already is.
 	listLines := make([]string, 0, len(problems)+1)
-	listLines = append(listLines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("%d problem(s) found", len(problems))))
+	listLines = append(listLines, padPlainLine(renderer.Styles.DetailMeta, fmt.Sprintf("%d problem(s) found", len(problems)), width))
 	for i, problem := range problems {
 		selected := m.problemSelected(i, problem)
 		muted := problem.severity == "warn"
@@ -1142,30 +1210,43 @@ func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
 // wrapInsightText measures width in runes; ANSI escape sequences embedded
 // beforehand inflate that count and corrupt the wrap, the exact bug fixed
 // earlier in the About screen's ship animation (see about_ship.go).
+// Every return path below wraps its final joined lines in
+// DetailBody.Width(width).Render(...) rather than a bare .Render(...) —
+// the same fix renderProblemsSplit's summary line needed (see its own
+// doc comment). heading here is built via foregroundSpan, which embeds
+// its own short-lived ANSI codes and is *not* itself padded to width;
+// joined with wrapInsightText's already-width-padded body lines and
+// handed to lipgloss.JoinVertical (in renderProblemsSplit) alongside the
+// full-width list/divider blocks, an unpadded heading line got stretched
+// to match by JoinVertical's own plain, unstyled space-padding — the
+// exact same stray-background-box bug, just on the "Analyzing with AI…"/
+// "AI Analysis"/"AI analysis failed" heading instead of the problem
+// count. Width(width) makes every line this function returns
+// self-contained instead of depending on a caller to pad it correctly.
 func (m Model) renderProblemInsight(renderer tideui.Renderer, row problemRow, width int) string {
 	if m.aiAnalysisFor != row.id {
 		lines := wrapInsightText(problemInsight(row), width, m.problemsInsightRows())
-		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+		return renderer.Styles.DetailBody.Width(width).Render(strings.Join(lines, "\n"))
 	}
 
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
 	switch {
 	case m.aiAnalyzing:
 		heading := foregroundSpan("Analyzing with AI…", renderer.Styles.Theme.Dimmed, baseFg, false)
-		return renderer.Styles.DetailBody.Render(heading)
+		return renderer.Styles.DetailBody.Width(width).Render(heading)
 	case m.aiAnalysisErr != nil:
 		heading := foregroundSpan("AI analysis failed", renderer.Styles.Theme.Error, baseFg, true)
 		body := wrapInsightText(m.aiAnalysisErr.Error(), width, max(1, m.problemsInsightRows()-1))
 		lines := append([]string{heading}, body...)
-		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+		return renderer.Styles.DetailBody.Width(width).Render(strings.Join(lines, "\n"))
 	case m.aiAnalysis != "":
 		heading := foregroundSpan("AI Analysis", renderer.Styles.Theme.BorderFocus, baseFg, true)
 		body := wrapInsightText(m.aiAnalysis, width, max(1, m.problemsInsightRows()-1))
 		lines := append([]string{heading}, body...)
-		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+		return renderer.Styles.DetailBody.Width(width).Render(strings.Join(lines, "\n"))
 	default:
 		lines := wrapInsightText(problemInsight(row), width, m.problemsInsightRows())
-		return renderer.Styles.DetailBody.Render(strings.Join(lines, "\n"))
+		return renderer.Styles.DetailBody.Width(width).Render(strings.Join(lines, "\n"))
 	}
 }
 
@@ -1481,6 +1562,44 @@ func foregroundSpan(text string, color, restore lipgloss.Color, bold bool) strin
 		style = style.Bold()
 	}
 	restoreStyle := ansi.NewStyle().ForegroundColor(restore).Normal().Italic(false)
+	return style.String() + text + restoreStyle.String()
+}
+
+// backgroundSpan is foregroundSpan for a span that needs to change
+// background too (a selection/match highlight, not just colored text) —
+// same non-resetting-restore shape: an absolute "\x1b[0m" reset would
+// wipe out whatever background an outer, already-open Style.Render() call
+// established before this span started, not just this span's own. bg/fg
+// are the highlight's own colors; restoreBg/restoreFg are what the
+// surrounding text's background/foreground should read as immediately
+// after the span ends.
+func backgroundSpan(text string, bg, fg, restoreBg, restoreFg lipgloss.Color, bold bool) string {
+	style := ansi.NewStyle().BackgroundColor(bg).ForegroundColor(fg)
+	if bold {
+		style = style.Bold()
+	}
+	restoreStyle := ansi.NewStyle().BackgroundColor(restoreBg).ForegroundColor(restoreFg).Normal().Italic(false)
+	return style.String() + text + restoreStyle.String()
+}
+
+// foregroundSpanDefault is foregroundSpan for text whose surrounding
+// context has no specific foreground color to restore to (e.g. adjacent
+// plain punctuation/whitespace that was never given an explicit
+// foreground of its own) — it resets foreground/bold/italic back to the
+// terminal's own default (SGR 39) instead of a specific color, using the
+// same non-resetting-restore shape foregroundSpan/backgroundSpan use:
+// never an absolute reset that would also wipe out whatever background an
+// outer, already-open Style.Render() call established before this span
+// started.
+func foregroundSpanDefault(text string, color lipgloss.Color, bold, italic bool) string {
+	style := ansi.NewStyle().ForegroundColor(color)
+	if bold {
+		style = style.Bold()
+	}
+	if italic {
+		style = style.Italic(true)
+	}
+	restoreStyle := ansi.NewStyle().DefaultForegroundColor().Normal().Italic(false)
 	return style.String() + text + restoreStyle.String()
 }
 
@@ -2361,30 +2480,63 @@ func (m Model) dashboardListBudget() int {
 	return max(3, m.softOverlayBodyBudget()-dashboardHeaderRows)
 }
 
-// dashboardOverlay renders the full fleet dashboard: a summary line
-// (counts by status plus aggregate CPU/memory/network, see fleetSummary),
-// a column header, then one row per running container with a name, state,
-// and a compact CPU/Mem/Net sparkline each — deliberately sized far wider
-// than every other overlay (m.width-4 instead of the usual m.width-8-ish
-// cap) since the point of this screen is showing as much of the fleet at
-// once as the terminal actually allows, not a small centered dialog.
-func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
-	width := max(70, m.width-4)
-	contentWidth := width - 4
-	summary := m.fleetSummary()
+// dashboardWarnPct/dashboardCritPct are the absolute utilization
+// thresholds the whole Dashboard uses to decide when a CPU/memory number
+// stops being "just information" and starts being worth a warning color.
+// This is the fix for the redesign's core complaint: the pre-redesign
+// version colored every graph via statHeatColor's *relative* gradient —
+// each sample's level relative to that one container's own historical
+// max — so a container quietly parked at 0.4% memory but sitting at its
+// own all-time peak lit up the same hot orange/red as a container
+// actually exhausting its limit. Comparing against fixed, absolute
+// percentages instead means low utilization reliably looks low no matter
+// how flat that container's own history happens to be.
+const (
+	dashboardWarnPct = 70.0
+	dashboardCritPct = 90.0
+)
 
-	lines := []string{
-		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary), contentWidth),
-		renderer.Styles.DetailMeta.Render(strings.Repeat("─", contentWidth)),
-		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
+// dashboardThresholdColor is neutral below dashboardWarnPct, amber from
+// there to dashboardCritPct, and red at/above it — reusing the exact
+// colors statusLegendEntries already assigns to "restarting" and
+// "dead/unhealthy" so a hot CPU/memory number reads as the same kind of
+// trouble as a stopped container, not a different color language.
+func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color {
+	switch {
+	case pct >= dashboardCritPct:
+		return "#e06c75"
+	case pct >= dashboardWarnPct:
+		return "#e5c07b"
+	default:
+		return neutral
 	}
+}
 
+// dashboardStatusWords labels dashboardSummaryLine's per-status counts —
+// mirrors statusLegendEntries' glyph set exactly (see its own doc
+// comment) so the header never drifts out of sync with what the tree/
+// inspector panes and the Problems pane already call each state.
+var dashboardStatusWords = map[string]string{
+	"●": "RUNNING",
+	"▲": "RESTARTING",
+	"○": "STOPPED",
+	"✖": "DEAD",
+	"!": "UNHEALTHY",
+}
+
+// dashboardRunningContainers returns every running container sorted by
+// display name (dashboardOverlay's order today; Compose-project grouping
+// is a natural next step once it can be designed properly — see the
+// package's goal #8 notes — but the sort lives in exactly one place so
+// swapping it for a grouped order later only touches this function) plus
+// how many non-running containers exist, matching fleetSummary/
+// statusGlyph's own running/not-running split so the Dashboard and
+// Problems pane never disagree about what counts as "stopped."
+func (m Model) dashboardRunningContainers() (running []domain.Container, stopped int) {
 	containers := m.snapshotContainers()
 	sort.Slice(containers, func(i, j int) bool {
 		return containers[i].DisplayName() < containers[j].DisplayName()
 	})
-	var running []domain.Container
-	stopped := 0
 	for _, ctr := range containers {
 		if ctr.IsRunning() {
 			running = append(running, ctr)
@@ -2392,31 +2544,123 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			stopped++
 		}
 	}
+	return running, stopped
+}
 
-	budget := m.dashboardListBudget()
-	shown := running
-	more := 0
-	if len(running) > budget {
-		cut := max(0, budget-1) // leave a line for the "N more" indicator itself
-		shown, more = running[:cut], len(running)-cut
+// dashboardVisiblePlan trims running down to what budget rows can show,
+// reserving exactly one of those rows for a "N more" indicator the moment
+// it doesn't all fit.
+func dashboardVisiblePlan(running []domain.Container, budget int) (shown []domain.Container, more int) {
+	if len(running) <= budget {
+		return running, 0
 	}
-	for _, ctr := range shown {
-		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, ctr, contentWidth), contentWidth))
+	cut := max(0, budget-1)
+	return running[:cut], len(running) - cut
+}
+
+// dashboardBodyPlan is the single source of truth for which running
+// containers dashboardOverlay shows, how many are hidden behind "N more",
+// and which body-content line (0-based, before the blank+hints lines
+// RenderSoftBody appends) ends up holding the bottom status row — shared
+// by dashboardOverlay's render and dashboardHitTest's mouse mapping so
+// the two can never disagree about which line is which.
+func (m Model) dashboardBodyPlan() (shown []domain.Container, more, stopped, statusLineIdx, totalLines int) {
+	running, stopped := m.dashboardRunningContainers()
+	budget := m.dashboardListBudget()
+	shown, more = dashboardVisiblePlan(running, budget)
+	statusLineIdx = dashboardHeaderRows + len(shown)
+	if more > 0 || len(shown) == 0 {
+		statusLineIdx++
+	}
+	totalLines = statusLineIdx + 1
+	return shown, more, stopped, statusLineIdx, totalLines
+}
+
+// dashboardOverlay renders the full fleet dashboard: a header line
+// (status counts plus aggregate CPU/memory/network, see fleetSummary), a
+// column header, one row per running container, and a bottom status row
+// that only turns into a warning when something actually needs attention
+// (see dashboardProblemsRow) — deliberately sized far wider than every
+// other overlay (m.width-4 instead of the usual m.width-8-ish cap) since
+// the point of this screen is showing as much of the fleet at once as the
+// terminal actually allows, not a small centered dialog.
+func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := max(70, m.width-4)
+	contentWidth := width - 4
+	summary := m.fleetSummary()
+
+	lines := []string{
+		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
+		renderer.Styles.DetailMeta.Render(strings.Repeat("─", contentWidth)),
+		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
+	}
+
+	shown, more, stopped, _, _ := m.dashboardBodyPlan()
+	cursor := clamp(m.dashboardCursor, 0, max(0, len(shown)-1))
+	for i, ctr := range shown {
+		selected := len(shown) > 0 && i == cursor
+		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, ctr, contentWidth, selected), contentWidth))
 	}
 	switch {
-	case len(running) == 0:
-		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render("No running containers."), contentWidth))
 	case more > 0:
 		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more running container(s)", more)), contentWidth))
+	case len(shown) == 0:
+		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render("No running containers."), contentWidth))
 	}
-	if stopped > 0 {
-		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render(fmt.Sprintf("+%d stopped/dead — p for Problems", stopped)), contentWidth))
-	}
+	lines = append(lines, dashboardPadLine(renderer, m.dashboardProblemsRow(renderer, stopped, contentWidth), contentWidth))
 
 	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n")+"\n\n"+
-		renderer.RenderSoftHints(contentWidth, tideui.SoftHint{Key: "esc/d/q", Label: "close"}))
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "esc/d/q", Label: "close"},
+			tideui.SoftHint{Key: "↑↓/jk", Label: "select"},
+			tideui.SoftHint{Key: "enter", Label: "open"},
+		))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "dashboard", Content: content, Width: width})
 	return &overlay
+}
+
+// dashboardHitTest maps a mouse click's screen coordinates back to a
+// container row index (or the bottom status row). Rather than
+// hand-deriving where tideui centers the overlay's box on screen (the
+// app's own topbar can wrap onto a second line depending on host name/
+// project-count text length, which shifts everything below it by a row
+// in a way that isn't knowable without actually measuring it), this
+// re-renders the real view and locates the box's own top border by its
+// title text — the exact same chrome RenderSoftPanel/RenderSoftBody (see
+// that module's soft_panel.go) build around dashboardBodyPlan's lines, so
+// the offsets below only need to account for what comes *after* that
+// anchor, not everything above it.
+func (m Model) dashboardHitTest(msg tea.MouseMsg) (rowIndex int, isStatusRow, ok bool) {
+	shown, _, _, statusLineIdx, _ := m.dashboardBodyPlan()
+	panelWidth := max(70, m.width-4)
+	contentWidth := panelWidth - 4
+
+	boxTop, boxLeft := -1, -1
+	for y, line := range strings.Split(m.View(), "\n") {
+		plain := ansi.Strip(line)
+		if idx := strings.Index(plain, "whatthedock · dashboard"); idx >= 0 {
+			boxTop = y
+			boxLeft = strings.Index(plain, "╭")
+			break
+		}
+	}
+	if boxTop < 0 || boxLeft < 0 {
+		return 0, false, false
+	}
+	bodyTop := boxTop + 2   // top border line + RenderSoftBody's blank top pad
+	bodyLeft := boxLeft + 3 // border(1) + RenderSoftBody's own left pad(2)
+
+	if msg.X < bodyLeft || msg.X >= bodyLeft+contentWidth {
+		return 0, false, false
+	}
+	y := msg.Y - bodyTop
+	switch {
+	case y >= dashboardHeaderRows && y < dashboardHeaderRows+len(shown):
+		return y - dashboardHeaderRows, false, true
+	case y == statusLineIdx:
+		return 0, true, true
+	}
+	return 0, false, false
 }
 
 // dashboardPadLine is the belt-and-suspenders fix for a bug reported live
@@ -2442,36 +2686,89 @@ func dashboardPadLine(renderer tideui.Renderer, line string, width int) string {
 	return line
 }
 
-// dashboardSummaryLine renders the fleet-wide rollup: counts by status
-// (statusLegendEntries' own glyphs/colors/order, skipping any status with
-// a zero count so the line doesn't pad itself out with "0 dead" noise)
-// followed by aggregate CPU/memory/network across running containers.
-// Every separator/gap is rendered through an explicit Background+Foreground
-// style, and (like dashboardRow) the result is never re-wrapped in an
-// outer Style.Width().Render() call — see dashboardRow's doc comment for
-// why that combination corrupts already-ANSI content.
-func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardSummary) string {
+// dashboardSummaryLine is the Dashboard's header: status counts (running
+// always shown; stopped/dead/restarting/unhealthy only when non-zero, and
+// colored via the exact same statusLegendEntries palette as the tree/
+// Problems pane) followed by aggregate CPU/RAM/network. CPU and RAM stay
+// neutral text unless the fleet-wide aggregate actually crosses
+// dashboardWarnPct/dashboardCritPct (see that constant's doc comment).
+// Status counts are never dropped for space — the panel floors at 70
+// columns wide (66 of content), which is always enough room for them —
+// but CPU/RAM/network are appended only while they still fit, in that
+// priority order, so a narrow terminal loses the least-important
+// information first instead of overflowing or wrapping mid-panel.
+func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardSummary, width int) string {
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	plain := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(baseFg)
+	bg := renderer.Styles.Theme.Bg
+	plain := lipgloss.NewStyle().Background(bg).Foreground(baseFg)
 	sep := plain.Render("   ")
 
-	bg := renderer.Styles.Theme.Bg
-	parts := make([]string, 0, len(statusLegendEntries)+1)
-	for _, entry := range statusLegendEntries {
-		if count := summary.counts[entry.glyph]; count > 0 {
-			// See dashboardRow's doc comment on its own glyph: foregroundSpan
-			// never sets a background, so each count+glyph pair needs its
-			// own explicit outer Background wrap here too, or it falls
-			// through to the terminal's default the moment the preceding
-			// separator's own Render call resets — reported live as the
-			// summary counts having the wrong background.
-			parts = append(parts, lipgloss.NewStyle().Background(bg).Render(foregroundSpan(fmt.Sprintf("%d %s", count, entry.glyph), entry.color, baseFg, false)))
-		}
+	type segment struct {
+		rendered string
+		plain    string
 	}
-	stats := fmt.Sprintf("CPU %.1f%%  Mem %s  Net %s/s down %s/s up",
-		summary.totalCPU, formatMemFraction(summary.memUsed, summary.memLimit),
-		formatBytes(summary.netRxRate), formatBytes(summary.netTxRate))
-	return strings.Join(parts, sep) + sep + plain.Render(stats)
+
+	var counts []segment
+	for _, entry := range statusLegendEntries {
+		count := summary.counts[entry.glyph]
+		if entry.glyph != "●" && count == 0 {
+			continue
+		}
+		text := fmt.Sprintf("%s %d %s", entry.glyph, count, dashboardStatusWords[entry.glyph])
+		// See dashboardRow's doc comment on its own glyph: foregroundSpan
+		// never sets a background, so each count+glyph pair needs its own
+		// explicit outer Background wrap here too, or it falls through to
+		// the terminal's default the moment the preceding separator's own
+		// Render call resets — reported live as the summary counts having
+		// the wrong background.
+		counts = append(counts, segment{
+			rendered: lipgloss.NewStyle().Background(bg).Render(foregroundSpan(text, entry.color, baseFg, false)),
+			plain:    text,
+		})
+	}
+
+	// totalCPU is a *sum* of each running container's own CPUPercent (see
+	// fleetSummary), not a value bounded to 0-100 the way a single
+	// container's CPU% or RAM's used/limit fraction is — a fleet of a
+	// dozen ordinary containers can trivially sum past 70-90 without any
+	// of them individually being hot. Applying dashboardThresholdColor to
+	// it would flag amber/red for a perfectly healthy fleet just because
+	// it has several containers, which is exactly the "alarming a normal
+	// metric" failure mode this redesign is trying to avoid — so the
+	// aggregate stays neutral here even though the per-row CPU number
+	// (a real single-container percentage) does use the threshold.
+	cpuText := fmt.Sprintf("CPU %.1f%%", summary.totalCPU)
+	cpuSeg := segment{rendered: plain.Render(cpuText), plain: cpuText}
+
+	ramColor := baseFg
+	if summary.memLimit > 0 {
+		ramColor = dashboardThresholdColor(float64(summary.memUsed)/float64(summary.memLimit)*100, baseFg)
+	}
+	ramText := "RAM " + formatMemFraction(summary.memUsed, summary.memLimit)
+	ramSeg := segment{rendered: lipgloss.NewStyle().Background(bg).Foreground(ramColor).Render(ramText), plain: ramText}
+
+	netText := fmt.Sprintf("↓%s ↑%s", formatCompactBytes(summary.netRxRate), formatCompactBytes(summary.netTxRate))
+	netSeg := segment{rendered: plain.Render(netText), plain: netText}
+
+	var parts []string
+	lineWidth := 0
+	for _, s := range counts {
+		if lineWidth > 0 {
+			parts = append(parts, sep)
+			lineWidth += 3
+		}
+		parts = append(parts, s.rendered)
+		lineWidth += lipgloss.Width(s.plain)
+	}
+	for _, s := range []segment{cpuSeg, ramSeg, netSeg} {
+		add := lipgloss.Width(s.plain) + 3
+		if lineWidth+add > width {
+			continue
+		}
+		parts = append(parts, sep, s.rendered)
+		lineWidth += add
+	}
+	return ansi.Truncate(strings.Join(parts, ""), width, "")
 }
 
 func formatMemFraction(used, limit uint64) string {
@@ -2481,70 +2778,111 @@ func formatMemFraction(used, limit uint64) string {
 	return formatBytes(used) + " / " + formatBytes(limit)
 }
 
-// dashboardColumns computes the fixed widths dashboardHeaderRow and
-// dashboardRow both share: a name column that gets whatever's left after
-// state glyph + three CPU/Mem/Net columns (each a right-aligned number
-// plus a mini sparkline) reserve their own space. Below dashboardMinSparkWidth
-// a column keeps its number but drops the sparkline entirely — graceful
-// degradation on a narrow terminal instead of overlapping/garbled columns.
-type dashboardColumns struct {
-	nameWidth  int
-	numWidth   int
-	sparkWidth int
-	showSpark  bool
+// dashboardTier picks how much visual detail a container row can afford:
+// narrow terminals get bare numbers, medium adds a CPU sparkline and a
+// memory meter, wide splits network into separate down/up columns with
+// their own trends. The breakpoints were chosen (and tested) against
+// roughly the 90/110/140/180-column terminals this redesign's test matrix
+// calls out.
+type dashboardTier int
+
+const (
+	dashboardTierNarrow dashboardTier = iota
+	dashboardTierMedium
+	dashboardTierWide
+)
+
+const (
+	dashboardNarrowBreak = 90
+	dashboardMediumBreak = 130
+)
+
+func dashboardTierFor(width int) dashboardTier {
+	switch {
+	case width < dashboardNarrowBreak:
+		return dashboardTierNarrow
+	case width < dashboardMediumBreak:
+		return dashboardTierMedium
+	default:
+		return dashboardTierWide
+	}
 }
 
-const dashboardMinSparkWidth = 8
+// dashboardColumns computes the widths dashboardHeaderRow and dashboardRow
+// both share, so header labels can never drift out of alignment with the
+// numbers/graphics they label (see TestDashboardHeaderRowAlignsWithRowNumbers).
+// A zero-value *Width field means "that visualization is dropped, number
+// only" — dashboardTierNarrow zeroes all three; medium adds cpuSparkW/
+// memMeterW; wide adds netSparkW and splits net into two columns.
+type dashboardColumns struct {
+	tier        dashboardTier
+	nameWidth   int
+	pctWidth    int
+	cpuSparkW   int
+	memMeterW   int
+	netColWidth int // combined "↓X ↑Y" width, used when !splitNet
+	netSparkW   int // per-direction trend width, used when splitNet
+	splitNet    bool
+}
 
-// dashboardNumWidth fits every number these columns actually produce —
-// "100.0%", "38.1%", and formatRateCompact's longest realistic output
-// ("999.9M/s") — with a little room to spare, so dashboardMetricColumn
-// never has to truncate a number (it doesn't; going over numWidth just
-// pushes that one row's sparkline column out of alignment, which is the
-// lesser evil versus silently cutting a number off).
-const dashboardNumWidth = 9
+const (
+	dashboardRailWidth   = 2 // selection marker (tideui.Renderer.SoftRail)
+	dashboardPctWidth    = 6 // "100.0%"
+	dashboardMeterWidth  = 10
+	dashboardNetNumWidth = 6 // e.g. "46.1K", "348B" — no "/s", the ↓/↑ glyph already implies "rate"
+	dashboardMinSparkW   = 6
+	dashboardColGap      = 2
+)
+
+// dashboardNarrowBaseline/dashboardMediumBaseline/dashboardWideBaseline
+// are each tier's fixed (non-sparkline) row width, hand-derived to match
+// dashboardRow's actual construction exactly — see that function's own
+// doc comment for the full column-by-column accounting. Any drift between
+// these constants and dashboardRow's real layout can only make a row
+// *narrower* than its budget (dashboardPadLine then pads the gap), never
+// wider — dashboardRow's own trailing ansi.Truncate is the hard backstop
+// against ever exceeding width — and TestDashboardRowNeverExceedsWidth
+// checks the real, rendered output directly rather than trusting this
+// arithmetic in isolation.
+const (
+	dashboardNarrowBaseline = dashboardPctWidth + dashboardColGap + dashboardPctWidth + dashboardColGap
+	dashboardMediumBaseline = dashboardPctWidth + dashboardColGap + dashboardColGap + dashboardPctWidth + dashboardColGap + dashboardMeterWidth + dashboardColGap + (2*(1+dashboardNetNumWidth) + 1)
+	dashboardWideBaseline   = dashboardPctWidth + dashboardColGap + dashboardColGap + dashboardPctWidth + dashboardColGap + dashboardMeterWidth + dashboardColGap + 2*(1+1+dashboardNetNumWidth) + 1 + 3 + 1
+)
 
 // dashboardColumnsFor's fixed prefix must equal exactly what dashboardRow
-// spends before its three metric columns start — nameWidth, the 2-space
-// gap after the name, the glyph itself (1 visible rune), and the space
-// after it — 4, not padded out further. A mismatch here previously left
-// every row a few columns short of the panel's actual width; combined
-// with dashboardPadLine (the belt-and-suspenders fix for that class of
-// bug generally) this keeps the columns as wide as the terminal actually
-// allows instead of leaving width on the table.
+// spends before its three metric columns start — the selection rail, the
+// name column, a gap, the glyph itself, and a gap. A mismatch here
+// previously left every row a few columns short of the panel's actual
+// width; combined with dashboardPadLine (the belt-and-suspenders fix for
+// that class of bug generally) this keeps the columns as wide as the
+// terminal actually allows instead of leaving width on the table.
 func (m Model) dashboardColumnsFor(width int) dashboardColumns {
-	const namePrefixWidth = 4 // "  " + glyph + " "
-	const gap = 2
+	tier := dashboardTierFor(width)
 	nameWidth := 22
-	fixed := nameWidth + namePrefixWidth
+	fixed := dashboardRailWidth + nameWidth + dashboardColGap + 1 /*glyph*/ + dashboardColGap
 	remaining := max(0, width-fixed)
-	// Integer division here can leave 0-2 columns of remaining unspent
-	// (remaining%3) — deliberately not chased further than this: rather
-	// than fold that remainder into one column asymmetrically,
-	// dashboardPadLine (see dashboardOverlay) pads any line that ends up
-	// short of the panel's real width regardless of the exact cause, so
-	// a couple of unused columns here just becomes a couple of extra
-	// background-colored spaces at the row's right edge — never an
-	// unstyled gap.
-	perCol := remaining / 3
-	sparkWidth := perCol - dashboardNumWidth - gap
-	showSpark := sparkWidth >= dashboardMinSparkWidth
-	if !showSpark {
-		sparkWidth = 0
-	}
-	return dashboardColumns{nameWidth: nameWidth, numWidth: dashboardNumWidth, sparkWidth: sparkWidth, showSpark: showSpark}
-}
 
-// dashboardColumnWidth is one CPU/Mem/Net column's total visible width —
-// the same numWidth+space+sparkWidth+space (or just numWidth+2 with no
-// sparkline) shape dashboardMetricColumn actually renders, so the header
-// label lines up with real data instead of a naive full-width label that
-// sits over the sparkline area instead of the number.
-func dashboardColumnWidth(cols dashboardColumns) int {
-	if cols.showSpark {
-		return cols.numWidth + 2 + cols.sparkWidth
+	cols := dashboardColumns{tier: tier, nameWidth: nameWidth, pctWidth: dashboardPctWidth}
+	switch tier {
+	case dashboardTierNarrow:
+		cols.netColWidth = max(8, remaining-dashboardNarrowBaseline)
+	case dashboardTierMedium:
+		cols.memMeterW = dashboardMeterWidth
+		cols.netColWidth = 2*(1+dashboardNetNumWidth) + 1
+		if spark := remaining - dashboardMediumBaseline; spark >= dashboardMinSparkW {
+			cols.cpuSparkW = min(spark, 16)
+		}
+	case dashboardTierWide:
+		cols.memMeterW = dashboardMeterWidth
+		cols.splitNet = true
+		if leftover := max(0, remaining-dashboardWideBaseline); leftover/3 >= dashboardMinSparkW {
+			spark := min(leftover/3, 24)
+			cols.cpuSparkW = spark
+			cols.netSparkW = spark
+		}
 	}
-	return cols.numWidth + 2
+	return cols
 }
 
 func padRunes(s string, n int) string {
@@ -2563,119 +2901,331 @@ func rightAlignRunes(s string, n int) string {
 	return strings.Repeat(" ", n-len(r)) + s
 }
 
-// dashboardHeaderRow builds "Name"/"CPU"/"Mem"/"Net" labels positioned to
-// match dashboardRow's real column layout exactly: the name column is the
-// same width, and each metric label is right-aligned within just
-// numWidth (where dashboardMetricColumn right-aligns its number too),
-// leaving the sparkline portion of that column blank — labeling the
-// number's own slot, not the whole (much wider) column.
-func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
-	cols := m.dashboardColumnsFor(width)
-	colWidth := dashboardColumnWidth(cols)
-	metricLabel := func(label string) string {
-		return padRunes(rightAlignRunes(label, cols.numWidth), colWidth)
+// truncateEllipsis shortens name to at most width runes, replacing the
+// last one with "…" once it doesn't fit — short() elsewhere in this file
+// truncates silently, which is fine for the compact IDs/hashes it's used
+// for, but a container name cut off mid-word with no indicator reads as a
+// rendering bug rather than "there's more here."
+func truncateEllipsis(name string, width int) string {
+	r := []rune(name)
+	if len(r) <= width {
+		return name
 	}
-	header := padRunes("Name", cols.nameWidth) + "  " + "  " +
-		metricLabel("CPU") + metricLabel("Mem") + metricLabel("Net")
-	return renderer.Styles.DetailMeta.Width(width).Render(header)
+	if width <= 1 {
+		if width <= 0 {
+			return ""
+		}
+		return string(r[:width])
+	}
+	return string(r[:width-1]) + "…"
 }
 
-// dashboardRow renders one running container's line: state glyph, name,
-// then CPU/Mem/Net as a right-aligned number plus a mini sparkline built
-// straight from the same m.statsHistory the single-container Stats pane
+// dashboardHeaderRow builds "CPU"/"MEM"/"NET" labels positioned to match
+// dashboardRow's real column layout exactly: CPU/MEM are right-aligned
+// within just pctWidth (where dashboardRow right-aligns its own numbers
+// too), leaving any sparkline/meter portion of that column blank —
+// labeling the number's own slot, not the whole column. NET is a group
+// label over the whole network area (one or two sub-columns) rather than
+// per-direction, matching the "Network" column header in the redesign's
+// own visual target.
+func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
+	cols := m.dashboardColumnsFor(width)
+	bg := renderer.Styles.Theme.Bg
+	style := renderer.Styles.DetailMeta.Copy().Background(bg)
+
+	prefix := strings.Repeat(" ", dashboardRailWidth+cols.nameWidth+dashboardColGap+1+dashboardColGap)
+	cpu := rightAlignRunes("CPU", cols.pctWidth)
+	if cols.cpuSparkW > 0 {
+		cpu += strings.Repeat(" ", dashboardColGap+cols.cpuSparkW)
+	}
+	mem := rightAlignRunes("MEM", cols.pctWidth)
+	if cols.memMeterW > 0 {
+		mem += strings.Repeat(" ", dashboardColGap+cols.memMeterW)
+	}
+	netWidth := cols.netColWidth
+	if cols.splitNet {
+		netWidth = 2*(2+dashboardNetNumWidth+1+cols.netSparkW) + 3
+	}
+	net := padRunes("NET", netWidth)
+
+	header := prefix + cpu + strings.Repeat(" ", dashboardColGap) + mem + strings.Repeat(" ", dashboardColGap) + net
+	return ansi.Truncate(style.Render(header), width, "")
+}
+
+// dashboardRow renders one running container's line: a selection rail,
+// name (ellipsis-truncated if it doesn't fit), state glyph, then CPU/Mem/
+// Net built from the same m.statsHistory the single-container Stats pane
 // already populates — Dashboard's own polling loop (dashboardRefreshCmd)
 // just makes sure history exists for every running container, not only
 // the selected one.
 //
-// Every plain-text segment (name, gaps, the padded number) is rendered
-// through plain (an explicit Background+Foreground style), and the whole
-// row is returned with NO further Width()-based wrapping applied on top —
-// calling an outer Style.Width().Render() on a string that already
-// contains other segments' own embedded ANSI resets (glyph, the
-// sparkline) mis-measures/reflows it, leaving stretches of the row on
-// whatever background the terminal happens to default to instead of the
-// theme's own — this was reported live as random-colored boxes in the
-// Mem/Net columns on a real terminal, the same root cause as the About
-// screen's earlier "ship animation renders as solid black" bug fixed
-// elsewhere this session (about_ship.go) and the exact failure mode
-// renderStatRow's own doc comment already warns about.
-func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int) string {
+// CPU and memory deliberately share the same "number, then a small
+// visualization" shape (a sparkline for CPU, a meter for memory) instead
+// of the old mismatched "near-empty line vs. huge heatmap" look, and
+// every color here comes from dashboardThresholdColor's absolute
+// percentage cutoffs rather than any per-container relative scale — see
+// dashboardWarnPct's doc comment for why that distinction is the point of
+// this redesign. Column layout: rail(2) name(nameWidth) gap(2) glyph(1)
+// gap(2) [cpuNum(pctWidth) [gap(2) cpuSpark]] gap(2) [memNum(pctWidth)
+// [gap(2) memMeter]] gap(2) net — see dashboardNarrowBaseline/
+// dashboardMediumBaseline/dashboardWideBaseline for the exact per-tier
+// accounting that must stay in sync with this.
+//
+// Every plain-text segment is rendered through plain (an explicit
+// Background+Foreground style), and the whole row is returned with NO
+// further Width()-based wrapping applied on top — calling an outer
+// Style.Width().Render() on a string that already contains other
+// segments' own embedded ANSI resets (glyph, sparklines, the meter)
+// mis-measures/reflows it, leaving stretches of the row on whatever
+// background the terminal happens to default to instead of the theme's
+// own — this was reported live as random-colored boxes in the Mem/Net
+// columns on a real terminal. ansi.Truncate at the end is a hard backstop
+// against ever exceeding width, independent of the column math above.
+func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int, selected bool) string {
 	cols := m.dashboardColumnsFor(width)
 	history := m.statsHistory[ctr.ID]
 	stats := history.lastStats
 
-	bg := renderer.Styles.Theme.Bg
+	rowBg := renderer.Styles.Theme.Bg
+	if selected {
+		if c, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
+			rowBg = c
+		}
+	}
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	plain := lipgloss.NewStyle().Background(bg).Foreground(baseFg)
+	plain := lipgloss.NewStyle().Background(rowBg).Foreground(baseFg)
 
+	rail := renderer.SoftRail(selected, rowBg)
 	// foregroundSpan only ever sets foreground (see its own doc comment) —
-	// it's meant to sit inside one continuous outer-styled Render call
-	// (e.g. renderInspectorField wrapping its whole row through RenderRow
-	// once), not standalone between independently-`.Render()`ed segments
-	// the way this row composes everything. Each of those independent
-	// Render calls emits its own trailing reset, so without this explicit
-	// outer Background wrap the glyph's cell falls through to the
-	// terminal's own default background the moment the segment before it
-	// resets — reported live as the status glyphs having the wrong
-	// background color.
-	glyph := lipgloss.NewStyle().Background(bg).Render(foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false))
-	name := short(ctr.DisplayName(), cols.nameWidth)
-	name = plain.Render(name + strings.Repeat(" ", max(0, cols.nameWidth-len([]rune(name)))))
+	// it's meant to sit inside one continuous outer-styled Render call,
+	// not standalone between independently-`.Render()`ed segments the way
+	// this row composes everything. Each of those independent Render
+	// calls emits its own trailing reset, so without this explicit outer
+	// Background wrap the glyph's cell falls through to the terminal's
+	// own default background the moment the segment before it resets —
+	// reported live as the status glyphs having the wrong background
+	// color.
+	glyph := lipgloss.NewStyle().Background(rowBg).Render(foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false))
+	name := plain.Render(padRunes(truncateEllipsis(ctr.DisplayName(), cols.nameWidth), cols.nameWidth))
 
-	cpuGraph := cpuStatGraph(stats, history)
-	memGraph := uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta)
-	netGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta)
-
-	cpuCol := m.dashboardMetricColumn(renderer, cols, fmt.Sprintf("%.1f%%", statsCPU(stats)), cpuGraph, "#7dcfff")
-	memPct := "n/a"
-	if stats != nil && stats.MemoryLimit > 0 {
-		memPct = fmt.Sprintf("%.1f%%", float64(stats.MemoryUsage)/float64(stats.MemoryLimit)*100)
-	} else if stats != nil {
-		memPct = formatCompactBytes(stats.MemoryUsage)
+	cpuPct := statsCPU(stats)
+	cpuNum := plain.Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
+	cpuPart := cpuNum
+	if cols.cpuSparkW > 0 {
+		color := dashboardThresholdColor(cpuPct, "#7dcfff")
+		cpuPart += plain.Render("  ") + dashboardSpark(renderer, m.settings, cpuStatGraph(stats, history), color, cols.cpuSparkW, rowBg)
 	}
-	memCol := m.dashboardMetricColumn(renderer, cols, memPct, memGraph, "#80c990")
-	netRate := "n/a"
-	if len(history.NetworkRx) > 0 || len(history.NetworkTx) > 0 {
-		var rx, tx uint64
-		if len(history.NetworkRx) > 0 {
-			rx = history.NetworkRx[len(history.NetworkRx)-1]
-		}
-		if len(history.NetworkTx) > 0 {
-			tx = history.NetworkTx[len(history.NetworkTx)-1]
-		}
-		netRate = formatRateCompact(rx + tx)
-	}
-	netCol := m.dashboardMetricColumn(renderer, cols, netRate, netGraph, "#8aadf4")
 
-	return name + plain.Render("  ") + glyph + plain.Render(" ") + cpuCol + memCol + netCol
+	memPct, hasLimit, memText := 0.0, false, "n/a"
+	switch {
+	case stats != nil && stats.MemoryLimit > 0:
+		memPct = float64(stats.MemoryUsage) / float64(stats.MemoryLimit) * 100
+		hasLimit = true
+		memText = fmt.Sprintf("%.1f%%", memPct)
+	case stats != nil:
+		memText = formatCompactBytes(stats.MemoryUsage)
+	}
+	memPart := plain.Render(rightAlignRunes(memText, cols.pctWidth))
+	if cols.memMeterW > 0 {
+		memPart += plain.Render("  ") + dashboardMemMeter(renderer, m.settings, memPct, hasLimit, cols.memMeterW, rowBg)
+	}
+
+	var rx, tx uint64
+	if len(history.NetworkRx) > 0 {
+		rx = history.NetworkRx[len(history.NetworkRx)-1]
+	}
+	if len(history.NetworkTx) > 0 {
+		tx = history.NetworkTx[len(history.NetworkTx)-1]
+	}
+
+	var netPart string
+	if cols.splitNet {
+		rxGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(rx), formatByteDelta)
+		txGraph := uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(tx), formatByteDelta)
+		down := plain.Render("↓ " + rightAlignRunes(formatCompactBytes(rx), dashboardNetNumWidth))
+		up := plain.Render("↑ " + rightAlignRunes(formatCompactBytes(tx), dashboardNetNumWidth))
+		netPart = down + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, rxGraph, cols.netSparkW, rowBg) +
+			plain.Render("   ") + up + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, txGraph, cols.netSparkW, rowBg)
+	} else {
+		combined := fmt.Sprintf("↓%s ↑%s", formatCompactBytes(rx), formatCompactBytes(tx))
+		netPart = plain.Render(padRunes(combined, cols.netColWidth))
+	}
+
+	row := rail + name + plain.Render("  ") + glyph + plain.Render("  ") +
+		cpuPart + plain.Render("  ") + memPart + plain.Render("  ") + netPart
+	return ansi.Truncate(row, width, "")
 }
 
-// dashboardMetricColumn right-pads number to numWidth and appends a mini
-// sparkline (padded to sparkWidth with explicit-background spaces —
-// renderSparkline only emits one glyph per history sample, so a container
-// with less history than sparkWidth needs explicit padding to keep every
-// row's columns aligned) — or nothing, once dashboardColumnsFor decided
-// the terminal's too narrow for one. number and every gap around it are
-// rendered through an explicit Background+Foreground style (never left as
-// bare unstyled text) — see dashboardRow's doc comment for why that
-// matters here specifically.
-func (m Model) dashboardMetricColumn(renderer tideui.Renderer, cols dashboardColumns, number string, graph statGraph, color lipgloss.Color) string {
-	bg := renderer.Styles.Theme.Bg
-	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	plain := lipgloss.NewStyle().Background(bg).Foreground(baseFg)
+// dashboardGaugeBar mirrors renderGaugeBar's graphStyleGauge look — a
+// single thin proportional bar: "━" filled, one "╸" leading-edge cap at
+// the fill boundary, "─" for the remainder — so picking that Graph style
+// in Settings gives the Dashboard the same shape it gives the
+// single-container Stats pane. Unlike renderGaugeBar, color is a plain
+// caller-supplied value rather than being derived from
+// settings.GraphColor/statHeatColor's relative gradient: see
+// dashboardWarnPct's doc comment for why the Dashboard's colors stay on
+// the absolute-threshold scale regardless of that setting.
+func dashboardGaugeBar(renderer tideui.Renderer, frac float64, color lipgloss.Color, width int, bg lipgloss.Color) string {
+	width = max(1, width)
+	if frac < 0 {
+		frac = 0
+	} else if frac > 1 {
+		frac = 1
+	}
+	filled := clamp(int(frac*float64(width)+0.5), 0, width)
+	dim := renderer.Styles.Theme.Dimmed
+	switch {
+	case filled <= 0:
+		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
+	case filled >= width:
+		return lipgloss.NewStyle().Background(bg).Foreground(color).Bold(true).Render(strings.Repeat("━", width))
+	default:
+		fill := lipgloss.NewStyle().Background(bg).Foreground(color).Bold(true).Render(strings.Repeat("━", filled-1) + "╸")
+		rest := lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width-filled))
+		return fill + rest
+	}
+}
 
-	numberPadded := number
-	if n := cols.numWidth - len([]rune(number)); n > 0 {
-		numberPadded = strings.Repeat(" ", n) + number
+// dashboardMemMeter draws the memory column's visualization. With
+// settings.GraphStyle == graphStyleGauge it's a single proportional
+// dashboardGaugeBar (matching what that style does everywhere else in the
+// app); otherwise it's a restrained "█"/"░" meter filled proportional to
+// sqrt(pct/100) rather than pct/100 directly — real container memory
+// usage is very often single-digit percentages, and a linear 0-100% meter
+// would render nearly every healthy container as entirely empty,
+// indistinguishable from 0% and useless for at-a-glance comparison across
+// a fleet. The square-root curve keeps low values visually distinct (0.4%
+// and 2.7% land on 1 and 2 filled cells of 10 respectively, matching this
+// redesign's own worked examples) while still saturating sensibly as
+// usage climbs toward its limit. Either shape colors via
+// dashboardThresholdColor, never settings.GraphColor's relative gradient
+// (see dashboardWarnPct's doc comment). hasLimit false (no memory limit
+// reported) falls back to a dim dashed line — the same "unknown, not
+// necessarily bad" treatment dashboardNetSpark gives zero traffic —
+// rather than guessing a color.
+func dashboardMemMeter(renderer tideui.Renderer, settings appSettings, pct float64, hasLimit bool, width int, bg lipgloss.Color) string {
+	width = max(0, width)
+	if width == 0 {
+		return ""
 	}
-	if !cols.showSpark {
-		return plain.Render(numberPadded + "  ")
+	dim := renderer.Styles.Theme.Dimmed
+	if !hasLimit {
+		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
 	}
-	spark := renderSparkline(renderer, m.settings, graph, color, cols.sparkWidth)
-	if pad := cols.sparkWidth - len([]rune(ansi.Strip(spark))); pad > 0 {
-		spark += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", pad))
+	color := dashboardThresholdColor(pct, "#80c990")
+	if settings.GraphStyle == graphStyleGauge {
+		return dashboardGaugeBar(renderer, pct/100, color, width, bg)
 	}
-	return plain.Render(numberPadded+" ") + spark + plain.Render(" ")
+	frac := pct / 100
+	if frac < 0 {
+		frac = 0
+	} else if frac > 1 {
+		frac = 1
+	}
+	filled := clamp(int(math.Sqrt(frac)*float64(width)+0.5), 0, width)
+	full := lipgloss.NewStyle().Background(bg).Foreground(color).Render(strings.Repeat("█", filled))
+	empty := lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("░", width-filled))
+	return full + empty
+}
+
+// dashboardSpark renders graph's values as a compact, single-color
+// sparkline using the caller's Graph style (settings.GraphStyle) for
+// glyph shape/spacing — graphGlyphs/graphGlyphSpacing are the exact same
+// functions the single-container Stats pane's own sparkline uses, so
+// Blocks/Braille/Bars/(the default) Wave all look the same style the user
+// picked in Settings. graphStyleGauge instead collapses to a single
+// dashboardGaugeBar for the latest value, matching that style's meaning
+// everywhere else in the app.
+//
+// What deliberately does NOT carry over from the shared renderSparkline
+// path is its coloring: statHeatColor scales each glyph's color by that
+// sample's level *relative to the container's own historical max* — a
+// container sitting near its own usual plateau glows the same hot orange/
+// red as one actually maxed out, regardless of how small that plateau is
+// in absolute terms. Every glyph here gets the one caller-supplied color
+// instead (see dashboardWarnPct's doc comment for why), so only the glyph
+// shapes vary with the data — activity reads as movement, not a color
+// show — and settings.GraphColor is never consulted.
+func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, color lipgloss.Color, width int, bg lipgloss.Color) string {
+	width = max(1, width)
+	if settings.GraphStyle == graphStyleGauge {
+		value, maxValue := 0.0, graph.maxValue
+		if len(graph.values) > 0 {
+			value = graph.values[len(graph.values)-1]
+		}
+		if maxValue <= 0 {
+			maxValue = 1
+		}
+		return dashboardGaugeBar(renderer, value/maxValue, color, width, bg)
+	}
+
+	glyphs := graphGlyphs(settings)
+	spacing := graphGlyphSpacing(settings)
+	unit := 1 + spacing
+	slots := max(1, width/unit)
+	gap := ""
+	if spacing > 0 {
+		gap = lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", spacing))
+	}
+	flatCell := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(glyphs[0]) + gap
+
+	if len(graph.values) == 0 || graph.maxValue <= 0 {
+		return strings.Repeat(flatCell, slots)
+	}
+	values := graph.values
+	if len(values) > slots {
+		values = values[len(values)-slots:]
+	}
+	var b strings.Builder
+	for _, v := range values {
+		level := clamp(int(v/graph.maxValue*float64(len(glyphs)-1)+0.5), 0, len(glyphs)-1)
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(color).Render(glyphs[level]) + gap)
+	}
+	if pad := slots - len(values); pad > 0 {
+		b.WriteString(strings.Repeat(flatCell, pad))
+	}
+	return b.String()
+}
+
+// dashboardNetSpark is dashboardSpark for network traffic specifically:
+// when the latest sample is zero (or there's no history yet), it renders
+// a flat dashed line instead of the style's own lowest glyph — "zero
+// traffic" and "very low but nonzero traffic" need to look different, and
+// a dim dash reads unambiguously as "quiet" rather than "chart with tiny
+// bars," regardless of which Graph style is selected (this also happens
+// to be exactly graphStyleGauge's own empty-bar look, so gauge style
+// needs no special-casing here at all).
+func dashboardNetSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, width int, bg lipgloss.Color) string {
+	width = max(1, width)
+	quiet := len(graph.values) == 0 || graph.maxValue <= 0 || graph.values[len(graph.values)-1] == 0
+	if quiet {
+		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(strings.Repeat("─", width))
+	}
+	return dashboardSpark(renderer, settings, graph, "#8aadf4", width, bg)
+}
+
+// dashboardProblemsRow is the Dashboard's bottom status/action row: a
+// warning naming how many containers need attention plus a clickable "p
+// View problems" hint when any exist (replacing the old easy-to-miss
+// inline "+N stopped/dead" text), or a quiet all-clear line when the
+// fleet is healthy — deliberately muted even then, so a healthy fleet
+// doesn't compete for attention with the rows above it.
+func (m Model) dashboardProblemsRow(renderer tideui.Renderer, stopped int, width int) string {
+	bg := renderer.Styles.Theme.Bg
+	if stopped == 0 {
+		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("✓ All monitored containers healthy")
+	}
+	noun, verb := "containers", "need"
+	if stopped == 1 {
+		noun, verb = "container", "needs"
+	}
+	left := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#e5c07b")).Bold(true).
+		Render(fmt.Sprintf("⚠ %d %s %s attention", stopped, noun, verb))
+	action := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Fg).Bold(true).Render("p") +
+		lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("  View problems")
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(action))
+	line := left + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", gap)) + action
+	return ansi.Truncate(line, width, "")
 }
 
 // aboutContentWidth mirrors the panel-width math in renderOverlay so the

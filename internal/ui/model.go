@@ -150,16 +150,17 @@ type logViewState struct {
 }
 
 type appSettings struct {
-	GraphStyle      graphStyle
-	GraphColor      graphColorMode
-	LogColor        logColorMode
-	LogHealthColor  bool
-	ShowDeltas      bool
-	CreateVim       bool
-	ModalShadow     bool
-	StatsRefresh    time.Duration
-	DefaultActivity activityMode
-	AppLog          appLogMode
+	GraphStyle       graphStyle
+	GraphColor       graphColorMode
+	LogColor         logColorMode
+	LogHealthColor   bool
+	ShowDeltas       bool
+	CreateVim        bool
+	ModalShadow      bool
+	StatsRefresh     time.Duration
+	DefaultActivity  activityMode
+	StartInDashboard bool
+	AppLog           appLogMode
 
 	// AI* configure the Problems pane's opt-in "analyze with AI" action —
 	// see internal/ai and aiConfig. AIAPIKey is whatthedock's first
@@ -326,6 +327,11 @@ type Model struct {
 	status    string
 	statusErr bool
 	overlay   overlayMode
+
+	// dashboardCursor is the currently highlighted row index within the
+	// Dashboard overlay's own visible container list (see
+	// dashboardBodyPlan) — reset to 0 each time the overlay opens.
+	dashboardCursor int
 
 	// appLogLines is every distinct status-bar message this session, kept
 	// when settings.AppLog is on or save (see recordAppLog) — viewable via
@@ -673,6 +679,12 @@ func NewModelWithSettings(provider app.Provider, persisted config.Settings, sett
 func NewModelWithProviderFactory(provider app.Provider, persisted config.Settings, settingsPath string, factory providerFactory) Model {
 	theme := whatthedockTheme()
 	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
+	initialThemeName := theme.Name
+	if persisted.Theme != "" {
+		initialThemeName = persisted.Theme
+	}
+	themePicker := tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: initialThemeName, Title: "THEMES"})
+	theme = themePicker.ConfirmedTheme()
 	settings := defaultSettings()
 	settings.applyPersisted(persisted)
 	setEditorVimMode(settings.CreateVim)
@@ -681,10 +693,10 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 	if persisted.UpdateLastCheck != "" {
 		updateLastCheck, _ = time.Parse(time.RFC3339, persisted.UpdateLastCheck)
 	}
-	return Model{
+	m := Model{
 		provider:             provider,
 		theme:                theme,
-		themes:               tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: theme.Name, Title: "THEMES"}),
+		themes:               themePicker,
 		mode:                 settings.DefaultActivity,
 		settings:             settings,
 		settingsDraft:        settings,
@@ -702,6 +714,10 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		updateIgnoredVersion: persisted.UpdateIgnoredVersion,
 		updateLastCheck:      updateLastCheck,
 	}
+	if settings.StartInDashboard {
+		m.overlay = overlayDashboard
+	}
+	return m
 }
 
 // WithVersion sets the running build's version (from cmd/whatthedock's
@@ -783,6 +799,9 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 	case "problems", "":
 		s.DefaultActivity = activityProblems
 	}
+	if persisted.StartInDashboard != nil {
+		s.StartInDashboard = *persisted.StartInDashboard
+	}
 	switch persisted.AppLog {
 	case "on":
 		s.AppLog = appLogOn
@@ -811,26 +830,29 @@ func (s appSettings) persisted() config.Settings {
 	logHealthColor := s.LogHealthColor
 	createVim := s.CreateVim
 	modalShadow := s.ModalShadow
+	startInDashboard := s.StartInDashboard
 	return config.Settings{
-		GraphStyle:      s.GraphStyle.String(),
-		GraphColor:      s.GraphColor.String(),
-		LogColor:        s.LogColor.String(),
-		LogHealthColor:  &logHealthColor,
-		ShowDeltas:      &showDeltas,
-		CreateVim:       &createVim,
-		ModalShadow:     &modalShadow,
-		StatsRefresh:    formatRefreshInterval(s.StatsRefresh),
-		DefaultActivity: activityModeName(s.DefaultActivity),
-		AppLog:          s.AppLog.String(),
-		AIProvider:      s.AIProvider.String(),
-		AIModel:         s.AIModel,
-		AIAPIKey:        s.AIAPIKey,
-		AIBaseURL:       s.AIBaseURL,
+		GraphStyle:       s.GraphStyle.String(),
+		GraphColor:       s.GraphColor.String(),
+		LogColor:         s.LogColor.String(),
+		LogHealthColor:   &logHealthColor,
+		ShowDeltas:       &showDeltas,
+		CreateVim:        &createVim,
+		ModalShadow:      &modalShadow,
+		StatsRefresh:     formatRefreshInterval(s.StatsRefresh),
+		DefaultActivity:  activityModeName(s.DefaultActivity),
+		StartInDashboard: &startInDashboard,
+		AppLog:           s.AppLog.String(),
+		AIProvider:       s.AIProvider.String(),
+		AIModel:          s.AIModel,
+		AIAPIKey:         s.AIAPIKey,
+		AIBaseURL:        s.AIBaseURL,
 	}
 }
 
 func (m Model) persistedSettings() config.Settings {
 	settings := m.settings.persisted()
+	settings.Theme = m.theme.Name
 	settings.Systems = append([]config.System(nil), m.systems...)
 	settings.ActiveSystem = m.activeSystem
 	settings.UpdateIgnoredVersion = m.updateIgnoredVersion
@@ -861,6 +883,15 @@ func whatthedockTheme() tideui.Theme {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.refreshCmd(), m.startEventsCmd(), tickStatusPulse()}
 	if cmd := m.autoCheckForUpdateCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Settings > Start in dashboard opens the Dashboard overlay from the
+	// very first frame (see NewModelWithProviderFactory), but that alone
+	// doesn't start its stats-polling loop — dashboardRefreshCmd is the
+	// same command the 'd' key dispatches, and it's already a no-op
+	// (returns nil) unless m.overlay == overlayDashboard, so this is safe
+	// to call unconditionally.
+	if cmd := m.dashboardRefreshCmd(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
@@ -1544,8 +1575,17 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayNone
 		}
 	case overlayDashboard:
-		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "d" {
+		switch msg.String() {
+		case "esc", "q", "d":
 			m.overlay = overlayNone
+		case "j", "down":
+			m.dashboardMoveCursor(1)
+		case "k", "up":
+			m.dashboardMoveCursor(-1)
+		case "enter":
+			return m.dashboardOpenSelected()
+		case "p":
+			return m.dashboardOpenProblems()
 		}
 	case overlayCommandPalette:
 		return m.handleCommandPaletteKey(msg)
@@ -1553,8 +1593,11 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.themes.Update(msg) {
 		case tideui.ThemePickerConfirm:
 			m.theme = m.themes.ConfirmedTheme()
-			m.status, m.statusErr = "theme: "+m.theme.Name, false
 			m.overlay = overlayNone
+			m.saveSettings()
+			if !m.statusErr {
+				m.status, m.statusErr = "theme: "+m.theme.Name, false
+			}
 		case tideui.ThemePickerCancel:
 			m.theme = m.themes.ConfirmedTheme()
 			m.overlay = overlayNone
@@ -2557,6 +2600,7 @@ func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 // load-on-entry shape as opening the single-container Stats pane.
 func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayDashboard
+	m.dashboardCursor = 0
 	return m, m.dashboardRefreshCmd()
 }
 
@@ -2807,6 +2851,7 @@ func (m Model) settingsRows() []settingsRow {
 		{label: "Log health color", value: onOff(settings.LogHealthColor)},
 		{label: "Behavior", kind: settingsRowSection},
 		{label: "Default pane", value: activityModeName(settings.DefaultActivity)},
+		{label: "Start in dashboard", value: onOff(settings.StartInDashboard)},
 		{label: "Modal shadow", value: onOff(settings.ModalShadow)},
 		{label: "Editor", kind: settingsRowSection},
 		{label: "Vim mode", value: onOff(settings.CreateVim)},
@@ -2930,6 +2975,8 @@ func (m *Model) cycleSetting(index, direction int) {
 		m.settingsDraft.StatsRefresh = intervals[modIndex(current+direction, len(intervals))]
 	case "Default pane":
 		m.settingsDraft.DefaultActivity = activityMode(modIndex(int(m.settingsDraft.DefaultActivity)+direction, 3))
+	case "Start in dashboard":
+		m.settingsDraft.StartInDashboard = !m.settingsDraft.StartInDashboard
 	case "Modal shadow":
 		m.settingsDraft.ModalShadow = !m.settingsDraft.ModalShadow
 	case "Vim mode":
@@ -3371,6 +3418,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
+	if m.overlay == overlayDashboard {
+		return m.handleDashboardMouse(msg)
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		switch {
@@ -3407,6 +3457,36 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.focus = paneActivity
 			return m.selectProblem(msg.Y - 4)
 		}
+	}
+	return m, nil
+}
+
+// handleDashboardMouse mirrors handleMouse's wheel-scroll/left-click
+// shape for the Dashboard overlay specifically: wheel moves the row
+// selection the same way it moves the tree cursor elsewhere, and a left
+// click either selects-and-opens a container row (dashboardOpenSelected,
+// reusing the same path Enter takes) or the bottom status row's "View
+// problems" action (dashboardOpenProblems, the same path "p" takes) —
+// see dashboardHitTest for how a click's screen coordinates map back to
+// a row.
+func (m Model) handleDashboardMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.dashboardMoveCursor(-1)
+		return m, nil
+	case tea.MouseButtonWheelDown:
+		m.dashboardMoveCursor(1)
+		return m, nil
+	case tea.MouseButtonLeft:
+		row, isStatusRow, ok := m.dashboardHitTest(msg)
+		if !ok {
+			return m, nil
+		}
+		if isStatusRow {
+			return m.dashboardOpenProblems()
+		}
+		m.dashboardCursor = row
+		return m.dashboardOpenSelected()
 	}
 	return m, nil
 }
@@ -3483,6 +3563,50 @@ func (m Model) selectProblem(index int) (tea.Model, tea.Cmd) {
 	}
 	m.focus = paneTree
 	return m, m.loadSelectedCmd()
+}
+
+// dashboardMoveCursor moves the Dashboard overlay's row selection by
+// delta, clamped to the overlay's own currently-visible container list
+// (see dashboardBodyPlan) — mirrors moveProblemCursor's shape for the
+// Problems pane.
+func (m *Model) dashboardMoveCursor(delta int) {
+	shown, _, _, _, _ := m.dashboardBodyPlan()
+	if len(shown) == 0 {
+		m.dashboardCursor = 0
+		return
+	}
+	m.dashboardCursor = clamp(m.dashboardCursor+delta, 0, len(shown)-1)
+}
+
+// dashboardOpenSelected closes the Dashboard and focuses the inspector on
+// the currently highlighted row's container — reusing moveTreeCursorTo/
+// loadSelectedCmd, the same path selectProblem uses to jump from the
+// Problems pane into the tree, rather than inventing a second "select a
+// container" workflow.
+func (m Model) dashboardOpenSelected() (tea.Model, tea.Cmd) {
+	shown, _, _, _, _ := m.dashboardBodyPlan()
+	if len(shown) == 0 {
+		return m, nil
+	}
+	index := clamp(m.dashboardCursor, 0, len(shown)-1)
+	if !m.moveTreeCursorTo(shown[index].ID) {
+		return m, nil
+	}
+	m.overlay = overlayNone
+	m.focus = paneInspector
+	return m, m.loadSelectedCmd()
+}
+
+// dashboardOpenProblems closes the Dashboard and opens the Problems pane
+// — the exact same focus/mode change the global "p" key performs
+// (handleKey's own "p" case), just also reachable while the Dashboard
+// overlay has the key/mouse focus.
+func (m Model) dashboardOpenProblems() (tea.Model, tea.Cmd) {
+	m.overlay = overlayNone
+	m.focus = paneActivity
+	m.mode = activityProblems
+	m.syncProblemCursor()
+	return m, nil
 }
 
 func (m *Model) moveTreeCursorTo(id domain.ResourceID) bool {
