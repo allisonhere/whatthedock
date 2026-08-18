@@ -74,6 +74,15 @@ const (
 	graphStyleWave graphStyle = iota
 	graphStyleBlocks
 	graphStyleBraille
+	// graphStyleBars is graphStyleBlocks' same 8-level glyph set with a
+	// blank column after every bar (see graphGlyphSpacing) — a spaced-out
+	// bar-chart look, distinct from blocks' unbroken sparkline.
+	graphStyleBars
+	// graphStyleGauge renders the latest value as a single proportional
+	// fill bar (renderGaugeBar) instead of a glyph-per-sample history —
+	// it doesn't use graphGlyphs for its main rendering path, only as a
+	// fallback for the static/no-history cases every style still shares.
+	graphStyleGauge
 )
 
 type graphColorMode int
@@ -724,6 +733,10 @@ func (s *appSettings) applyPersisted(persisted config.Settings) {
 		s.GraphStyle = graphStyleBlocks
 	case "braille":
 		s.GraphStyle = graphStyleBraille
+	case "bars":
+		s.GraphStyle = graphStyleBars
+	case "gauge":
+		s.GraphStyle = graphStyleGauge
 	case "wave", "":
 		s.GraphStyle = graphStyleWave
 	}
@@ -2896,7 +2909,7 @@ func (m *Model) cycleSetting(index, direction int) {
 	}
 	switch row.label {
 	case "Graph style":
-		m.settingsDraft.GraphStyle = graphStyle(modIndex(int(m.settingsDraft.GraphStyle)+direction, 3))
+		m.settingsDraft.GraphStyle = graphStyle(modIndex(int(m.settingsDraft.GraphStyle)+direction, 5))
 	case "Graph color":
 		m.settingsDraft.GraphColor = graphColorMode(modIndex(int(m.settingsDraft.GraphColor)+direction, 3))
 	case "Log color":
@@ -3021,6 +3034,10 @@ func (s graphStyle) String() string {
 		return "blocks"
 	case graphStyleBraille:
 		return "braille"
+	case graphStyleBars:
+		return "bars"
+	case graphStyleGauge:
+		return "gauge"
 	default:
 		return "wave"
 	}

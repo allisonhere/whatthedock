@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/allisonhere/tideui"
 	"github.com/charmbracelet/x/ansi"
@@ -302,5 +305,95 @@ func TestDashboardHeaderRowAlignsWithRowNumbers(t *testing.T) {
 	cpuDataEnd := cpuDataIdx + len("41.5%")
 	if cpuHeaderEnd != cpuDataEnd {
 		t.Fatalf("CPU header right edge = %d, data right edge = %d, want equal:\nheader: %q\nrow:    %q", cpuHeaderEnd, cpuDataEnd, header, row)
+	}
+}
+
+// TestDashboardPadLineReachesExactWidth is the regression test for the bug
+// reported live twice: dashboard rows/lines that ended up a few columns
+// short of the panel's real width left an unstyled gap on the right that
+// rendered as a stray, wrong-colored strip on a real terminal. Every line
+// dashboardOverlay builds must come out to exactly the requested width
+// after padding, never short (and dashboardPadLine itself must never
+// truncate a line that's already at or past the target width).
+func TestDashboardPadLineReachesExactWidth(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	cases := []string{"", "short", strings.Repeat("x", 50), strings.Repeat("x", 60)}
+	for _, s := range cases {
+		got := dashboardPadLine(renderer, s, 50)
+		if visible := len([]rune(ansi.Strip(got))); visible < 50 {
+			t.Fatalf("dashboardPadLine(%q, 50) visible width = %d, want >= 50", s, visible)
+		}
+	}
+}
+
+// TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth is a direct
+// regression test against the real failure mode: dashboardColumnsFor's
+// width math (nameWidth + fixed prefix + 3 metric columns) previously
+// left a 2-6 column gap versus the actual contentWidth passed to
+// RenderSoftBody, at a range of realistic terminal widths — this checks
+// the padded, panel-ready line (as dashboardOverlay actually builds it)
+// always reaches exactly contentWidth, not just that the unpadded row
+// happens to be close.
+func TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth(t *testing.T) {
+	model := testModel()
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "1"}, CPUPercent: 41.5, MemoryUsage: 100, MemoryLimit: 200, NetworkRx: 10, NetworkTx: 10})
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	for _, width := range []int{66, 90, 100, 120, 140, 200} {
+		for _, ctr := range model.snapshotContainers() {
+			if !ctr.IsRunning() {
+				continue
+			}
+			row := dashboardPadLine(renderer, model.dashboardRow(renderer, ctr, width), width)
+			if got := len([]rune(ansi.Strip(row))); got != width {
+				t.Fatalf("width=%d: padded row visible width = %d, want exactly %d\nrow: %q", width, got, width, ansi.Strip(row))
+			}
+		}
+		summary := dashboardPadLine(renderer, model.dashboardSummaryLine(renderer, model.fleetSummary()), width)
+		if got := len([]rune(ansi.Strip(summary))); got != width {
+			t.Fatalf("width=%d: padded summary line visible width = %d, want exactly %d", width, got, width)
+		}
+	}
+}
+
+// dashboardBgThenFgSGR matches an explicit truecolor background SGR
+// immediately followed by a foreground SGR — the exact shape
+// dashboardRow's glyph and dashboardSummaryLine's count+glyph produce now
+// that each is wrapped in its own outer Background(...).Render(...). Its
+// absence is the regression this test guards: foregroundSpan only ever
+// sets foreground (by design — see its own doc comment), so a glyph
+// composed via foregroundSpan alone, sitting next to other independently-
+// `.Render()`ed segments, relies on background "carrying over" from a
+// neighboring segment — which it doesn't, because each of those Render
+// calls emits its own trailing full reset. That gap was reported live
+// twice as the status glyphs (and the summary line's count+glyph pairs)
+// showing the wrong background color.
+var dashboardBgThenFgSGR = regexp.MustCompile(`\x1b\[48;2;\d+;\d+;\d+m\x1b\[38;2;\d+;\d+;\d+m`)
+
+func TestDashboardGlyphsCarryExplicitBackground(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
+	model := testModel()
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	var row string
+	for _, ctr := range model.snapshotContainers() {
+		if ctr.IsRunning() {
+			row = model.dashboardRow(renderer, ctr, 120)
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("no running container found to render a row for")
+	}
+	if !dashboardBgThenFgSGR.MatchString(row) {
+		t.Fatalf("dashboardRow's status glyph has no explicit background SGR immediately preceding its foreground SGR — it's relying on a neighboring segment's background to carry over, which it doesn't:\n%q", row)
+	}
+
+	summary := model.dashboardSummaryLine(renderer, dashboardSummary{counts: map[string]int{"●": 3}})
+	if !dashboardBgThenFgSGR.MatchString(summary) {
+		t.Fatalf("dashboardSummaryLine's count+glyph has no explicit background SGR immediately preceding its foreground SGR:\n%q", summary)
 	}
 }

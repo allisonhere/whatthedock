@@ -692,8 +692,16 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	if width < 12 {
 		return renderSparkline(renderer, settings, graph, color, width)
 	}
-	meter := renderMeter(renderer, settings, graphLevel(settings, graph), color)
-	sparkWidth := width - lipgloss.Width(meter) - 2
+	// The gauge style's own bar is already a proportional fill — pairing
+	// it with the old 5-segment meter would show the same information
+	// twice, so gauge skips the meter and lets the bar fill the space
+	// the meter would otherwise have taken.
+	meter := ""
+	sparkWidth := width
+	if settings.GraphStyle != graphStyleGauge {
+		meter = renderMeter(renderer, settings, graphLevel(settings, graph), color)
+		sparkWidth = width - lipgloss.Width(meter) - 2
+	}
 	delta := graph.delta
 	if !settings.ShowDeltas {
 		delta = ""
@@ -709,7 +717,10 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 		delta = ""
 	}
 	spark := renderSparkline(renderer, settings, graph, color, max(1, sparkWidth))
-	parts := []string{meter, spark}
+	parts := []string{spark}
+	if meter != "" {
+		parts = []string{meter, spark}
+	}
 	if delta != "" {
 		parts = append(parts, renderer.Styles.DetailMeta.Render(delta))
 	}
@@ -717,6 +728,39 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	// falls-through-to-default issue as the suffix above.
 	gap := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Render("  ")
 	return strings.Join(parts, gap)
+}
+
+// renderGaugeBar draws the graphStyleGauge look: a single thin progress
+// bar for the latest value, rather than a glyph-per-sample history —
+// value/maxValue as a fraction of width columns of "━", one "╸" leading-edge
+// cap at the fill boundary, and "─" for the remainder.
+func renderGaugeBar(renderer tideui.Renderer, settings appSettings, value, maxValue float64, color lipgloss.Color, width int) string {
+	width = max(1, width)
+	frac := 0.0
+	if maxValue > 0 {
+		frac = value / maxValue
+		if frac < 0 {
+			frac = 0
+		} else if frac > 1 {
+			frac = 1
+		}
+	}
+	filled := clamp(int(frac*float64(width)+0.5), 0, width)
+	level := clamp(int(frac*7)+1, 1, 7)
+	hotColor := statHeatColor(settings, level, color, renderer)
+	bg := renderer.Styles.Theme.Bg
+	dimmed := renderer.Styles.Theme.Dimmed
+
+	switch {
+	case filled <= 0:
+		return lipgloss.NewStyle().Background(bg).Foreground(dimmed).Render(strings.Repeat("─", width))
+	case filled >= width:
+		return lipgloss.NewStyle().Background(bg).Foreground(hotColor).Bold(true).Render(strings.Repeat("━", width))
+	default:
+		fill := lipgloss.NewStyle().Background(bg).Foreground(hotColor).Bold(true).Render(strings.Repeat("━", filled-1) + "╸")
+		rest := lipgloss.NewStyle().Background(bg).Foreground(dimmed).Render(strings.Repeat("─", width-filled))
+		return fill + rest
+	}
 }
 
 func renderMeter(renderer tideui.Renderer, settings appSettings, level int, color lipgloss.Color) string {
@@ -735,29 +779,48 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 		return styleGraphGlyphs(renderer, settings, graph.static, graph.fallbackLevel, color)
 	}
 	if len(graph.values) == 0 || graph.maxValue <= 0 {
+		if settings.GraphStyle == graphStyleGauge {
+			return renderGaugeBar(renderer, settings, 0, 1, color, width)
+		}
 		level := clamp(graph.fallbackLevel, 1, len(glyphs))
 		return styleGraphGlyphs(renderer, settings, strings.Join(glyphs[:level], ""), level, color)
 	}
-	values := graph.values
-	if len(values) > width {
-		values = values[len(values)-width:]
+	if settings.GraphStyle == graphStyleGauge {
+		return renderGaugeBar(renderer, settings, graph.values[len(graph.values)-1], graph.maxValue, color, width)
 	}
+	// Each bar takes 1+spacing columns (bars' spaced style takes 2: the
+	// glyph plus its trailing blank), so fewer values fit in the same
+	// width budget than a style with no spacing — callers size width in
+	// total columns, not glyph count, so this keeps that contract intact
+	// rather than letting a spaced sparkline overflow it.
+	unit := 1 + graphGlyphSpacing(settings)
+	maxValues := max(1, width/unit)
+	values := graph.values
+	if len(values) > maxValues {
+		values = values[len(values)-maxValues:]
+	}
+	bg := renderer.Styles.Theme.Bg
+	spacing := graphGlyphSpacing(settings)
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		level := graphValueLevel(settings, value, graph.maxValue)
 		glyph := glyphs[level-1]
-		out = append(out, lipgloss.NewStyle().
-			Background(renderer.Styles.Theme.Bg).
+		cell := lipgloss.NewStyle().
+			Background(bg).
 			Foreground(statGlyphColor(settings, glyph, color, renderer)).
 			Bold(statGlyphBold(glyph)).
-			Render(glyph))
+			Render(glyph)
+		if spacing > 0 {
+			cell += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", spacing))
+		}
+		out = append(out, cell)
 	}
 	return strings.Join(out, "")
 }
 
 func graphGlyphs(settings appSettings) []string {
 	switch settings.GraphStyle {
-	case graphStyleBlocks:
+	case graphStyleBlocks, graphStyleBars, graphStyleGauge:
 		return []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 	case graphStyleBraille:
 		return []string{"⣀", "⣤", "⣶", "⣿"}
@@ -766,20 +829,37 @@ func graphGlyphs(settings appSettings) []string {
 	}
 }
 
+// graphGlyphSpacing is how many blank, background-colored columns follow
+// every glyph a graph style draws — 0 for every style except bars, which
+// is otherwise identical to blocks (same 8-level glyph set) but reads as
+// a spaced-out bar chart instead of an unbroken sparkline.
+func graphGlyphSpacing(settings appSettings) int {
+	if settings.GraphStyle == graphStyleBars {
+		return 1
+	}
+	return 0
+}
+
 func staticGraphGlyph(settings appSettings, level int) string {
 	glyphs := graphGlyphs(settings)
 	return glyphs[clamp(level, 1, len(glyphs))-1]
 }
 
 func styleGraphGlyphs(renderer tideui.Renderer, settings appSettings, graph string, _ int, color lipgloss.Color) string {
+	bg := renderer.Styles.Theme.Bg
+	spacing := graphGlyphSpacing(settings)
 	var out []string
 	for _, glyph := range graph {
 		glyph := string(glyph)
-		out = append(out, lipgloss.NewStyle().
-			Background(renderer.Styles.Theme.Bg).
+		cell := lipgloss.NewStyle().
+			Background(bg).
 			Foreground(statGlyphColor(settings, glyph, color, renderer)).
 			Bold(statGlyphBold(glyph)).
-			Render(glyph))
+			Render(glyph)
+		if spacing > 0 {
+			cell += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", spacing))
+		}
+		out = append(out, cell)
 	}
 	return strings.Join(out, "")
 }
@@ -2294,9 +2374,9 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	summary := m.fleetSummary()
 
 	lines := []string{
-		m.dashboardSummaryLine(renderer, summary, contentWidth),
+		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary), contentWidth),
 		renderer.Styles.DetailMeta.Render(strings.Repeat("─", contentWidth)),
-		m.dashboardHeaderRow(renderer, contentWidth),
+		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
 	}
 
 	containers := m.snapshotContainers()
@@ -2321,16 +2401,16 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		shown, more = running[:cut], len(running)-cut
 	}
 	for _, ctr := range shown {
-		lines = append(lines, m.dashboardRow(renderer, ctr, contentWidth))
+		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, ctr, contentWidth), contentWidth))
 	}
 	switch {
 	case len(running) == 0:
-		lines = append(lines, renderer.Styles.DetailMeta.Render("No running containers."))
+		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render("No running containers."), contentWidth))
 	case more > 0:
-		lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more running container(s)", more)))
+		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more running container(s)", more)), contentWidth))
 	}
 	if stopped > 0 {
-		lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("+%d stopped/dead — p for Problems", stopped)))
+		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render(fmt.Sprintf("+%d stopped/dead — p for Problems", stopped)), contentWidth))
 	}
 
 	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n")+"\n\n"+
@@ -2339,23 +2419,59 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	return &overlay
 }
 
+// dashboardPadLine is the belt-and-suspenders fix for a bug reported live
+// twice: every line dashboardOverlay builds is supposed to end up exactly
+// contentWidth visible columns wide (dashboardColumnsFor's own width math
+// is meant to guarantee that), but any drift between that math and what a
+// row/line actually renders — even a column or two — leaves a gap on the
+// right with no explicit background, which showed up as a stray,
+// wrong-colored strip on a real terminal (most visibly a persistent
+// vertical band down the right edge of the whole container list). Rather
+// than keep chasing exact-width arithmetic across several column-budget
+// functions, every line gets measured (ansi.Strip, so this works whether
+// the line is pure plain text or already carries other segments' own
+// embedded ANSI) and explicitly padded with the panel's own background to
+// reach exactly width — so even if the width math is ever off again, the
+// gap is never left unstyled.
+func dashboardPadLine(renderer tideui.Renderer, line string, width int) string {
+	if pad := width - len([]rune(ansi.Strip(line))); pad > 0 {
+		bg := renderer.Styles.Theme.Bg
+		fg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+		line += lipgloss.NewStyle().Background(bg).Foreground(fg).Render(strings.Repeat(" ", pad))
+	}
+	return line
+}
+
 // dashboardSummaryLine renders the fleet-wide rollup: counts by status
 // (statusLegendEntries' own glyphs/colors/order, skipping any status with
 // a zero count so the line doesn't pad itself out with "0 dead" noise)
 // followed by aggregate CPU/memory/network across running containers.
-func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardSummary, width int) string {
+// Every separator/gap is rendered through an explicit Background+Foreground
+// style, and (like dashboardRow) the result is never re-wrapped in an
+// outer Style.Width().Render() call — see dashboardRow's doc comment for
+// why that combination corrupts already-ANSI content.
+func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardSummary) string {
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	plain := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(baseFg)
+	sep := plain.Render("   ")
+
+	bg := renderer.Styles.Theme.Bg
 	parts := make([]string, 0, len(statusLegendEntries)+1)
 	for _, entry := range statusLegendEntries {
 		if count := summary.counts[entry.glyph]; count > 0 {
-			parts = append(parts, foregroundSpan(fmt.Sprintf("%d %s", count, entry.glyph), entry.color, baseFg, false))
+			// See dashboardRow's doc comment on its own glyph: foregroundSpan
+			// never sets a background, so each count+glyph pair needs its
+			// own explicit outer Background wrap here too, or it falls
+			// through to the terminal's default the moment the preceding
+			// separator's own Render call resets — reported live as the
+			// summary counts having the wrong background.
+			parts = append(parts, lipgloss.NewStyle().Background(bg).Render(foregroundSpan(fmt.Sprintf("%d %s", count, entry.glyph), entry.color, baseFg, false)))
 		}
 	}
 	stats := fmt.Sprintf("CPU %.1f%%  Mem %s  Net %s/s down %s/s up",
 		summary.totalCPU, formatMemFraction(summary.memUsed, summary.memLimit),
 		formatBytes(summary.netRxRate), formatBytes(summary.netTxRate))
-	line := strings.Join(parts, "   ") + "   " + renderer.Styles.DetailBody.Render(stats)
-	return renderer.Styles.DetailBody.Width(width).Render(line)
+	return strings.Join(parts, sep) + sep + plain.Render(stats)
 }
 
 func formatMemFraction(used, limit uint64) string {
@@ -2388,12 +2504,28 @@ const dashboardMinSparkWidth = 8
 // lesser evil versus silently cutting a number off).
 const dashboardNumWidth = 9
 
+// dashboardColumnsFor's fixed prefix must equal exactly what dashboardRow
+// spends before its three metric columns start — nameWidth, the 2-space
+// gap after the name, the glyph itself (1 visible rune), and the space
+// after it — 4, not padded out further. A mismatch here previously left
+// every row a few columns short of the panel's actual width; combined
+// with dashboardPadLine (the belt-and-suspenders fix for that class of
+// bug generally) this keeps the columns as wide as the terminal actually
+// allows instead of leaving width on the table.
 func (m Model) dashboardColumnsFor(width int) dashboardColumns {
-	const stateWidth = 2
+	const namePrefixWidth = 4 // "  " + glyph + " "
 	const gap = 2
 	nameWidth := 22
-	fixed := nameWidth + gap + stateWidth + gap
+	fixed := nameWidth + namePrefixWidth
 	remaining := max(0, width-fixed)
+	// Integer division here can leave 0-2 columns of remaining unspent
+	// (remaining%3) — deliberately not chased further than this: rather
+	// than fold that remainder into one column asymmetrically,
+	// dashboardPadLine (see dashboardOverlay) pads any line that ends up
+	// short of the panel's real width regardless of the exact cause, so
+	// a couple of unused columns here just becomes a couple of extra
+	// background-colored spaces at the row's right edge — never an
+	// unstyled gap.
 	perCol := remaining / 3
 	sparkWidth := perCol - dashboardNumWidth - gap
 	showSpark := sparkWidth >= dashboardMinSparkWidth
@@ -2454,15 +2586,41 @@ func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
 // already populates — Dashboard's own polling loop (dashboardRefreshCmd)
 // just makes sure history exists for every running container, not only
 // the selected one.
+//
+// Every plain-text segment (name, gaps, the padded number) is rendered
+// through plain (an explicit Background+Foreground style), and the whole
+// row is returned with NO further Width()-based wrapping applied on top —
+// calling an outer Style.Width().Render() on a string that already
+// contains other segments' own embedded ANSI resets (glyph, the
+// sparkline) mis-measures/reflows it, leaving stretches of the row on
+// whatever background the terminal happens to default to instead of the
+// theme's own — this was reported live as random-colored boxes in the
+// Mem/Net columns on a real terminal, the same root cause as the About
+// screen's earlier "ship animation renders as solid black" bug fixed
+// elsewhere this session (about_ship.go) and the exact failure mode
+// renderStatRow's own doc comment already warns about.
 func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int) string {
 	cols := m.dashboardColumnsFor(width)
 	history := m.statsHistory[ctr.ID]
 	stats := history.lastStats
 
+	bg := renderer.Styles.Theme.Bg
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	glyph := foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false)
+	plain := lipgloss.NewStyle().Background(bg).Foreground(baseFg)
+
+	// foregroundSpan only ever sets foreground (see its own doc comment) —
+	// it's meant to sit inside one continuous outer-styled Render call
+	// (e.g. renderInspectorField wrapping its whole row through RenderRow
+	// once), not standalone between independently-`.Render()`ed segments
+	// the way this row composes everything. Each of those independent
+	// Render calls emits its own trailing reset, so without this explicit
+	// outer Background wrap the glyph's cell falls through to the
+	// terminal's own default background the moment the segment before it
+	// resets — reported live as the status glyphs having the wrong
+	// background color.
+	glyph := lipgloss.NewStyle().Background(bg).Render(foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false))
 	name := short(ctr.DisplayName(), cols.nameWidth)
-	name = name + strings.Repeat(" ", max(0, cols.nameWidth-len([]rune(name))))
+	name = plain.Render(name + strings.Repeat(" ", max(0, cols.nameWidth-len([]rune(name)))))
 
 	cpuGraph := cpuStatGraph(stats, history)
 	memGraph := uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta)
@@ -2489,29 +2647,35 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	}
 	netCol := m.dashboardMetricColumn(renderer, cols, netRate, netGraph, "#8aadf4")
 
-	row := name + "  " + glyph + " " + cpuCol + memCol + netCol
-	return renderer.Styles.DetailBody.Width(width).Render(row)
+	return name + plain.Render("  ") + glyph + plain.Render(" ") + cpuCol + memCol + netCol
 }
 
 // dashboardMetricColumn right-pads number to numWidth and appends a mini
-// sparkline (padded to sparkWidth with plain background-colored spaces —
+// sparkline (padded to sparkWidth with explicit-background spaces —
 // renderSparkline only emits one glyph per history sample, so a container
 // with less history than sparkWidth needs explicit padding to keep every
 // row's columns aligned) — or nothing, once dashboardColumnsFor decided
-// the terminal's too narrow for one.
+// the terminal's too narrow for one. number and every gap around it are
+// rendered through an explicit Background+Foreground style (never left as
+// bare unstyled text) — see dashboardRow's doc comment for why that
+// matters here specifically.
 func (m Model) dashboardMetricColumn(renderer tideui.Renderer, cols dashboardColumns, number string, graph statGraph, color lipgloss.Color) string {
+	bg := renderer.Styles.Theme.Bg
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	plain := lipgloss.NewStyle().Background(bg).Foreground(baseFg)
+
 	numberPadded := number
 	if n := cols.numWidth - len([]rune(number)); n > 0 {
 		numberPadded = strings.Repeat(" ", n) + number
 	}
 	if !cols.showSpark {
-		return numberPadded + "  "
+		return plain.Render(numberPadded + "  ")
 	}
 	spark := renderSparkline(renderer, m.settings, graph, color, cols.sparkWidth)
 	if pad := cols.sparkWidth - len([]rune(ansi.Strip(spark))); pad > 0 {
-		spark += lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Render(strings.Repeat(" ", pad))
+		spark += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", pad))
 	}
-	return numberPadded + " " + spark + " "
+	return plain.Render(numberPadded+" ") + spark + plain.Render(" ")
 }
 
 // aboutContentWidth mirrors the panel-width math in renderOverlay so the

@@ -132,3 +132,184 @@ func TestStatusLegendLinesAreFullyColored(t *testing.T) {
 		}
 	}
 }
+
+func TestGraphStyleBarsStringAndPersistedRoundTrip(t *testing.T) {
+	if got := graphStyleBars.String(); got != "bars" {
+		t.Fatalf("graphStyleBars.String() = %q, want bars", got)
+	}
+	var s appSettings
+	s.GraphStyle = graphStyleBars
+	var restored appSettings
+	restored.applyPersisted(s.persisted())
+	if restored.GraphStyle != graphStyleBars {
+		t.Fatalf("GraphStyle round-tripped to %v, want graphStyleBars", restored.GraphStyle)
+	}
+}
+
+func TestCycleSettingGraphStyleIncludesBars(t *testing.T) {
+	model := testModel()
+	rows := model.settingsRows()
+	index := -1
+	for i, row := range rows {
+		if row.label == "Graph style" {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatal("settingsRows() has no \"Graph style\" row")
+	}
+	seen := map[graphStyle]bool{}
+	for i := 0; i < 5; i++ {
+		model.cycleSetting(index, 1)
+		seen[model.settingsDraft.GraphStyle] = true
+	}
+	for _, want := range []graphStyle{graphStyleWave, graphStyleBlocks, graphStyleBraille, graphStyleBars, graphStyleGauge} {
+		if !seen[want] {
+			t.Fatalf("cycling Graph style 5 times never landed on %v, want all five styles reachable", want)
+		}
+	}
+	// A 5th cycle from gauge must land back on wave — confirms the cycle
+	// length is actually 5, not silently still shorter with gauge
+	// unreachable via wraparound.
+	model.settingsDraft.GraphStyle = graphStyleGauge
+	model.cycleSetting(index, 1)
+	if model.settingsDraft.GraphStyle != graphStyleWave {
+		t.Fatalf("GraphStyle after cycling past gauge = %v, want it to wrap to wave", model.settingsDraft.GraphStyle)
+	}
+}
+
+func TestGraphGlyphsBarsMatchesBlocksGlyphSet(t *testing.T) {
+	var blocks, bars appSettings
+	blocks.GraphStyle = graphStyleBlocks
+	bars.GraphStyle = graphStyleBars
+	blocksGlyphs := graphGlyphs(blocks)
+	barsGlyphs := graphGlyphs(bars)
+	if len(blocksGlyphs) != len(barsGlyphs) {
+		t.Fatalf("bars glyph count = %d, want it to match blocks' %d", len(barsGlyphs), len(blocksGlyphs))
+	}
+	for i := range blocksGlyphs {
+		if blocksGlyphs[i] != barsGlyphs[i] {
+			t.Fatalf("glyph %d: bars=%q blocks=%q, want the same glyph set — bars only differs by spacing", i, barsGlyphs[i], blocksGlyphs[i])
+		}
+	}
+}
+
+// TestRenderSparklineBarsInsertsSpaceBetweenGlyphs is the regression test
+// for the feature requested live: a graph style using blocks' glyph set
+// but with a blank column after every bar, instead of an unbroken
+// sparkline.
+func TestRenderSparklineBarsInsertsSpaceBetweenGlyphs(t *testing.T) {
+	withTrueColorProfile(t)
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	var settings appSettings
+	settings.GraphStyle = graphStyleBars
+	graph := statGraph{values: []float64{10, 50, 90}, maxValue: 100}
+
+	got := ansi.Strip(renderSparkline(renderer, settings, graph, "#7dcfff", 20))
+	if !strings.Contains(got, " ") {
+		t.Fatalf("bars sparkline = %q, want a space between each bar", got)
+	}
+	// Every non-space rune should be immediately followed by a space (or
+	// be the last rune) — i.e. genuinely spaced, not just containing a
+	// space somewhere incidentally.
+	runes := []rune(got)
+	for i, r := range runes {
+		if r == ' ' {
+			continue
+		}
+		if i+1 < len(runes) && runes[i+1] != ' ' {
+			t.Fatalf("bars sparkline = %q, glyph at index %d not followed by a space", got, i)
+		}
+	}
+}
+
+// TestRenderSparklineBlocksHasNoSpacing guards the un-spaced style against
+// regressing into always-spaced output — bars and blocks share a glyph
+// set but must still render differently.
+func TestRenderSparklineBlocksHasNoSpacing(t *testing.T) {
+	withTrueColorProfile(t)
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	var settings appSettings
+	settings.GraphStyle = graphStyleBlocks
+	graph := statGraph{values: []float64{10, 50, 90}, maxValue: 100}
+
+	got := ansi.Strip(renderSparkline(renderer, settings, graph, "#7dcfff", 20))
+	if strings.Contains(got, " ") {
+		t.Fatalf("blocks sparkline = %q, want no spacing between bars", got)
+	}
+}
+
+// TestRenderSparklineBarsRespectsWidthBudget checks bars' 2-columns-per-bar
+// spacing still stays within the width callers pass — a spaced style
+// packing the same number of values as an unspaced one would overflow
+// every caller's width budget (e.g. the Dashboard's per-column layout).
+func TestRenderSparklineBarsRespectsWidthBudget(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	var settings appSettings
+	settings.GraphStyle = graphStyleBars
+	values := make([]float64, 30)
+	for i := range values {
+		values[i] = float64(i)
+	}
+	graph := statGraph{values: values, maxValue: 30}
+
+	for _, width := range []int{5, 10, 21, 40} {
+		got := ansi.Strip(renderSparkline(renderer, settings, graph, "#7dcfff", width))
+		if visible := len([]rune(got)); visible > width {
+			t.Fatalf("width=%d: bars sparkline visible width = %d, want <= %d:\n%q", width, visible, width, got)
+		}
+	}
+}
+
+// TestRenderSparklineGaugeDrawsProportionalFill is the regression test for
+// the gauge style: a single thin progress bar for the latest value, not a
+// glyph-per-sample history — value=37 of maxValue=100 at width=20 should
+// fill roughly 37% of the bar with "━" and leave the rest "─", separated
+// by exactly one "╸" leading-edge cap.
+func TestRenderSparklineGaugeDrawsProportionalFill(t *testing.T) {
+	withTrueColorProfile(t)
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	var settings appSettings
+	settings.GraphStyle = graphStyleGauge
+	graph := statGraph{values: []float64{10, 50, 37}, maxValue: 100}
+
+	got := ansi.Strip(renderSparkline(renderer, settings, graph, "#7dcfff", 20))
+	runes := []rune(got)
+	if len(runes) != 20 {
+		t.Fatalf("gauge bar width = %d, want 20 (got %q)", len(runes), got)
+	}
+	if strings.Count(got, "╸") != 1 {
+		t.Fatalf("gauge bar = %q, want exactly one leading-edge cap", got)
+	}
+	capIndex := -1
+	for i, r := range runes {
+		if r == '╸' {
+			capIndex = i
+			break
+		}
+	}
+	frac := 0.37
+	wantFilled := int(frac*20 + 0.5)
+	if capIndex != wantFilled-1 {
+		t.Fatalf("gauge bar = %q, cap at rune index %d, want it at %d for 37%% of width 20", got, capIndex, wantFilled-1)
+	}
+	if strings.ContainsAny(got, "▁▂▃▄▅▆▇█") {
+		t.Fatalf("gauge bar = %q, want no sparkline glyphs, only ━/╸/─", got)
+	}
+}
+
+// TestRenderSparklineGaugeEmptyWithNoHistory guards the no-history
+// fallback: with no values yet, gauge should render an all-empty bar
+// rather than guessing a level like the glyph-based styles do.
+func TestRenderSparklineGaugeEmptyWithNoHistory(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	var settings appSettings
+	settings.GraphStyle = graphStyleGauge
+	graph := statGraph{fallbackLevel: 4}
+
+	got := ansi.Strip(renderSparkline(renderer, settings, graph, "#7dcfff", 10))
+	if got != strings.Repeat("─", 10) {
+		t.Fatalf("gauge bar with no history = %q, want an all-empty 10-wide bar", got)
+	}
+}
