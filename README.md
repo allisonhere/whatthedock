@@ -12,6 +12,39 @@ presentation primitives.
 > Early-stage project: this repository currently contains the first working
 > vertical slice, not the full planned Docker operations suite.
 
+## Screenshots
+
+<table>
+<tr>
+<td width="50%">
+
+**Problems, with AI analysis**
+![Problems pane with an AI-generated analysis of a restarting container](screenshots/problems-ai-analysis.png)
+
+</td>
+<td width="50%">
+
+**Logs**
+![Color-coded log stream for a selected container](screenshots/logs.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Stats**
+![Live CPU, memory, network, and disk sparklines](screenshots/stats.png)
+
+</td>
+<td width="50%">
+
+**Create / edit**
+![Compose service create form with a live generated YAML preview](screenshots/create.png)
+
+</td>
+</tr>
+</table>
+
 ## Philosophy
 
 WhatTheDock treats Compose projects as first-class objects. The default view is not
