@@ -16,6 +16,14 @@ presentation primitives.
 
 <table>
 <tr>
+<td colspan="2">
+
+**Dashboard: fleet summary and every container's CPU/memory/network**
+![Full-screen dashboard with a fleet summary line and a CPU/memory/network sparkline row per running container](screenshots/dashboard.png)
+
+</td>
+</tr>
+<tr>
 <td width="50%">
 
 **Problems, with AI analysis**
@@ -136,6 +144,7 @@ Docker socket paths must be present.
 | `Ctrl+K` | Command palette |
 | `?` | Keyboard help |
 | `A` | About screen with Spotlights-style ANSI splash animation |
+| `d` | Full-screen fleet dashboard: host summary plus every running container's CPU/memory/network |
 | `q` | Quit |
 
 Mouse row selection and wheel navigation are enabled where the terminal and
@@ -262,6 +271,14 @@ More detail:
   copyable through the Copy overlay (`c`) once you've selected that container.
 - Shows polling stats graphs and sparklines for the selected container, with
   CPU, memory, network, disk I/O, restart, uptime, and PID readouts.
+- Press `d` for a full-screen fleet Dashboard: a summary line (counts by
+  status, aggregate CPU/memory/network across every running container) plus
+  one row per running container with a mini CPU/memory/network sparkline
+  each, sized to use as much of the terminal as this app's presentation
+  style allows rather than the narrower single-pane Stats view. Polls
+  independently of whichever container is selected elsewhere, at the same
+  configurable refresh interval as Stats; columns drop their sparklines
+  (keeping the numbers) on a narrow terminal instead of overlapping.
 - Includes a grouped settings panel with reset defaults, persisted graph style,
   graph colors, log color mode, log health color, deltas, refresh interval,
   default activity pane, a modal drop shadow toggle, a "Check for update"

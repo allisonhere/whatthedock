@@ -65,6 +65,7 @@ const (
 	overlayReplicate
 	overlayUpdate
 	overlayAppLog
+	overlayDashboard
 )
 
 type graphStyle int
@@ -553,6 +554,19 @@ type statsTickMsg struct {
 	id domain.ResourceID
 }
 
+// dashboardStatsMsg/dashboardTickMsg drive the Dashboard overlay's own
+// stats-polling loop — deliberately separate from statsMsg/statsTickMsg's
+// single-selected-container loop above (see dashboardRefreshCmd) rather
+// than reusing it, so there's no risk of the two interacting and
+// regressing the already-fixed "stats loading flash" bug that loop's
+// gating logic depends on.
+type dashboardStatsMsg struct {
+	stats domain.ContainerStats
+	err   error // one container's fetch failing shouldn't blank the rest
+}
+
+type dashboardTickMsg struct{}
+
 type statsHistory struct {
 	CPU        []float64
 	Memory     []uint64
@@ -1032,6 +1046,22 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// stats…" header on and off once per poll interval indefinitely —
 		// reported live as text flashing too fast to read.
 		return m, m.loadStatsCmd(msg.id)
+	case dashboardStatsMsg:
+		// A response for a screen the user already left (closed the
+		// overlay since this was dispatched) — discard rather than
+		// appending into history nobody's looking at anymore.
+		if m.overlay != overlayDashboard {
+			return m, nil
+		}
+		if msg.err == nil {
+			m.appendStats(msg.stats)
+		}
+		return m, nil
+	case dashboardTickMsg:
+		if m.overlay != overlayDashboard {
+			return m, nil
+		}
+		return m, m.dashboardRefreshCmd()
 	case actionDoneMsg:
 		m.busy = false
 		m.replicateProgress = nil
@@ -1357,6 +1387,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.helpScroll = 0
 	case "A":
 		return m.openAboutOverlay()
+	case "d":
+		return m.openDashboardOverlay()
 	case "T":
 		m.openThemePicker()
 	case ",", "ctrl+,":
@@ -1496,6 +1528,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case overlayAbout:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
+			m.overlay = overlayNone
+		}
+	case overlayDashboard:
+		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "d" {
 			m.overlay = overlayNone
 		}
 	case overlayCommandPalette:
@@ -2500,6 +2536,15 @@ func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 	m.aboutFrame = 0
 	m.aboutSpotlights = newAboutSpotlights(aboutSpotlightCount, len(aboutLogo()), aboutContentWidth(m.width))
 	return m, tickAbout()
+}
+
+// openDashboardOverlay opens the full-screen fleet dashboard and kicks off
+// its own stats-polling loop immediately (see dashboardRefreshCmd) rather
+// than waiting a full StatsRefresh interval for the first paint — same
+// load-on-entry shape as opening the single-container Stats pane.
+func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
+	m.overlay = overlayDashboard
+	return m, m.dashboardRefreshCmd()
 }
 
 func (m *Model) openThemePicker() {
@@ -3669,6 +3714,45 @@ func (m Model) nextStatsTickCmd(id domain.ResourceID) tea.Cmd {
 	return tea.Tick(interval, func(time.Time) tea.Msg {
 		return statsTickMsg{id: id}
 	})
+}
+
+// dashboardRefreshCmd fans out one ContainerStats fetch per currently
+// running container (stopped/dead ones have nothing to graph) and re-arms
+// itself on a timer — the Dashboard overlay's own polling loop, kept
+// independent of loadStatsCmd/nextStatsTickCmd's single-selected-container
+// loop above (see dashboardStatsMsg/dashboardTickMsg). Returns nil once the
+// overlay's been closed, so a stray tick that fires just after Esc doesn't
+// keep dispatching fetches for a screen nobody's looking at.
+func (m Model) dashboardRefreshCmd() tea.Cmd {
+	if m.overlay != overlayDashboard {
+		return nil
+	}
+	provider := m.provider
+	var cmds []tea.Cmd
+	for _, ctr := range m.snapshotContainers() {
+		if !ctr.IsRunning() {
+			continue
+		}
+		id := ctr.ID
+		cmds = append(cmds, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			stats, err := provider.ContainerStats(ctx, id)
+			if stats.ID.ID == "" {
+				stats.ID = id
+			}
+			return dashboardStatsMsg{stats: stats, err: err}
+		})
+	}
+	cmds = append(cmds, dashboardTickCmd(m.settings.StatsRefresh))
+	return tea.Batch(cmds...)
+}
+
+func dashboardTickCmd(interval time.Duration) tea.Cmd {
+	if interval <= 0 {
+		interval = defaultSettings().StatsRefresh
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg { return dashboardTickMsg{} })
 }
 
 func (m *Model) appendStats(stats domain.ContainerStats) {

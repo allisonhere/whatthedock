@@ -1242,6 +1242,52 @@ func (m Model) snapshotContainers() []domain.Container {
 	return containers
 }
 
+// dashboardSummary is the Dashboard overlay's fleet-wide rollup — a
+// "fleet summary" per the user's own framing, not real host-OS metrics
+// (Docker's API doesn't expose those, and they wouldn't work uniformly
+// across a local vs. SSH-tunneled remote system anyway). counts is keyed
+// by statusGlyph(ctr), the exact same classification (and glyph/color set,
+// via statusLegendEntries) already used everywhere else in this app —
+// deliberately reused rather than reinvented, so the Dashboard's summary
+// line never disagrees with the tree/Problems pane about what a container
+// counts as.
+type dashboardSummary struct {
+	counts               map[string]int
+	totalCPU             float64
+	memUsed, memLimit    uint64
+	netRxRate, netTxRate uint64
+}
+
+// fleetSummary computes dashboardSummary from whatever containers/history
+// whatthedock already has in memory — no new Docker API call. CPU/memory/
+// network aggregates only include containers whose history has actually
+// received at least one sample yet (history.lastStats != nil); a
+// container the Dashboard hasn't polled yet (this render, right after
+// opening) simply doesn't contribute rather than counting as zero.
+func (m Model) fleetSummary() dashboardSummary {
+	summary := dashboardSummary{counts: map[string]int{}}
+	for _, ctr := range m.snapshotContainers() {
+		summary.counts[statusGlyph(ctr)]++
+		if !ctr.IsRunning() {
+			continue
+		}
+		history := m.statsHistory[ctr.ID]
+		if history.lastStats == nil {
+			continue
+		}
+		summary.totalCPU += history.lastStats.CPUPercent
+		summary.memUsed += history.lastStats.MemoryUsage
+		summary.memLimit += history.lastStats.MemoryLimit
+		if len(history.NetworkRx) > 0 {
+			summary.netRxRate += history.NetworkRx[len(history.NetworkRx)-1]
+		}
+		if len(history.NetworkTx) > 0 {
+			summary.netTxRate += history.NetworkTx[len(history.NetworkTx)-1]
+		}
+	}
+	return summary
+}
+
 func (m Model) renderInspector(renderer tideui.Renderer) string {
 	if m.selected == nil {
 		return renderer.Styles.DetailMeta.Render("No container selected.")
@@ -1607,6 +1653,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/A/q", Label: "close"}))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "about", Content: content, Width: width})
 		return &overlay
+	case overlayDashboard:
+		return m.dashboardOverlay(renderer)
 	case overlayFilter:
 		width := min(72, max(40, m.width-8))
 		input := renderer.Styles.InputFocused.Width(max(20, width-8)).Render(m.filterDraft)
@@ -2145,6 +2193,7 @@ var helpLines = []string{
 	"Ctrl+K         command palette",
 	"?              keyboard help",
 	"A              about screen",
+	"d              dashboard: fleet summary and every container's stats",
 	"q              quit",
 }
 
@@ -2220,6 +2269,249 @@ func (m Model) helpBodyBudget() int {
 // it's just the plain softOverlayBodyBudget allowance.
 func (m Model) appLogBodyBudget() int {
 	return m.softOverlayBodyBudget()
+}
+
+// dashboardHeaderRows is the fleet summary line, divider, and column
+// header row dashboardOverlay always renders above the container list —
+// subtracted from softOverlayBodyBudget's allowance to get the list's own
+// budget, same shape as helpBodyBudget subtracting the status legend.
+const dashboardHeaderRows = 3
+
+func (m Model) dashboardListBudget() int {
+	return max(3, m.softOverlayBodyBudget()-dashboardHeaderRows)
+}
+
+// dashboardOverlay renders the full fleet dashboard: a summary line
+// (counts by status plus aggregate CPU/memory/network, see fleetSummary),
+// a column header, then one row per running container with a name, state,
+// and a compact CPU/Mem/Net sparkline each — deliberately sized far wider
+// than every other overlay (m.width-4 instead of the usual m.width-8-ish
+// cap) since the point of this screen is showing as much of the fleet at
+// once as the terminal actually allows, not a small centered dialog.
+func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := max(70, m.width-4)
+	contentWidth := width - 4
+	summary := m.fleetSummary()
+
+	lines := []string{
+		m.dashboardSummaryLine(renderer, summary, contentWidth),
+		renderer.Styles.DetailMeta.Render(strings.Repeat("─", contentWidth)),
+		m.dashboardHeaderRow(renderer, contentWidth),
+	}
+
+	containers := m.snapshotContainers()
+	sort.Slice(containers, func(i, j int) bool {
+		return containers[i].DisplayName() < containers[j].DisplayName()
+	})
+	var running []domain.Container
+	stopped := 0
+	for _, ctr := range containers {
+		if ctr.IsRunning() {
+			running = append(running, ctr)
+		} else {
+			stopped++
+		}
+	}
+
+	budget := m.dashboardListBudget()
+	shown := running
+	more := 0
+	if len(running) > budget {
+		cut := max(0, budget-1) // leave a line for the "N more" indicator itself
+		shown, more = running[:cut], len(running)-cut
+	}
+	for _, ctr := range shown {
+		lines = append(lines, m.dashboardRow(renderer, ctr, contentWidth))
+	}
+	switch {
+	case len(running) == 0:
+		lines = append(lines, renderer.Styles.DetailMeta.Render("No running containers."))
+	case more > 0:
+		lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more running container(s)", more)))
+	}
+	if stopped > 0 {
+		lines = append(lines, renderer.Styles.DetailMeta.Render(fmt.Sprintf("+%d stopped/dead — p for Problems", stopped)))
+	}
+
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n")+"\n\n"+
+		renderer.RenderSoftHints(contentWidth, tideui.SoftHint{Key: "esc/d/q", Label: "close"}))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "dashboard", Content: content, Width: width})
+	return &overlay
+}
+
+// dashboardSummaryLine renders the fleet-wide rollup: counts by status
+// (statusLegendEntries' own glyphs/colors/order, skipping any status with
+// a zero count so the line doesn't pad itself out with "0 dead" noise)
+// followed by aggregate CPU/memory/network across running containers.
+func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardSummary, width int) string {
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	parts := make([]string, 0, len(statusLegendEntries)+1)
+	for _, entry := range statusLegendEntries {
+		if count := summary.counts[entry.glyph]; count > 0 {
+			parts = append(parts, foregroundSpan(fmt.Sprintf("%d %s", count, entry.glyph), entry.color, baseFg, false))
+		}
+	}
+	stats := fmt.Sprintf("CPU %.1f%%  Mem %s  Net %s/s down %s/s up",
+		summary.totalCPU, formatMemFraction(summary.memUsed, summary.memLimit),
+		formatBytes(summary.netRxRate), formatBytes(summary.netTxRate))
+	line := strings.Join(parts, "   ") + "   " + renderer.Styles.DetailBody.Render(stats)
+	return renderer.Styles.DetailBody.Width(width).Render(line)
+}
+
+func formatMemFraction(used, limit uint64) string {
+	if limit == 0 {
+		return formatBytes(used)
+	}
+	return formatBytes(used) + " / " + formatBytes(limit)
+}
+
+// dashboardColumns computes the fixed widths dashboardHeaderRow and
+// dashboardRow both share: a name column that gets whatever's left after
+// state glyph + three CPU/Mem/Net columns (each a right-aligned number
+// plus a mini sparkline) reserve their own space. Below dashboardMinSparkWidth
+// a column keeps its number but drops the sparkline entirely — graceful
+// degradation on a narrow terminal instead of overlapping/garbled columns.
+type dashboardColumns struct {
+	nameWidth  int
+	numWidth   int
+	sparkWidth int
+	showSpark  bool
+}
+
+const dashboardMinSparkWidth = 8
+
+// dashboardNumWidth fits every number these columns actually produce —
+// "100.0%", "38.1%", and formatRateCompact's longest realistic output
+// ("999.9M/s") — with a little room to spare, so dashboardMetricColumn
+// never has to truncate a number (it doesn't; going over numWidth just
+// pushes that one row's sparkline column out of alignment, which is the
+// lesser evil versus silently cutting a number off).
+const dashboardNumWidth = 9
+
+func (m Model) dashboardColumnsFor(width int) dashboardColumns {
+	const stateWidth = 2
+	const gap = 2
+	nameWidth := 22
+	fixed := nameWidth + gap + stateWidth + gap
+	remaining := max(0, width-fixed)
+	perCol := remaining / 3
+	sparkWidth := perCol - dashboardNumWidth - gap
+	showSpark := sparkWidth >= dashboardMinSparkWidth
+	if !showSpark {
+		sparkWidth = 0
+	}
+	return dashboardColumns{nameWidth: nameWidth, numWidth: dashboardNumWidth, sparkWidth: sparkWidth, showSpark: showSpark}
+}
+
+// dashboardColumnWidth is one CPU/Mem/Net column's total visible width —
+// the same numWidth+space+sparkWidth+space (or just numWidth+2 with no
+// sparkline) shape dashboardMetricColumn actually renders, so the header
+// label lines up with real data instead of a naive full-width label that
+// sits over the sparkline area instead of the number.
+func dashboardColumnWidth(cols dashboardColumns) int {
+	if cols.showSpark {
+		return cols.numWidth + 2 + cols.sparkWidth
+	}
+	return cols.numWidth + 2
+}
+
+func padRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) >= n {
+		return string(r[:n])
+	}
+	return s + strings.Repeat(" ", n-len(r))
+}
+
+func rightAlignRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) >= n {
+		return string(r[:n])
+	}
+	return strings.Repeat(" ", n-len(r)) + s
+}
+
+// dashboardHeaderRow builds "Name"/"CPU"/"Mem"/"Net" labels positioned to
+// match dashboardRow's real column layout exactly: the name column is the
+// same width, and each metric label is right-aligned within just
+// numWidth (where dashboardMetricColumn right-aligns its number too),
+// leaving the sparkline portion of that column blank — labeling the
+// number's own slot, not the whole (much wider) column.
+func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
+	cols := m.dashboardColumnsFor(width)
+	colWidth := dashboardColumnWidth(cols)
+	metricLabel := func(label string) string {
+		return padRunes(rightAlignRunes(label, cols.numWidth), colWidth)
+	}
+	header := padRunes("Name", cols.nameWidth) + "  " + "  " +
+		metricLabel("CPU") + metricLabel("Mem") + metricLabel("Net")
+	return renderer.Styles.DetailMeta.Width(width).Render(header)
+}
+
+// dashboardRow renders one running container's line: state glyph, name,
+// then CPU/Mem/Net as a right-aligned number plus a mini sparkline built
+// straight from the same m.statsHistory the single-container Stats pane
+// already populates — Dashboard's own polling loop (dashboardRefreshCmd)
+// just makes sure history exists for every running container, not only
+// the selected one.
+func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int) string {
+	cols := m.dashboardColumnsFor(width)
+	history := m.statsHistory[ctr.ID]
+	stats := history.lastStats
+
+	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	glyph := foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false)
+	name := short(ctr.DisplayName(), cols.nameWidth)
+	name = name + strings.Repeat(" ", max(0, cols.nameWidth-len([]rune(name))))
+
+	cpuGraph := cpuStatGraph(stats, history)
+	memGraph := uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta)
+	netGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta)
+
+	cpuCol := m.dashboardMetricColumn(renderer, cols, fmt.Sprintf("%.1f%%", statsCPU(stats)), cpuGraph, "#7dcfff")
+	memPct := "n/a"
+	if stats != nil && stats.MemoryLimit > 0 {
+		memPct = fmt.Sprintf("%.1f%%", float64(stats.MemoryUsage)/float64(stats.MemoryLimit)*100)
+	} else if stats != nil {
+		memPct = formatCompactBytes(stats.MemoryUsage)
+	}
+	memCol := m.dashboardMetricColumn(renderer, cols, memPct, memGraph, "#80c990")
+	netRate := "n/a"
+	if len(history.NetworkRx) > 0 || len(history.NetworkTx) > 0 {
+		var rx, tx uint64
+		if len(history.NetworkRx) > 0 {
+			rx = history.NetworkRx[len(history.NetworkRx)-1]
+		}
+		if len(history.NetworkTx) > 0 {
+			tx = history.NetworkTx[len(history.NetworkTx)-1]
+		}
+		netRate = formatRateCompact(rx + tx)
+	}
+	netCol := m.dashboardMetricColumn(renderer, cols, netRate, netGraph, "#8aadf4")
+
+	row := name + "  " + glyph + " " + cpuCol + memCol + netCol
+	return renderer.Styles.DetailBody.Width(width).Render(row)
+}
+
+// dashboardMetricColumn right-pads number to numWidth and appends a mini
+// sparkline (padded to sparkWidth with plain background-colored spaces —
+// renderSparkline only emits one glyph per history sample, so a container
+// with less history than sparkWidth needs explicit padding to keep every
+// row's columns aligned) — or nothing, once dashboardColumnsFor decided
+// the terminal's too narrow for one.
+func (m Model) dashboardMetricColumn(renderer tideui.Renderer, cols dashboardColumns, number string, graph statGraph, color lipgloss.Color) string {
+	numberPadded := number
+	if n := cols.numWidth - len([]rune(number)); n > 0 {
+		numberPadded = strings.Repeat(" ", n) + number
+	}
+	if !cols.showSpark {
+		return numberPadded + "  "
+	}
+	spark := renderSparkline(renderer, m.settings, graph, color, cols.sparkWidth)
+	if pad := cols.sparkWidth - len([]rune(ansi.Strip(spark))); pad > 0 {
+		spark += lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Render(strings.Repeat(" ", pad))
+	}
+	return numberPadded + " " + spark + " "
 }
 
 // aboutContentWidth mirrors the panel-width math in renderOverlay so the
@@ -2532,6 +2824,29 @@ func formatBytes(value uint64) string {
 		return fmt.Sprintf("%d %s", value, units[unit])
 	}
 	return fmt.Sprintf("%.1f %s", size, units[unit])
+}
+
+// formatCompactBytes is formatBytes without the space and with single-
+// letter units ("14.0M" not "14.0 MiB") — for the Dashboard's per-row
+// columns, where dashboardNumWidth is sized for this shorter form, not
+// formatBytes' own (that's still used for the wider fleet-summary line
+// and the single-container Stats pane, where the extra width is fine).
+func formatCompactBytes(value uint64) string {
+	units := []string{"B", "K", "M", "G", "T"}
+	size := float64(value)
+	unit := 0
+	for size >= 1024 && unit < len(units)-1 {
+		size /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d%s", value, units[unit])
+	}
+	return fmt.Sprintf("%.1f%s", size, units[unit])
+}
+
+func formatRateCompact(value uint64) string {
+	return formatCompactBytes(value) + "/s"
 }
 
 func short(value string, n int) string {
