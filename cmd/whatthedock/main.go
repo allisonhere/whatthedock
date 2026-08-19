@@ -39,12 +39,27 @@ func main() {
 		os.Exit(1)
 	}
 	factory := systems.NewFactory()
-	provider, err := providerForMode(context.Background(), *demoMode || os.Getenv("WHATTHEDOCK_PROVIDER") == "demo", settings, factory)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
-		os.Exit(1)
+	provider, systemName, startupErr := providerForMode(context.Background(), *demoMode || os.Getenv("WHATTHEDOCK_PROVIDER") == "demo", settings, factory)
+	if startupErr != nil {
+		// A configured active system that can't connect (unreachable host,
+		// no key-based auth set up yet, ...) used to be fatal here — the app
+		// would refuse to even open, which is exactly the wrong failure mode
+		// for a config problem the Systems overlay exists to let you fix:
+		// you'd be locked out of the one place that could fix it. Fall back
+		// to local Docker instead and say why, so the app still launches
+		// and the broken system can be repaired (or switched away from)
+		// from inside it.
+		local := config.DefaultSystem()
+		provider, err = factory.Provider(context.Background(), local)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	model := ui.NewModelWithProviderFactory(provider, settings, settingsPath, factory.Provider).WithVersion(version)
+	if startupErr != nil {
+		model = model.WithStatus("couldn't connect to "+systemName+": "+startupErr.Error()+" — using local Docker instead", true)
+	}
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := program.Run()
 	if err != nil {
@@ -89,9 +104,13 @@ func versionString() string {
 	return strings.Join(parts, " ")
 }
 
-func providerForMode(ctx context.Context, demoMode bool, settings config.Settings, factory systems.Factory) (app.Provider, error) {
+// providerForMode resolves settings.ActiveSystem to a live provider.
+// systemName is the resolved system's display name — always returned
+// (even on error) purely so a caller can name it in a fallback message
+// without re-deriving config.FindSystem's result itself.
+func providerForMode(ctx context.Context, demoMode bool, settings config.Settings, factory systems.Factory) (provider app.Provider, systemName string, err error) {
 	if demoMode {
-		return demo.NewProvider(), nil
+		return demo.NewProvider(), "demo", nil
 	}
 	settings = config.NormalizeSystems(settings)
 	system := config.FindSystem(settings.Systems, settings.ActiveSystem)
@@ -99,7 +118,8 @@ func providerForMode(ctx context.Context, demoMode bool, settings config.Setting
 		local := config.DefaultSystem()
 		system = &local
 	}
-	return factory.Provider(ctx, *system)
+	provider, err = factory.Provider(ctx, *system)
+	return provider, system.Name, err
 }
 
 func loadSettings() (string, config.Settings, error) {

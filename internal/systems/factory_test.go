@@ -35,7 +35,7 @@ func TestFactoryBuildsSSHTunnelCommand(t *testing.T) {
 	}
 	_ = provider.Close()
 
-	wantArgs := []string{"-fN", "-L", "/tmp/whatthedock-test-jarvis.sock:/var/run/docker.sock", "allie@jarvis"}
+	wantArgs := []string{"-fN", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-L", "/tmp/whatthedock-test-jarvis.sock:/var/run/docker.sock", "allie@jarvis"}
 	if gotName != "ssh" || !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("runner = %q %#v, want ssh %#v", gotName, gotArgs, wantArgs)
 	}
@@ -68,9 +68,67 @@ func TestFactoryBuildsSSHTunnelCommandWithSeparateUserAndPort(t *testing.T) {
 	}
 	_ = provider.Close()
 
-	wantArgs := []string{"-fN", "-p", "2222", "-L", "/tmp/whatthedock-test-jarvis.sock:/var/run/docker.sock", "allie@jarvis.lan"}
+	wantArgs := []string{"-fN", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-p", "2222", "-L", "/tmp/whatthedock-test-jarvis.sock:/var/run/docker.sock", "allie@jarvis.lan"}
 	if gotName != "ssh" || !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("runner = %q %#v, want ssh %#v", gotName, gotArgs, wantArgs)
+	}
+}
+
+// TestSSHCommandOmitsBatchModeForInteractiveUse is the regression test for
+// a live report: an automatic, non-interactive connection attempt to a
+// password-auth system hung indefinitely, because ssh still tried to
+// prompt for a password on /dev/tty despite the caller having no way to
+// answer it. SSHCommandArgs (used by every automatic caller) now adds
+// BatchMode=yes to fail fast instead — but SSHCommand specifically must
+// keep allowing the prompt, since its only caller (switchSystemCmd/
+// testSystemCmd) hands the real terminal over via tea.ExecProcess so a
+// password-auth system can actually be used at all.
+func TestSSHCommandOmitsBatchModeForInteractiveUse(t *testing.T) {
+	cmd, err := SSHCommand(config.System{
+		ID:           "jarvis",
+		Kind:         "ssh",
+		SSHHost:      "192.168.86.74",
+		SSHUser:      "allie",
+		RemoteSocket: "/var/run/docker.sock",
+		LocalSocket:  filepath.Join(t.TempDir(), "jarvis.sock"),
+	})
+	if err != nil {
+		t.Fatalf("SSHCommand() err = %v", err)
+	}
+	if cmd == nil {
+		t.Fatal("SSHCommand() = nil command")
+	}
+	for _, arg := range cmd.Args {
+		if arg == "BatchMode=yes" {
+			t.Fatalf("SSHCommand() args = %v, want no BatchMode — it must still be able to prompt interactively", cmd.Args)
+		}
+	}
+}
+
+// TestSSHCommandArgsIncludesBatchModeForAutomaticUse is
+// TestSSHCommandOmitsBatchModeForInteractiveUse's complement: every
+// non-interactive caller (app launch, automatic reconnects) must get
+// BatchMode so a password-auth system fails fast instead of hanging.
+func TestSSHCommandArgsIncludesBatchModeForAutomaticUse(t *testing.T) {
+	args, err := SSHCommandArgs(config.System{
+		ID:           "jarvis",
+		Kind:         "ssh",
+		SSHHost:      "192.168.86.74",
+		SSHUser:      "allie",
+		RemoteSocket: "/var/run/docker.sock",
+		LocalSocket:  filepath.Join(t.TempDir(), "jarvis.sock"),
+	})
+	if err != nil {
+		t.Fatalf("SSHCommandArgs() err = %v", err)
+	}
+	found := false
+	for _, arg := range args {
+		if arg == "BatchMode=yes" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("SSHCommandArgs() args = %v, want BatchMode=yes so this never hangs on a password prompt it can't answer", args)
 	}
 }
 

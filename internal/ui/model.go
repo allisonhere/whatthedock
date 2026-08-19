@@ -753,6 +753,15 @@ func (m Model) WithVersion(version string) Model {
 	return m
 }
 
+// WithStatus overrides the initial "connecting to Docker" status set in
+// NewModelWithProviderFactory — for main() to explain a startup fallback
+// (e.g. the configured active system couldn't connect, so this launched
+// against local Docker instead) before the first frame ever paints.
+func (m Model) WithStatus(status string, isErr bool) Model {
+	m.status, m.statusErr = status, isErr
+	return m
+}
+
 func defaultSettings() appSettings {
 	return appSettings{
 		GraphStyle:      graphStyleWave,

@@ -57,14 +57,21 @@ func (f Factory) ensureSSHTunnel(ctx context.Context, system config.System) erro
 	return cmd.Run()
 }
 
+// SSHCommand builds the tunnel command for an *interactive* connection
+// attempt — the caller hands the real terminal over to it (tea.ExecProcess
+// in switchSystemCmd/testSystemCmd), so a password-auth system can safely
+// prompt on it. Never use this for a connection attempt that isn't backed
+// by a real terminal handoff — see SSHCommandArgs's doc comment for why.
 func SSHCommand(system config.System) (*exec.Cmd, error) {
-	args, err := SSHCommandArgs(system)
+	args, err := sshCommandArgs(system, true)
 	if err != nil || args == nil {
 		return nil, err
 	}
 	return exec.Command("ssh", args...), nil
 }
 
+// SSHCommandContext builds the tunnel command for an *automatic*
+// connection attempt — see SSHCommandArgs.
 func SSHCommandContext(ctx context.Context, system config.System) (*exec.Cmd, error) {
 	args, err := SSHCommandArgs(system)
 	if err != nil || args == nil {
@@ -73,7 +80,24 @@ func SSHCommandContext(ctx context.Context, system config.System) (*exec.Cmd, er
 	return exec.CommandContext(ctx, "ssh", args...), nil
 }
 
+// SSHCommandArgs builds the tunnel args for an *automatic* connection
+// attempt — app launch (providerForMode) and any other non-interactive
+// caller, none of which wire the child's stdio up to a real terminal (see
+// ensureSSHTunnel/runCommand). Without BatchMode, a password-auth system
+// ssh can't reach programmatically would still try to prompt by opening
+// /dev/tty directly — bypassing the disconnected Cmd.Stdin entirely — and
+// then hang indefinitely with nothing on screen to explain why, since
+// there's no context timeout on this path either. This was reported live
+// as "the app wants a password... it's not connecting": ssh was sitting at
+// a bare tty prompt before the TUI had even painted a frame. BatchMode
+// makes ssh fail fast and cleanly instead of ever attempting to prompt;
+// ConnectTimeout bounds the separate case of an unreachable host. Neither
+// applies to SSHCommand's interactive path, which needs the prompt to work.
 func SSHCommandArgs(system config.System) ([]string, error) {
+	return sshCommandArgs(system, false)
+}
+
+func sshCommandArgs(system config.System, interactive bool) ([]string, error) {
 	system = config.NormalizeSystems(config.Settings{ActiveSystem: system.ID, Systems: []config.System{system}}).Systems[0]
 	if system.SSHHost == "" {
 		return nil, fmt.Errorf("ssh host is required")
@@ -92,6 +116,9 @@ func SSHCommandArgs(system config.System) ([]string, error) {
 		return nil, err
 	}
 	args := []string{"-fN"}
+	if !interactive {
+		args = append(args, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+	}
 	if system.SSHPort != "" {
 		args = append(args, "-p", system.SSHPort)
 	}

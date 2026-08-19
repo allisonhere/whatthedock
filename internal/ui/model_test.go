@@ -1907,6 +1907,23 @@ func TestNewModelDoesNotStartInDashboardByDefault(t *testing.T) {
 	}
 }
 
+// TestWithStatusOverridesInitialConnectingMessage covers main.go's startup
+// fallback (a configured active system that can't connect falls back to
+// local Docker instead of refusing to launch — see providerForMode/
+// TestProviderForModeFallsBackToLocalOnConnectError): WithStatus is how it
+// explains that on the very first frame instead of the default "connecting
+// to Docker".
+func TestWithStatusOverridesInitialConnectingMessage(t *testing.T) {
+	model := NewModelWithSettings(newFakeProvider(), config.Settings{}, "").WithStatus("couldn't connect to jarvis: boom — using local Docker instead", true)
+
+	if model.status != "couldn't connect to jarvis: boom — using local Docker instead" {
+		t.Fatalf("status = %q, want the overridden message", model.status)
+	}
+	if !model.statusErr {
+		t.Fatal("statusErr = false, want true")
+	}
+}
+
 // TestInitStartsDashboardStatsPollWhenStartingInDashboard checks that
 // opening the Dashboard overlay from Start in dashboard also kicks off
 // its stats-polling loop immediately (dashboardRefreshCmd, the same
