@@ -75,14 +75,27 @@ SSH systems have separate `Host`, `User`, and optional `Port` fields. Existing
 settings that used `user@host` in the host field are still accepted and are
 shown as separate user and host values in the app.
 
-SSH systems support two auth modes:
+SSH systems support three auth modes (`Auth` cycles between them):
 
 - `config/agent`: uses your existing SSH config, keys, and agent in the
-  background.
+  background — fully automatic, including on app launch.
+- `keychain`: stores the password in your OS keychain (Secret Service on
+  Linux, Keychain on macOS, Credential Manager on Windows) via a native Go
+  SSH client, so this also connects automatically, including on app launch —
+  the password never touches settings.json, a subprocess's argv, or its
+  environment. Host keys are checked against your real `~/.ssh/known_hosts`,
+  same as a normal `ssh` connection; deleting a keychain-mode system also
+  removes its stored password.
 - `password prompt`: temporarily hands the terminal to `ssh` while switching
-  systems so OpenSSH can ask for the password, then returns to WhatTheDock.
+  systems so OpenSSH can ask for the password, then returns to WhatTheDock —
+  the password is typed fresh every time and never stored anywhere.
 
-WhatTheDock does not store SSH passwords or private keys.
+Only `keychain` mode stores anything: `config/agent` and `password prompt`
+never persist a password or key anywhere WhatTheDock controls. An automatic
+connection attempt (app launch, or any other non-interactive path) that
+would otherwise need to prompt now fails fast instead of hanging, and a
+configured active system that can't connect no longer blocks the app from
+launching — it falls back to local Docker and says why.
 
 Settings and Systems form changes are saved with `Ctrl+S`; `Esc` cancels
 unsaved form edits. Systems editor text fields support normal caret editing

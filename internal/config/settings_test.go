@@ -178,6 +178,15 @@ func TestNormalizeSystemsPreservesSSHPasswordPrompt(t *testing.T) {
 	}
 }
 
+func TestNormalizeSystemsPreservesSSHKeychainAuth(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis", SSHAuth: "keychain"}},
+	})
+	if got := settings.Systems[0].SSHAuth; got != "keychain" {
+		t.Fatalf("SSHAuth = %q, want keychain", got)
+	}
+}
+
 func TestSettingsPathUsesUserConfigDir(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configDir)

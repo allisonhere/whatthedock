@@ -2289,6 +2289,13 @@ func TestSystemsOverlayListsAndEditsSystems(t *testing.T) {
 	}
 }
 
+// TestSystemsOverlayCanSelectSSHPasswordPrompt covers the auth cycle's
+// full 3-state loop: config -> keychain -> password -> config. Both left
+// and right call the same non-directional cycleSystemChoice — with the
+// old 2-state (config/password) toggle "left" happened to look like "go
+// back" purely because toggling a 2-state value is its own inverse; that
+// coincidence doesn't hold now that there are three states, so this just
+// cycles forward three times back to the start.
 func TestSystemsOverlayCanSelectSSHPasswordPrompt(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 30
@@ -2297,6 +2304,12 @@ func TestSystemsOverlayCanSelectSSHPasswordPrompt(t *testing.T) {
 	model.systemField = systemFieldSSHAuth
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.systemDraft.SSHAuth != "keychain" {
+		t.Fatalf("SSHAuth = %q, want keychain", model.systemDraft.SSHAuth)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = updated.(Model)
 	if model.systemDraft.SSHAuth != "password" {
 		t.Fatalf("SSHAuth = %q, want password", model.systemDraft.SSHAuth)
@@ -2307,7 +2320,7 @@ func TestSystemsOverlayCanSelectSSHPasswordPrompt(t *testing.T) {
 		t.Fatalf("systems overlay missing password prompt auth:\n%s", view)
 	}
 
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = updated.(Model)
 	if model.systemDraft.SSHAuth != "config" {
 		t.Fatalf("SSHAuth = %q, want config", model.systemDraft.SSHAuth)
@@ -2438,6 +2451,137 @@ func TestSystemsOverlaySavesDraftWithCtrlS(t *testing.T) {
 	}
 	if len(model.systems) != 2 || model.systems[1].SSHHost != "jarvis" || model.systems[1].SSHUser != "allie" {
 		t.Fatalf("systems = %#v, want saved ssh system", model.systems)
+	}
+}
+
+// stubPasswordStore wires model's storePassword/forgetPassword/passwordFor
+// to an in-memory map instead of the real OS keychain (internal/systems'
+// default) — the same dependency-injection pattern providerFor already
+// uses. Returns the backing map for assertions.
+func stubPasswordStore(model *Model) map[string]string {
+	store := map[string]string{}
+	model.storePassword = func(systemID, password string) error {
+		store[systemID] = password
+		return nil
+	}
+	model.forgetPassword = func(systemID string) error {
+		delete(store, systemID)
+		return nil
+	}
+	model.passwordFor = func(systemID string) (string, error) {
+		v, ok := store[systemID]
+		if !ok {
+			return "", errors.New("no password stored")
+		}
+		return v, nil
+	}
+	return store
+}
+
+// TestSystemsOverlaySavesTypedKeychainPassword covers the actual point of
+// this feature: saving a keychain-mode system with a freshly typed
+// password stores it (via storePassword, not settings.json) and clears
+// the in-memory draft afterward.
+func TestSystemsOverlaySavesTypedKeychainPassword(t *testing.T) {
+	model := testModel()
+	store := stubPasswordStore(&model)
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemDraft.SSHHost = "jarvis"
+	model.systemDraft.SSHUser = "allie"
+	model.systemDraft.SSHAuth = "keychain"
+	model.systemDraftPassword = "hunter2"
+
+	model.saveSystemDraft()
+
+	if store["remote-2"] != "hunter2" {
+		t.Fatalf("stored passwords = %#v, want remote-2 -> hunter2", store)
+	}
+	if model.systemDraftPassword != "" {
+		t.Fatalf("systemDraftPassword = %q, want cleared after a successful store", model.systemDraftPassword)
+	}
+	if model.systemMode != systemModeList {
+		t.Fatalf("systemMode = %v, want list after save", model.systemMode)
+	}
+}
+
+// TestSystemsOverlayBlankPasswordFieldKeepsExistingStoredPassword checks
+// the "leave it alone" half of saveSystemDraft's contract: editing an
+// existing keychain-mode system without retyping the password must not
+// touch (let alone clear) what's already stored.
+func TestSystemsOverlayBlankPasswordFieldKeepsExistingStoredPassword(t *testing.T) {
+	model := testModel()
+	store := stubPasswordStore(&model)
+	store["jarvis"] = "already-stored"
+	model.systems = []config.System{
+		{ID: "local", Name: "local", Kind: "local"},
+		{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "jarvis", SSHUser: "allie", SSHAuth: "keychain", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/jarvis.sock"},
+	}
+	model.systemsCursor = 1
+	model.startEditSystem()
+
+	if !model.systemDraftHasStoredPassword {
+		t.Fatal("systemDraftHasStoredPassword = false, want true — a password is already stored")
+	}
+	if model.systemDraftPassword != "" {
+		t.Fatalf("systemDraftPassword = %q, want blank until retyped", model.systemDraftPassword)
+	}
+
+	model.systemDraft.SSHUser = "allie2" // change something unrelated
+	model.saveSystemDraft()
+
+	if store["jarvis"] != "already-stored" {
+		t.Fatalf("stored password = %q, want untouched", store["jarvis"])
+	}
+}
+
+// TestSystemsOverlayStorePasswordFailureAbortsSave covers the fail-closed
+// requirement: a keychain backend error must not silently persist a
+// system that can never actually connect.
+func TestSystemsOverlayStorePasswordFailureAbortsSave(t *testing.T) {
+	model := testModel()
+	stubPasswordStore(&model)
+	model.storePassword = func(string, string) error { return errors.New("no keyring backend available") }
+	model.openSystemsOverlay()
+	model.startAddSystem()
+	model.systemDraft.SSHHost = "jarvis"
+	model.systemDraft.SSHUser = "allie"
+	model.systemDraft.SSHAuth = "keychain"
+	model.systemDraftPassword = "hunter2"
+
+	model.saveSystemDraft()
+
+	if model.systemMode == systemModeList {
+		t.Fatal("systemMode = list, want still editing — a store failure must not proceed as if it saved")
+	}
+	if len(model.systems) != 1 {
+		t.Fatalf("systems = %#v, want unchanged (only the default local system)", model.systems)
+	}
+	if !model.statusErr || !strings.Contains(model.status, "no keyring backend") {
+		t.Fatalf("status/statusErr = %q/%v, want the keychain error surfaced", model.status, model.statusErr)
+	}
+}
+
+// TestSystemsOverlayDeleteForgetsKeychainPassword checks no orphaned
+// secret is left behind in the OS keychain after its system is deleted.
+func TestSystemsOverlayDeleteForgetsKeychainPassword(t *testing.T) {
+	model := testModel()
+	store := stubPasswordStore(&model)
+	store["jarvis"] = "hunter2"
+	model.systems = []config.System{
+		{ID: "local", Name: "local", Kind: "local"},
+		{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "jarvis", SSHAuth: "keychain", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/jarvis.sock"},
+	}
+	model.activeSystem = "local"
+	model.systemsCursor = 1
+
+	model.deleteCurrentSystem()
+
+	if _, ok := store["jarvis"]; ok {
+		t.Fatalf("stored passwords = %#v, want jarvis's entry gone", store)
+	}
+	if len(model.systems) != 1 {
+		t.Fatalf("systems = %#v, want jarvis removed", model.systems)
 	}
 }
 

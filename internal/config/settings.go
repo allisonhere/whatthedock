@@ -138,7 +138,7 @@ func NormalizeSystems(settings Settings) Settings {
 				settings.Systems[i].SSHHost = host
 			}
 			switch settings.Systems[i].SSHAuth {
-			case "password":
+			case "password", "keychain":
 			default:
 				settings.Systems[i].SSHAuth = "config"
 			}

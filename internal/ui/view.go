@@ -2276,6 +2276,8 @@ func (m Model) systemFieldDisplay(field systemField) (string, string) {
 		return "Port", emptyAsDefault(m.systemDraft.SSHPort)
 	case systemFieldSSHAuth:
 		return "Auth", systemAuthLabel(m.systemDraft.SSHAuth)
+	case systemFieldSSHPassword:
+		return "Password", m.systemPasswordFieldDisplay()
 	case systemFieldRemoteSocket:
 		return "Remote socket", m.systemDraft.RemoteSocket
 	case systemFieldLocalSocket:

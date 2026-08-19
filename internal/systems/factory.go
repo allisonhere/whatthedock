@@ -2,6 +2,7 @@ package systems
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -30,7 +31,18 @@ func (f Factory) Provider(ctx context.Context, system config.System) (app.Provid
 	system = config.NormalizeSystems(config.Settings{ActiveSystem: system.ID, Systems: []config.System{system}}).Systems[0]
 	switch system.Kind {
 	case "ssh":
-		if err := f.ensureSSHTunnel(ctx, system); err != nil {
+		if system.SSHAuth == "keychain" {
+			password, err := PasswordFor(system.ID)
+			if err != nil {
+				if errors.Is(err, errNoStoredPassword) {
+					return nil, fmt.Errorf("no password stored in keychain for %q — open Systems and set one", system.Name)
+				}
+				return nil, err
+			}
+			if err := dialKeychainTunnel(ctx, system, password); err != nil {
+				return nil, err
+			}
+		} else if err := f.ensureSSHTunnel(ctx, system); err != nil {
 			return nil, err
 		}
 		return dockerprovider.NewProvider(system.ID, system.Name, "unix://"+system.LocalSocket)
@@ -108,12 +120,12 @@ func sshCommandArgs(system config.System, interactive bool) ([]string, error) {
 	if system.RemoteSocket == "" {
 		return nil, fmt.Errorf("remote socket is required")
 	}
-	if isLiveSocket(system.LocalSocket) {
-		return nil, nil
-	}
-	_ = os.Remove(system.LocalSocket)
-	if err := os.MkdirAll(filepath.Dir(system.LocalSocket), 0o755); err != nil {
+	live, err := prepareLocalSocket(system.LocalSocket)
+	if err != nil {
 		return nil, err
+	}
+	if live {
+		return nil, nil
 	}
 	args := []string{"-fN"}
 	if !interactive {
@@ -179,6 +191,23 @@ func isLiveSocket(path string) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// prepareLocalSocket reports whether path is already a live tunnel socket
+// (nothing to do — caller should reuse it) or, if not, removes any stale
+// socket file and ensures its parent directory exists so a fresh listener
+// can bind there. Shared by both the shelled-out ssh tunnel (SSHCommandArgs)
+// and the native keychain tunnel (dialKeychainTunnel) — the exact same
+// stale-socket handling either way.
+func prepareLocalSocket(path string) (live bool, err error) {
+	if isLiveSocket(path) {
+		return true, nil
+	}
+	_ = os.Remove(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func runCommand(ctx context.Context, name string, args ...string) error {

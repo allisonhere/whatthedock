@@ -268,6 +268,7 @@ const (
 	systemFieldSSHUser
 	systemFieldSSHPort
 	systemFieldSSHAuth
+	systemFieldSSHPassword
 	systemFieldRemoteSocket
 	systemFieldLocalSocket
 )
@@ -373,9 +374,30 @@ type Model struct {
 	systemMode           systemOverlayMode
 	systemDraft          config.System
 	systemDraftNew       bool
-	systemField          systemField
-	systemCursor         int
-	providerFor          providerFactory
+	// systemDraftPassword holds a keychain-mode system's password only
+	// while it's being typed in the Systems overlay — deliberately never
+	// added to config.System, so there's no path for it to round-trip
+	// through saveSettings/settings.json even by accident. saveSystemDraft
+	// writes it to the OS keychain (see internal/systems.StorePassword)
+	// and clears it from memory immediately after a successful store.
+	// systemDraftHasStoredPassword reflects whether the keychain already
+	// has a password for this system's ID, checked once on entering edit
+	// mode (or toggling into keychain auth) rather than every render — it
+	// lets the idle field show "(stored)" instead of a misleading
+	// "(not set)" for an existing entry the user just hasn't retyped.
+	systemDraftPassword          string
+	systemDraftHasStoredPassword bool
+	systemField                  systemField
+	systemCursor                 int
+	providerFor                  providerFactory
+	// storePassword/forgetPassword/passwordFor default to
+	// internal/systems' real keychain-backed functions (see
+	// NewModelWithProviderFactory) but are swappable fields — same
+	// dependency-injection pattern providerFor already uses — so tests
+	// never touch a real OS keychain.
+	storePassword  func(systemID, password string) error
+	forgetPassword func(systemID string) error
+	passwordFor    func(systemID string) (string, error)
 
 	copyCursor int
 	openCursor int
@@ -736,6 +758,9 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		appVersion:           "dev",
 		updateIgnoredVersion: persisted.UpdateIgnoredVersion,
 		updateLastCheck:      updateLastCheck,
+		storePassword:        systems.StorePassword,
+		forgetPassword:       systems.ForgetPassword,
+		passwordFor:          systems.PasswordFor,
 	}
 	if settings.StartInDashboard {
 		m.overlay = overlayDashboard
@@ -2136,6 +2161,8 @@ func (m *Model) startAddSystem() {
 		LocalSocket:  filepath.Join(os.TempDir(), fmt.Sprintf("whatthedock-remote-%d.sock", next)),
 	}
 	m.systemDraftNew = true
+	m.systemDraftPassword = ""
+	m.systemDraftHasStoredPassword = false
 	m.systemField = systemFieldName
 	m.systemCursor = len([]rune(m.systemDraft.Name))
 	m.systemMode = systemModeEdit
@@ -2144,9 +2171,23 @@ func (m *Model) startAddSystem() {
 func (m *Model) startEditSystem() {
 	m.systemDraft = m.currentSystem()
 	m.systemDraftNew = false
+	m.systemDraftPassword = ""
+	m.systemDraftHasStoredPassword = m.hasStoredPasswordFor(m.systemDraft)
 	m.systemField = systemFieldName
 	m.systemCursor = len([]rune(m.systemDraft.Name))
 	m.systemMode = systemModeEdit
+}
+
+// hasStoredPasswordFor reports whether the OS keychain already has a
+// password for system's ID — checked once, on entering edit mode or
+// toggling into keychain auth, rather than on every render (a keychain
+// lookup is a real D-Bus round trip on Linux, not free).
+func (m Model) hasStoredPasswordFor(system config.System) bool {
+	if system.Kind != "ssh" || system.SSHAuth != "keychain" || m.passwordFor == nil {
+		return false
+	}
+	_, err := m.passwordFor(system.ID)
+	return err == nil
 }
 
 func (m *Model) moveSystemField(delta int) {
@@ -2170,7 +2211,11 @@ func (m *Model) moveSystemField(delta int) {
 func (m Model) visibleSystemFields() []systemField {
 	fields := []systemField{systemFieldName, systemFieldKind}
 	if m.systemDraft.Kind == "ssh" {
-		return append(fields, systemFieldSSHHost, systemFieldSSHUser, systemFieldSSHPort, systemFieldSSHAuth, systemFieldRemoteSocket, systemFieldLocalSocket)
+		fields = append(fields, systemFieldSSHHost, systemFieldSSHUser, systemFieldSSHPort, systemFieldSSHAuth)
+		if m.systemDraft.SSHAuth == "keychain" {
+			fields = append(fields, systemFieldSSHPassword)
+		}
+		return append(fields, systemFieldRemoteSocket, systemFieldLocalSocket)
 	}
 	return append(fields, systemFieldDockerHost)
 }
@@ -2210,15 +2255,25 @@ func (m *Model) toggleSystemKind() {
 	}
 }
 
+// toggleSystemAuth cycles config -> keychain -> password -> config. A
+// blank SSHAuth (a system.Kind just switched to "ssh" this edit, before
+// NormalizeSystems would default it) counts as "config" for this cycle —
+// otherwise the very first press on a brand new system would only
+// normalize the blank value instead of actually advancing it.
 func (m *Model) toggleSystemAuth() {
 	if m.systemDraft.Kind != "ssh" {
 		return
 	}
-	if m.systemDraft.SSHAuth == "password" {
+	switch m.systemDraft.SSHAuth {
+	case "config", "":
+		m.systemDraft.SSHAuth = "keychain"
+	case "keychain":
+		m.systemDraft.SSHAuth = "password"
+	default: // "password"
 		m.systemDraft.SSHAuth = "config"
-		return
 	}
-	m.systemDraft.SSHAuth = "password"
+	m.systemDraftPassword = ""
+	m.systemDraftHasStoredPassword = m.hasStoredPasswordFor(m.systemDraft)
 }
 
 func (m *Model) editSystemFieldBackspace() {
@@ -2281,6 +2336,8 @@ func (m Model) systemFieldValue() string {
 		return m.systemDraft.SSHPort
 	case systemFieldSSHAuth:
 		return systemAuthLabel(m.systemDraft.SSHAuth)
+	case systemFieldSSHPassword:
+		return m.systemDraftPassword
 	case systemFieldRemoteSocket:
 		return m.systemDraft.RemoteSocket
 	case systemFieldLocalSocket:
@@ -2290,8 +2347,14 @@ func (m Model) systemFieldValue() string {
 	}
 }
 
+// systemFieldValueWithCaret mirrors settingsEditValueWithCaret's caret
+// convention — masked as bullets for systemFieldSSHPassword (a real
+// password field being actively typed, not just masked when idle).
 func (m Model) systemFieldValueWithCaret() string {
 	runes := []rune(m.systemFieldValue())
+	if m.systemField == systemFieldSSHPassword {
+		runes = []rune(strings.Repeat("•", len(runes)))
+	}
 	cursor := clamp(m.systemCursor, 0, len(runes))
 	withCaret := append([]rune{}, runes[:cursor]...)
 	withCaret = append(withCaret, '|')
@@ -2311,6 +2374,8 @@ func (m *Model) setSystemFieldValue(value string) {
 		m.systemDraft.SSHUser = value
 	case systemFieldSSHPort:
 		m.systemDraft.SSHPort = value
+	case systemFieldSSHPassword:
+		m.systemDraftPassword = value
 	case systemFieldRemoteSocket:
 		m.systemDraft.RemoteSocket = value
 	case systemFieldLocalSocket:
@@ -2323,6 +2388,18 @@ func (m *Model) saveSystemDraft() {
 	if err := validateSystem(m.systemDraft); err != nil {
 		m.status, m.statusErr = "system: "+err.Error(), true
 		return
+	}
+	// A blank password field on an existing keychain-mode entry means
+	// "leave the already-stored password alone," not "clear it" — only a
+	// non-empty retype writes anything. A store failure (no keychain
+	// backend available, etc.) aborts the save rather than silently
+	// persisting a system that can never actually connect.
+	if m.systemDraft.SSHAuth == "keychain" && m.systemDraftPassword != "" && m.storePassword != nil {
+		if err := m.storePassword(m.systemDraft.ID, m.systemDraftPassword); err != nil {
+			m.status, m.statusErr = "system: "+err.Error(), true
+			return
+		}
+		m.systemDraftPassword = ""
 	}
 	if m.systemDraftNew {
 		m.systems = append(m.systems, m.systemDraft)
@@ -2346,6 +2423,9 @@ func (m *Model) deleteCurrentSystem() {
 		m.systemMode = systemModeList
 		m.status, m.statusErr = "switch systems before deleting the active system", true
 		return
+	}
+	if deleted.SSHAuth == "keychain" && m.forgetPassword != nil {
+		_ = m.forgetPassword(deleted.ID) // best-effort: no orphaned secret left behind, but a deleted system shouldn't fail to delete over it
 	}
 	m.systems = append(m.systems[:index], m.systems[index+1:]...)
 	m.systemsCursor = clamp(index, 0, len(m.systems)-1)
@@ -2497,10 +2577,14 @@ func systemTestStatus(system config.System) string {
 }
 
 func systemAuthLabel(auth string) string {
-	if auth == "password" {
+	switch auth {
+	case "password":
 		return "password prompt"
+	case "keychain":
+		return "keychain"
+	default:
+		return "config/agent"
 	}
-	return "config/agent"
 }
 
 func (m *Model) resetDockerState() {
@@ -2945,6 +3029,21 @@ func maskedSecret(value string) string {
 		return "(not set)"
 	}
 	return strings.Repeat("•", 8)
+}
+
+// systemPasswordFieldDisplay is the keychain-mode password row's idle
+// value: masked bullets for a freshly typed, not-yet-saved password;
+// "(stored)" for an existing entry the user just hasn't retyped (see
+// systemDraftHasStoredPassword's doc comment — showing "(not set)" here
+// would wrongly suggest nothing is saved); "(not set)" otherwise.
+func (m Model) systemPasswordFieldDisplay() string {
+	if m.systemDraftPassword != "" {
+		return maskedSecret(m.systemDraftPassword)
+	}
+	if m.systemDraftHasStoredPassword {
+		return "(stored)"
+	}
+	return "(not set)"
 }
 
 // updateCheckRowValue is the "Check for update" settings row's right-hand
