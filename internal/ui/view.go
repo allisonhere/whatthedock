@@ -1782,9 +1782,9 @@ func (m Model) paneActions(pane pane) []paneAction {
 				{key: "p", label: "problems"},
 			}
 		default:
-			follow := paneAction{key: "f", label: "live"}
+			follow := paneAction{key: "space", label: "live"}
 			if m.logFollow {
-				follow = paneAction{key: "k", label: "pause"}
+				follow = paneAction{key: "space", label: "pause"}
 			}
 			return []paneAction{
 				follow,
@@ -2425,7 +2425,8 @@ var helpLines = []string{
 	"/              filter logs while logs pane is focused",
 	"e / w / i / a  log errors, warnings, info, all",
 	"n / N          next/previous log search match",
-	"f / End        resume live log tail",
+	"Space          toggle live/paused log tail",
+	"f / End        jump to end (live)",
 	"x / Esc        clear active log filter",
 	"u              replicate: pull latest image, recreate",
 	"D              delete: real, permanent removal",

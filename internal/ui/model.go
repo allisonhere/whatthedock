@@ -1462,6 +1462,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.rows = m.buildRows()
 				return m, m.restoreFocusedTreeRow(previousCursor, false)
 			}
+		} else if m.mode == activityLogs {
+			m.focus = paneActivity
+			if m.logFollow {
+				m.pauseLogs()
+			} else {
+				m.followLogs()
+			}
+			return m, nil
 		}
 	case "enter":
 		if m.focus == paneActivity && m.mode == activityProblems {
@@ -3377,6 +3385,27 @@ func (m *Model) scrollLogs(delta int) {
 	m.logFollow = false
 	m.logScroll += delta
 	m.clampLogScroll()
+	m.saveLogViewState()
+}
+
+// pauseLogs stops auto-following at the current bottom line, without
+// moving the view — unlike scrollLogs(0), which pins logScroll to the
+// same position but then calls clampLogScroll, whose own "scrolled to the
+// bottom" check immediately flips logFollow back to true, making a
+// same-position pause a no-op. Setting logFollow here directly, after
+// pinning the position, sidesteps that: a new incoming line while paused
+// is then correctly ignored (see the logChan drain loop's `if
+// m.logFollow` guard) rather than silently resuming.
+func (m *Model) pauseLogs() {
+	lines := len(m.visibleLogLines())
+	if lines == 0 {
+		m.logScroll = 0
+		m.logFollow = true // nothing to pause on — trivially caught up
+		m.saveLogViewState()
+		return
+	}
+	m.logScroll = max(0, lines-m.logVisibleRows())
+	m.logFollow = false
 	m.saveLogViewState()
 }
 

@@ -134,6 +134,7 @@ Docker socket paths must be present.
 | `j` / `k` in logs | Scroll log history |
 | `PgUp` / `PgDown` in logs | Page through log history |
 | `Home` / `End` in logs | Jump to log start or resume tail |
+| `Space` in logs | Toggle live/paused log tail |
 | `f` in logs | Resume live log tail |
 | `n` / `N` in logs | Next/previous log search match |
 | `x` / `Esc` in logs | Clear active log filters |

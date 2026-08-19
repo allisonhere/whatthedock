@@ -859,7 +859,7 @@ func TestActivityActionStripChangesByMode(t *testing.T) {
 	model.logFollow = true
 
 	logView := ansi.Strip(model.View())
-	for _, want := range []string{"k pause", "/ search", "n/N match", "x clear"} {
+	for _, want := range []string{"space pause", "/ search", "n/N match", "x clear"} {
 		if !strings.Contains(logView, want) {
 			t.Fatalf("logs action strip missing %q:\n%s", want, logView)
 		}
@@ -867,7 +867,7 @@ func TestActivityActionStripChangesByMode(t *testing.T) {
 
 	model.logFollow = false
 	pausedView := ansi.Strip(model.View())
-	if !strings.Contains(pausedView, "f live") || strings.Contains(pausedView, "k pause") {
+	if !strings.Contains(pausedView, "space live") || strings.Contains(pausedView, "space pause") {
 		t.Fatalf("paused logs action strip =\n%s", pausedView)
 	}
 
@@ -886,7 +886,7 @@ func TestActivityActionStripChangesByMode(t *testing.T) {
 			t.Fatalf("stats action strip missing %q:\n%s", want, statsView)
 		}
 	}
-	if strings.Contains(statsView, "k pause") || strings.Contains(statsView, "f live") {
+	if strings.Contains(statsView, "space pause") || strings.Contains(statsView, "space live") {
 		t.Fatalf("stats action strip should not advertise log live controls:\n%s", statsView)
 	}
 }
@@ -900,7 +900,7 @@ func TestLogActionStripStaysVisibleWhenLogPaneIsFull(t *testing.T) {
 	model.logFollow = true
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"k pause", "/ search", "x clear"} {
+	for _, want := range []string{"space pause", "/ search", "x clear"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("full log pane missing persistent footer chip %q:\n%s", want, view)
 		}
@@ -1091,6 +1091,69 @@ func TestLogFollowKeyWorksFromAnyFocusWhileInLogs(t *testing.T) {
 	}
 	if view := ansi.Strip(model.View()); !strings.Contains(view, "tail 12/12") || !strings.Contains(view, "line-12") {
 		t.Fatalf("follow from tree focus view =\n%s", view)
+	}
+}
+
+// TestSpaceKeyTogglesLogFollow covers the space-as-live/paused-toggle
+// request: pressing space while following pauses at the current bottom
+// (not mid-scroll — a plain toggle, not a scroll), and pressing it again
+// resumes live tailing. Unlike f/End (see
+// TestLogFollowKeyWorksFromAnyFocusWhileInLogs), this deliberately only
+// applies outside paneTree focus — space already means "expand/collapse
+// project" there (see TestSpaceKeyStillCollapsesTreeWhenFocused), so
+// starting from paneActivity here is the realistic case, not an
+// arbitrary choice.
+func TestSpaceKeyTogglesLogFollow(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 12
+	model.focus = paneActivity
+	model.mode = activityLogs
+	ctr := model.provider.(*fakeProvider).containers["1"]
+	model.selected = &ctr
+	model.selectedID = ctr.ID
+	model.logViewID = ctr.ID
+	model.logLines = numberedLogLines(12)
+	model.logFollow = true
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeySpace})
+	model = updated.(Model)
+	if model.focus != paneActivity || model.logFollow {
+		t.Fatalf("focus/follow after space = %v/%v, want activity/false (paused)", model.focus, model.logFollow)
+	}
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "paused") || !strings.Contains(view, "line-12") {
+		t.Fatalf("paused-by-space view should still show the bottom, not scroll away from it:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeySpace})
+	model = updated.(Model)
+	if !model.logFollow {
+		t.Fatal("logFollow = false after second space, want true (resumed)")
+	}
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "tail 12/12") || !strings.Contains(view, "line-12") {
+		t.Fatalf("resumed-by-space view =\n%s", view)
+	}
+}
+
+// TestSpaceKeyStillCollapsesTreeWhenFocused checks the pre-existing tree
+// behavior (space expands/collapses a project row) wasn't clobbered by
+// wiring space into log-follow toggling.
+func TestSpaceKeyStillCollapsesTreeWhenFocused(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 100, 30
+	model.focus = paneTree
+	model.mode = activityLogs // even in Logs mode, tree focus keeps space's tree meaning
+	model.cursor = 0
+
+	row := model.currentRow()
+	if row == nil || row.kind != rowProject {
+		t.Skip("fixture's first tree row isn't a project row; nothing to collapse")
+	}
+	project := row.project
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeySpace})
+	model = updated.(Model)
+	if !model.collapsed[project] {
+		t.Fatal("collapsed[project] = false after space on a tree project row, want true")
 	}
 }
 
