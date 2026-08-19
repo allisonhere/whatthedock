@@ -212,9 +212,9 @@ go build -buildvcs=false \
 
 ## Release
 
-Publishing a release (build, tag, push the tag, and create the GitHub
-release with the binary attached) is a small TUI, not a manual sequence of
-commands:
+Publishing a release (build, sign, tag, push the tag, and create the
+GitHub release with the binary and its signature attached) is a small
+TUI, not a manual sequence of commands:
 
 ```bash
 go run ./cmd/release
@@ -223,7 +223,25 @@ go run ./cmd/release
 Shows the branch, latest tag, and commit log/diff stat since that tag, lets
 you confirm or edit the suggested next version, then runs every step with
 live progress. Add `-dry-run` to walk through the whole flow (including a
-real build) without actually tagging, pushing, or publishing anything.
+real build and a real signature) without actually tagging, pushing, or
+publishing anything.
+
+Every release binary is signed with a detached ed25519 signature (see
+"Update security" below) — `go run ./cmd/release -genkey` generates the
+one-time signing keypair; the private half is exported as
+`WHATTHEDOCK_SIGNING_KEY` and must never be committed, and the public half
+is baked into `internal/update`. A release without `WHATTHEDOCK_SIGNING_KEY`
+set fails at the Sign step rather than publishing unsigned.
+
+### Update security
+
+The self-updater doesn't trust "GitHub served it over HTTPS" alone: every
+release's binary is signed at publish time (see above), and
+`internal/update.ReplaceRunningExecutable` verifies that signature against
+a public key baked into the already-installed binary before it will
+overwrite anything — an unsigned or invalid update is refused outright,
+never installed. The signing private key only ever exists on the
+maintainer's own machine.
 
 ## Development
 
@@ -303,8 +321,10 @@ More detail:
   about that release, but a later one prompts fresh (a manual check always
   re-shows it, even for a version already ignored). Confirming stays on the
   same popup with a fill-bar showing install progress, downloads the
-  matching release asset, and atomically replaces the running binary; the
-  popup then shows an "updated to vX.Y.Z" confirmation and waits for enter
+  matching release asset, verifies its signature (see "Update security"
+  below — a failed check refuses to install rather than overwriting
+  anything), and atomically replaces the running binary; the popup then
+  shows an "updated to vX.Y.Z" confirmation and waits for enter
   before restarting into it — same terminal, no manual restart, and no
   guessing how long the message needs to stay up.
 - Starts, stops, restarts, and refreshes containers.

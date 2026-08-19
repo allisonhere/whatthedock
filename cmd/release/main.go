@@ -1,12 +1,14 @@
 // Command release is a small TUI for publishing a WhatTheDock GitHub
 // release: builds the version-stamped binary the same way the README's
-// manual build instructions do, tags the commit, pushes the tag, and
-// publishes a GitHub release with the binary attached via gh.
+// manual build instructions do, signs it, tags the commit, pushes the
+// tag, and publishes a GitHub release with the binary and its detached
+// signature attached via gh.
 //
 // Run it from the repository root:
 //
 //	go run ./cmd/release
 //	go run ./cmd/release -dry-run   # walk through every step without tagging, pushing, or publishing
+//	go run ./cmd/release -genkey    # one-time: generate the release signing keypair
 package main
 
 import (
@@ -20,8 +22,15 @@ import (
 func main() {
 	dryRun := false
 	for _, arg := range os.Args[1:] {
-		if arg == "-dry-run" || arg == "--dry-run" {
+		switch arg {
+		case "-dry-run", "--dry-run":
 			dryRun = true
+		case "-genkey", "--genkey":
+			if err := genKey(os.Stdout); err != nil {
+				fmt.Fprintln(os.Stderr, "release:", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 

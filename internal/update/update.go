@@ -117,6 +117,18 @@ func DownloadURL(repo, version string) string {
 	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, version, AssetName(version))
 }
 
+// SignatureAssetName is the detached-signature asset filename cmd/release
+// publishes alongside AssetName's binary — see verify.go.
+func SignatureAssetName(version string) string {
+	return AssetName(version) + ".sig"
+}
+
+// SignatureDownloadURL is the GitHub release asset URL for version's
+// detached signature.
+func SignatureDownloadURL(repo, version string) string {
+	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, version, SignatureAssetName(version))
+}
+
 // download fetches url's body into a new file in dir (so the caller's
 // later rename is same-filesystem, and therefore atomic), returning its
 // path. The caller owns cleaning it up on error.
@@ -155,12 +167,32 @@ func download(ctx context.Context, url, dir string) (string, error) {
 	return name, nil
 }
 
-// ReplaceRunningExecutable downloads version's release asset for repo and
-// atomically replaces the currently running binary with it. It returns the
-// executable's path so the caller can re-exec into it — this package never
-// does that itself, since replacing a running process image is a
-// main-package/process-lifecycle concern, not something a library package
-// should reach for.
+// downloadBytes fetches url's entire body into memory — for the small
+// (64-byte) detached signature asset, unlike the multi-megabyte binary
+// download() writes straight to a temp file instead.
+func downloadBytes(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download %s: unexpected status %s", url, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// ReplaceRunningExecutable downloads version's release asset for repo,
+// verifies it against the matching detached signature (see verify.go)
+// before touching anything, and only then atomically replaces the
+// currently running binary with it. It returns the executable's path so
+// the caller can re-exec into it — this package never does that itself,
+// since replacing a running process image is a main-package/process-
+// lifecycle concern, not something a library package should reach for.
 func ReplaceRunningExecutable(ctx context.Context, repo, version string) (string, error) {
 	exe, err := executableOverride()
 	if err != nil {
@@ -173,6 +205,20 @@ func ReplaceRunningExecutable(ctx context.Context, repo, version string) (string
 	tmp, err := download(ctx, DownloadURL(repo, version), filepath.Dir(exe))
 	if err != nil {
 		return "", err
+	}
+	sig, err := downloadBytes(ctx, SignatureDownloadURL(repo, version))
+	if err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("download signature: %w", err)
+	}
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := verifyBinary(verificationPublicKey, data, sig); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("refusing to install unverified update: %w", err)
 	}
 	if err := os.Rename(tmp, exe); err != nil {
 		os.Remove(tmp)

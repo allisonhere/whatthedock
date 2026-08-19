@@ -19,6 +19,7 @@ import (
 func releasePlanSteps(version string) []stepStatus {
 	labels := []string{
 		"Build " + releaseBinaryName(version),
+		"Sign " + releaseBinaryName(version),
 		"Tag " + version,
 		"Push tag to origin",
 		"Publish GitHub release",
@@ -44,6 +45,7 @@ func runReleaseCmd(version string, dryRun bool, events chan stepEvent) tea.Cmd {
 		defer close(events)
 		binName := releaseBinaryName(version)
 		binPath := "dist/" + binName
+		sigPath := binPath + ".sig"
 
 		run := func(index int, label string, fn func() (string, error)) bool {
 			events <- stepEvent{index: index, label: label, starting: true}
@@ -60,7 +62,22 @@ func runReleaseCmd(version string, dryRun bool, events chan stepEvent) tea.Cmd {
 			return nil
 		}
 
-		ok = run(1, "Tag "+version, func() (string, error) {
+		// Signing runs for real even in a dry run — like the build itself,
+		// it's a local, non-destructive step (nothing pushed or published),
+		// so a dry run doubles as a safe way to confirm the signing key is
+		// set up correctly before ever touching git or GitHub. No key set
+		// is a hard failure either way: this repo never publishes an
+		// unsigned release (see internal/update/verify.go — the app
+		// refuses to install one).
+		ok = run(1, "Sign "+binName, func() (string, error) {
+			return signReleaseBinary(binPath, sigPath)
+		})
+		if !ok {
+			events <- stepEvent{done: true}
+			return nil
+		}
+
+		ok = run(2, "Tag "+version, func() (string, error) {
 			if dryRun {
 				return "(dry run) git tag " + version, nil
 			}
@@ -71,7 +88,7 @@ func runReleaseCmd(version string, dryRun bool, events chan stepEvent) tea.Cmd {
 			return nil
 		}
 
-		ok = run(2, "Push tag to origin", func() (string, error) {
+		ok = run(3, "Push tag to origin", func() (string, error) {
 			if dryRun {
 				return "(dry run) git push origin " + version, nil
 			}
@@ -82,16 +99,37 @@ func runReleaseCmd(version string, dryRun bool, events chan stepEvent) tea.Cmd {
 			return nil
 		}
 
-		run(3, "Publish GitHub release", func() (string, error) {
+		run(4, "Publish GitHub release", func() (string, error) {
 			if dryRun {
-				return "(dry run) gh release create " + version + " " + binPath + " --title " + version + " --generate-notes", nil
+				return "(dry run) gh release create " + version + " " + binPath + " " + sigPath + " --title " + version + " --generate-notes", nil
 			}
-			return runCmd("gh", "release", "create", version, binPath, "--title", version, "--generate-notes")
+			return runCmd("gh", "release", "create", version, binPath, sigPath, "--title", version, "--generate-notes")
 		})
 
 		events <- stepEvent{done: true}
 		return nil
 	}
+}
+
+// signReleaseBinary reads binPath, signs it with the private key in
+// signingKeyEnvVar, and writes the raw detached signature to sigPath.
+func signReleaseBinary(binPath, sigPath string) (string, error) {
+	key := os.Getenv(signingKeyEnvVar)
+	if key == "" {
+		return "", fmt.Errorf("%s is not set — run `go run ./cmd/release -genkey` once, then export it", signingKeyEnvVar)
+	}
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		return "", err
+	}
+	sig, err := signBinary(key, data)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(sigPath, sig, 0o644); err != nil {
+		return "", err
+	}
+	return sigPath, nil
 }
 
 func buildBinary(version, outPath string) (string, error) {

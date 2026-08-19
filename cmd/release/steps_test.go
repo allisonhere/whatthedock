@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"strings"
+	"testing"
+)
 
 func TestParseVersion(t *testing.T) {
 	tests := []struct {
@@ -70,5 +76,68 @@ func TestReleaseBinaryName(t *testing.T) {
 	const prefix = "whatthedock-v1.2.3-"
 	if len(name) <= len(prefix) || name[:len(prefix)] != prefix {
 		t.Fatalf("releaseBinaryName(%q) = %q, want prefix %q", "v1.2.3", name, prefix)
+	}
+}
+
+func TestSignBinaryRoundTripsThroughVerify(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("a whatthedock release binary")
+
+	sig, err := signBinary(hex.EncodeToString(priv), data)
+	if err != nil {
+		t.Fatalf("signBinary() error = %v", err)
+	}
+	if !ed25519.Verify(pub, data, sig) {
+		t.Fatal("signBinary() produced a signature that doesn't verify against the matching public key")
+	}
+}
+
+func TestSignBinaryRejectsMalformedHexKey(t *testing.T) {
+	if _, err := signBinary("not-hex", []byte("data")); err == nil {
+		t.Fatal("signBinary() error = nil, want an error for non-hex input")
+	}
+}
+
+func TestSignBinaryRejectsWrongLengthKey(t *testing.T) {
+	if _, err := signBinary(hex.EncodeToString([]byte("too short")), []byte("data")); err == nil {
+		t.Fatal("signBinary() error = nil, want an error for a wrong-length key")
+	}
+}
+
+func TestGenKeyPrintsMatchingKeypair(t *testing.T) {
+	var buf bytes.Buffer
+	if err := genKey(&buf); err != nil {
+		t.Fatalf("genKey() error = %v", err)
+	}
+	out := buf.String()
+
+	var pubHex, privHex string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case len(line) == hex.EncodedLen(ed25519.PublicKeySize) && pubHex == "":
+			pubHex = line
+		case strings.HasPrefix(line, "export "+signingKeyEnvVar+"="):
+			privHex = strings.TrimPrefix(line, "export "+signingKeyEnvVar+"=")
+		}
+	}
+	if pubHex == "" || privHex == "" {
+		t.Fatalf("genKey() output missing public/private key lines:\n%s", out)
+	}
+
+	pub, err := hex.DecodeString(pubHex)
+	if err != nil {
+		t.Fatalf("printed public key isn't valid hex: %v", err)
+	}
+	priv, err := hex.DecodeString(privHex)
+	if err != nil {
+		t.Fatalf("printed private key isn't valid hex: %v", err)
+	}
+	sig := ed25519.Sign(ed25519.PrivateKey(priv), []byte("check"))
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte("check"), sig) {
+		t.Fatal("genKey() printed a public/private key pair that don't match each other")
 	}
 }
