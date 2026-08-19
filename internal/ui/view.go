@@ -474,13 +474,21 @@ func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, f
 // renderLogToken) is deliberately dropped here — highlighting a token
 // that's also, say, an HTTP status code just shows it plain-highlighted,
 // not fighting two colors for the same characters.
+//
+// The purple/white pair is fixed, not theme-derived — the same choice
+// renderLogToken already makes for timestamps/HTTP methods/severity
+// keywords. Theme.Selected is used elsewhere for ordinary row selection,
+// so reusing it here made a live search match look like just another
+// selected row instead of standing out against arbitrary log text.
 func renderLogMatch(renderer tideui.Renderer, query, token, rendered string) string {
 	query = strings.TrimSpace(query)
 	if query == "" || !strings.Contains(strings.ToLower(token), strings.ToLower(query)) {
 		return rendered
 	}
+	const matchBg = lipgloss.Color("#a855f7")
+	const matchFg = lipgloss.Color("#ffffff")
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	return backgroundSpan(token, renderer.Styles.Theme.Selected, renderer.Styles.Theme.Fg, renderer.Styles.Theme.Bg, baseFg, true)
+	return backgroundSpan(token, matchBg, matchFg, renderer.Styles.Theme.Bg, baseFg, true)
 }
 
 func isLogSpace(char byte) bool {
