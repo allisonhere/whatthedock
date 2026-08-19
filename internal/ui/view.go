@@ -269,7 +269,19 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	}
 	lines = append(lines, renderer.Styles.DetailMeta.Width(width).Render(header))
 	for _, line := range filtered[start:end] {
-		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(renderLogLine(renderer, m.settings.LogColor, m.logFilter, line)))
+		// ansi.Truncate first, then Width to pad (not wrap) — logVisibleRows/
+		// logStartIndex both assume one log line occupies exactly one
+		// terminal row, so a long line must be cut to fit, never wrapped
+		// onto extra rows. Word-wrapping pre-styled content here also hit a
+		// real rendering bug: lipgloss's wrap-width measurement miscounts
+		// backgroundSpan's "restore to a specific color" close sequence
+		// (not a plain reset), splitting words mid-token once any part of
+		// the line carried a background span — reported live as "why does
+		// it change wrapping" once live filter highlighting made that
+		// common. Truncating first means Width() only ever pads, never
+		// triggers that wrap path at all.
+		rendered := ansi.Truncate(renderLogLine(renderer, m.settings.LogColor, m.logFilter, line), width, "…")
+		lines = append(lines, renderer.Styles.DetailBody.Width(width).Render(rendered))
 	}
 	return m.withPaneActionStrip(renderer, paneActivity, width, strings.Join(lines, "\n"))
 }

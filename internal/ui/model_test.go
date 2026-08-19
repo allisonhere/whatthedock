@@ -800,7 +800,9 @@ func TestStatsKeySwitchesActivityMode(t *testing.T) {
 
 func TestLogsRenderColorCodedTokens(t *testing.T) {
 	model := testModel()
-	model.width, model.height = 100, 30
+	// Wide enough that neither line gets truncated (log lines are cut to
+	// one row, not wrapped — see renderActivity's ansi.Truncate).
+	model.width, model.height = 200, 30
 	model.mode = activityLogs
 	ctr := model.provider.(*fakeProvider).containers["1"]
 	model.selected = &ctr
@@ -818,6 +820,52 @@ func TestLogsRenderColorCodedTokens(t *testing.T) {
 	}
 	if strings.Count(rawView, "\x1b[") < 6 {
 		t.Fatalf("View() missing ANSI styling for color-coded logs:\n%s", rawView)
+	}
+}
+
+// TestLongLogLineTruncatesInsteadOfWrappingWithHighlight is the
+// regression test for a live report ("why does it change wrapping"): a
+// log line long enough to overflow the pane used to word-wrap onto extra
+// terminal rows, which broke — mid-word — as soon as any part of the line
+// carried a colored span from a live filter match. The real bug was a
+// lipgloss word-wrap width-miscount specific to backgroundSpan's
+// "restore to a specific color" close sequence (confirmed by isolating it
+// down to a bare background-color span with no other styling at all); the
+// fix truncates each log line to one row before rendering instead of
+// relying on Width()-triggered wrap at all — which also matches
+// logVisibleRows/logStartIndex's own assumption that one log line is
+// exactly one terminal row. This checks the observable contract that
+// actually matters: a long line renders as exactly one row, identically,
+// whether or not part of it is highlighted.
+func TestLongLogLineTruncatesInsteadOfWrappingWithHighlight(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 60, 30
+	model.focus = paneActivity
+	model.mode = activityLogs
+	ctr := model.provider.(*fakeProvider).containers["1"]
+	model.selected = &ctr
+	longLine := "this is a long log line about api failures that should never wrap across rows no matter what"
+	model.logLines = []string{longLine}
+
+	unfiltered := ansi.Strip(model.View())
+	model.logFilter = "api"
+	filtered := ansi.Strip(model.View())
+
+	for name, view := range map[string]string{"unfiltered": unfiltered, "filtered (highlighted)": filtered} {
+		lines := strings.Split(view, "\n")
+		logRow := -1
+		for i, l := range lines {
+			if strings.Contains(l, "this is a long") {
+				logRow = i
+				break
+			}
+		}
+		if logRow < 0 {
+			t.Fatalf("%s: could not find the log line's row:\n%s", name, view)
+		}
+		if strings.Contains(lines[logRow+1], "no matter what") || strings.Contains(lines[logRow+1], "wrap across row") {
+			t.Fatalf("%s: log line spilled onto a second row instead of being truncated:\n%s", name, view)
+		}
 	}
 }
 
@@ -1041,7 +1089,9 @@ func TestSlashSearchesLogsWhenLogsAreVisibleFromTreeFocus(t *testing.T) {
 
 func TestLogSeverityQuickFilters(t *testing.T) {
 	model := testModel()
-	model.width, model.height = 100, 30
+	// Wide enough that no line gets truncated (log lines are cut to one
+	// row, not wrapped — see renderActivity's ansi.Truncate).
+	model.width, model.height = 200, 30
 	model.focus = paneActivity
 	model.mode = activityLogs
 	ctr := model.provider.(*fakeProvider).containers["1"]
@@ -1530,7 +1580,12 @@ func TestRenderLogLineKeepsBackgroundAfterColoredToken(t *testing.T) {
 	defer lipgloss.SetColorProfile(original)
 
 	model := testModelWithSelectedContainer()
-	model.width, model.height = 120, 34
+	// Wide enough that the whole line fits within the Activity pane without
+	// truncation — log lines are truncated to one row, not word-wrapped
+	// (see renderActivity's ansi.Truncate), so a too-narrow pane here would
+	// just cut the very text this test needs to see, rather than testing
+	// what it's actually about: background bleed after a colored token.
+	model.width, model.height = 260, 34
 	model.mode = activityLogs
 	model.logLines = []string{"2024-01-01T12:00:00Z GET /api/v3/queue 200 trailing text after the status code"}
 
