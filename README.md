@@ -295,13 +295,17 @@ More detail:
   Diagnostics section with an app-activity log (off/on/save-to-disk) and a
   viewer for it. Settings are written with owner-only (`0600`) file
   permissions, since the AI API key is the first secret WhatTheDock persists.
-- Checks GitHub for a newer release once per day on launch (throttled and
-  cached — "Check for update" in Settings always forces a fresh check). A
-  newer version prompts "update now (`y`) or ignore (`n`/`Esc`)"; ignoring
-  is remembered per-version, so it won't ask again about that release, but
-  a later one prompts fresh. Confirming downloads the matching release
-  asset, atomically replaces the running binary, and re-execs into it —
-  same terminal, no manual restart.
+- Checks GitHub for a newer release on every launch ("Check for update" in
+  Settings also triggers the same check on demand, and always surfaces the
+  install prompt directly — even from inside Settings — rather than a
+  status-bar hint). A newer version prompts "update now (`y`) or ignore
+  (`n`/`Esc`)"; ignoring is remembered per-version, so it won't ask again
+  about that release, but a later one prompts fresh (a manual check always
+  re-shows it, even for a version already ignored). Confirming downloads
+  the matching release
+  asset, atomically replaces the running binary, shows a brief "updated to
+  vX.Y.Z — restarting…" confirmation, then re-execs into it — same
+  terminal, no manual restart.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and

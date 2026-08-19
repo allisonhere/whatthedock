@@ -3882,16 +3882,18 @@ func TestInitStartsSnapshotAndEventSubscription(t *testing.T) {
 		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
 	}
 	// snapshot refresh, event subscription, the status-bar pulse tick, and
-	// an update check — a fresh model has never checked before
-	// (updateLastCheck is zero), so the once-a-day throttle doesn't apply
-	// yet. See TestInitSkipsUpdateCheckWhenRecentlyChecked for the
-	// throttled case.
+	// an update check.
 	if len(batch) != 4 {
 		t.Fatalf("Init() batch length = %d, want 4", len(batch))
 	}
 }
 
-func TestInitSkipsUpdateCheckWhenRecentlyChecked(t *testing.T) {
+// TestInitAlwaysChecksForUpdateRegardlessOfLastCheck is the regression
+// test for a live report: the update check used to be throttled to once
+// per 24h (via updateLastCheck), which meant relaunching the app later the
+// same day silently skipped checking at all — easy to mistake for the
+// check being broken. There's no throttle anymore; every launch checks.
+func TestInitAlwaysChecksForUpdateRegardlessOfLastCheck(t *testing.T) {
 	model := testModel()
 	model.updateLastCheck = time.Now()
 
@@ -3900,8 +3902,8 @@ func TestInitSkipsUpdateCheckWhenRecentlyChecked(t *testing.T) {
 	if !ok {
 		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
 	}
-	if len(batch) != 3 {
-		t.Fatalf("Init() batch length = %d, want 3 (no update check within the once-a-day throttle)", len(batch))
+	if len(batch) != 4 {
+		t.Fatalf("Init() batch length = %d, want 4 (an update check even though updateLastCheck was just set)", len(batch))
 	}
 }
 
@@ -3964,6 +3966,29 @@ func TestUpdateCheckDoesNotStealAnAlreadyOpenOverlay(t *testing.T) {
 	}
 	if !strings.Contains(got.status, "v0.1.4") {
 		t.Fatalf("status = %q, want it to mention the available version", got.status)
+	}
+}
+
+// TestUpdateCheckManualFromSettingsShowsInstallPrompt is the regression
+// test for a bug reported live: triggering "Check for update" from inside
+// Settings (a manual check) left Settings open and only ever showed the
+// quiet "update vX available (see Settings)" status-bar hint — never the
+// actual install/ignore popup — because Settings itself was the "already
+// open overlay" the non-manual deferral logic was protecting. Since the
+// user explicitly asked for the check, they should always get the popup.
+func TestUpdateCheckManualFromSettingsShowsInstallPrompt(t *testing.T) {
+	model := testModel()
+	model.appVersion = "v0.1.3"
+	model.overlay = overlaySettings
+
+	updated, _ := model.Update(updateCheckMsg{manual: true, latest: "v0.1.4"})
+	got := updated.(Model)
+
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate (a manual check must show the install prompt, not just a status hint)", got.overlay)
+	}
+	if got.updateAvailableVersion != "v0.1.4" {
+		t.Fatalf("updateAvailableVersion = %q, want v0.1.4", got.updateAvailableVersion)
 	}
 }
 
@@ -4069,9 +4094,19 @@ func TestUpdateKeyNoIgnoresVersion(t *testing.T) {
 	}
 }
 
-func TestUpdateInstalledSuccessQuits(t *testing.T) {
+// TestUpdateInstalledSuccessShowsMessageThenQuits is the regression test
+// for a live report: a successful install used to return tea.Quit
+// immediately, and main.go's restartInto re-execs via syscall.Exec — an
+// instant process-image replacement with no visible transition — so the
+// whole thing happened "in a flash with no messaging," giving no chance to
+// actually read that it worked. A successful install must now show a
+// status naming the version before quitting, and quitting itself must wait
+// for updateRestartMsg (see tickUpdateRestart's delay) rather than firing
+// immediately.
+func TestUpdateInstalledSuccessShowsMessageThenQuits(t *testing.T) {
 	model := testModel()
 	model.updateInstalling = true
+	model.updateAvailableVersion = "v0.1.8"
 
 	updated, cmd := model.Update(updateInstalledMsg{exePath: "/usr/local/bin/whatthedock"})
 	got := updated.(Model)
@@ -4082,8 +4117,23 @@ func TestUpdateInstalledSuccessQuits(t *testing.T) {
 	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
 		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
 	}
+	if got.statusErr || !strings.Contains(got.status, "v0.1.8") {
+		t.Fatalf("status/statusErr = %q/%v, want a success message naming v0.1.8", got.status, got.statusErr)
+	}
 	if cmd == nil {
-		t.Fatal("cmd = nil, want tea.Quit")
+		t.Fatal("cmd = nil, want the delayed restart tick")
+	}
+
+	msg := runCmd(t, cmd)
+	if _, ok := msg.(updateRestartMsg); !ok {
+		t.Fatalf("msg = %#v, want updateRestartMsg (the delayed tick), not an immediate quit", msg)
+	}
+	_, quitCmd := got.Update(msg)
+	if quitCmd == nil {
+		t.Fatal("cmd = nil after updateRestartMsg, want tea.Quit")
+	}
+	if quitMsg := runCmd(t, quitCmd); quitMsg != (tea.QuitMsg{}) {
+		t.Fatalf("msg = %#v, want tea.QuitMsg", quitMsg)
 	}
 }
 

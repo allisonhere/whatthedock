@@ -70,9 +70,11 @@ Untracked local files at handoff:
     itself — see `internal/ui/update.go` and `cmd/whatthedock/main.go` for
     why that's deliberately left to `main()`.
 - `internal/ui/update.go`
-  - Wires `internal/update` into the Bubble Tea model: the once-a-day
-    auto-check on launch (`autoCheckForUpdateCmd`, gated by
-    `updateLastCheck`), the manual check from Settings, the "update
+  - Wires `internal/update` into the Bubble Tea model: the auto-check on
+    every launch (`autoCheckForUpdateCmd` — no throttle; a once-a-day gate
+    on `updateLastCheck` was removed after a live report that it made a
+    same-day relaunch silently skip checking at all, easy to mistake for
+    the check being broken), the manual check from Settings, the "update
     available" confirm overlay (`handleUpdateKey`) and its
     persisted-per-version "ignore", and `RestartExecPath` — the seam
     `cmd/whatthedock/main.go` polls after `program.Run()` returns to decide

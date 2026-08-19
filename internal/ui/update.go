@@ -9,11 +9,6 @@ import (
 	"github.com/allisonhere/whatthedock/internal/update"
 )
 
-// updateCheckInterval throttles the automatic on-launch update check to
-// once per day; "Check for update" in Settings (manual=true) always
-// bypasses it.
-const updateCheckInterval = 24 * time.Hour
-
 // updateCheckMsg carries an update check's result back into Update.
 // manual distinguishes a Settings-triggered check (always worth a status
 // line, even "up to date" or a network error) from the automatic
@@ -34,14 +29,32 @@ type updateInstalledMsg struct {
 	err     error
 }
 
-// autoCheckForUpdateCmd returns a check command gated by
-// updateCheckInterval — nil if the last check (persisted across restarts
-// as settings' updateLastCheck) is still fresh, so relaunching the app
-// repeatedly in a day doesn't hit the GitHub API every time.
+// updateRestartDelay is how long a successful "updated to vX — restarting…"
+// status stays on screen before quitting actually happens. main.go's
+// restartInto replaces the process image with syscall.Exec — instant, no
+// visible transition — so without a deliberate pause here the success
+// message never has time to actually be read: reported live as the whole
+// install "happening in a flash with no messaging."
+const updateRestartDelay = 1200 * time.Millisecond
+
+// updateRestartMsg fires once updateRestartDelay has elapsed after a
+// successful install, finally triggering the tea.Quit that lets main()
+// re-exec into the new binary. It's only ever produced by
+// tickUpdateRestart, itself only ever returned from the updateInstalledMsg
+// success case, so there's no scenario where a stale one could arrive and
+// needs guarding against.
+type updateRestartMsg struct{}
+
+func tickUpdateRestart() tea.Cmd {
+	return tea.Tick(updateRestartDelay, func(time.Time) tea.Msg { return updateRestartMsg{} })
+}
+
+// autoCheckForUpdateCmd returns the automatic on-launch update check —
+// unconditional, every launch, no once-a-day throttle. updateLastCheck is
+// still recorded after each check (see the updateCheckMsg handler in
+// model.go) purely for Settings' "Check for update" row to show "up to
+// date" once at least one check has happened, not to gate this.
 func (m Model) autoCheckForUpdateCmd() tea.Cmd {
-	if !m.updateLastCheck.IsZero() && time.Since(m.updateLastCheck) < updateCheckInterval {
-		return nil
-	}
 	return m.checkForUpdateCmd(false)
 }
 
