@@ -65,19 +65,41 @@ const (
 	aboutShipOceanDarkest = "#0a4187" // 10,65,135   — final-frame bottom row
 	aboutShipOceanRipple  = "#1982c8" // 25,130,200  — lighter ripple, mast-submerging frame
 
-	aboutShipStatusDim   = aboutShipOceanMid // fade-in start: same shade as the water it sits on
-	aboutShipStatusBrite = aboutShipSail     // fade-in end: ivory, matching the sail
+	// aboutSwimWater/Arm/Head/Tail are the swimmer epilogue's own palette —
+	// transcribed exactly from the user's own terminal prototype for this
+	// animation (a brighter, calmer blue than the storm's own ocean tones,
+	// marking the shift from "sinking in a storm" to "swimming to safety").
+	aboutSwimWater = "#46beff" // 70,190,255  — brighter calm water, swim epilogue only
+	aboutSwimArm   = "#ffd264" // 255,210,100 — stroke arm
+	aboutSwimHead  = "#ffe6b4" // 255,230,180 — head, and the wake text behind it
+	aboutSwimTail  = "#ff7878" // 255,120,120 — leading ">" marker
 )
 
-// aboutShipStatusFadeDelay is how many ticks the settled ocean holds, ship
-// gone, before the version/update-status line starts fading in — a beat of
-// "just water" so the text reads as materializing out of the scene rather
-// than popping in the instant the ship sinks.
-const aboutShipStatusFadeDelay = 12
+// aboutSwimArmGlyphs is the swimmer's 4-step arm-stroke cycle (down, level,
+// up, level — repeating), transcribed from the same prototype: one glyph
+// per position step, indexed by swimmerCol so the stroke advances in
+// lockstep with movement rather than on its own independent clock.
+var aboutSwimArmGlyphs = [4]rune{'\\', '-', '/', '-'}
 
-// aboutShipStatusFadeTicks is how many ticks the fade-in itself takes, once
-// it starts.
-const aboutShipStatusFadeTicks = 24
+// aboutSwimStartColumn is where the swimmer surfaces — the same column the
+// mast finally submerges at (aboutShipFrames' frames 11/12 hardcode this
+// same 22 as their own leading-space count), so they pick up swimming
+// right where the ship went down instead of from the stage's left edge.
+const aboutSwimStartColumn = 22
+
+// aboutSwimStartDelay is how many ticks the settled ocean holds, ship gone,
+// before the swimmer surfaces and starts across — a beat of "just water" so
+// they read as emerging into a calm scene rather than popping in the
+// instant the ship sinks.
+const aboutSwimStartDelay = 12
+
+// aboutSwimDuration is how many ticks the swim itself takes to cross from
+// aboutSwimStartColumn to the stage's right edge, once it starts — past
+// this the swimmer has exited off-stage and the position math clamps,
+// holding the final revealed text forever (see overlayAboutSwimmerCells).
+// Tuned to roughly the prototype's own ~90ms-per-column pace at this app's
+// real 55ms tick rate.
+const aboutSwimDuration = 38
 
 // aboutShipStageWidth is the ship's fixed "stage" — within the 50-70 column
 // range asked for — centered inside the panel's (wider, variable) content
@@ -247,10 +269,11 @@ var aboutShipFrames = []aboutShipFrame{
 // black in a real terminal despite every isolated check on the byte stream
 // looking fine — the corruption only exists post-render, one layer up from
 // where the earlier checks were looking.
-// statusText, when non-empty, is composited onto the middle row (centered)
-// once the animation has settled on its final held frame — see
-// overlayAboutShipStatusCells. It fades in at the aboutCell level, same as
-// the ship/water art itself, so it's subject to the same never-truncate-an-
+// statusText, when non-empty, drives a swimmer who surfaces once the ship
+// has settled and strokes across the stage on row 1 (the waterline) — see
+// overlayAboutSwimmerCells. Text is revealed character-by-character in
+// their wake as they go. Composited at the aboutCell level, same as the
+// ship/water art itself, so it's subject to the same never-truncate-an-
 // already-rendered-ANSI-string rule and can't reintroduce this file's own
 // bug.
 func aboutShipRows(width, frame int, bg lipgloss.TerminalColor, statusText string) []string {
@@ -272,7 +295,7 @@ func aboutShipRows(width, frame int, bg lipgloss.TerminalColor, statusText strin
 		cells = append(cells, aboutShipSegmentsToCells(segs, stageWidth)...)
 		cells = append(cells, blankAboutCells(width-len(cells))...)
 		if i == 1 && statusText != "" {
-			cells = overlayAboutShipStatusCells(cells, width, elapsed, statusText)
+			cells = overlayAboutSwimmerCells(cells, col, stageWidth, elapsed, statusText)
 		}
 		rows[i] = lipgloss.NewStyle().Width(width).Background(bg).Render(renderCells(cells, bg))
 	}
@@ -293,33 +316,81 @@ func aboutShipFinalFrameStart() int {
 	return total
 }
 
-// overlayAboutShipStatusCells fades text into the center of a row's cells
-// once the ship has finished sinking and the ocean has settled — before
-// that it's a no-op, returning cells untouched, so it never affects the
-// storm/sinking sequence itself. The fade goes from the same hex as the
-// water it sits on up to full ivory brightness over aboutShipStatusFadeTicks,
-// so the text reads as materializing out of the ocean rather than popping in.
-func overlayAboutShipStatusCells(cells []aboutCell, width, elapsed int, text string) []aboutCell {
-	fadeStart := aboutShipFinalFrameStart() + aboutShipStatusFadeDelay
-	if elapsed < fadeStart {
+// overlayAboutSwimmerCells draws the swimmer and their wake-trail text onto
+// row 1's cells (the waterline), once the ship has finished sinking and the
+// ocean has settled — before that it's a no-op, returning cells untouched,
+// so it never affects the storm/sinking sequence itself.
+//
+// Position, not color, drives the reveal here: swimmerCol walks from
+// aboutSwimStartColumn to stageWidth over aboutSwimDuration ticks once the
+// swim starts. The version text's own resting position (textStart) is
+// centered on the stage, independent of where the swimmer enters — the
+// text must end up centered, not wherever the sink column happens to land
+// it — and a rune reveals the instant swimmerCol reaches its column. Since
+// aboutSwimStartColumn (22, matching the mast's own sink column) sits
+// close to but not exactly at the 45-wide stage's center, this can reveal
+// a handful of characters in the text's leading edge all at once the
+// moment the swimmer appears (whichever columns before aboutSwimStartColumn
+// the centered text already occupies), then the rest one at a time as the
+// swimmer actually swims past them — a minor, deliberate trade-off in favor
+// of the text always landing dead-center rather than tracking the swim
+// path exactly. Past aboutSwimDuration, elapsed-since-start clamps, so
+// swimmerCol (and therefore how much text is revealed) stops changing —
+// full text stays put, the swimmer glyphs stop being drawn (they've
+// exited past the stage's right edge), and this holds forever, the same
+// "clamp to hold the final state" shape as aboutShipFrameAt's own
+// off-the-end clamp.
+//
+// The swimmer's own sprite is 3 cells wide, transcribed from the user's own
+// terminal prototype: a cycling arm-stroke glyph (aboutSwimArmGlyphs,
+// indexed by swimmerCol so the stroke advances in lockstep with movement)
+// trailing behind a head ('o') and a leading ">" marker — in that
+// left-to-right order, matching the direction of travel. The water from
+// aboutSwimStartColumn onward is repainted to the swim epilogue's own
+// brighter palette (aboutSwimWater) the whole time this function is active,
+// distinct from the darker storm-aftermath tone the settled-ocean frame
+// otherwise leaves there.
+func overlayAboutSwimmerCells(cells []aboutCell, stageStart, stageWidth, elapsed int, text string) []aboutCell {
+	swimStart := aboutShipFinalFrameStart() + aboutSwimStartDelay
+	if elapsed < swimStart {
 		return cells
 	}
-	progress := float64(elapsed-fadeStart) / float64(aboutShipStatusFadeTicks)
-	if progress > 1 {
-		progress = 1
+	t := elapsed - swimStart
+	if t > aboutSwimDuration {
+		t = aboutSwimDuration
 	}
-	color := lerpHexColor(aboutShipStatusDim, aboutShipStatusBrite, progress)
-	runes := []rune(text)
-	if len(runes) > width {
-		runes = runes[:width]
+	progress := float64(t) / float64(aboutSwimDuration)
+	swimmerCol := aboutSwimStartColumn
+	if swimRange := stageWidth - aboutSwimStartColumn; swimRange > 0 {
+		swimmerCol = aboutSwimStartColumn + int(progress*float64(swimRange))
 	}
-	start := max(0, (width-len(runes))/2)
-	for i, r := range runes {
-		pos := start + i
-		if pos < 0 || pos >= len(cells) {
-			continue
+	onStage := swimmerCol < stageWidth
+
+	for i := aboutSwimStartColumn; i < stageWidth; i++ {
+		if pos := stageStart + i; pos >= 0 && pos < len(cells) {
+			cells[pos] = aboutCell{r: '~', color: aboutSwimWater}
 		}
-		cells[pos] = aboutCell{r: r, color: color}
+	}
+
+	runes := []rune(text)
+	textStart := max(0, (stageWidth-len(runes))/2)
+	reveal := clamp(swimmerCol-textStart, 0, len(runes))
+	for i := 0; i < reveal; i++ {
+		if pos := stageStart + textStart + i; pos >= 0 && pos < len(cells) {
+			cells[pos] = aboutCell{r: runes[i], color: aboutSwimHead}
+		}
+	}
+	if onStage {
+		arm := aboutSwimArmGlyphs[swimmerCol%len(aboutSwimArmGlyphs)]
+		if pos := stageStart + swimmerCol; pos >= 0 && pos < len(cells) {
+			cells[pos] = aboutCell{r: arm, color: aboutSwimArm}
+		}
+		if pos := stageStart + swimmerCol + 1; pos >= 0 && pos < len(cells) {
+			cells[pos] = aboutCell{r: 'o', color: aboutSwimHead}
+		}
+		if pos := stageStart + swimmerCol + 2; pos >= 0 && pos < len(cells) {
+			cells[pos] = aboutCell{r: '>', color: aboutSwimTail}
+		}
 	}
 	return cells
 }

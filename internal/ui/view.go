@@ -3277,8 +3277,8 @@ func (m Model) aboutExtras(renderer tideui.Renderer, width int) string {
 	return strings.Join(lines, "\n")
 }
 
-// aboutShipStatusText is the version line that fades into the ship
-// animation's final settled-ocean frame (see overlayAboutShipStatusCells in
+// aboutShipStatusText is the version line a swimmer writes into their wake
+// once the ship animation settles (see overlayAboutSwimmerCells in
 // about_ship.go). Update status is deliberately left out — it's already
 // checked automatically on startup and shown in Settings, so repeating it
 // here would just be stale-by-the-time-you-see-it duplication, not new info.

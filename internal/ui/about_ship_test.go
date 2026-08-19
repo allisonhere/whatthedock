@@ -209,53 +209,115 @@ func TestAboutShipRowsGlyphsSurviveWideCentering(t *testing.T) {
 	}
 }
 
-// TestAboutShipRowsStatusHiddenBeforeFinalFrame checks the version/update
-// status text never appears while the ship is still sailing/storming/
-// sinking — only once the ocean has settled on its final held frame.
-func TestAboutShipRowsStatusHiddenBeforeFinalFrame(t *testing.T) {
+// aboutSwimStartElapsed mirrors overlayAboutSwimmerCells' own swimStart
+// computation, so tests can target specific points in the swim by name
+// instead of duplicating the formula inline everywhere.
+func aboutSwimStartElapsed() int {
+	return aboutShipFinalFrameStart() + aboutSwimStartDelay
+}
+
+// TestAboutShipRowsSwimmerHiddenBeforeSwimStarts checks neither the
+// swimmer nor any of the version text appears before the swim's own start
+// boundary — only calm water (and the ship/storm/sinking sequence earlier
+// still) up to that point.
+func TestAboutShipRowsSwimmerHiddenBeforeSwimStarts(t *testing.T) {
 	width := 60
 	bg := lipgloss.Color("#1e1e2e")
 	start := aboutShipStartFrame()
-	final := aboutShipFinalFrameStart()
-	for elapsed := 0; elapsed < final+aboutShipStatusFadeDelay; elapsed += 3 {
-		rows := aboutShipRows(width, start+elapsed, bg, "v0.1.4 — up to date")
+	swimStart := aboutSwimStartElapsed()
+	text := "Version 0.1.4"
+	for elapsed := 0; elapsed < swimStart; elapsed += 3 {
+		rows := aboutShipRows(width, start+elapsed, bg, text)
 		joined := ansi.Strip(strings.Join(rows, "\n"))
 		if strings.Contains(joined, "0.1.4") {
-			t.Fatalf("elapsed=%d: status text visible before the fade-in should start:\n%s", elapsed, joined)
+			t.Fatalf("elapsed=%d: version text visible before the swim starts:\n%s", elapsed, joined)
 		}
 	}
 }
 
-// TestAboutShipRowsStatusFadesInAndHolds checks the status text is fully
-// visible (and unclipped) well after the fade-in window, and stays visible
-// indefinitely once shown (matching the non-looping final frame it rides
-// on).
-func TestAboutShipRowsStatusFadesInAndHolds(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
-	defer lipgloss.SetColorProfile(termenv.Ascii)
+// TestAboutShipRowsSwimmerRevealsTextProgressively is the regression test
+// for this design's central idea: the version text is written into the
+// swimmer's wake as they cross the stage, not faded in as one block —
+// partway through the swim, only a prefix should be visible, not the full
+// string. The text's own resting position is centered on the stage (see
+// overlayAboutSwimmerCells' doc comment), which sits left of
+// aboutSwimStartColumn — so a handful of leading characters are already
+// visible the instant the swimmer appears, and the reveal window that's
+// left genuinely "progressive" (as opposed to "already complete") is
+// narrower than it would be if the text started exactly where the swimmer
+// does; this checks a point inside that narrower window, not an arbitrary
+// fixed offset.
+func TestAboutShipRowsSwimmerRevealsTextProgressively(t *testing.T) {
 	width := 60
 	bg := lipgloss.Color("#1e1e2e")
 	start := aboutShipStartFrame()
-	final := aboutShipFinalFrameStart()
-	text := "v0.1.4 — up to date"
-	for _, extra := range []int{aboutShipStatusFadeDelay + aboutShipStatusFadeTicks + 5, 2000, 20000} {
-		rows := aboutShipRows(width, start+final+extra, bg, text)
-		joined := ansi.Strip(strings.Join(rows, "\n"))
-		if !strings.Contains(joined, text) {
-			t.Fatalf("elapsed=final+%d: status text not intact:\n%s", extra, joined)
+	text := "Version 0.1.4"
+	elapsed := aboutSwimStartElapsed() + 5 // partway through aboutSwimDuration
+	rows := aboutShipRows(width, start+elapsed, bg, text)
+	joined := ansi.Strip(strings.Join(rows, "\n"))
+	if !strings.Contains(joined, "Version 0") {
+		t.Fatalf("elapsed=swimStart+5: wake text prefix missing, want at least \"Version 0\":\n%s", joined)
+	}
+	if strings.Contains(joined, text) {
+		t.Fatalf("elapsed=swimStart+5: full text %q already visible, want only a partial reveal this early:\n%s", text, joined)
+	}
+}
+
+// TestAboutShipRowsSwimmerTextEndsUpCentered is the regression test for a
+// bug reported live: the wake text's resting column used to be
+// aboutSwimStartColumn (matching the mast's own sink column, close to but
+// not exactly the stage's center), so it landed slightly off-center —
+// noticeably so for a longer status string. The text's own start column
+// must always be exactly centered on the stage, independent of the
+// swimmer's own path.
+func TestAboutShipRowsSwimmerTextEndsUpCentered(t *testing.T) {
+	bg := lipgloss.Color("#1e1e2e")
+	start := aboutShipStartFrame()
+	elapsed := aboutSwimStartElapsed() + aboutSwimDuration + 5
+	for _, width := range []int{aboutShipStageWidth, 60, 90} {
+		for _, text := range []string{"Version 0.1.4", "v0.1.4 — up to date"} {
+			rows := aboutShipRows(width, start+elapsed, bg, text)
+			row := ansi.Strip(rows[1])
+			idx := strings.Index(row, text)
+			if idx < 0 {
+				t.Fatalf("width=%d text=%q: not found in row:\n%q", width, text, row)
+			}
+			stageWidth := min(aboutShipStageWidth, width)
+			stageStart := max(0, (width-stageWidth)/2)
+			wantStart := stageStart + max(0, (stageWidth-len([]rune(text)))/2)
+			if gotStart := len([]rune(row[:idx])); gotStart != wantStart {
+				t.Fatalf("width=%d text=%q: text starts at column %d, want %d (centered on the stage):\n%q", width, text, gotStart, wantStart, row)
+			}
 		}
 	}
 }
 
-// TestAboutShipRowsStatusNeverExceedsWidth checks the status overlay never
-// blows out the row's fixed width, including when the text is wider than
-// the panel itself.
-func TestAboutShipRowsStatusNeverExceedsWidth(t *testing.T) {
+// TestAboutShipRowsSwimmerTextHoldsAfterSwim checks the full version text
+// is present and stable long after the swim finishes (matching the
+// non-looping "hold forever" shape every other phase in this file uses).
+func TestAboutShipRowsSwimmerTextHoldsAfterSwim(t *testing.T) {
+	width := 60
 	bg := lipgloss.Color("#1e1e2e")
 	start := aboutShipStartFrame()
-	final := aboutShipFinalFrameStart()
-	elapsed := final + aboutShipStatusFadeDelay + aboutShipStatusFadeTicks + 5
-	longText := strings.Repeat("v0.1.4 — up to date ", 5)
+	text := "Version 0.1.4"
+	swimStart := aboutSwimStartElapsed()
+	for _, extra := range []int{aboutSwimDuration + 5, 2000, 20000} {
+		rows := aboutShipRows(width, start+swimStart+extra, bg, text)
+		joined := ansi.Strip(strings.Join(rows, "\n"))
+		if !strings.Contains(joined, text) {
+			t.Fatalf("elapsed=swimStart+%d: wake text not intact:\n%s", extra, joined)
+		}
+	}
+}
+
+// TestAboutShipRowsSwimmerNeverExceedsWidth checks the swimmer/wake overlay
+// never blows out a row's fixed width, including when the text is wider
+// than the panel itself.
+func TestAboutShipRowsSwimmerNeverExceedsWidth(t *testing.T) {
+	bg := lipgloss.Color("#1e1e2e")
+	start := aboutShipStartFrame()
+	elapsed := aboutSwimStartElapsed() + aboutSwimDuration + 5
+	longText := strings.Repeat("Version 0.1.4 — up to date ", 5)
 	for _, width := range []int{10, 20, 45, 60, 100} {
 		rows := aboutShipRows(width, start+elapsed, bg, longText)
 		for i, row := range rows {
