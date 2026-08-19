@@ -1962,13 +1962,24 @@ func (m Model) replicateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 // Once installing, the same overlay switches to a progress bar (see
 // updateProgressBar) instead of the y/n hints — visible confirmation that
 // something is actually happening, not just a status-bar line the user
-// might not be looking at.
+// might not be looking at. Once installed, it switches again to a success
+// message with an "enter restart" hint (see updateInstallSucceeded).
 func (m Model) updateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
 	title := "update available"
 	var lines []string
-	if m.updateInstalling {
+	switch {
+	case m.updateInstallSucceeded:
+		title = "update installed"
+		lines = []string{
+			renderer.Styles.DetailMeta.Width(contentWidth).Render("Updated whatthedock to " + m.updateAvailableVersion + "."),
+			"",
+			renderer.RenderSoftHints(contentWidth,
+				tideui.SoftHint{Key: "enter", Label: "restart"},
+			),
+		}
+	case m.updateInstalling:
 		title = "installing update"
 		label := fmt.Sprintf("Installing whatthedock %s… %d%%", m.updateAvailableVersion, m.updateInstallProgress)
 		lines = []string{
@@ -1976,7 +1987,7 @@ func (m Model) updateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			"",
 			updateProgressBar(renderer, m.updateInstallProgress, contentWidth),
 		}
-	} else {
+	default:
 		prompt := fmt.Sprintf("whatthedock %s is available (you have %s). Download and install it now?", m.updateAvailableVersion, m.appVersion)
 		lines = []string{
 			renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),

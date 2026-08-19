@@ -303,9 +303,10 @@ More detail:
   about that release, but a later one prompts fresh (a manual check always
   re-shows it, even for a version already ignored). Confirming stays on the
   same popup with a fill-bar showing install progress, downloads the
-  matching release asset, atomically replaces the running binary, shows a
-  brief "updated to vX.Y.Z — restarting…" confirmation, then re-execs into
-  it — same terminal, no manual restart.
+  matching release asset, and atomically replaces the running binary; the
+  popup then shows an "updated to vX.Y.Z" confirmation and waits for enter
+  before restarting into it — same terminal, no manual restart, and no
+  guessing how long the message needs to stay up.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and

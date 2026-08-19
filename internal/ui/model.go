@@ -451,6 +451,14 @@ type Model struct {
 	updateInstallReady    bool
 	updateInstallErr      error
 	updateInstallExePath  string
+	// updateInstallSucceeded is set once a successful install has
+	// finalized — the overlay swaps to a "updated to vX — press enter to
+	// restart" message and waits there. A quit-on-timer used to do this
+	// automatically, but any fixed delay is either too short to actually
+	// read (the original "over in a flash" report) or an arbitrary wait
+	// for someone who read it in half the time — enter puts the user in
+	// control of exactly when the restart happens instead.
+	updateInstallSucceeded bool
 
 	// aiAnalyzing/aiAnalysis/aiAnalysisErr mirror the update-check pattern
 	// above (updateChecking/updateCheckErr) for the Problems pane's "a"
@@ -1201,8 +1209,6 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.finalizeUpdateInstall()
 		}
 		return m, nil // bar's done animating, still waiting on the real result
-	case updateRestartMsg:
-		return m, tea.Quit
 	case aiAnalysisDoneMsg:
 		if msg.id != m.aiAnalysisFor {
 			// A response for a row the user has since moved past (a newer

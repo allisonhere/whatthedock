@@ -125,6 +125,11 @@ func TestBackgroundStaysExplicitAcrossScreensAndThemes(t *testing.T) {
 			m.updateInstalling = true
 			m.updateInstallProgress = 55
 		}},
+		{"update overlay succeeded", func(m *Model) {
+			m.overlay = overlayUpdate
+			m.updateAvailableVersion = "v0.1.9"
+			m.updateInstallSucceeded = true
+		}},
 		{"app log overlay", func(m *Model) { m.overlay = overlayAppLog }},
 		{"dashboard", func(m *Model) { m.overlay = overlayDashboard }},
 		{"dashboard many containers", func(m *Model) {

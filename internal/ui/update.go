@@ -29,14 +29,6 @@ type updateInstalledMsg struct {
 	err     error
 }
 
-// updateRestartDelay is how long a successful "updated to vX — restarting…"
-// status stays on screen before quitting actually happens. main.go's
-// restartInto replaces the process image with syscall.Exec — instant, no
-// visible transition — so without a deliberate pause here the success
-// message never has time to actually be read: reported live as the whole
-// install "happening in a flash with no messaging."
-const updateRestartDelay = 1200 * time.Millisecond
-
 // updateProgressStep/Interval drive the update overlay's fake install
 // progress bar: a step every 120ms fills the bar to 100% in ~2.4s,
 // landing it in the "2 or 3 sec" range asked for. It's on its own fixed
@@ -57,18 +49,6 @@ type updateProgressTickMsg struct{}
 
 func tickUpdateProgress() tea.Cmd {
 	return tea.Tick(updateProgressInterval, func(time.Time) tea.Msg { return updateProgressTickMsg{} })
-}
-
-// updateRestartMsg fires once updateRestartDelay has elapsed after a
-// successful install, finally triggering the tea.Quit that lets main()
-// re-exec into the new binary. It's only ever produced by
-// tickUpdateRestart, itself only ever returned from the updateInstalledMsg
-// success case, so there's no scenario where a stale one could arrive and
-// needs guarding against.
-type updateRestartMsg struct{}
-
-func tickUpdateRestart() tea.Cmd {
-	return tea.Tick(updateRestartDelay, func(time.Time) tea.Msg { return updateRestartMsg{} })
 }
 
 // autoCheckForUpdateCmd returns the automatic on-launch update check —
@@ -107,8 +87,16 @@ func (m Model) installUpdateCmd(version string) tea.Cmd {
 // ignored, so the automatic check won't prompt again for it), y installs.
 // Once installing, the overlay stays up showing progress (see updateOverlay)
 // and every key is ignored — there's no cancel, and re-pressing y shouldn't
-// restart the install out from under itself.
+// restart the install out from under itself. Once installed, it shows a
+// success message and waits for enter — see updateInstallSucceeded's doc
+// comment for why that's a deliberate user action rather than a timer.
 func (m Model) handleUpdateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.updateInstallSucceeded {
+		if msg.String() == "enter" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
 	if m.updateInstalling {
 		return m, nil
 	}
@@ -132,17 +120,21 @@ func (m Model) handleUpdateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // finalizeUpdateInstall applies the real installUpdateCmd result once it's
 // safe to act on — either immediately (a failure) or once the fake
 // progress bar has also finished animating (a success) — see
-// updateInstalledMsg/updateProgressTickMsg in model.go.
+// updateInstalledMsg/updateProgressTickMsg in model.go. A failure returns
+// straight to overlayNone with a status-bar error; a success keeps the
+// overlay up in its "succeeded" state (see updateInstallSucceeded) so the
+// user reads the confirmation and dismisses it with enter themselves,
+// rather than the app guessing how long that takes and quitting on a timer.
 func (m Model) finalizeUpdateInstall() (Model, tea.Cmd) {
 	m.updateInstalling = false
-	m.overlay = overlayNone
 	if m.updateInstallErr != nil {
+		m.overlay = overlayNone
 		m.status, m.statusErr = "update failed: "+friendlyDockerError(m.updateInstallErr), true
 		return m, nil
 	}
+	m.updateInstallSucceeded = true
 	m.restartExecPath = m.updateInstallExePath
-	m.status, m.statusErr = "updated to "+m.updateAvailableVersion+" — restarting…", false
-	return m, tickUpdateRestart()
+	return m, nil
 }
 
 // RestartExecPath is set once an update finishes installing successfully —

@@ -4119,16 +4119,16 @@ func TestUpdateKeyNoIgnoresVersion(t *testing.T) {
 	}
 }
 
-// TestUpdateInstalledSuccessShowsMessageThenQuits is the regression test
-// for a live report: a successful install used to return tea.Quit
+// TestUpdateInstalledSuccessShowsMessageAndWaitsForEnter is the regression
+// test for a live report: a successful install used to return tea.Quit
 // immediately, and main.go's restartInto re-execs via syscall.Exec — an
 // instant process-image replacement with no visible transition — so the
 // whole thing happened "in a flash with no messaging," giving no chance to
-// actually read that it worked. A successful install must now show a
-// status naming the version before quitting, and quitting itself must wait
-// for updateRestartMsg (see tickUpdateRestart's delay) rather than firing
-// immediately.
-func TestUpdateInstalledSuccessShowsMessageThenQuits(t *testing.T) {
+// actually read that it worked. A fixed delay fixed that but was still a
+// guess at how long "enough time to read it" is; a successful install now
+// shows the overlay's success message and waits indefinitely for the user
+// to press enter themselves before quitting.
+func TestUpdateInstalledSuccessShowsMessageAndWaitsForEnter(t *testing.T) {
 	model := testModel()
 	model.overlay = overlayUpdate
 	model.updateInstalling = true
@@ -4141,26 +4141,31 @@ func TestUpdateInstalledSuccessShowsMessageThenQuits(t *testing.T) {
 	if got.updateInstalling {
 		t.Fatal("updateInstalling = true, want false")
 	}
-	if got.overlay != overlayNone {
-		t.Fatalf("overlay = %v, want overlayNone once the install finalizes", got.overlay)
+	if !got.updateInstallSucceeded {
+		t.Fatal("updateInstallSucceeded = false, want true")
+	}
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate to stay open showing the success message", got.overlay)
 	}
 	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
 		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
 	}
-	if got.statusErr || !strings.Contains(got.status, "v0.1.8") {
-		t.Fatalf("status/statusErr = %q/%v, want a success message naming v0.1.8", got.status, got.statusErr)
-	}
-	if cmd == nil {
-		t.Fatal("cmd = nil, want the delayed restart tick")
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil — no timer, quitting waits for the user's own enter")
 	}
 
-	msg := runCmd(t, cmd)
-	if _, ok := msg.(updateRestartMsg); !ok {
-		t.Fatalf("msg = %#v, want updateRestartMsg (the delayed tick), not an immediate quit", msg)
+	// Any other key is a no-op; only enter quits.
+	stillWaiting, noopCmd := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if sw := stillWaiting.(Model); !sw.updateInstallSucceeded || sw.overlay != overlayUpdate {
+		t.Fatalf("stray key closed the success message: succeeded=%v overlay=%v", sw.updateInstallSucceeded, sw.overlay)
 	}
-	_, quitCmd := got.Update(msg)
+	if noopCmd != nil {
+		t.Fatal("cmd != nil for a non-enter key, want nil")
+	}
+
+	_, quitCmd := got.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if quitCmd == nil {
-		t.Fatal("cmd = nil after updateRestartMsg, want tea.Quit")
+		t.Fatal("cmd = nil after enter, want tea.Quit")
 	}
 	if quitMsg := runCmd(t, quitCmd); quitMsg != (tea.QuitMsg{}) {
 		t.Fatalf("msg = %#v, want tea.QuitMsg", quitMsg)
@@ -4206,11 +4211,17 @@ func TestUpdateInstalledSuccessWaitsForProgressBarBeforeFinalizing(t *testing.T)
 	if got.updateInstalling {
 		t.Fatal("updateInstalling = true, want false once the bar reaches 100 with a ready result")
 	}
+	if !got.updateInstallSucceeded {
+		t.Fatal("updateInstallSucceeded = false, want true once the bar reaches 100 with a ready result")
+	}
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate to stay open showing the success message", got.overlay)
+	}
 	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
 		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
 	}
-	if cmd == nil {
-		t.Fatal("cmd = nil, want the delayed restart tick once finalized")
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil — no timer, quitting now waits for the user's own enter")
 	}
 }
 
@@ -4353,6 +4364,25 @@ func TestUpdateOverlayRendersProgressWhileInstalling(t *testing.T) {
 	}
 	if !strings.ContainsAny(view, "█░") {
 		t.Fatalf("update overlay missing the progress bar glyphs:\n%s", view)
+	}
+}
+
+// TestUpdateOverlayRendersSuccessMessageAwaitingEnter covers the success
+// state: once installed, the overlay shows a message naming the version
+// and an "enter restart" hint, not the progress bar or the y/n prompt.
+func TestUpdateOverlayRendersSuccessMessageAwaitingEnter(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+	model.updateInstallSucceeded = true
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "v0.1.4") || !strings.Contains(view, "enter restart") {
+		t.Fatalf("update overlay missing success message/hint:\n%s", view)
+	}
+	if strings.Contains(view, "y update") || strings.Contains(view, "n/esc ignore") || strings.ContainsAny(view, "█░") {
+		t.Fatalf("update overlay still shows the prompt or progress bar after success:\n%s", view)
 	}
 }
 
