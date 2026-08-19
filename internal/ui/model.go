@@ -142,11 +142,10 @@ const (
 )
 
 type logViewState struct {
-	filter     string
-	level      logSeverityFilter
-	scroll     int
-	follow     bool
-	matchIndex int
+	filter string
+	level  logSeverityFilter
+	scroll int
+	follow bool
 }
 
 type appSettings struct {
@@ -305,7 +304,6 @@ type Model struct {
 	logLevel          logSeverityFilter
 	logScroll         int
 	logFollow         bool
-	logMatch          int
 	logViews          map[domain.ResourceID]logViewState
 	logViewID         domain.ResourceID
 	logChan           chan string
@@ -1432,28 +1430,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearLogFilter()
 			return m, nil
 		}
-	case "x":
-		if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
-			m.focus = paneActivity
-			m.clearLogFilter()
-			return m, nil
-		}
 	case "n":
-		if m.focus == paneActivity && m.mode == activityLogs {
-			if strings.TrimSpace(m.logFilter) == "" {
-				m.openLogFilter()
-				return m, nil
-			}
-			m.jumpLogMatch(1)
-			return m, nil
-		}
 		return m, m.openCreateOverlay()
-	case "N":
-		if m.mode == activityLogs && strings.TrimSpace(m.logFilter) != "" {
-			m.focus = paneActivity
-			m.jumpLogMatch(-1)
-			return m, nil
-		}
 	case " ":
 		if m.focus == paneTree {
 			if row := m.currentRow(); row != nil && row.kind == rowProject {
@@ -1612,24 +1590,28 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case overlayLogFilter:
+		// Live filter: every keystroke re-applies logDraft as the active
+		// filter (applyLiveLogFilter) — there's no separate draft-vs-
+		// applied state anymore. enter just stops editing, keeping
+		// whatever's currently live; esc always clears (same as pressing
+		// esc from plain log navigation with a filter already set — see
+		// the top-level "esc" case), for one consistent meaning of esc
+		// rather than "cancel" while editing and "clear" otherwise.
 		switch msg.String() {
 		case "esc":
+			m.clearLogFilter()
 			m.overlay = overlayNone
-			m.logDraft = ""
 		case "enter":
-			m.logFilter = strings.TrimSpace(m.logDraft)
-			m.logMatch = 0
 			m.overlay = overlayNone
-			m.clampLogScroll()
-			m.saveLogViewState()
-			m.status, m.statusErr = "log filter: "+filterStatus(m.logFilter, m.logLevel), false
 		case "backspace":
 			if len(m.logDraft) > 0 {
 				m.logDraft = m.logDraft[:len(m.logDraft)-1]
 			}
+			m.applyLiveLogFilter()
 		default:
 			if len(msg.Runes) > 0 {
 				m.logDraft += string(msg.Runes)
+				m.applyLiveLogFilter()
 			}
 		}
 	case overlayHelp:
@@ -3313,9 +3295,20 @@ func (m *Model) openLogFilter() {
 	m.logDraft = m.logFilter
 }
 
+// applyLiveLogFilter re-applies logDraft as the active filter on every
+// keystroke while overlayLogFilter is open — see handleOverlayKey's
+// overlayLogFilter case. There's no separate "commit" step anymore
+// (enter just stops editing; esc clears via clearLogFilter): the filter,
+// the hidden/shown lines, and the highlighted matches (renderLogLine)
+// are all live as the user types, not applied only once they finish.
+func (m *Model) applyLiveLogFilter() {
+	m.logFilter = strings.TrimSpace(m.logDraft)
+	m.clampLogScroll()
+	m.saveLogViewState()
+}
+
 func (m *Model) setLogSeverityFilter(filter logSeverityFilter) {
 	m.logLevel = filter
-	m.logMatch = 0
 	m.clampLogScroll()
 	m.saveLogViewState()
 	m.status, m.statusErr = "log filter: "+filterStatus(m.logFilter, m.logLevel), false
@@ -3325,49 +3318,8 @@ func (m *Model) clearLogFilter() {
 	m.logFilter = ""
 	m.logDraft = ""
 	m.logLevel = logSeverityAll
-	m.logMatch = 0
 	m.followLogs()
 	m.status, m.statusErr = "log filter cleared", false
-}
-
-func (m *Model) jumpLogMatch(direction int) {
-	matches := m.logMatchIndexes()
-	if len(matches) == 0 {
-		m.status, m.statusErr = "no log matches", false
-		return
-	}
-	if direction == 0 {
-		direction = 1
-	}
-	m.logMatch = modIndex(m.logMatch+direction, len(matches))
-	m.logFollow = false
-	m.logScroll = matches[m.logMatch]
-	m.clampLogScroll()
-	m.saveLogViewState()
-	m.status, m.statusErr = fmt.Sprintf("match %d/%d", m.logMatch+1, len(matches)), false
-}
-
-func (m Model) logMatchIndexes() []int {
-	query := strings.ToLower(strings.TrimSpace(m.logFilter))
-	if query == "" {
-		return nil
-	}
-	lines := m.visibleLogLines()
-	matches := make([]int, 0, len(lines))
-	for i, line := range lines {
-		if strings.Contains(strings.ToLower(line), query) {
-			matches = append(matches, i)
-		}
-	}
-	return matches
-}
-
-func (m Model) logMatchStatus() (int, int) {
-	matches := m.logMatchIndexes()
-	if len(matches) == 0 {
-		return 0, 0
-	}
-	return clamp(m.logMatch, 0, len(matches)-1) + 1, len(matches)
 }
 
 func (m *Model) scrollLogs(delta int) {
@@ -3430,11 +3382,6 @@ func (m *Model) clampLogScroll() {
 	m.logScroll = clamp(m.logScroll, 0, maxScroll)
 	if m.logScroll >= maxScroll {
 		m.logFollow = true
-	}
-	if matchCount := len(m.logMatchIndexes()); matchCount > 0 {
-		m.logMatch = clamp(m.logMatch, 0, matchCount-1)
-	} else {
-		m.logMatch = 0
 	}
 }
 
@@ -3510,11 +3457,10 @@ func (m *Model) saveLogViewState() {
 		return
 	}
 	m.logViews[id] = logViewState{
-		filter:     m.logFilter,
-		level:      m.logLevel,
-		scroll:     m.logScroll,
-		follow:     m.logFollow,
-		matchIndex: m.logMatch,
+		filter: m.logFilter,
+		level:  m.logLevel,
+		scroll: m.logScroll,
+		follow: m.logFollow,
 	}
 	m.logViewID = id
 }
@@ -3536,7 +3482,6 @@ func (m *Model) restoreLogViewState(id domain.ResourceID) {
 	m.logLevel = state.level
 	m.logScroll = state.scroll
 	m.logFollow = state.follow
-	m.logMatch = state.matchIndex
 	if !ok {
 		m.logFollow = true
 	}

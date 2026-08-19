@@ -859,9 +859,14 @@ func TestActivityActionStripChangesByMode(t *testing.T) {
 	model.logFollow = true
 
 	logView := ansi.Strip(model.View())
-	for _, want := range []string{"space pause", "/ search", "n/N match", "x clear"} {
+	for _, want := range []string{"space pause", "/ filter"} {
 		if !strings.Contains(logView, want) {
 			t.Fatalf("logs action strip missing %q:\n%s", want, logView)
+		}
+	}
+	for _, unwanted := range []string{"n/N", "x clear"} {
+		if strings.Contains(logView, unwanted) {
+			t.Fatalf("logs action strip still shows removed hint %q:\n%s", unwanted, logView)
 		}
 	}
 
@@ -900,7 +905,7 @@ func TestLogActionStripStaysVisibleWhenLogPaneIsFull(t *testing.T) {
 	model.logFollow = true
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"space pause", "/ search", "x clear"} {
+	for _, want := range []string{"space pause", "/ filter"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("full log pane missing persistent footer chip %q:\n%s", want, view)
 		}
@@ -919,7 +924,12 @@ func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
 	}
 }
 
-func TestLogFilterOverlayFiltersVisibleLogsAndHighlightsMatches(t *testing.T) {
+// TestLogFilterIsLiveWhileTyping covers the actual point of the redesign:
+// filtering and highlighting apply on every keystroke, before enter is
+// ever pressed — not only once a draft is committed. Typing "a" already
+// hides the non-matching line; typing the rest of "api" narrows further,
+// all without leaving overlayLogFilter.
+func TestLogFilterIsLiveWhileTyping(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 30
 	model.focus = paneActivity
@@ -927,8 +937,8 @@ func TestLogFilterOverlayFiltersVisibleLogsAndHighlightsMatches(t *testing.T) {
 	ctr := model.provider.(*fakeProvider).containers["1"]
 	model.selected = &ctr
 	model.logLines = []string{
-		"2026-08-12T12:00:00Z [INFO] GET /healthz 200",
-		"2026-08-12T12:00:01Z [ERROR] POST /api failed 500",
+		"GET /ok 200",
+		"POST /api failed 500",
 	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
@@ -936,27 +946,77 @@ func TestLogFilterOverlayFiltersVisibleLogsAndHighlightsMatches(t *testing.T) {
 	if model.overlay != overlayLogFilter {
 		t.Fatalf("overlay = %v, want log filter", model.overlay)
 	}
-	for _, char := range []rune("api") {
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	model = updated.(Model)
+	if model.logFilter != "a" {
+		t.Fatalf("logFilter after typing 'a' = %q, want live-applied \"a\"", model.logFilter)
+	}
+	midTypeView := ansi.Strip(model.View())
+	if strings.Contains(midTypeView, "/ok 200") || !strings.Contains(midTypeView, "/api failed") {
+		t.Fatalf("live-filtered view after one character =\n%s", midTypeView)
+	}
+	if model.overlay != overlayLogFilter {
+		t.Fatal("overlay changed after a single character, want still editing")
+	}
+
+	for _, char := range []rune("pi") {
 		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}})
 		model = updated.(Model)
 	}
+	if model.logFilter != "api" {
+		t.Fatalf("logFilter = %q, want api", model.logFilter)
+	}
+	rawView := model.View()
+	if !strings.Contains(rawView, "\x1b[") {
+		t.Fatalf("live-filtered match should be highlighted while still editing:\n%s", rawView)
+	}
+
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if model.logFilter != "api" || model.overlay != overlayNone {
-		t.Fatalf("logFilter/overlay = %q/%v, want api/none", model.logFilter, model.overlay)
+		t.Fatalf("logFilter/overlay after enter = %q/%v, want api/none (enter keeps the live value)", model.logFilter, model.overlay)
 	}
-	rawView := model.View()
-	view := ansi.Strip(rawView)
+	view := ansi.Strip(model.View())
 	if strings.Contains(view, "/healthz") || !strings.Contains(view, "/api failed") {
-		t.Fatalf("filtered log view =\n%s", view)
+		t.Fatalf("filtered log view after enter =\n%s", view)
 	}
-	for _, want := range []string{"tail 1/1", "filter api", "match 1/1", "x", "clear"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("filtered log view missing %q:\n%s", want, view)
+	if !strings.Contains(view, "tail 1/1") || !strings.Contains(view, "filter api") {
+		t.Fatalf("filtered log view missing header chips:\n%s", view)
+	}
+	for _, unwanted := range []string{"match 1/1", "x clear"} {
+		if strings.Contains(view, unwanted) {
+			t.Fatalf("filtered log view still shows removed %q:\n%s", unwanted, view)
 		}
 	}
-	if !strings.Contains(rawView, "\x1b[") {
-		t.Fatalf("filtered log match should be highlighted:\n%s", rawView)
+}
+
+// TestLogFilterEscClearsWhileEditing covers esc's unified meaning: it
+// always clears the filter now, whether pressed while actively editing
+// or from plain log navigation — not "cancel the edit but keep whatever
+// was previously committed", since there's no separate committed value
+// to fall back to anymore.
+func TestLogFilterEscClearsWhileEditing(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.focus = paneActivity
+	model.mode = activityLogs
+	ctr := model.provider.(*fakeProvider).containers["1"]
+	model.selected = &ctr
+	model.logLines = []string{"line one", "line two"}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	model = updated.(Model)
+	if model.logFilter != "o" {
+		t.Fatalf("logFilter = %q, want live-applied \"o\"", model.logFilter)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.logFilter != "" || model.overlay != overlayNone {
+		t.Fatalf("logFilter/overlay after esc = %q/%v, want cleared/none", model.logFilter, model.overlay)
 	}
 }
 
@@ -1184,7 +1244,11 @@ func TestEscapeClearsStuckLogSearch(t *testing.T) {
 	}
 }
 
-func TestXClearsActiveLogFilterFromAnyFocus(t *testing.T) {
+// TestEscClearsActiveLogFilterFromAnyFocus is what
+// TestXClearsActiveLogFilterFromAnyFocus covered before 'x' was removed —
+// esc is now the only key that clears a filter from plain log navigation
+// (not currently editing).
+func TestEscClearsActiveLogFilterFromAnyFocus(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 12
 	model.focus = paneTree
@@ -1198,28 +1262,13 @@ func TestXClearsActiveLogFilterFromAnyFocus(t *testing.T) {
 	model.logLevel = logSeverityWarnings
 	model.logFollow = false
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = updated.(Model)
-	if model.focus != paneActivity || model.logFilter != "" || model.logLevel != logSeverityAll || !model.logFollow {
-		t.Fatalf("log state = focus:%v filter:%q level:%v follow:%v, want activity/empty/all/follow", model.focus, model.logFilter, model.logLevel, model.logFollow)
+	if model.logFilter != "" || model.logLevel != logSeverityAll || !model.logFollow {
+		t.Fatalf("log state = filter:%q level:%v follow:%v, want empty/all/follow", model.logFilter, model.logLevel, model.logFollow)
 	}
 	if view := ansi.Strip(model.View()); strings.Contains(view, "No logs match") || !strings.Contains(view, "line-05") {
-		t.Fatalf("x-cleared log view =\n%s", view)
-	}
-}
-
-func TestLogSearchNOpensFilterWhenNoTextFilter(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 12
-	model.focus = paneActivity
-	model.mode = activityLogs
-	ctr := model.provider.(*fakeProvider).containers["1"]
-	model.selected = &ctr
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	model = updated.(Model)
-	if model.focus != paneActivity || model.overlay != overlayLogFilter {
-		t.Fatalf("focus/overlay = %v/%v, want activity/log filter", model.focus, model.overlay)
+		t.Fatalf("esc-cleared log view =\n%s", view)
 	}
 }
 
@@ -1238,7 +1287,13 @@ func TestNOpensCreateOverlayWhenNotFocusedOnLogs(t *testing.T) {
 	}
 }
 
-func TestLogSearchMatchNavigation(t *testing.T) {
+// TestNKeyAlwaysOpensCreateEvenWithActiveLogFilter is the regression test
+// for removing match navigation: 'n' used to be overloaded (jump to the
+// next log match with a filter active, open the filter with none, create
+// a container otherwise). It now always means "create," full stop,
+// regardless of Logs mode or an active filter — live filtering already
+// shows every match at once, so there's nothing left to jump between.
+func TestNKeyAlwaysOpensCreateEvenWithActiveLogFilter(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 8
 	model.focus = paneActivity
@@ -1248,36 +1303,12 @@ func TestLogSearchMatchNavigation(t *testing.T) {
 	model.selectedID = ctr.ID
 	model.logViewID = ctr.ID
 	model.logFilter = "api"
-	model.logFollow = true
-	model.logLines = []string{
-		"api match 01",
-		"api match 02",
-		"api match 03",
-		"api match 04",
-	}
+	model.logLines = []string{"api match 01", "api match 02"}
 
-	view := ansi.Strip(model.View())
-	if !strings.Contains(view, "match 1/4") {
-		t.Fatalf("initial match indicator missing:\n%s", view)
-	}
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	model = updated.(Model)
-	if model.logMatch != 1 || model.logFollow {
-		t.Fatalf("match/follow = %d/%v, want 1/false", model.logMatch, model.logFollow)
-	}
-	view = ansi.Strip(model.View())
-	if !strings.Contains(view, "match 2/4") || strings.Contains(view, "api match 01") {
-		t.Fatalf("next match view =\n%s", view)
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
-	model = updated.(Model)
-	if model.logMatch != 0 {
-		t.Fatalf("logMatch = %d, want 0 after previous", model.logMatch)
-	}
-	view = ansi.Strip(model.View())
-	if !strings.Contains(view, "match 1/4") || !strings.Contains(view, "api match 01") {
-		t.Fatalf("previous match view =\n%s", view)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate", model.overlay)
 	}
 }
 

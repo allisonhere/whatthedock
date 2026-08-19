@@ -92,6 +92,14 @@ func TestBackgroundStaysExplicitAcrossScreensAndThemes(t *testing.T) {
 		{"help overlay", func(m *Model) { m.overlay = overlayHelp }},
 		{"filter overlay", func(m *Model) { m.overlay = overlayFilter }},
 		{"log filter overlay", func(m *Model) { m.mode = activityLogs; m.overlay = overlayLogFilter }},
+		{"log filter overlay typing", func(m *Model) {
+			m.mode = activityLogs
+			m.focus = paneActivity
+			m.overlay = overlayLogFilter
+			m.logDraft = "api"
+			m.logFilter = "api"
+			m.logLines = []string{"2024-01-01T12:00:00Z GET /api/v3/queue 200 trailing plain text here"}
+		}},
 		{"settings overlay", func(m *Model) { m.overlay = overlaySettings }},
 		{"command palette", func(m *Model) { m.overlay = overlayCommandPalette }},
 		{"theme picker", func(m *Model) { m.overlay = overlayThemePicker }},

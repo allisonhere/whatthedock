@@ -317,15 +317,9 @@ func (m Model) logFilterChips() []string {
 	var chips []string
 	if query := strings.TrimSpace(m.logFilter); query != "" {
 		chips = append(chips, "filter "+query)
-		if current, total := m.logMatchStatus(); total > 0 {
-			chips = append(chips, fmt.Sprintf("match %d/%d", current, total))
-		}
 	}
 	if m.logLevel != logSeverityAll {
 		chips = append(chips, m.logLevel.String())
-	}
-	if len(chips) > 0 {
-		chips = append(chips, "x clear")
 	}
 	return chips
 }
@@ -1675,6 +1669,10 @@ func detailHint(hasValue, openable bool) string {
 type paneAction struct {
 	key   string
 	label string
+	// raw skips the label's usual lowercasing — for live-typed content
+	// (the log filter chip's input echo), which must show exactly what
+	// the user typed, not a static hint.
+	raw bool
 }
 
 func (m Model) withPaneActionStrip(renderer tideui.Renderer, pane pane, width int, content string) string {
@@ -1728,7 +1726,11 @@ func (m Model) renderPaneActionStrip(renderer tideui.Renderer, pane pane, width 
 		if action.key == "" || action.label == "" {
 			continue
 		}
-		chip := keyStyle.Render(" "+action.key+" ") + labelStyle.Render(strings.ToLower(action.label)+" ")
+		label := action.label
+		if !action.raw {
+			label = strings.ToLower(label)
+		}
+		chip := keyStyle.Render(" "+action.key+" ") + labelStyle.Render(label+" ")
 		parts = append(parts, chip)
 	}
 	if len(parts) == 0 {
@@ -1749,6 +1751,28 @@ func (m Model) renderPaneActionStrip(renderer tideui.Renderer, pane pane, width 
 		return ""
 	}
 	return renderer.Styles.DetailMeta.Width(width).Render(line)
+}
+
+// logFilterFieldAction is the Logs pane's live filter field, rendered as
+// a pane-action chip right next to the live/pause one rather than a
+// separate modal (see handleOverlayKey's overlayLogFilter case, which
+// applies logDraft as the active filter on every keystroke, not just on
+// enter). Idle, it's a "/" hint; once open (overlay == overlayLogFilter)
+// it echoes exactly what's been typed so far with a trailing caret — raw:
+// true so renderPaneActionStrip doesn't lowercase the user's own input;
+// once closed with something typed, it keeps showing the active filter
+// text instead of falling back to the generic hint, so it's still
+// visible what's currently filtering.
+func (m Model) logFilterFieldAction() paneAction {
+	const maxFieldWidth = 40
+	switch {
+	case m.overlay == overlayLogFilter:
+		return paneAction{key: "/", label: short(m.logDraft, maxFieldWidth) + "|", raw: true}
+	case strings.TrimSpace(m.logFilter) != "":
+		return paneAction{key: "/", label: short(m.logFilter, maxFieldWidth), raw: true}
+	default:
+		return paneAction{key: "/", label: "filter"}
+	}
 }
 
 func (m Model) paneActions(pane pane) []paneAction {
@@ -1786,12 +1810,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 			if m.logFollow {
 				follow = paneAction{key: "space", label: "pause"}
 			}
-			return []paneAction{
-				follow,
-				{key: "/", label: "search"},
-				{key: "x", label: "clear"},
-				{key: "n/N", label: "match"},
-			}
+			return []paneAction{follow, m.logFilterFieldAction()}
 		}
 	case paneInspector:
 		return []paneAction{
@@ -1865,17 +1884,10 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "filter", Content: content, Width: width})
 		return &overlay
 	case overlayLogFilter:
-		width := min(72, max(40, m.width-8))
-		input := renderer.Styles.InputFocused.Width(max(20, width-8)).Render(m.logDraft)
-		content := renderer.RenderSoftBody(width,
-			renderer.Styles.DetailMeta.Render("Severity  "+m.logLevel.String())+"\n"+
-				input+"\n\n"+
-				renderer.RenderSoftHints(width-4,
-					tideui.SoftHint{Key: "enter", Label: "apply"},
-					tideui.SoftHint{Key: "esc", Label: "cancel"},
-				))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "log filter", Content: content, Width: width})
-		return &overlay
+		// No modal: the Logs pane's own action strip shows the live input
+		// in place (see logFilterFieldAction) — editing happens right next
+		// to the log lines it's filtering, not in a separate overlay.
+		return nil
 	case overlayCommandPalette:
 		return m.commandPaletteOverlay(renderer)
 	case overlayThemePicker:
@@ -2422,12 +2434,11 @@ var helpLines = []string{
 	"o              open port, mount, or compose path",
 	"e              open shell in selected container",
 	"l              logs",
-	"/              filter logs while logs pane is focused",
+	"/              live-filter logs as you type, hiding non-matches",
 	"e / w / i / a  log errors, warnings, info, all",
-	"n / N          next/previous log search match",
 	"Space          toggle live/paused log tail",
 	"f / End        jump to end (live)",
-	"x / Esc        clear active log filter",
+	"Esc            clear active log filter",
 	"u              replicate: pull latest image, recreate",
 	"D              delete: real, permanent removal",
 	"C              clone under a new name",

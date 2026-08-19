@@ -129,15 +129,14 @@ Docker socket paths must be present.
 | `p` | Show problems |
 | `a` in problems | Analyze the selected problem with AI |
 | `g` | Show stats graphs |
-| `/` in logs | Filter visible log lines |
+| `/` in logs | Open the live log filter — hides non-matching lines and highlights matches as you type, no Enter needed |
 | `e` / `w` / `i` / `a` in logs | Show errors, warnings, info, or all log lines |
 | `j` / `k` in logs | Scroll log history |
 | `PgUp` / `PgDown` in logs | Page through log history |
 | `Home` / `End` in logs | Jump to log start or resume tail |
 | `Space` in logs | Toggle live/paused log tail |
 | `f` in logs | Resume live log tail |
-| `n` / `N` in logs | Next/previous log search match |
-| `x` / `Esc` in logs | Clear active log filters |
+| `Esc` in logs | Clear the active log filter (also stops editing it, if open) |
 | `T` | Theme picker |
 | `S` | Manage local and remote Docker systems |
 | `,` / `Ctrl+,` | Settings |
@@ -280,8 +279,10 @@ More detail:
 - Displays useful selected-container details without dumping Docker JSON.
 - Streams selected-container logs through a cancellable reader with color-coded
   timestamps, severity, HTTP methods, and HTTP status codes.
-- Supports log filtering, severity quick filters, match navigation, scrollback,
-  follow-tail pause/resume, and per-container log view state.
+- Supports a live log filter (hides non-matching lines and highlights matches
+  character-by-character as you type, no Enter needed), severity quick
+  filters, scrollback, follow-tail pause/resume (`Space`), and per-container
+  log view state.
 - Shows a problems view for unhealthy, restarting, stopped, dead, high-restart,
   unknown-health, and public-port containers, split into the problem list plus
   a lower panel with a rule-based, zero-network suggestion for whichever
