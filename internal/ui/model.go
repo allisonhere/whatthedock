@@ -437,6 +437,21 @@ type Model struct {
 	updateInstalling       bool
 	restartExecPath        string
 
+	// updateInstallProgress drives the update overlay's fake install
+	// progress bar (see tickUpdateProgress) — cosmetic, on a fixed clock,
+	// independent of how long the real installUpdateCmd actually takes.
+	// updateInstallReady/Err/ExePath hold that real command's result once
+	// it arrives; finalizeUpdateInstall only acts on it once the bar has
+	// also finished animating (see the updateInstalledMsg/
+	// updateProgressTickMsg handlers), so a fast network doesn't make the
+	// bar-fill look instant and pointless. A failure is the one exception:
+	// it finalizes immediately rather than making the user watch a bar
+	// fill toward what turns out to be bad news.
+	updateInstallProgress int
+	updateInstallReady    bool
+	updateInstallErr      error
+	updateInstallExePath  string
+
 	// aiAnalyzing/aiAnalysis/aiAnalysisErr mirror the update-check pattern
 	// above (updateChecking/updateCheckErr) for the Problems pane's "a"
 	// (analyze with AI) action. aiAnalysisFor is the problem row's ID the
@@ -1163,14 +1178,29 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case updateInstalledMsg:
-		m.updateInstalling = false
-		if msg.err != nil {
-			m.status, m.statusErr = "update failed: "+friendlyDockerError(msg.err), true
-			return m, nil
+		m.updateInstallReady = true
+		m.updateInstallErr = msg.err
+		m.updateInstallExePath = msg.exePath
+		// A failure finalizes right away — no reason to make the user
+		// watch the fake bar fill toward bad news. A success waits for
+		// the bar to finish animating (see updateProgressTickMsg below)
+		// unless it's already there.
+		if msg.err != nil || m.updateInstallProgress >= 100 {
+			return m.finalizeUpdateInstall()
 		}
-		m.restartExecPath = msg.exePath
-		m.status, m.statusErr = "updated to "+m.updateAvailableVersion+" — restarting…", false
-		return m, tickUpdateRestart()
+		return m, nil
+	case updateProgressTickMsg:
+		if !m.updateInstalling {
+			return m, nil // stale tick from an install attempt that already finished
+		}
+		m.updateInstallProgress = min(100, m.updateInstallProgress+updateProgressStep)
+		if m.updateInstallProgress < 100 {
+			return m, tickUpdateProgress()
+		}
+		if m.updateInstallReady {
+			return m.finalizeUpdateInstall()
+		}
+		return m, nil // bar's done animating, still waiting on the real result
 	case updateRestartMsg:
 		return m, tea.Quit
 	case aiAnalysisDoneMsg:

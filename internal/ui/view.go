@@ -1959,20 +1959,57 @@ func (m Model) replicateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 // Model.handleUpdateKey: y downloads and installs it in place, n/esc
 // dismisses and remembers this version as ignored (see
 // updateIgnoredVersion) so the automatic check won't prompt again for it.
+// Once installing, the same overlay switches to a progress bar (see
+// updateProgressBar) instead of the y/n hints — visible confirmation that
+// something is actually happening, not just a status-bar line the user
+// might not be looking at.
 func (m Model) updateOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
-	prompt := fmt.Sprintf("whatthedock %s is available (you have %s). Download and install it now?", m.updateAvailableVersion, m.appVersion)
-	content := renderer.RenderSoftBody(width, strings.Join([]string{
-		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
-		"",
-		renderer.RenderSoftHints(contentWidth,
-			tideui.SoftHint{Key: "y", Label: "update"},
-			tideui.SoftHint{Key: "n/esc", Label: "ignore"},
-		),
-	}, "\n"))
-	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "update available", Content: content, Width: width})
+	title := "update available"
+	var lines []string
+	if m.updateInstalling {
+		title = "installing update"
+		label := fmt.Sprintf("Installing whatthedock %s… %d%%", m.updateAvailableVersion, m.updateInstallProgress)
+		lines = []string{
+			renderer.Styles.DetailMeta.Width(contentWidth).Render(label),
+			"",
+			updateProgressBar(renderer, m.updateInstallProgress, contentWidth),
+		}
+	} else {
+		prompt := fmt.Sprintf("whatthedock %s is available (you have %s). Download and install it now?", m.updateAvailableVersion, m.appVersion)
+		lines = []string{
+			renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+			"",
+			renderer.RenderSoftHints(contentWidth,
+				tideui.SoftHint{Key: "y", Label: "update"},
+				tideui.SoftHint{Key: "n/esc", Label: "ignore"},
+			),
+		}
+	}
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
 	return &overlay
+}
+
+// updateProgressBar renders a plain linear 0-100% fill for the update
+// overlay's install progress. Deliberately linear rather than the
+// sqrt-scaled perceptual fill dashboardMemMeter uses — this is a literal
+// percentage of a fixed-duration fake animation, not an area meter. Every
+// cell sets its own background explicitly (matching dashboardMemMeter's own
+// pattern), so concatenating the filled/empty spans on one line is safe —
+// neither depends on an ambient background surviving the other's reset.
+func updateProgressBar(renderer tideui.Renderer, pct int, width int) string {
+	width = max(1, width)
+	pct = clamp(pct, 0, 100)
+	bg, ok := renderer.Styles.DetailMeta.GetBackground().(lipgloss.Color)
+	if !ok {
+		bg = renderer.Styles.Theme.Bg
+	}
+	filled := clamp(width*pct/100, 0, width)
+	full := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.BorderFocus).Render(strings.Repeat("█", filled))
+	empty := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(strings.Repeat("░", width-filled))
+	return full + empty
 }
 
 func (m Model) openOverlay(renderer tideui.Renderer) *tideui.Overlay {

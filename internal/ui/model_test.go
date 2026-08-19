@@ -4064,14 +4064,39 @@ func TestUpdateKeyYesInstalls(t *testing.T) {
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	got := updated.(Model)
 
-	if got.overlay != overlayNone {
-		t.Fatalf("overlay = %v, want overlayNone", got.overlay)
+	if got.overlay != overlayUpdate {
+		t.Fatalf("overlay = %v, want overlayUpdate to stay open showing progress", got.overlay)
 	}
 	if !got.updateInstalling {
 		t.Fatal("updateInstalling = false, want true")
 	}
+	if got.updateInstallProgress != 0 {
+		t.Fatalf("updateInstallProgress = %d, want 0 at the start of an install", got.updateInstallProgress)
+	}
 	if cmd == nil {
-		t.Fatal("cmd = nil, want the install command")
+		t.Fatal("cmd = nil, want a batch of the install command and the progress-bar tick")
+	}
+}
+
+// TestUpdateKeyIgnoredWhileInstalling guards against re-triggering or
+// cancelling an install already in flight: once updateInstalling is true,
+// the overlay is showing progress, not the y/n prompt, so every key
+// (including a stray y or n) should be a no-op.
+func TestUpdateKeyIgnoredWhileInstalling(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+	model.updateInstalling = true
+	model.updateInstallProgress = 40
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	got := updated.(Model)
+
+	if got.overlay != overlayUpdate || !got.updateInstalling || got.updateInstallProgress != 40 {
+		t.Fatalf("state changed on a key press mid-install: overlay=%v installing=%v progress=%d", got.overlay, got.updateInstalling, got.updateInstallProgress)
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want a no-op while installing")
 	}
 }
 
@@ -4105,14 +4130,19 @@ func TestUpdateKeyNoIgnoresVersion(t *testing.T) {
 // immediately.
 func TestUpdateInstalledSuccessShowsMessageThenQuits(t *testing.T) {
 	model := testModel()
+	model.overlay = overlayUpdate
 	model.updateInstalling = true
 	model.updateAvailableVersion = "v0.1.8"
+	model.updateInstallProgress = 100 // bar already finished animating
 
 	updated, cmd := model.Update(updateInstalledMsg{exePath: "/usr/local/bin/whatthedock"})
 	got := updated.(Model)
 
 	if got.updateInstalling {
 		t.Fatal("updateInstalling = true, want false")
+	}
+	if got.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone once the install finalizes", got.overlay)
 	}
 	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
 		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
@@ -4137,8 +4167,56 @@ func TestUpdateInstalledSuccessShowsMessageThenQuits(t *testing.T) {
 	}
 }
 
+// TestUpdateInstalledSuccessWaitsForProgressBarBeforeFinalizing covers the
+// common case where the real download/replace finishes before the fake
+// progress bar has animated to 100% — the result must be held (not
+// finalized, not quitting) until a later updateProgressTickMsg actually
+// reaches 100, otherwise the bar would jump around or the message would
+// still show up before the bar visually finished, which is the exact
+// "over in a flash" complaint the bar was added to fix in the first place.
+func TestUpdateInstalledSuccessWaitsForProgressBarBeforeFinalizing(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateInstalling = true
+	model.updateAvailableVersion = "v0.1.8"
+	model.updateInstallProgress = 40 // bar still animating
+
+	updated, cmd := model.Update(updateInstalledMsg{exePath: "/usr/local/bin/whatthedock"})
+	got := updated.(Model)
+
+	if !got.updateInstalling || got.overlay != overlayUpdate {
+		t.Fatalf("install finalized early: installing=%v overlay=%v", got.updateInstalling, got.overlay)
+	}
+	if got.RestartExecPath() != "" {
+		t.Fatalf("RestartExecPath() = %q, want still empty until the bar catches up", got.RestartExecPath())
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil — the result is just stored, the tick already in flight drives things forward")
+	}
+	if !got.updateInstallReady {
+		t.Fatal("updateInstallReady = false, want true once the real result has arrived")
+	}
+
+	// Ticking the rest of the way to 100 should now finalize using the
+	// stored result.
+	for got.updateInstallProgress < 100 {
+		updated, cmd = got.Update(updateProgressTickMsg{})
+		got = updated.(Model)
+	}
+	if got.updateInstalling {
+		t.Fatal("updateInstalling = true, want false once the bar reaches 100 with a ready result")
+	}
+	if got.RestartExecPath() != "/usr/local/bin/whatthedock" {
+		t.Fatalf("RestartExecPath() = %q, want /usr/local/bin/whatthedock", got.RestartExecPath())
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want the delayed restart tick once finalized")
+	}
+}
+
 func TestUpdateInstalledFailureShowsStatus(t *testing.T) {
 	model := testModel()
+	model.overlay = overlayUpdate
 	model.updateInstalling = true
 
 	updated, _ := model.Update(updateInstalledMsg{err: errors.New("disk full")})
@@ -4147,11 +4225,74 @@ func TestUpdateInstalledFailureShowsStatus(t *testing.T) {
 	if got.updateInstalling {
 		t.Fatal("updateInstalling = true, want false")
 	}
+	if got.overlay != overlayNone {
+		t.Fatalf("overlay = %v, want overlayNone", got.overlay)
+	}
 	if !got.statusErr || !strings.Contains(got.status, "disk full") {
 		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", got.status, got.statusErr)
 	}
 	if got.RestartExecPath() != "" {
 		t.Fatalf("RestartExecPath() = %q, want empty on failure", got.RestartExecPath())
+	}
+}
+
+// TestUpdateInstalledFailureFinalizesImmediatelyMidBar is
+// TestUpdateInstalledFailureShowsStatus's complement: a failure shouldn't
+// make the user wait through the rest of the fake progress bar to hear
+// about it — it finalizes as soon as it arrives, whatever the bar's at.
+func TestUpdateInstalledFailureFinalizesImmediatelyMidBar(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateInstalling = true
+	model.updateInstallProgress = 25
+
+	updated, cmd := model.Update(updateInstalledMsg{err: errors.New("disk full")})
+	got := updated.(Model)
+
+	if got.updateInstalling || got.overlay != overlayNone {
+		t.Fatalf("install did not finalize immediately: installing=%v overlay=%v", got.updateInstalling, got.overlay)
+	}
+	if !got.statusErr || !strings.Contains(got.status, "disk full") {
+		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", got.status, got.statusErr)
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil — a failure doesn't schedule a restart")
+	}
+}
+
+func TestUpdateProgressTickAdvancesAndReschedules(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayUpdate
+	model.updateInstalling = true
+	model.updateInstallProgress = 0
+
+	updated, cmd := model.Update(updateProgressTickMsg{})
+	got := updated.(Model)
+
+	if got.updateInstallProgress != updateProgressStep {
+		t.Fatalf("updateInstallProgress = %d, want %d", got.updateInstallProgress, updateProgressStep)
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want the next tick scheduled")
+	}
+}
+
+// TestUpdateProgressTickIgnoredWhenNotInstalling guards against a stale
+// tick — e.g. one already in flight when a fast failure finalized the
+// install early — reviving progress state after the fact.
+func TestUpdateProgressTickIgnoredWhenNotInstalling(t *testing.T) {
+	model := testModel()
+	model.updateInstalling = false
+	model.updateInstallProgress = 0
+
+	updated, cmd := model.Update(updateProgressTickMsg{})
+	got := updated.(Model)
+
+	if got.updateInstallProgress != 0 {
+		t.Fatalf("updateInstallProgress = %d, want unchanged at 0", got.updateInstallProgress)
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil for a stale tick")
 	}
 }
 
@@ -4188,6 +4329,30 @@ func TestUpdateOverlayRendersVersions(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("update overlay missing %q:\n%s", want, view)
 		}
+	}
+}
+
+// TestUpdateOverlayRendersProgressWhileInstalling covers the confirmation
+// the update prompt was missing: once installing, the overlay must show
+// visible progress (a percentage and a fill bar), not the y/n prompt it
+// already answered.
+func TestUpdateOverlayRendersProgressWhileInstalling(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 30
+	model.overlay = overlayUpdate
+	model.updateAvailableVersion = "v0.1.4"
+	model.updateInstalling = true
+	model.updateInstallProgress = 40
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "v0.1.4") || !strings.Contains(view, "40%") {
+		t.Fatalf("update overlay missing version/progress:\n%s", view)
+	}
+	if strings.Contains(view, "y update") || strings.Contains(view, "n/esc ignore") {
+		t.Fatalf("update overlay still shows the y/n prompt while installing:\n%s", view)
+	}
+	if !strings.ContainsAny(view, "█░") {
+		t.Fatalf("update overlay missing the progress bar glyphs:\n%s", view)
 	}
 }
 

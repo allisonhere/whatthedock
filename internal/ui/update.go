@@ -37,6 +37,28 @@ type updateInstalledMsg struct {
 // install "happening in a flash with no messaging."
 const updateRestartDelay = 1200 * time.Millisecond
 
+// updateProgressStep/Interval drive the update overlay's fake install
+// progress bar: a step every 120ms fills the bar to 100% in ~2.4s,
+// landing it in the "2 or 3 sec" range asked for. It's on its own fixed
+// clock regardless of how long installUpdateCmd actually takes — see
+// Model.updateInstallProgress's doc comment for how that's reconciled
+// with the real result.
+const (
+	updateProgressStep     = 5
+	updateProgressInterval = 120 * time.Millisecond
+)
+
+// updateProgressTickMsg advances the update overlay's fake progress bar by
+// one step. Only ever produced by tickUpdateProgress, itself only ever
+// returned while an install is in flight (see handleUpdateKey's "y" case
+// and the updateProgressTickMsg handler in model.go), so a tick arriving
+// after the install has already finalized is simply stale and ignored.
+type updateProgressTickMsg struct{}
+
+func tickUpdateProgress() tea.Cmd {
+	return tea.Tick(updateProgressInterval, func(time.Time) tea.Msg { return updateProgressTickMsg{} })
+}
+
 // updateRestartMsg fires once updateRestartDelay has elapsed after a
 // successful install, finally triggering the tea.Quit that lets main()
 // re-exec into the new binary. It's only ever produced by
@@ -83,7 +105,13 @@ func (m Model) installUpdateCmd(version string) tea.Cmd {
 // handleUpdateKey gates the "update available" confirmation the same way
 // Delete/Replicate do: esc/n/q declines (and persists this version as
 // ignored, so the automatic check won't prompt again for it), y installs.
+// Once installing, the overlay stays up showing progress (see updateOverlay)
+// and every key is ignored — there's no cancel, and re-pressing y shouldn't
+// restart the install out from under itself.
 func (m Model) handleUpdateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.updateInstalling {
+		return m, nil
+	}
 	switch msg.String() {
 	case "esc", "n", "q":
 		m.overlay = overlayNone
@@ -91,12 +119,30 @@ func (m Model) handleUpdateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.saveSettings()
 		m.updateAvailableVersion = ""
 	case "y":
-		m.overlay = overlayNone
 		m.updateInstalling = true
-		m.status, m.statusErr = "updating to "+m.updateAvailableVersion+"…", false
-		return m, m.installUpdateCmd(m.updateAvailableVersion)
+		m.updateInstallProgress = 0
+		m.updateInstallReady = false
+		m.updateInstallErr = nil
+		m.updateInstallExePath = ""
+		return m, tea.Batch(m.installUpdateCmd(m.updateAvailableVersion), tickUpdateProgress())
 	}
 	return m, nil
+}
+
+// finalizeUpdateInstall applies the real installUpdateCmd result once it's
+// safe to act on — either immediately (a failure) or once the fake
+// progress bar has also finished animating (a success) — see
+// updateInstalledMsg/updateProgressTickMsg in model.go.
+func (m Model) finalizeUpdateInstall() (Model, tea.Cmd) {
+	m.updateInstalling = false
+	m.overlay = overlayNone
+	if m.updateInstallErr != nil {
+		m.status, m.statusErr = "update failed: "+friendlyDockerError(m.updateInstallErr), true
+		return m, nil
+	}
+	m.restartExecPath = m.updateInstallExePath
+	m.status, m.statusErr = "updated to "+m.updateAvailableVersion+" — restarting…", false
+	return m, tickUpdateRestart()
 }
 
 // RestartExecPath is set once an update finishes installing successfully —

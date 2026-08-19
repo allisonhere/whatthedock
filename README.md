@@ -301,11 +301,11 @@ More detail:
   status-bar hint). A newer version prompts "update now (`y`) or ignore
   (`n`/`Esc`)"; ignoring is remembered per-version, so it won't ask again
   about that release, but a later one prompts fresh (a manual check always
-  re-shows it, even for a version already ignored). Confirming downloads
-  the matching release
-  asset, atomically replaces the running binary, shows a brief "updated to
-  vX.Y.Z — restarting…" confirmation, then re-execs into it — same
-  terminal, no manual restart.
+  re-shows it, even for a version already ignored). Confirming stays on the
+  same popup with a fill-bar showing install progress, downloads the
+  matching release asset, atomically replaces the running binary, shows a
+  brief "updated to vX.Y.Z — restarting…" confirmation, then re-execs into
+  it — same terminal, no manual restart.
 - Starts, stops, restarts, and refreshes containers.
 - Drafts new Compose services or standalone containers in a keyboard-first
   creation overlay with live generated previews, syntax-highlighted YAML, and
