@@ -41,6 +41,7 @@ type fakeProvider struct {
 	progressCalls []app.PullProgress
 	removeErr     error
 	pullErr       error
+	createErr     error
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -74,6 +75,9 @@ func (f *fakeProvider) RestartContainer(context.Context, domain.ResourceID) erro
 }
 func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
 	f.creates = append(f.creates, spec)
+	if f.createErr != nil {
+		return domain.ResourceID{}, f.createErr
+	}
 	id := domain.ResourceID{Host: f.host.ID, ID: "created-" + spec.Name}
 	ctr := domain.Container{ID: id, Name: spec.Name, Image: spec.Image, State: domain.StateRunning, Status: "Up 1 second", Labels: map[string]string{}}
 	f.containers[id.ID] = ctr

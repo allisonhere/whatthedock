@@ -133,6 +133,51 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 	}
 }
 
+// TestCreateFailureKeepsOverlayOpenAndPreservesDraft is the regression
+// test for a live report: a create failure (a conflicting port is the
+// common one — Docker succeeds at creating the container but fails to
+// start it, e.g. "port is already allocated") used to unconditionally
+// close the Create overlay, throwing away everything the user had typed
+// and dumping them back to the main view with only a terse status-bar
+// message to go on. It should stay on the form — dropped back out of the
+// confirm step so they can see/fix the offending field and retry —
+// with the draft itself untouched.
+func TestCreateFailureKeepsOverlayOpenAndPreservesDraft(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.provider.(*fakeProvider).createErr = errors.New("port is already allocated")
+	model.openCreateOverlay()
+	model.createDraft.Image = "nginx:alpine"
+	model.createDraft.Ports = "8080:80"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate to stay open after a failed create", model.overlay)
+	}
+	if model.createDraft.Confirming {
+		t.Fatal("createDraft.Confirming = true, want back to the editable field list, not stuck on the confirm step")
+	}
+	if model.createDraft.Image != "nginx:alpine" || model.createDraft.Ports != "8080:80" {
+		t.Fatalf("createDraft = %+v, want the typed fields preserved", model.createDraft)
+	}
+	if !model.statusErr || !strings.Contains(model.status, "port is already allocated") {
+		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", model.status, model.statusErr)
+	}
+	if model.busy {
+		t.Fatal("busy = true after createDoneMsg, want false")
+	}
+}
+
 func TestCreateStandaloneSpecParsesFields(t *testing.T) {
 	draft := createDraft{
 		Mode:          createModeStandalone,

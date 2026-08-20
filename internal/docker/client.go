@@ -161,7 +161,15 @@ func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerC
 	id := domain.ResourceID{Host: p.host.ID, ID: resp.ID}
 	if spec.Start {
 		if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-			return id, err
+			// A container that exists but never started (the common case:
+			// a port already bound by something else) is pure clutter —
+			// it can't be selected/used for anything, and its name blocks
+			// retrying with the same one until it's removed by hand. Best-
+			// effort cleanup with the original start error, not the
+			// removal outcome: if this also fails, the start error is
+			// still what the user needs to see and act on.
+			_ = p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+			return domain.ResourceID{}, err
 		}
 	}
 	return id, nil

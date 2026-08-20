@@ -1263,15 +1263,25 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case createDoneMsg:
 		m.busy = false
-		m.overlay = overlayNone
 		verb := "create"
 		if msg.edited {
 			verb = "update"
 		}
 		if msg.err != nil {
 			m.status, m.statusErr = verb+" "+msg.name+": "+friendlyDockerError(msg.err), true
+			// Stay on the form instead of dumping the user back to the
+			// main view — a failure here (a conflicting port is the
+			// common one) is often just one field away from working, and
+			// closing the overlay used to throw away everything they'd
+			// typed. Drop back out of the confirm step to the editable
+			// field list so they can fix it and retry; createDraft itself
+			// is untouched either way.
+			if m.overlay == overlayCreate {
+				m.createDraft.Confirming = false
+			}
 			return m, nil
 		}
+		m.overlay = overlayNone
 		if msg.id.ID != "" {
 			m.selectedID = msg.id
 			m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
