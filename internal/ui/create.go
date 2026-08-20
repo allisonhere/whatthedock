@@ -1134,19 +1134,39 @@ type composeOverrideService struct {
 	Environment interface{} `yaml:"environment"`
 }
 
-// applyOverrideFieldsFromYAML parses content as Compose override YAML and,
-// if a service can be unambiguously identified (matching d.Service, or the
-// sole service present), updates d's structured fields to match it — so the
-// form reflects content that was loaded (override-detection) or hand-edited
-// (the Ripple editor) outside the fields themselves. Content that fails to
-// parse, or that names no service matching d.Service among several, leaves
-// d unchanged rather than guessing.
+// applyOverrideFieldsFromYAML parses content as Compose override YAML and
+// updates d's structured fields — Service and Image among them — to match
+// whichever service selectOverrideService picks (falling back to the
+// first service in the document's own source order when that's ambiguous
+// — see below), so the form (the create overlay's own field column)
+// actually reflects content that was loaded (override-detection) or
+// hand-edited/pasted (the Ripple editor) instead of continuing to show
+// whatever was there before. Only content that fails to parse, or names
+// no services at all, leaves d unchanged — there's nothing to derive from.
 func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
 	var doc composeOverrideDoc
 	if err := yaml.Unmarshal([]byte(content), &doc); err != nil || len(doc.Services) == 0 {
 		return
 	}
 	name, svc, ok := selectOverrideService(doc.Services, d.Service)
+	if !ok {
+		// Multiple services, none matching d.Service — a paste of a whole
+		// multi-service stack (the common real case) used to leave every
+		// field showing stale data guaranteed to mismatch the content that
+		// was actually about to get written (see Validate's own check for
+		// that failure mode surfacing as a bare "no such service" from the
+		// compose CLI). Derive from the first service in the document's
+		// own source order instead: the form is reviewable/correctable
+		// before confirming, unlike mergeComposeCreateIntoBase's apply-time
+		// use of selectOverrideService below, which stays strict/no-
+		// guessing since a wrong guess there writes into the user's real
+		// compose file, not just a UI field.
+		if first := firstOverrideServiceName(content); first != "" {
+			if fsvc, fok := doc.Services[first]; fok {
+				name, svc, ok = first, fsvc, true
+			}
+		}
+	}
 	if !ok {
 		return
 	}
@@ -1164,7 +1184,11 @@ func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
 // selectOverrideService picks which parsed service to sync fields from: the
 // one named preferredService if present, else the sole service when there's
 // exactly one. Multiple services with no name match is ambiguous, so callers
-// leave the draft untouched rather than guessing which one the user means.
+// leave the draft untouched rather than guessing which one the user means —
+// mergeComposeCreateIntoBase's apply-time use of this needs that strictness
+// (a wrong guess would write another service's fields into the user's real
+// compose file); applyOverrideFieldsFromYAML's form-population use adds its
+// own best-effort fallback on top instead of loosening this shared helper.
 func selectOverrideService(services map[string]composeOverrideService, preferredService string) (string, composeOverrideService, bool) {
 	if svc, ok := services[strings.TrimSpace(preferredService)]; ok {
 		return strings.TrimSpace(preferredService), svc, true
@@ -1175,6 +1199,34 @@ func selectOverrideService(services map[string]composeOverrideService, preferred
 		}
 	}
 	return "", composeOverrideService{}, false
+}
+
+// firstOverrideServiceName returns the first key under content's top-level
+// "services:" mapping, in the YAML document's own source order — the
+// gopkg.in/yaml.v3 unmarshal into composeOverrideDoc's map loses that
+// order, so applyOverrideFieldsFromYAML's fallback walks the raw node tree
+// instead of the decoded map to get a deterministic, document-order
+// answer rather than Go's randomized map iteration.
+func firstOverrideServiceName(content string) string {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &root); err != nil || len(root.Content) == 0 {
+		return ""
+	}
+	doc := root.Content[0]
+	if doc.Kind != yaml.MappingNode {
+		return ""
+	}
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		if doc.Content[i].Value != "services" {
+			continue
+		}
+		services := doc.Content[i+1]
+		if services.Kind == yaml.MappingNode && len(services.Content) > 0 {
+			return services.Content[0].Value
+		}
+		return ""
+	}
+	return ""
 }
 
 // normalizeComposeEnvironment reconciles Compose's two allowed environment

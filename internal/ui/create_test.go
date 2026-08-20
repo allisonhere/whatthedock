@@ -1672,13 +1672,20 @@ func TestApplyOverrideFieldsFromYAMLLeavesDraftUnchangedOnParseError(t *testing.
 	}
 }
 
-func TestApplyOverrideFieldsFromYAMLLeavesDraftUnchangedWhenServiceNameIsAmbiguous(t *testing.T) {
+// TestApplyOverrideFieldsFromYAMLDerivesFirstServiceWhenAmbiguous checks
+// the fallback for a multi-service paste that names no service matching
+// d.Service: rather than leave the form showing stale data guaranteed to
+// mismatch the content about to be written (see Validate's own check for
+// that failure mode), it derives Service/Image from the first service in
+// the document's own source order — sonarr here, since it's listed first,
+// not lidarr, and not Go's randomized map order.
+func TestApplyOverrideFieldsFromYAMLDerivesFirstServiceWhenAmbiguous(t *testing.T) {
 	d := createDraft{Service: "radarr", Image: "kept:as-is"}
 	content := "services:\n  sonarr:\n    image: sonarr:latest\n  lidarr:\n    image: lidarr:latest\n"
 	d.applyOverrideFieldsFromYAML(content)
 
-	if d.Image != "kept:as-is" || d.Service != "radarr" {
-		t.Fatalf("Image/Service = %q/%q, want unchanged when no service matches and there's more than one", d.Image, d.Service)
+	if d.Service != "sonarr" || d.Image != "sonarr:latest" {
+		t.Fatalf("Service/Image = %q/%q, want sonarr/sonarr:latest (the first service in source order)", d.Service, d.Image)
 	}
 }
 
@@ -1717,7 +1724,14 @@ func TestValidateCatchesServiceNotDefinedInOverrideContent(t *testing.T) {
 // TestSaveCreateEditorWarnsWhenServiceMismatchesOverride checks the same
 // mismatch is surfaced immediately at save time (ctrl+s in the raw
 // editor), not only much later at confirm.
-func TestSaveCreateEditorWarnsWhenServiceMismatchesOverride(t *testing.T) {
+// TestSaveCreateEditorDerivesServiceFromMultiServicePaste checks that
+// pasting a whole multi-service stack into the raw editor and saving no
+// longer leaves the Service/Image fields stale — it derives them from the
+// first service in the pasted content's own source order, so the form
+// (the create overlay's own field column) actually reflects what was
+// pasted instead of continuing to show whatever placeholder or prior
+// selection had been there.
+func TestSaveCreateEditorDerivesServiceFromMultiServicePaste(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeCompose
@@ -1729,11 +1743,35 @@ func TestSaveCreateEditorWarnsWhenServiceMismatchesOverride(t *testing.T) {
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 
-	if !model.statusErr {
-		t.Fatalf("statusErr = false after saving override content that doesn't define Service %q, want true", model.createDraft.Service)
+	if model.statusErr {
+		t.Fatalf("statusErr = true, want false — Service should derive from the pasted content, not stay mismatched: %q", model.status)
 	}
-	if !strings.Contains(model.status, "new-service") {
-		t.Fatalf("status = %q, want it to name the mismatched service", model.status)
+	if model.createDraft.Service != "web" || model.createDraft.Image != "nginx:alpine" {
+		t.Fatalf("Service/Image = %q/%q, want web/nginx:alpine (the first service in the pasted content)", model.createDraft.Service, model.createDraft.Image)
+	}
+}
+
+// TestValidateWarnsIfServiceManuallyRetypedAwayFromOverrideContent checks
+// the residual case applyOverrideFieldsFromYAML's own derivation can't
+// resolve on its own: the Service field gets hand-edited, after the fact,
+// to a name the saved override content doesn't define at all.
+func TestValidateWarnsIfServiceManuallyRetypedAwayFromOverrideContent(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(Model)
+	model.createEditor.SetValue("services:\n  web:\n    image: nginx:alpine\n")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+	if model.createDraft.Service != "web" {
+		t.Fatalf("setup: Service = %q, want web after saving the single-service paste", model.createDraft.Service)
+	}
+
+	model.createDraft.Service = "totally-different"
+	if err := model.createDraft.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want an error — Service no longer names anything the saved override content defines")
 	}
 }
 
