@@ -866,6 +866,10 @@ func (m *Model) saveCreateEditor() {
 	} else {
 		m.status, m.statusErr = "override YAML reset to generated", false
 	}
+	// Saving can change whether this draft is a stack (createDraft.
+	// IsStack), which changes visibleCreateFields() in both directions —
+	// re-anchor the selection if it just dropped out of view.
+	m.revalidateCreateField()
 }
 
 // cancelCreateEditor discards the in-progress edit and returns to the form.
@@ -2153,15 +2157,29 @@ func (m *Model) cycleCreateMode() {
 	} else {
 		m.createDraft.Mode = createModeCompose
 	}
+	m.revalidateCreateField()
+}
+
+// revalidateCreateField resets m.createField to the first visible field
+// if the current one has dropped out of visibleCreateFields() — a mode
+// switch is the obvious case, but it also happens within Compose mode
+// alone: saving a paste that turns a single-service draft into a stack
+// (createDraft.IsStack) drops Service/Image/Ports/etc. from the visible
+// list, and the reverse happens on the way back down to one service.
+// Without this, a field that's no longer shown stays "selected" with
+// nothing highlighted in the UI, and further keystrokes silently edit
+// that hidden field instead of doing anything visible — call this
+// anywhere the visible field list can change out from under the current
+// selection, not just on an explicit mode cycle.
+func (m *Model) revalidateCreateField() {
 	fields := m.visibleCreateFields()
-	stillVisible := false
 	for _, field := range fields {
 		if field == m.createField {
-			stillVisible = true
-			break
+			m.createCursor = len([]rune(m.createFieldValue()))
+			return
 		}
 	}
-	if !stillVisible && len(fields) > 0 {
+	if len(fields) > 0 {
 		m.createField = fields[0]
 	}
 	m.createCursor = len([]rune(m.createFieldValue()))

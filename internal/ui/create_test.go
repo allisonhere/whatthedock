@@ -1995,6 +1995,52 @@ func TestSaveCreateEditorDerivesServiceFromMultiServicePaste(t *testing.T) {
 	}
 }
 
+// TestSaveCreateEditorRevalidatesFieldSelectionOnStackTransition guards
+// against a regression where m.createField was never re-checked against
+// visibleCreateFields() after saving turned the draft into a stack: with
+// the cursor left on createFieldService (now hidden — stack mode only
+// shows Mode/Project/ComposeFile), the UI had nothing highlighted as
+// selected, and further keystrokes silently mutated the hidden Service
+// field instead of doing anything visible.
+func TestSaveCreateEditorRevalidatesFieldSelectionOnStackTransition(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "new-service"
+	model.createField = createFieldService // cursor parked on Service before the paste
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(Model)
+	model.createEditor.SetValue("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: httpd\n")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+
+	if !model.createDraft.IsStack() {
+		t.Fatal("setup: IsStack() = false, want true after pasting two services")
+	}
+	visible := model.visibleCreateFields()
+	found := false
+	for _, f := range visible {
+		if f == model.createField {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("createField = %v, not present in visibleCreateFields() = %v — selection points at a hidden field", model.createField, visible)
+	}
+
+	// The regression's second symptom: a keystroke after the transition
+	// must land on a field the user can actually see, not silently edit
+	// the now-hidden Service field.
+	beforeService := model.createDraft.Service
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'X'}})
+	model = updated.(Model)
+	if model.createDraft.Service != beforeService {
+		t.Fatalf("Service changed to %q from a keystroke after the field list shrank — it should have landed on a visible field instead", model.createDraft.Service)
+	}
+}
+
 // TestValidateWarnsIfServiceManuallyRetypedAwayFromOverrideContent checks
 // the residual case applyOverrideFieldsFromYAML's own derivation can't
 // resolve on its own: the Service field gets hand-edited, after the fact,
