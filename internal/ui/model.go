@@ -66,6 +66,7 @@ const (
 	overlayUpdate
 	overlayAppLog
 	overlayDashboard
+	overlayEditScope
 )
 
 type graphStyle int
@@ -605,6 +606,7 @@ var clipboardWriter io.Writer = os.Stderr
 var openTarget = defaultOpenTarget
 var applyComposeCreate = defaultApplyComposeCreate
 var applyComposeAdopt = defaultApplyComposeAdopt
+var applyComposeStack = defaultApplyComposeStack
 var applyComposeDelete = defaultApplyComposeDelete
 var applyComposeReplicate = defaultApplyComposeReplicate
 var composeCommand = runDockerCompose
@@ -1029,7 +1031,17 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshot = msg.snapshot
 		m.rows = m.buildRows()
 		if m.pendingSelectProject != "" || m.pendingSelectService != "" {
-			if key, ok := m.findContainerRowKey(m.pendingSelectProject, m.pendingSelectService); ok {
+			// A stack create/edit has no single service to land on (see
+			// stackComposeCmd) — pendingSelectService stays empty in that
+			// case, so land on the project row itself instead.
+			var key treeRowKey
+			var ok bool
+			if m.pendingSelectService == "" {
+				key, ok = m.findProjectRowKey(m.pendingSelectProject)
+			} else {
+				key, ok = m.findContainerRowKey(m.pendingSelectProject, m.pendingSelectService)
+			}
+			if ok {
 				m.focusedTreeKey = key
 				delete(m.collapsed, m.pendingSelectProject) // don't leave the new service hidden under a collapsed project
 			}
@@ -1317,6 +1329,10 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// pendingSelectProject's doc comment — resolved once the
 			// refreshCmd dispatched below lands.
 			m.pendingSelectProject, m.pendingSelectService = msg.project, msg.service
+		} else if msg.project != "" {
+			// A stack create/edit (stackComposeCmd) — no single service
+			// either, land on the project row instead once refreshed.
+			m.pendingSelectProject = msg.project
 		}
 		if msg.edited {
 			m.status, m.statusErr = "updated "+msg.name, false
@@ -1345,6 +1361,19 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
 			}
 		}
+		return m, nil
+	case createStackFileCheckMsg:
+		if m.overlay != overlayCreate || m.createDraft.Project != msg.project {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.status, m.statusErr = "loading "+msg.project+": "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.createDraft.OverrideRaw = msg.content
+		m.createDraft.OverrideRawSet = true
+		m.createDraft.OverrideLoaded = true
+		m.status, m.statusErr = "loaded "+msg.project+" for editing", false
 		return m, nil
 	case createFileBrowseMsg:
 		m.createFileLoading = false
@@ -1619,7 +1648,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openCloneOverlay()
 		}
 	case "m":
+		// Selecting the project/folder row directly and pressing "m" is
+		// an unambiguous "edit the whole project" signal — no prompt, the
+		// same way selecting a specific container unambiguously means
+		// "edit just this one." Checked before falling through to the
+		// selectedContainer()-based single-service path below, since
+		// selectedContainer() itself would otherwise fall back to
+		// whatever container was previously selected rather than
+		// recognizing "the cursor is on a project row right now."
+		if row := m.currentRow(); row != nil && row.kind == rowProject {
+			return m, m.openEditWholeStackOverlay(row.project)
+		}
 		if selected := m.selectedContainer(); selected != nil {
+			if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
+				m.overlay = overlayEditScope
+				return m, nil
+			}
 			return m, m.openEditOverlay()
 		}
 	}
@@ -1757,6 +1801,32 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleReplicateKey(msg)
 	case overlayUpdate:
 		return m.handleUpdateKey(msg)
+	case overlayEditScope:
+		return m.handleEditScopeKey(msg)
+	}
+	return m, nil
+}
+
+// handleEditScopeKey answers the warn-and-offer prompt shown when "m" is
+// pressed on an individual container that's part of a multi-service
+// project (see the "m" case above and openEditWholeStackOverlay's doc
+// comment) — enter/e proceeds exactly as a genuinely single-service
+// project always has (openEditOverlay), "s" escalates to editing the
+// whole stack at once, esc backs out with no change.
+func (m Model) handleEditScopeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.overlay = overlayNone
+	case "enter", "e":
+		m.overlay = overlayNone
+		return m, m.openEditOverlay()
+	case "s":
+		project := ""
+		if selected := m.selectedContainer(); selected != nil {
+			project = selected.Compose.Project
+		}
+		m.overlay = overlayNone
+		return m, m.openEditWholeStackOverlay(project)
 	}
 	return m, nil
 }
@@ -3942,6 +4012,18 @@ func (m *Model) restoreFocusedTreeRow(previousCursor int, selectInitial bool) te
 func (m Model) findContainerRowKey(project, service string) (treeRowKey, bool) {
 	for _, row := range m.rows {
 		if row.kind == rowContainer && row.project == project && row.service == service {
+			return row.key(), true
+		}
+	}
+	return treeRowKey{}, false
+}
+
+// findProjectRowKey is findContainerRowKey's counterpart for a stack
+// create/edit, which has no single service to land on — locates the
+// project's own header row instead.
+func (m Model) findProjectRowKey(project string) (treeRowKey, bool) {
+	for _, row := range m.rows {
+		if row.kind == rowProject && row.project == project {
 			return row.key(), true
 		}
 	}

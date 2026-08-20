@@ -379,6 +379,105 @@ func TestComposeCreateSelectsNewServiceInTree(t *testing.T) {
 	}
 }
 
+// TestStackConfirmDispatchesStackApplyWithNoServiceArg checks that
+// confirming a stack draft (IsStack) calls applyComposeStack — not the
+// ordinary single-service applyComposeCreate/applyComposeAdopt — and that
+// the spec it's called with has no Service name, matching stackComposeCmd's
+// own doc comment (there's no single target to report).
+func TestStackConfirmDispatchesStackApplyWithNoServiceArg(t *testing.T) {
+	originalCreate, originalStack := applyComposeCreate, applyComposeStack
+	defer func() { applyComposeCreate, applyComposeStack = originalCreate, originalStack }()
+	var createCalls, stackCalls int
+	var stackSpec composeCreateSpec
+	applyComposeCreate = func(_ context.Context, _ composeCreateSpec) error {
+		createCalls++
+		return nil
+	}
+	applyComposeStack = func(_ context.Context, spec composeCreateSpec) error {
+		stackCalls++
+		stackSpec = spec
+		return nil
+	}
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Project = "media"
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
+	model.createDraft.OverrideRaw = "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	model.createDraft.OverrideRawSet = true
+	if !model.createDraft.IsStack() {
+		t.Fatal("setup: IsStack() = false, want true")
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	if !model.createDraft.Confirming {
+		t.Fatalf("confirming = false, want true")
+	}
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	runCmd(t, cmd)
+
+	if createCalls != 0 {
+		t.Fatalf("applyComposeCreate called %d times, want 0 — a stack draft must use applyComposeStack", createCalls)
+	}
+	if stackCalls != 1 {
+		t.Fatalf("applyComposeStack called %d times, want 1", stackCalls)
+	}
+	if stackSpec.Service != "" {
+		t.Fatalf("spec.Service = %q, want empty — a stack has no single service target", stackSpec.Service)
+	}
+	if stackSpec.Content != model.createDraft.OverrideRaw {
+		t.Fatalf("spec.Content = %q, want the full pasted document", stackSpec.Content)
+	}
+}
+
+// TestStackCreateSelectsProjectRowInTree checks that a stack create/edit
+// lands the tree's selection on the project's own row — no single
+// service is more "the" result than another, unlike a single-service
+// create (TestComposeCreateSelectsNewServiceInTree above).
+func TestStackCreateSelectsProjectRowInTree(t *testing.T) {
+	original := applyComposeStack
+	defer func() { applyComposeStack = original }()
+	applyComposeStack = func(context.Context, composeCreateSpec) error { return nil }
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Project = "media"
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
+	model.createDraft.OverrideRaw = "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	model.createDraft.OverrideRawSet = true
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.service != "" {
+		t.Fatalf("createDoneMsg.service = %q, want empty for a stack", msg.service)
+	}
+
+	updated, cmd = model.Update(msg)
+	model = updated.(Model)
+	if model.pendingSelectProject != "media" || model.pendingSelectService != "" {
+		t.Fatalf("pendingSelectProject/Service = %q/%q, want media/\"\"", model.pendingSelectProject, model.pendingSelectService)
+	}
+	if cmd == nil {
+		t.Fatal("no refresh cmd returned")
+	}
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+
+	row := model.currentRow()
+	if row == nil || row.kind != rowProject || row.project != "media" {
+		t.Fatalf("cursor row = %+v, want the media project row", row)
+	}
+}
+
 // TestCreateComposeAdoptConfirmDispatchesAdoptCmd checks the confirm step's
 // wording and dispatch when BaseFileMissing is set: the modal must show the
 // adopt-specific explanation (not the ordinary "Write ... and run compose
@@ -1689,6 +1788,30 @@ func TestApplyOverrideFieldsFromYAMLDerivesFirstServiceWhenAmbiguous(t *testing.
 	}
 }
 
+// TestComposeDraftDetectedAsStackWhenMultipleServicesParsed and
+// TestComposeDraftRevertsToSingleServiceWhenTrimmedBackToOne check
+// createDraft.IsStack's whole premise: it's derived purely from the
+// content currently in OverrideRaw, never stored state — so detecting a
+// stack and reverting out of one are both automatic, free side effects
+// of what's actually pasted, not something toggled explicitly.
+func TestComposeDraftDetectedAsStackWhenMultipleServicesParsed(t *testing.T) {
+	d := createDraft{Mode: createModeCompose, OverrideRawSet: true, OverrideRaw: "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"}
+	if !d.IsStack() {
+		t.Fatal("IsStack() = false, want true for a two-service document")
+	}
+}
+
+func TestComposeDraftRevertsToSingleServiceWhenTrimmedBackToOne(t *testing.T) {
+	d := createDraft{Mode: createModeCompose, OverrideRawSet: true, OverrideRaw: "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"}
+	if !d.IsStack() {
+		t.Fatal("setup: IsStack() = false, want true before trimming")
+	}
+	d.OverrideRaw = "services:\n  web:\n    image: nginx\n"
+	if d.IsStack() {
+		t.Fatal("IsStack() = true, want false once trimmed back down to one service — nothing should need to be un-set explicitly")
+	}
+}
+
 // TestApplyOverrideFieldsFromYAMLHandlesExecFormCommand guards against a
 // real-world regression the two tests above couldn't catch: composeOverrideDoc
 // decoded a service's "command:" strictly as a plain string, so any real
@@ -1730,13 +1853,17 @@ func TestApplyOverrideFieldsFromYAMLHandlesExecFormCommand(t *testing.T) {
 // surfaced as a bare, confusing "no such service: <name>" from the
 // compose CLI instead of a clear, actionable message in-app.
 func TestValidateCatchesServiceNotDefinedInOverrideContent(t *testing.T) {
+	// A single-service override — two or more services makes this draft
+	// a stack (see createDraft.IsStack), where there's no single Service
+	// field to mismatch against at all; that case is covered by
+	// TestValidateAllowsStackDraftWithNoSingleService below instead.
 	d := createDraft{
 		Mode:           createModeCompose,
 		Project:        "default",
 		Service:        "new-service",
 		Image:          "image:tag",
 		ComposeFile:    "compose.yml",
-		OverrideRaw:    "services:\n  web:\n    image: nginx:alpine\n  api:\n    image: httpd\n",
+		OverrideRaw:    "services:\n  web:\n    image: nginx:alpine\n",
 		OverrideRawSet: true,
 	}
 	err := d.Validate()
@@ -1750,6 +1877,26 @@ func TestValidateCatchesServiceNotDefinedInOverrideContent(t *testing.T) {
 	d.Service = "web"
 	if err := d.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil once Service matches a service the override actually defines", err)
+	}
+}
+
+// TestValidateAllowsStackDraftWithNoSingleService checks the flip side of
+// the test above: once content defines more than one service, the draft
+// is a stack (createDraft.IsStack) and Validate must not require Service/
+// Image at all — there's no single target for either to name.
+func TestValidateAllowsStackDraftWithNoSingleService(t *testing.T) {
+	d := createDraft{
+		Mode:           createModeCompose,
+		Project:        "default",
+		ComposeFile:    "compose.yml",
+		OverrideRaw:    "services:\n  web:\n    image: nginx:alpine\n  api:\n    image: httpd\n",
+		OverrideRawSet: true,
+	}
+	if !d.IsStack() {
+		t.Fatal("IsStack() = false, want true for a two-service override")
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a stack draft with Project/ComposeFile set", err)
 	}
 }
 

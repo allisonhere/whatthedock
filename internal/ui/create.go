@@ -197,6 +197,106 @@ func (m *Model) openEditOverlay() tea.Cmd {
 	return nil
 }
 
+// siblingServiceCount is how many services project's containers actually
+// span right now, per the app's own live snapshot (domain.Project.Services
+// — grouped by domain.BuildSnapshot from real Docker compose labels, not a
+// YAML parse) — used by the "m" key handler to decide whether an
+// individual container needs the warn-and-offer prompt before editing
+// (siblingServiceCount(...) > 1) or can go straight to single-service
+// edit as always (a project with only one service, the common case).
+func siblingServiceCount(snapshot domain.Snapshot, project string) int {
+	for _, p := range snapshot.Projects {
+		if p.Name == project {
+			return len(p.Services)
+		}
+	}
+	return 0
+}
+
+// resolveProjectComposeFile finds project's base compose file path by
+// reading any of its services' containers' own Compose.ConfigFiles label
+// — every service in a normal compose deployment shares one base file,
+// so the first one found is as good as any.
+func (m Model) resolveProjectComposeFile(project string) string {
+	for _, p := range m.snapshot.Projects {
+		if p.Name != project {
+			continue
+		}
+		for _, svc := range p.Services {
+			for _, ctr := range svc.Containers {
+				if files := splitComposeConfigFiles(ctr.Compose.ConfigFiles); len(files) > 0 {
+					return files[0]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// openEditWholeStackOverlay opens the create form seeded to edit an
+// existing multi-service project's whole base compose file at once,
+// rather than one service's own override — reached either by selecting
+// the project/folder row directly (model.go's "m" handler) or by
+// choosing "s" at the warn-and-offer prompt shown for an individual
+// container in a multi-service project. Loads the base file's real
+// current on-disk content; since that necessarily defines more than one
+// service (that's how either entry point was reached), createDraft.
+// IsStack activates automatically and the form renders in stack mode,
+// pre-populated and flagged as an edit. Confirming overwrites that same
+// file and reconciles with `up -d` (defaultApplyComposeStack) — no new
+// apply logic, just seeded differently than a fresh stack paste.
+func (m *Model) openEditWholeStackOverlay(project string) tea.Cmd {
+	composeFile := m.resolveProjectComposeFile(project)
+	m.openCreateOverlayWithDraft(createDraft{
+		Mode:        createModeCompose,
+		Editing:     true,
+		Project:     project,
+		ComposeFile: composeFile,
+	})
+	if composeFile == "" {
+		m.status, m.statusErr = "could not resolve a compose file for "+project, true
+		return nil
+	}
+	system := m.activeSystemConfig()
+	if system.Kind == "ssh" {
+		return checkStackFileCmd(system, project, composeFile)
+	}
+	content, err := os.ReadFile(composeFile)
+	if err != nil {
+		m.status, m.statusErr = "reading "+composeFile+": "+err.Error(), true
+		return nil
+	}
+	m.createDraft.OverrideRaw = string(content)
+	m.createDraft.OverrideRawSet = true
+	m.createDraft.OverrideLoaded = true
+	m.status, m.statusErr = "loaded "+project+" for editing", false
+	return nil
+}
+
+// createStackFileCheckMsg carries the SSH round trip of loading a whole
+// project's base compose file (openEditWholeStackOverlay's remote path)
+// back into Update. project guards against applying a stale result if
+// the draft's target project changed (or the overlay closed) before the
+// round trip finished — same convention as createOverrideCheckMsg's
+// service guard.
+type createStackFileCheckMsg struct {
+	project string
+	content string
+	err     error
+}
+
+func checkStackFileCmd(system config.System, project, composeFile string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		output, err := sshRun(ctx, system, "cat "+systems.ShellQuote(composeFile), "")
+		if err != nil {
+			return createStackFileCheckMsg{project: project, err: err}
+		}
+		return createStackFileCheckMsg{project: project, content: string(output)}
+	}
+}
+
 // openCreateOverlayWithDraft sets the create-overlay state shared by a fresh
 // Create draft and a Clone draft.
 func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
@@ -428,6 +528,14 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.busy = true
+				if m.createDraft.IsStack() {
+					// No adopt/merge distinction for a stack — the whole
+					// file gets written either way (see
+					// defaultApplyComposeStack), whether or not
+					// spec.BaseFile already existed.
+					m.status, m.statusErr = "deploying stack "+spec.Project, false
+					return m, m.stackComposeCmd(spec)
+				}
 				if m.createDraft.BaseFileMissing {
 					m.status, m.statusErr = "creating compose file for "+spec.Service, false
 					return m, m.adoptComposeCmd(spec)
@@ -534,9 +642,12 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+enter", "alt+enter":
 		if m.validateCreateDraft() {
 			m.createDraft.Confirming = true
-			if m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing {
+			switch {
+			case m.createDraft.IsStack():
+				m.status, m.statusErr = "confirm deploy stack "+m.createDraft.TargetName(), false
+			case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
 				m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
-			} else {
+			default:
 				m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
 			}
 		}
@@ -596,6 +707,22 @@ func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
 		defer cancel()
 		err := apply(ctx, spec)
 		return createDoneMsg{name: spec.Service, project: spec.Project, service: spec.Service, err: err}
+	}
+}
+
+// stackComposeCmd is createComposeCmd's stack counterpart — see
+// defaultApplyComposeStack. No single service name to report: name/
+// project both use spec.Project, and service is left empty so the
+// createDoneMsg handler's tree-selection logic (pendingSelectProject)
+// knows to land on the project row rather than hunt for a container that
+// isn't any more "the" result than its siblings.
+func (m Model) stackComposeCmd(spec composeCreateSpec) tea.Cmd {
+	apply := applyComposeStack
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		err := apply(ctx, spec)
+		return createDoneMsg{name: spec.Project, project: spec.Project, err: err}
 	}
 }
 
@@ -969,14 +1096,20 @@ func (d createDraft) Validate() error {
 		if strings.TrimSpace(d.Project) == "" {
 			return errors.New("project is required")
 		}
+		if strings.TrimSpace(d.ComposeFile) == "" {
+			return errors.New("compose file is required")
+		}
+		if d.IsStack() {
+			// No single Service/Image to require — the content itself
+			// (already confirmed to define more than one service, or
+			// IsStack wouldn't be true) is what gets written.
+			return nil
+		}
 		if strings.TrimSpace(d.Service) == "" {
 			return errors.New("service name is required")
 		}
 		if strings.TrimSpace(d.Image) == "" {
 			return errors.New("image is required")
-		}
-		if strings.TrimSpace(d.ComposeFile) == "" {
-			return errors.New("compose file is required")
 		}
 		// Hand-edited or loaded override content (OverrideRawSet) isn't
 		// generated from the Service field the way composeOverrideContent
@@ -1050,6 +1183,17 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 	}
 	if err := d.Validate(); err != nil {
 		return composeCreateSpec{}, err
+	}
+	if d.IsStack() {
+		// No per-service override filename, no Ports/Mounts/Env to parse
+		// (there's no single service field they'd belong to) — the whole
+		// document is the base file's own content.
+		return composeCreateSpec{
+			Project:  strings.TrimSpace(d.Project),
+			BaseFile: strings.TrimSpace(d.ComposeFile),
+			Content:  d.OverrideRaw,
+			System:   system,
+		}, nil
 	}
 	if _, err := parseCreatePorts(d.Ports); err != nil {
 		return composeCreateSpec{}, err
@@ -1216,25 +1360,57 @@ func selectOverrideService(services map[string]composeOverrideService, preferred
 // instead of the decoded map to get a deterministic, document-order
 // answer rather than Go's randomized map iteration.
 func firstOverrideServiceName(content string) string {
+	names := allOverrideServiceNames(content)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// allOverrideServiceNames returns every key under content's top-level
+// "services:" mapping, in the YAML document's own source order —
+// firstOverrideServiceName's generalization, used by the derived "is this
+// draft a stack" check (createDraft.IsStack) and the stack confirm-step's
+// service list, where every name matters, not just the first. gopkg.in/
+// yaml.v3's unmarshal into a Go map loses source order, so this walks the
+// raw node tree instead of decoding into composeOverrideDoc.
+func allOverrideServiceNames(content string) []string {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(content), &root); err != nil || len(root.Content) == 0 {
-		return ""
+		return nil
 	}
 	doc := root.Content[0]
 	if doc.Kind != yaml.MappingNode {
-		return ""
+		return nil
 	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
 		if doc.Content[i].Value != "services" {
 			continue
 		}
 		services := doc.Content[i+1]
-		if services.Kind == yaml.MappingNode && len(services.Content) > 0 {
-			return services.Content[0].Value
+		if services.Kind != yaml.MappingNode {
+			return nil
 		}
-		return ""
+		names := make([]string, 0, len(services.Content)/2)
+		for j := 0; j+1 < len(services.Content); j += 2 {
+			names = append(names, services.Content[j].Value)
+		}
+		return names
 	}
-	return ""
+	return nil
+}
+
+// summarizeServiceNames renders a service-name list capped to max entries
+// for the stack confirm-step prompt/status text ("web, api, ... +3 more")
+// — a document with a dozen services shouldn't grow that single prompt
+// line unboundedly (the confirm overlay's own body-height truncation,
+// see softOverlayBodyBudget in view.go, handles the YAML preview below
+// it separately).
+func summarizeServiceNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return strings.Join(names[:max], ", ") + fmt.Sprintf(" +%d more", len(names)-max)
 }
 
 // normalizeComposeEnvironment reconciles Compose's two allowed environment
@@ -1405,6 +1581,75 @@ func applyComposeAdoptRemote(ctx context.Context, spec composeCreateSpec) error 
 		return err
 	}
 	return composeCommand(ctx, finalSpec, "up", "-d", spec.Service)
+}
+
+// defaultApplyComposeStack writes spec.Content as the entire base compose
+// file (full replace, not a merge — see createDraft.IsStack's doc comment
+// on why a stack draft has no per-service override to layer instead) and
+// brings up every service it defines in one `docker compose up -d` call,
+// deliberately with no service argument — the literal fix for the bug
+// this feature exists for, where every other compose apply function here
+// always appends spec.Service and only ever starts one service. A single
+// whole-file invocation, not a loop of `up -d <name>` per service: it
+// lets `docker compose` resolve `depends_on` ordering across the whole
+// file itself, and keeps the same one-invocation-is-one-thing-to-report
+// convention every other apply function in this file already follows
+// (see runDockerCompose/composeCommand) rather than inventing per-service
+// status tracking. Same write-temp/validate/rename/up shape as
+// defaultApplyComposeAdopt just above.
+func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error {
+	if strings.TrimSpace(spec.BaseFile) == "" {
+		return errors.New("compose file is required")
+	}
+	if spec.System.Kind == "ssh" {
+		return applyComposeStackRemote(ctx, spec)
+	}
+	if err := os.MkdirAll(filepath.Dir(spec.BaseFile), 0o755); err != nil {
+		return err
+	}
+	tempSpec := spec
+	tempSpec.BaseFile = spec.BaseFile + ".tmp"
+	tempSpec.OverrideFile = ""
+	if err := os.WriteFile(tempSpec.BaseFile, []byte(spec.Content), 0o644); err != nil {
+		return err
+	}
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_ = os.Remove(tempSpec.BaseFile)
+		return err
+	}
+	if err := os.Rename(tempSpec.BaseFile, spec.BaseFile); err != nil {
+		_ = os.Remove(tempSpec.BaseFile)
+		return err
+	}
+	finalSpec := spec
+	finalSpec.OverrideFile = ""
+	return composeCommand(ctx, finalSpec, "up", "-d")
+}
+
+// applyComposeStackRemote is defaultApplyComposeStack's SSH counterpart,
+// mirroring applyComposeAdoptRemote's shape exactly minus the trailing
+// service argument on the final up.
+func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error {
+	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.BaseFile)), ""); err != nil {
+		return err
+	}
+	finalSpec := spec
+	finalSpec.OverrideFile = ""
+	tempBase := spec.BaseFile + ".tmp"
+	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
+		return err
+	}
+	tempSpec := finalSpec
+	tempSpec.BaseFile = tempBase
+	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	return composeCommand(ctx, finalSpec, "up", "-d")
 }
 
 // mergeComposeCreateIntoBase is defaultApplyComposeCreate's path for a
@@ -1799,6 +2044,11 @@ func (m Model) visibleCreateFields() []createField {
 	if m.createDraft.Mode == createModeStandalone {
 		return []createField{createFieldMode, createFieldContainerName, createFieldImage, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart}
 	}
+	if m.createDraft.IsStack() {
+		// No single Service/Image/Ports/etc. to edit — the pasted/loaded
+		// document itself is the content (see createDraft.IsStack, Preview).
+		return []createField{createFieldMode, createFieldProject, createFieldComposeFile}
+	}
 	return []createField{createFieldMode, createFieldProject, createFieldService, createFieldImage, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart, createFieldComposeFile}
 }
 
@@ -1973,9 +2223,22 @@ func (mode createMode) String() string {
 	return "compose service"
 }
 
+// IsStack is a derived property, not stored state: a Compose draft is "a
+// stack" purely because its current content happens to define more than
+// one service — never because the user picked a separate mode. Trimming
+// content back down to one service and re-saving reverts this to false
+// for free, since nothing was ever set to begin with. Only meaningful for
+// createModeCompose; standalone drafts have no override content at all.
+func (d createDraft) IsStack() bool {
+	return d.Mode == createModeCompose && d.OverrideRawSet && len(allOverrideServiceNames(d.OverrideRaw)) > 1
+}
+
 func (d createDraft) TargetName() string {
 	if d.Mode == createModeStandalone {
 		return emptyAs(d.ContainerName, "new-container")
+	}
+	if d.IsStack() {
+		return emptyAs(d.Project, "stack")
 	}
 	return emptyAs(d.Service, "new-service")
 }

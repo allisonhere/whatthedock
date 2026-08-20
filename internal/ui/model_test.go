@@ -3048,8 +3048,16 @@ func TestPressCOpensCloneOverlayPrefilled(t *testing.T) {
 }
 
 func TestPressMOpensEditOverlayComposePrefilled(t *testing.T) {
-	model := testModelWithSelectedContainer() // radarr-1, Compose service "radarr"
+	model := testModelWithSelectedContainer() // radarr-1, Compose service "radarr", project "media" (2 services — jellyfin too)
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	// media has more than one service, so this container's own edit goes
+	// through the warn-and-offer prompt first (see handleEditScopeKey) —
+	// "enter" proceeds to single-service edit exactly as before.
+	if model.overlay != overlayEditScope {
+		t.Fatalf("overlay = %v, want overlayEditScope (media has 2 services)", model.overlay)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if model.overlay != overlayCreate {
 		t.Fatalf("overlay = %v, want overlayCreate (edit reuses the create overlay)", model.overlay)
@@ -3059,6 +3067,144 @@ func TestPressMOpensEditOverlayComposePrefilled(t *testing.T) {
 	}
 	if model.createDraft.Service != "radarr" {
 		t.Fatalf("Service = %q, want radarr (edit keeps the real identity, unlike Clone's -clone suffix)", model.createDraft.Service)
+	}
+}
+
+// TestEditWarnsWhenContainerRowHasSiblingServices checks the same warn
+// step as TestPressMOpensEditOverlayComposePrefilled above, focused
+// specifically on siblingServiceCount's role: media has two services
+// (radarr, jellyfin), so pressing "m" on radarr-1 must show
+// overlayEditScope, not open the edit form directly.
+func TestEditWarnsWhenContainerRowHasSiblingServices(t *testing.T) {
+	model := testModelWithSelectedContainer() // radarr-1, project "media" (2 services)
+	if got := siblingServiceCount(model.snapshot, "media"); got != 2 {
+		t.Fatalf("setup: siblingServiceCount(media) = %d, want 2", got)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayEditScope {
+		t.Fatalf("overlay = %v, want overlayEditScope", model.overlay)
+	}
+}
+
+// TestEditSkipsWarningForSingleServiceProject checks the common case is
+// untouched: a container whose project has only one service goes
+// straight to single-service edit, exactly as before this feature.
+func TestEditSkipsWarningForSingleServiceProject(t *testing.T) {
+	host := domain.Host{ID: "local", Name: "local"}
+	containers := []domain.Container{{
+		ID:      domain.ResourceID{Host: "local", ID: "solo-1"},
+		Name:    "solo-1",
+		Image:   "solo",
+		State:   domain.StateRunning,
+		Compose: domain.ComposeRef{Project: "solo-project", Service: "solo", ConfigFiles: "/srv/solo/compose.yml"},
+		Labels:  map[string]string{"com.docker.compose.project": "solo-project", "com.docker.compose.service": "solo"},
+	}}
+	snapshot := domain.BuildSnapshot(host, containers, time.Now())
+	model := testModel()
+	model.snapshot = snapshot
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.container != nil {
+			model.cursor = i
+			model.selectedID = row.container.ID
+			model.selected = row.container
+			break
+		}
+	}
+	if got := siblingServiceCount(model.snapshot, "solo-project"); got != 1 {
+		t.Fatalf("setup: siblingServiceCount(solo-project) = %d, want 1", got)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate directly, no warn prompt", model.overlay)
+	}
+	if model.createDraft.Service != "solo" {
+		t.Fatalf("Service = %q, want solo", model.createDraft.Service)
+	}
+}
+
+// TestEditOnProjectRowOpensWholeStackDirectlyNoPrompt checks the primary
+// entry point: putting the cursor on the project/folder header row and
+// pressing "m" jumps straight to whole-stack edit, with no warn prompt —
+// selecting the folder is itself an unambiguous "the whole project"
+// signal, unlike selecting one of its containers.
+func TestEditOnProjectRowOpensWholeStackDirectlyNoPrompt(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := "services:\n  radarr:\n    image: radarr\n  jellyfin:\n    image: jellyfin\n"
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := testModelWithSelectedContainer()
+	for pi := range model.snapshot.Projects {
+		for si := range model.snapshot.Projects[pi].Services {
+			for ci := range model.snapshot.Projects[pi].Services[si].Containers {
+				model.snapshot.Projects[pi].Services[si].Containers[ci].Compose.ConfigFiles = base
+			}
+		}
+	}
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.kind == rowProject {
+			model.cursor = i
+			break
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate directly, no overlayEditScope prompt", model.overlay)
+	}
+	if !model.createDraft.Editing || model.createDraft.Project != "media" {
+		t.Fatalf("Editing/Project = %v/%q, want true/media", model.createDraft.Editing, model.createDraft.Project)
+	}
+	if !model.createDraft.IsStack() {
+		t.Fatal("IsStack() = false, want true after loading the real 2-service base file")
+	}
+}
+
+// TestEditWholeStackLoadsRealBaseFileContent checks both entry points
+// (project row, and "s" from the warn-and-offer prompt) land on the same
+// place: OverrideRaw actually holds the base compose file's real current
+// on-disk content, byte for byte — not a per-service override, not
+// generated content.
+func TestEditWholeStackLoadsRealBaseFileContent(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := "services:\n  radarr:\n    image: radarr:custom\n  jellyfin:\n    image: jellyfin:custom\n"
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := testModelWithSelectedContainer()
+	for pi := range model.snapshot.Projects {
+		for si := range model.snapshot.Projects[pi].Services {
+			for ci := range model.snapshot.Projects[pi].Services[si].Containers {
+				model.snapshot.Projects[pi].Services[si].Containers[ci].Compose.ConfigFiles = base
+			}
+		}
+	}
+	model.rows = model.buildRows()
+
+	// Escalate from the container row via "m" then "s".
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.overlay != overlayEditScope {
+		t.Fatalf("overlay = %v, want overlayEditScope", model.overlay)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	model = updated.(Model)
+
+	if model.createDraft.OverrideRaw != content {
+		t.Fatalf("OverrideRaw = %q, want the real base file content %q", model.createDraft.OverrideRaw, content)
+	}
+	if !model.createDraft.OverrideRawSet {
+		t.Fatal("OverrideRawSet = false, want true")
 	}
 }
 

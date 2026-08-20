@@ -19,6 +19,15 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		switch {
 		case editing && m.createDraft.Mode != createModeCompose:
 			prompt = "Replace standalone container " + name + " with these changes?"
+		case m.createDraft.Mode == createModeCompose && m.createDraft.IsStack():
+			// Ahead of the BaseFileMissing case below on purpose — a stack
+			// write/replace doesn't distinguish adopt vs. update the way a
+			// single service does (see defaultApplyComposeStack), so its
+			// wording applies whether or not ComposeFile already exists.
+			names := allOverrideServiceNames(m.createDraft.OverrideRaw)
+			prompt = "Write " + short(m.createDraft.ComposeFile, max(12, contentWidth-10)) +
+				fmt.Sprintf(" with %d services (%s) and bring them all up?", len(names), summarizeServiceNames(names, 6))
+			confirmLabel = "deploy stack"
 		case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
 			host := "the local filesystem"
 			if sys := m.activeSystemConfig(); sys.Kind == "ssh" {
@@ -81,7 +90,11 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if m.createBrowsing {
 		return m.createFileBrowserOverlay(renderer, width, contentWidth)
 	}
-	tabs := renderCreateModeTabs(renderer, contentWidth, m.createDraft.Mode, m.createField == createFieldMode)
+	composeLabel := "Compose service"
+	if m.createDraft.IsStack() {
+		composeLabel = fmt.Sprintf("Compose stack (%d)", len(allOverrideServiceNames(m.createDraft.OverrideRaw)))
+	}
+	tabs := renderCreateModeTabs(renderer, contentWidth, m.createDraft.Mode, m.createField == createFieldMode, composeLabel)
 	formWidth := max(28, contentWidth/2-1)
 	previewWidth := max(24, contentWidth-formWidth-3)
 	fields := m.visibleCreateFields()
@@ -102,6 +115,13 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			Text:     createFieldLabel(field),
 			Suffix:   suffix,
 			Selected: field == m.createField,
+		}, formWidth))
+	}
+	if m.createDraft.IsStack() {
+		names := allOverrideServiceNames(m.createDraft.OverrideRaw)
+		formRows = append(formRows, renderer.RenderSoftRow(tideui.SoftRow{
+			Text:   fmt.Sprintf("%d services", len(names)),
+			Suffix: summarizeServiceNames(names, 4),
 		}, formWidth))
 	}
 	// The preview column is styled to look like a black terminal surface,
@@ -132,6 +152,10 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		composeFileLine := "Local compose file  " + short(m.createDraft.ComposeFile, max(12, previewWidth-20))
 		previewLines = append(previewLines, blankPreviewLine, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render(composeFileLine))
 		switch {
+		case m.createDraft.IsStack() && m.createDraft.OverrideLoaded:
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Compose file  existing file loaded (ctrl+y to edit)"))
+		case m.createDraft.IsStack():
+			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Compose file  hand-edited (ctrl+y to re-edit)"))
 		case m.createDraft.OverrideLoaded:
 			previewLines = append(previewLines, renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Override YAML  existing file loaded (ctrl+y to edit)"))
 		case m.createDraft.OverrideRawSet:
@@ -285,7 +309,7 @@ func (m Model) createEditorOverlay(renderer tideui.Renderer) *tideui.Overlay {
 // dedicated tab row above the form, rather than as a cycled field mixed in
 // with the rest — cycled with "[" and "]" (handleCreateKey), reachable from
 // any field since it isn't part of the focusable field list.
-func renderCreateModeTabs(renderer tideui.Renderer, width int, active createMode, focused bool) string {
+func renderCreateModeTabs(renderer tideui.Renderer, width int, active createMode, focused bool, composeLabel string) string {
 	// OverlayTitle already carries Padding(0, 1) (see tideui's soft-modal
 	// title style) — don't also wrap its content in manual spaces, or the
 	// padding stacks into an extra highlighted blank column on each side
@@ -309,7 +333,7 @@ func renderCreateModeTabs(renderer tideui.Renderer, width int, active createMode
 	}
 	blank := fill.Render("  ")
 
-	compose := "Compose service"
+	compose := composeLabel
 	standalone := "Standalone container"
 
 	// The focus rail sits directly before whichever pill is active, not

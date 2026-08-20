@@ -121,7 +121,7 @@ Docker socket paths must be present.
 | `u` | Replicate: pull the latest image and recreate in place |
 | `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file) |
 | `C` | Clone under a new name via the create overlay |
-| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm |
+| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. On a project/folder row, edits the whole stack's base compose file directly; on a container that's part of a multi-service project, prompts to edit just that service or the whole stack |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -378,6 +378,19 @@ More detail:
   service's current definition and adopts it out of that tool's management,
   going forward a normal Compose service WhatTheDock (and `docker compose`
   directly) controls.
+- Pasting or loading a compose file that defines more than one service is
+  detected automatically — no separate mode to pick. The form relabels
+  itself "Compose stack (N)", the single-service fields (Image, Ports, ...)
+  give way to just Project and the compose file path, and confirming writes
+  the whole document as the base compose file and brings every service in
+  it up with a single `docker compose up -d` (no service filter), instead
+  of only starting whichever one service the draft happened to target.
+  Trimming the content back down to one service reverts to the ordinary
+  single-service form automatically. Editing an existing multi-service
+  project works the same way: select its folder/project row and press `m`
+  to edit the whole stack's base file directly, or press `m` on one of its
+  individual containers to get a prompt choosing between editing just that
+  service or the whole stack.
 - Deletes (`D`), replicates (`u`), clones (`C`), and edits (`m`) the selected
   container or Compose service. Delete is a real, permanent removal for both
   kinds: it stops and removes the container, then deletes the service's

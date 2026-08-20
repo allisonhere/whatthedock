@@ -2029,9 +2029,36 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.replicateOverlay(renderer)
 	case overlayUpdate:
 		return m.updateOverlay(renderer)
+	case overlayEditScope:
+		return m.editScopeOverlay(renderer)
 	default:
 		return nil
 	}
+}
+
+// editScopeOverlay is the warn-and-offer prompt shown when "m" targets an
+// individual container that's part of a multi-service project — see the
+// "m" key handler and openEditWholeStackOverlay's doc comment.
+func (m Model) editScopeOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	prompt := "No container selected."
+	if selected := m.selectedContainer(); selected != nil {
+		project := selected.Compose.Project
+		count := siblingServiceCount(m.snapshot, project)
+		prompt = fmt.Sprintf("Project %q has %d services. Edit just %s, or the whole stack?", project, count, selected.Compose.Service)
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter/e", Label: "this service"},
+			tideui.SoftHint{Key: "s", Label: "whole stack"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "edit scope", Content: content, Width: width})
+	return &overlay
 }
 
 // deleteOverlay confirms Delete. The prompt reads the same for Compose
