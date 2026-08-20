@@ -1694,7 +1694,7 @@ func TestOpenCreateOverlayLoadedOverrideSyncsFormFields(t *testing.T) {
 	}
 
 	model := modelSelecting("media", "radarr", base)
-	model.openCreateOverlay()
+	model.openEditOverlay()
 
 	if model.createDraft.Image != "radarr:custom" {
 		t.Fatalf("Image = %q after loading an existing override, want radarr:custom", model.createDraft.Image)
@@ -1820,9 +1820,26 @@ func TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere(t *testing.T) {
 	}
 }
 
-func TestDefaultCreateDraftPrefillsServiceFromSelectedContainer(t *testing.T) {
+// TestDefaultCreateDraftIgnoresSelectedContainer guards against a
+// regression back to the old behavior: 'n' used to prefill Image/Project/
+// Service/ComposeFile from whatever was currently selected in the tree,
+// which made "create something new" indistinguishable from "look at the
+// current selection" — a container under the cursor for an unrelated
+// reason silently leaked its identity into what was supposed to be an
+// unrelated new service. defaultCreateDraft must always be the generic
+// blank slate regardless of selection; selectionCreateDraft (below) is
+// the prefill-from-selection shape Clone/Edit intentionally use instead.
+func TestDefaultCreateDraftIgnoresSelectedContainer(t *testing.T) {
 	model := testModelWithSelectedContainer() // container "1": Compose.Service = "radarr"
 	draft := model.defaultCreateDraft()
+	if draft.Service != "new-service" || draft.Project != "default" || draft.Image != "image:tag" || draft.ComposeFile != "compose.yml" {
+		t.Fatalf("draft = %+v, want the generic placeholders regardless of the selected container", draft)
+	}
+}
+
+func TestSelectionCreateDraftPrefillsFromSelectedContainer(t *testing.T) {
+	model := testModelWithSelectedContainer() // container "1": Compose.Service = "radarr"
+	draft := model.selectionCreateDraft()
 	if draft.Service != "radarr" {
 		t.Fatalf("Service = %q, want radarr prefilled from the selected container", draft.Service)
 	}
@@ -1926,9 +1943,9 @@ func TestOpenCreateOverlayLoadsExistingLocalOverride(t *testing.T) {
 	}
 
 	model := modelSelecting("media", "radarr", base)
-	cmd := model.openCreateOverlay()
+	cmd := model.openEditOverlay()
 	if cmd != nil {
-		t.Fatal("openCreateOverlay() returned a Cmd for a local system, want synchronous detection (nil)")
+		t.Fatal("openEditOverlay() returned a Cmd for a local system, want synchronous detection (nil)")
 	}
 
 	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideLoaded {
@@ -2011,7 +2028,7 @@ func TestOpenCreateOverlayDoesNotFlagExistingBaseFile(t *testing.T) {
 	}
 
 	model := modelSelecting("media", "radarr", base)
-	model.openCreateOverlay()
+	model.openEditOverlay()
 
 	if model.createDraft.BaseFileMissing {
 		t.Fatal("BaseFileMissing = true for a base file that exists, want false")
@@ -2029,7 +2046,7 @@ func TestSavingCreateEditorClearsOverrideLoadedFlag(t *testing.T) {
 	}
 
 	model := modelSelecting("media", "radarr", base)
-	model.openCreateOverlay()
+	model.openEditOverlay()
 	if !model.createDraft.OverrideLoaded {
 		t.Fatal("OverrideLoaded = false after loading an existing override, want true")
 	}

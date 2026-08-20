@@ -108,13 +108,13 @@ type createFileEntry struct {
 	Selected bool
 }
 
-// openCreateOverlay opens the create form. When the draft already targets a
-// Compose service that has a WhatTheDock-generated override on disk (the
-// common case: re-opening create for an already-selected, already-managed
-// service), it loads that override into the draft instead of silently
-// offering to regenerate — and overwrite — it on confirm. Local systems are
-// checked synchronously (a fast stat+read); SSH systems return a Cmd since
-// that's a network round trip (see checkRemoteOverrideCmd).
+// openCreateOverlay opens the create form on a blank, generic-placeholder
+// draft (see defaultCreateDraft) — 'n' is for making something new, not a
+// view onto whatever's currently selected. It still runs
+// checkComposeOverrideCmd in case that placeholder ComposeFile/Service
+// pair happens to already have an override on disk (the common real case:
+// nothing, since they're generic placeholders); openEditOverlay is the
+// path that actually targets an already-managed service.
 func (m *Model) openCreateOverlay() tea.Cmd {
 	m.openCreateOverlayWithDraft(m.defaultCreateDraft())
 	return m.checkComposeOverrideCmd()
@@ -181,8 +181,14 @@ func (m *Model) openEditOverlay() tea.Cmd {
 		return nil
 	}
 	if selected.Compose.Project != "" {
-		cmd := m.openCreateOverlay()
+		// Not openCreateOverlay: that opens the blank, generic-placeholder
+		// draft (see defaultCreateDraft's doc comment) — editing needs the
+		// selected service's real project/service/compose file so the
+		// override check below looks in the right place, not "new-service"
+		// beside "compose.yml".
+		m.openCreateOverlayWithDraft(m.selectionCreateDraft())
 		m.createDraft.Editing = true
+		cmd := m.checkComposeOverrideCmd()
 		return cmd
 	}
 	m.openCreateOverlayWithDraft(m.defaultEditDraft())
@@ -251,8 +257,18 @@ func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd 
 	}
 }
 
+// defaultCreateDraft is the blank slate 'n' opens: generic placeholders
+// only, never pulled from whatever happens to be selected in the tree. It
+// used to prefill Image/Project/Service/ComposeFile (and default Mode)
+// from the current selection as a convenience, but that made "create
+// something new" and "look at what's currently selected" indistinguishable
+// at a glance — a container picked for an unrelated reason (just
+// happened to be under the cursor) silently leaked its image/project into
+// what was supposed to be an unrelated new service. Clone (C) and Edit (e)
+// are the intentional "start from what's selected" actions — see
+// selectionCreateDraft, which they use instead.
 func (m Model) defaultCreateDraft() createDraft {
-	draft := createDraft{
+	return createDraft{
 		Mode:          createModeCompose,
 		Project:       "default",
 		Service:       "new-service",
@@ -261,36 +277,46 @@ func (m Model) defaultCreateDraft() createDraft {
 		Restart:       "unless-stopped",
 		ComposeFile:   "compose.yml",
 	}
-	if selected := m.selectedContainer(); selected != nil {
-		if selected.Image != "" {
-			draft.Image = selected.Image
-		}
-		if selected.Compose.Project != "" {
-			draft.Project = selected.Compose.Project
-		} else {
-			draft.Mode = createModeStandalone
-		}
-		if selected.Compose.Service != "" {
-			draft.Service = selected.Compose.Service
-		}
-		if selected.Compose.ConfigFiles != "" {
-			files := splitComposeConfigFiles(selected.Compose.ConfigFiles)
-			if len(files) > 0 {
-				draft.ComposeFile = files[0]
-			}
+}
+
+// selectionCreateDraft is defaultCreateDraft's old prefill-from-selection
+// shape, kept for Clone/Edit — the two actions that are actually meant to
+// start from what's currently selected (see defaultCreateDraft's own doc
+// comment for why plain Create no longer does).
+func (m Model) selectionCreateDraft() createDraft {
+	draft := m.defaultCreateDraft()
+	selected := m.selectedContainer()
+	if selected == nil {
+		return draft
+	}
+	if selected.Image != "" {
+		draft.Image = selected.Image
+	}
+	if selected.Compose.Project != "" {
+		draft.Project = selected.Compose.Project
+	} else {
+		draft.Mode = createModeStandalone
+	}
+	if selected.Compose.Service != "" {
+		draft.Service = selected.Compose.Service
+	}
+	if selected.Compose.ConfigFiles != "" {
+		files := splitComposeConfigFiles(selected.Compose.ConfigFiles)
+		if len(files) > 0 {
+			draft.ComposeFile = files[0]
 		}
 	}
 	return draft
 }
 
-// defaultCloneDraft mirrors defaultCreateDraft but carries the selected
+// defaultCloneDraft mirrors selectionCreateDraft but carries the selected
 // container's full runtime shape (Ports/Mounts/Env/Restart/Command) into the
-// draft — defaultCreateDraft only carries Image/Project/Service/ComposeFile,
+// draft — selectionCreateDraft only carries Image/Project/Service/ComposeFile,
 // which is enough for a fresh draft but not for duplicating something that
 // already exists — and suffixes the identity field so the user renames it
 // before confirming. Clone must never silently overwrite the original.
 func (m Model) defaultCloneDraft() createDraft {
-	draft := m.defaultCreateDraft()
+	draft := m.selectionCreateDraft()
 	selected := m.selectedContainer()
 	if selected == nil {
 		return draft
