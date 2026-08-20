@@ -123,6 +123,15 @@ func containerTitle(ctr domain.Container) string {
 // through.
 func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	width := max(1, m.width)
+	// StatusBar itself carries a real Padding(0, 1) (tideui's own style,
+	// not something this func adds) that reserves 2 columns on top of
+	// whatever Width(width) is given below — content built to the full
+	// width here always overflowed the box by exactly those 2 columns,
+	// which lipgloss's Render() silently fixed by word-wrapping onto a
+	// second line instead of erroring, pushing the entire app down one
+	// row on every single screen at every terminal size. contentWidth is
+	// the actual usable space once that padding is accounted for.
+	contentWidth := max(1, width-2)
 	statusBarBG, _ := renderer.Styles.StatusBar.GetBackground().(lipgloss.Color)
 	statusBarFG := styleForeground(renderer.Styles.StatusBar, renderer.Styles.Theme.Fg)
 	noticeBG, _ := renderer.Styles.StatusNotice.GetBackground().(lipgloss.Color)
@@ -140,7 +149,7 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	if m.statusErr {
 		right = m.status
 	}
-	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, width))
+	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, contentWidth))
 }
 
 func (m Model) renderTree(renderer tideui.Renderer) string {

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1991,5 +1992,53 @@ func TestCreateOverrideCheckMsgIgnoredIfServiceChangedBeforeItArrived(t *testing
 
 	if model.createDraft.OverrideRawSet {
 		t.Fatal("a stale override-check result was applied after the draft's service changed")
+	}
+}
+
+// TestTopbarFitsInOneLine guards against a regression where the topbar's
+// content was built to the full box width without leaving room for
+// StatusBar's own Padding(0, 1), so lipgloss's Render() silently wrapped
+// it onto a second line at every terminal width — pushing the whole app
+// down by one row and clipping the bottom row off every screen.
+func TestTopbarFitsInOneLine(t *testing.T) {
+	for _, width := range []int{40, 80, 120, 160, 220} {
+		model := testModelWithSelectedContainer()
+		model.width, model.height = width, 34
+		view := ansi.Strip(model.View())
+		lines := strings.Split(view, "\n")
+		if len(lines) != model.height {
+			t.Fatalf("width=%d: view height = %d, want exactly %d (topbar likely wrapped)", width, len(lines), model.height)
+		}
+	}
+}
+
+// TestComposePreviewOverflowDoesNotClipTheOverlay guards against a
+// regression where the Create overlay's compose-preview column had no
+// height bound at all — a service with enough env vars/labels grew the
+// preview taller than the terminal and clipped the whole overlay off the
+// top and bottom of the screen instead of being capped and pointing at
+// ctrl+y for the full file.
+func TestComposePreviewOverflowDoesNotClipTheOverlay(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Project = "media"
+	model.createDraft.Service = "radarr"
+	model.createDraft.Image = "lscr.io/linuxserver/radarr:latest"
+	model.createDraft.Ports = "7878:7878"
+	var envLines []string
+	for i := 0; i < 60; i++ {
+		envLines = append(envLines, fmt.Sprintf("VAR_%d=value_%d", i, i))
+	}
+	model.createDraft.Env = strings.Join(envLines, "\n")
+
+	view := ansi.Strip(model.View())
+	lines := strings.Split(view, "\n")
+	if len(lines) != model.height {
+		t.Fatalf("view height = %d, want exactly %d (overlay clipping)", len(lines), model.height)
+	}
+	if !strings.Contains(view, "more — ctrl+y for the full file") {
+		t.Fatal("expected a truncation notice pointing at ctrl+y once the preview overflows the budget")
 	}
 }

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/allisonhere/tideui"
@@ -135,7 +136,23 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	formText := strings.Split(strings.Join(formRows, "\n"), "\n")
 	previewText := strings.Split(strings.Join(previewLines, "\n"), "\n")
 	rowCount := max(len(formText), len(previewText))
-	bodyRows := make([]string, 0, rowCount+4)
+	// The preview column scales with the service's own real content
+	// (labels, env, volumes, ...), completely unbounded — a service with
+	// enough of that clipped the whole overlay off the top and bottom of
+	// the terminal, reported live. Cap the shared row count to what
+	// actually fits (mirroring softOverlayBodyBudget's own allowance,
+	// minus this overlay's own always-present rows: the mode tabs + blank
+	// above this split, the blank + two hint rows below it, plus one row
+	// of slack verified empirically against this overlay's actual layout
+	// rather than derived exactly) and point at ctrl+y — the full-height
+	// override-YAML editor already exists for when the whole file needs
+	// reviewing — instead of ever overflowing.
+	budget := max(5, m.softOverlayBodyBudget()-6)
+	truncated := rowCount > budget
+	if truncated {
+		rowCount = budget - 1 // reserve the last row for the "N more" notice
+	}
+	bodyRows := make([]string, 0, rowCount+5)
 	for i := 0; i < rowCount; i++ {
 		left, right := "", ""
 		if i < len(formText) {
@@ -145,6 +162,15 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			right = previewText[i]
 		}
 		bodyRows = append(bodyRows, lipgloss.NewStyle().Width(formWidth).Background(panelBG).Render(left)+lipgloss.NewStyle().Background(panelBG).Render(" ")+renderer.Styles.DetailMeta.Background(panelBG).Render("│")+lipgloss.NewStyle().Background(previewBG).Render(" ")+lipgloss.NewStyle().Width(previewWidth).Render(right))
+	}
+	if truncated {
+		hiddenPreview := len(previewText) - rowCount
+		notice := lipgloss.NewStyle().Width(formWidth).Background(panelBG).Render("") +
+			lipgloss.NewStyle().Background(panelBG).Render(" ") +
+			renderer.Styles.DetailMeta.Background(panelBG).Render("│") +
+			lipgloss.NewStyle().Background(previewBG).Render(" ") +
+			renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render(fmt.Sprintf("▼ %d more — ctrl+y for the full file", hiddenPreview))
+		bodyRows = append(bodyRows, notice)
 	}
 	bodyRows = append(bodyRows,
 		lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(""),
