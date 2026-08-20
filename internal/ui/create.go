@@ -1117,10 +1117,18 @@ func appendQuotedYAMLList(lines []string, title string, values []string, prefix 
 
 // composeOverrideDoc/composeOverrideService are the subset of Compose YAML
 // shape applyOverrideFieldsFromYAML reads back out of override content — the
-// mirror image of composeOverrideContent's generation. Environment is typed
-// as interface{} because Compose allows it as either a list ("KEY=value"
-// entries) or a map (KEY: value); normalizeComposeEnvironment reconciles
-// both into the list form the Env field stores.
+// mirror image of composeOverrideContent's generation. Environment and
+// Command are both typed as interface{} because Compose allows either of
+// them as more than one shape — Environment as a list ("KEY=value" entries)
+// or a map (KEY: value); Command as a single string or an exec-form list
+// (["sh", "-c", "..."]) — normalizeComposeEnvironment/normalizeComposeCommand
+// reconcile each into the single string/list form the rest of this file
+// works with. Decoding Command as a plain string used to hard-fail
+// yaml.Unmarshal on any real-world file with even one exec-form command
+// among its services — cannot unmarshal !!seq into string — which silently
+// aborted applyOverrideFieldsFromYAML before it ever got a chance to derive
+// anything, even though doc.Services had already been populated for every
+// service that didn't hit the mismatch.
 type composeOverrideDoc struct {
 	Services map[string]composeOverrideService `yaml:"services"`
 }
@@ -1128,7 +1136,7 @@ type composeOverrideDoc struct {
 type composeOverrideService struct {
 	Image       string      `yaml:"image"`
 	Restart     string      `yaml:"restart"`
-	Command     string      `yaml:"command"`
+	Command     interface{} `yaml:"command"`
 	Ports       []string    `yaml:"ports"`
 	Volumes     []string    `yaml:"volumes"`
 	Environment interface{} `yaml:"environment"`
@@ -1175,7 +1183,7 @@ func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
 	if strings.TrimSpace(svc.Restart) != "" {
 		d.Restart = svc.Restart
 	}
-	d.Command = svc.Command
+	d.Command = normalizeComposeCommand(svc.Command)
 	d.Ports = strings.Join(svc.Ports, ", ")
 	d.Mounts = strings.Join(svc.Volumes, ", ")
 	d.Env = strings.Join(normalizeComposeEnvironment(svc.Environment), ", ")
@@ -1252,6 +1260,28 @@ func normalizeComposeEnvironment(v interface{}) []string {
 		return out
 	default:
 		return nil
+	}
+}
+
+// normalizeComposeCommand reconciles Compose's two allowed command shapes
+// — a plain string ("run --flag"), or an exec-form list (["sh", "-c",
+// "..."]) — into the single space-joined string the Command field stores
+// and splitCommand (strings.Fields) later re-splits on, the same
+// convention domain.Container.Command and defaultCloneDraft already use.
+func normalizeComposeCommand(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []interface{}:
+		parts := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
 	}
 }
 

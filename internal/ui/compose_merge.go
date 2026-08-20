@@ -136,7 +136,7 @@ func mergeComposeServiceFields(base []byte, service string, fields composeOverri
 	}
 	setMappingScalar(value, "image", fields.Image)
 	setMappingScalar(value, "restart", fields.Restart)
-	setMappingScalar(value, "command", fields.Command)
+	setMappingScalar(value, "command", normalizeComposeCommand(fields.Command))
 	setMappingList(value, "ports", fields.Ports)
 	setMappingList(value, "volumes", fields.Volumes)
 	setMappingList(value, "environment", normalizeComposeEnvironment(fields.Environment))

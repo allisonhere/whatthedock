@@ -48,6 +48,34 @@ services:
 	}
 }
 
+// TestMergeComposeServiceFieldsHandlesExecFormCommand guards against a
+// regression where Command was decoded strictly as a string, so a real
+// override whose OWN service used Compose's other allowed command shape
+// — command: ["sh", "-c", "..."] — made composeServiceFieldsFromContent's
+// yaml.Unmarshal fail outright ("cannot unmarshal !!seq into string"),
+// which mergeComposeCreateIntoBase treated as "could not read fields for
+// service" and aborted the whole merge, even for services elsewhere in
+// the same document with a perfectly normal string command.
+func TestMergeComposeServiceFieldsHandlesExecFormCommand(t *testing.T) {
+	content := "services:\n  web:\n    image: nginx:alpine\n    command:\n      - sh\n      - -c\n      - echo hi\n"
+	fields, ok := composeServiceFieldsFromContent(content, "web")
+	if !ok {
+		t.Fatal("composeServiceFieldsFromContent() ok = false, want true")
+	}
+	if normalizeComposeCommand(fields.Command) != "sh -c echo hi" {
+		t.Fatalf("normalizeComposeCommand(fields.Command) = %q, want %q", normalizeComposeCommand(fields.Command), "sh -c echo hi")
+	}
+
+	base := []byte("services:\n  web:\n    image: nginx:1.25\n")
+	merged, err := mergeComposeServiceFields(base, "web", fields)
+	if err != nil {
+		t.Fatalf("mergeComposeServiceFields() error = %v", err)
+	}
+	if !strings.Contains(string(merged), "sh -c echo hi") {
+		t.Fatalf("merged output missing the joined command:\n%s", merged)
+	}
+}
+
 func TestMergeComposeServiceFieldsErrorsWhenServiceMissing(t *testing.T) {
 	base := []byte("services:\n  web:\n    image: nginx:latest\n")
 	if _, err := mergeComposeServiceFields(base, "cache", composeOverrideService{Image: "redis:7"}); err == nil {

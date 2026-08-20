@@ -1689,6 +1689,38 @@ func TestApplyOverrideFieldsFromYAMLDerivesFirstServiceWhenAmbiguous(t *testing.
 	}
 }
 
+// TestApplyOverrideFieldsFromYAMLHandlesExecFormCommand guards against a
+// real-world regression the two tests above couldn't catch: composeOverrideDoc
+// decoded a service's "command:" strictly as a plain string, so any real
+// compose file with even one service using Compose's other allowed form —
+// an exec-form list, command: ["sh", "-c", "..."] — made the whole
+// yaml.Unmarshal call return an error ("cannot unmarshal !!seq into
+// string"), which applyOverrideFieldsFromYAML treated as "nothing to
+// derive from" and bailed out immediately, before ever reaching the
+// first-service fallback above — even though doc.Services had, in fact,
+// already been populated for every service that didn't hit the mismatch.
+// This is trimmed from a real file that reproduced it: a mix of
+// string-image services and one with an exec-form command.
+func TestApplyOverrideFieldsFromYAMLHandlesExecFormCommand(t *testing.T) {
+	d := createDraft{Service: "new-service", Image: "image:tag"}
+	content := "services:\n" +
+		"  web:\n" +
+		"    image: nginx:alpine\n" +
+		"    ports:\n" +
+		"      - \"8080:80\"\n" +
+		"  logger:\n" +
+		"    image: alpine:latest\n" +
+		"    command:\n" +
+		"      - sh\n" +
+		"      - -c\n" +
+		"      - echo hi\n"
+	d.applyOverrideFieldsFromYAML(content)
+
+	if d.Service != "web" || d.Image != "nginx:alpine" || d.Ports != "8080:80" {
+		t.Fatalf("Service/Image/Ports = %q/%q/%q, want web/nginx:alpine/8080:80 — derivation should survive an exec-form command elsewhere in the document", d.Service, d.Image, d.Ports)
+	}
+}
+
 // TestValidateCatchesServiceNotDefinedInOverrideContent guards against a
 // regression where a draft could confirm and reach `docker compose up`
 // with a Service name that the override content it was about to write
