@@ -497,6 +497,43 @@ func TestCreateComposeFileBrowserSelectsFile(t *testing.T) {
 	}
 }
 
+// TestCreateComposeFileBrowserReloadsExistingOverride guards against a
+// regression where picking a compose file through the file browser only
+// set ComposeFile and left every other field (Image, Ports, ...) exactly
+// as it was before — the same existing-override check openCreateOverlay
+// runs at open time never re-ran, so switching to a file whose target
+// service already has a WhatTheDock-managed override on disk kept showing
+// stale data from whatever had populated the form previously instead of
+// loading it.
+func TestCreateComposeFileBrowserReloadsExistingOverride(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	override := filepath.Join(dir, "compose.whatthedock.sonarr.yml")
+	if err := os.WriteFile(override, []byte("services:\n  sonarr:\n    image: \"sonarr:target\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("media", "sonarr", "/some/stale/compose.yml")
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "sonarr"
+	model.createDraft.Image = "adguard/adguardhome" // stale leftover from a previous selection
+
+	model.createBrowsing = true
+	model.createFiles = []createFileEntry{{Name: "compose.yml", Path: base}}
+	model.createFileCursor = 0
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+
+	if model.createDraft.Image != "sonarr:target" {
+		t.Fatalf("Image = %q after picking a compose file with an existing override for sonarr, want sonarr:target", model.createDraft.Image)
+	}
+}
+
 func TestCreateComposeFileBrowserOpensWithCtrlOFromAnyCreateField(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {

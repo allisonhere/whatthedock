@@ -117,7 +117,19 @@ type createFileEntry struct {
 // that's a network round trip (see checkRemoteOverrideCmd).
 func (m *Model) openCreateOverlay() tea.Cmd {
 	m.openCreateOverlayWithDraft(m.defaultCreateDraft())
+	return m.checkComposeOverrideCmd()
+}
 
+// checkComposeOverrideCmd looks up whether the draft's current
+// (ComposeFile, Service) pair already has a WhatTheDock-managed override —
+// or a missing base file — on disk, and loads/flags it into the draft.
+// Factored out of openCreateOverlay so anything that changes ComposeFile
+// or Service after the form is already open can re-run the same check:
+// the file browser used to only set ComposeFile and leave every other
+// field (Image, Ports, ...) exactly as it was before, which meant picking
+// a different compose file never actually populated the form from it —
+// still showing whatever an earlier selection had left behind.
+func (m *Model) checkComposeOverrideCmd() tea.Cmd {
 	if m.createDraft.Mode != createModeCompose {
 		return nil
 	}
@@ -125,6 +137,7 @@ func (m *Model) openCreateOverlay() tea.Cmd {
 	if system.Kind == "ssh" {
 		return checkRemoteOverrideCmd(system, m.createDraft.ComposeFile, m.createDraft.Service)
 	}
+	m.createDraft.BaseFileMissing = false
 	if strings.TrimSpace(m.createDraft.ComposeFile) != "" {
 		if _, err := os.Stat(m.createDraft.ComposeFile); err != nil {
 			m.createDraft.BaseFileMissing = true
@@ -621,6 +634,7 @@ func (m Model) handleCreateFileBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.createCursor = len([]rune(m.createDraft.ComposeFile))
 		m.createBrowsing = false
 		m.status, m.statusErr = "compose file selected", false
+		return m, m.checkComposeOverrideCmd()
 	}
 	return m, nil
 }
