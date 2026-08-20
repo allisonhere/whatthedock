@@ -556,7 +556,7 @@ func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		err := apply(ctx, spec)
-		return createDoneMsg{name: spec.Service, err: err}
+		return createDoneMsg{name: spec.Service, project: spec.Project, service: spec.Service, err: err}
 	}
 }
 
@@ -569,7 +569,7 @@ func (m Model) adoptComposeCmd(spec composeCreateSpec) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		err := apply(ctx, spec)
-		return createDoneMsg{name: spec.Service, err: err}
+		return createDoneMsg{name: spec.Service, project: spec.Project, service: spec.Service, err: err}
 	}
 }
 

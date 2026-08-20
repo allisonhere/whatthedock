@@ -290,19 +290,30 @@ type Model struct {
 	// a durable preference.
 	logsExpanded bool
 
-	loading         bool
-	snapshot        domain.Snapshot
-	rows            []treeRow
-	cursor          int
-	focusedTreeKey  treeRowKey
-	problemCursor   int
-	collapsed       map[string]bool
-	selectedID      domain.ResourceID
-	selected        *domain.Container
-	filter          string
-	filterDraft     string
-	inspectorScroll int
-	helpScroll      int
+	loading        bool
+	snapshot       domain.Snapshot
+	rows           []treeRow
+	cursor         int
+	focusedTreeKey treeRowKey
+	problemCursor  int
+	collapsed      map[string]bool
+	// pendingSelectProject/Service is set right after a successful Compose
+	// create/adopt, whose createDoneMsg carries no container ID (unlike a
+	// standalone create, it's run as an external `docker compose up`, not
+	// a Docker API call that hands one back synchronously) — so there's
+	// nothing to point focusedTreeKey at yet. The very next snapshotMsg
+	// (refreshCmd, dispatched right after) resolves it by matching a
+	// container row's project/service instead, so the tree actually jumps
+	// to and selects the new service rather than just refreshing its data
+	// while leaving selection wherever it happened to be before.
+	pendingSelectProject string
+	pendingSelectService string
+	selectedID           domain.ResourceID
+	selected             *domain.Container
+	filter               string
+	filterDraft          string
+	inspectorScroll      int
+	helpScroll           int
 
 	logLines          []string
 	logFilter         string
@@ -715,6 +726,11 @@ type createDoneMsg struct {
 	id     domain.ResourceID
 	edited bool
 	err    error
+	// project/service are set by the Compose create/adopt paths, which
+	// have no container ID to report here (see pendingSelectProject) —
+	// empty for a standalone create/edit, which reports id instead.
+	project string
+	service string
 }
 
 func NewModel(provider app.Provider) Model {
@@ -1012,6 +1028,17 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		previousCursor := m.cursor
 		m.snapshot = msg.snapshot
 		m.rows = m.buildRows()
+		if m.pendingSelectProject != "" || m.pendingSelectService != "" {
+			if key, ok := m.findContainerRowKey(m.pendingSelectProject, m.pendingSelectService); ok {
+				m.focusedTreeKey = key
+				delete(m.collapsed, m.pendingSelectProject) // don't leave the new service hidden under a collapsed project
+			}
+			// One-shot regardless of whether it resolved — see the field's
+			// doc comment; a miss here (compose up hasn't reflected in the
+			// very next snapshot yet) just falls back to the tree staying
+			// where it was, same as any other refresh.
+			m.pendingSelectProject, m.pendingSelectService = "", ""
+		}
 		return m, m.restoreFocusedTreeRow(previousCursor, true)
 	case detailMsg:
 		if msg.id != m.selectedID {
@@ -1285,6 +1312,11 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id.ID != "" {
 			m.selectedID = msg.id
 			m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
+		} else if msg.service != "" {
+			// Compose create/adopt has no container ID to select yet — see
+			// pendingSelectProject's doc comment — resolved once the
+			// refreshCmd dispatched below lands.
+			m.pendingSelectProject, m.pendingSelectService = msg.project, msg.service
 		}
 		if msg.edited {
 			m.status, m.statusErr = "updated "+msg.name, false
@@ -3901,6 +3933,19 @@ func (m *Model) restoreFocusedTreeRow(previousCursor int, selectInitial bool) te
 	m.syncFocusedTreeKey()
 	m.clearSelectedContainer()
 	return nil
+}
+
+// findContainerRowKey locates the container row for a just-created/adopted
+// Compose service by (project, service) — the only identifying info a
+// createDoneMsg for Compose carries, since it has no container ID (see
+// pendingSelectProject).
+func (m Model) findContainerRowKey(project, service string) (treeRowKey, bool) {
+	for _, row := range m.rows {
+		if row.kind == rowContainer && row.project == project && row.service == service {
+			return row.key(), true
+		}
+	}
+	return treeRowKey{}, false
 }
 
 func (m *Model) moveTreeCursorToKey(key treeRowKey) bool {

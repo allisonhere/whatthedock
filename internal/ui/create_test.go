@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/allisonhere/ripple"
 	tea "github.com/charmbracelet/bubbletea"
@@ -298,6 +299,83 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("compose completion returned nil cmd, want refresh")
+	}
+}
+
+// TestComposeCreateSelectsNewServiceInTree guards against a regression
+// where the Projects tree (the app's left pane) never moved to show a
+// newly created/adopted Compose service. Unlike a standalone create,
+// applying a Compose service runs an external `docker compose up`, not a
+// Docker API call that hands back a container ID synchronously — so
+// createDoneMsg had nothing to select, and the tree just kept whatever
+// was focused before, which could be a completely different project. This
+// simulates what a real `docker compose up -d` leaves behind (a new
+// container the next Snapshot() picks up) and checks the tree actually
+// selects it once that snapshot lands.
+func TestComposeCreateSelectsNewServiceInTree(t *testing.T) {
+	original := applyComposeCreate
+	defer func() { applyComposeCreate = original }()
+
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	provider := model.provider.(*fakeProvider)
+
+	applyComposeCreate = func(_ context.Context, spec composeCreateSpec) error {
+		newCtr := domain.Container{
+			ID:      domain.ResourceID{Host: "local", ID: "sonarr-id"},
+			Name:    "sonarr-1",
+			Image:   "sonarr",
+			State:   domain.StateRunning,
+			Compose: domain.ComposeRef{Project: spec.Project, Service: spec.Service},
+			Labels:  map[string]string{"com.docker.compose.project": spec.Project, "com.docker.compose.service": spec.Service},
+		}
+		provider.containers["sonarr-id"] = newCtr
+		all := append([]domain.Container{}, provider.snapshot.Standalone...)
+		for _, p := range provider.snapshot.Projects {
+			for _, s := range p.Services {
+				all = append(all, s.Containers...)
+			}
+		}
+		all = append(all, newCtr)
+		provider.snapshot = domain.BuildSnapshot(provider.host, all, time.Now())
+		return nil
+	}
+
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.BaseFileMissing = false
+	model.createDraft.Project = "media"
+	model.createDraft.Service = "sonarr"
+	model.createDraft.Image = "sonarr"
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	if !model.createDraft.Confirming {
+		t.Fatalf("confirming = false, want true")
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+
+	updated, cmd = model.Update(msg)
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("no refresh cmd returned")
+	}
+	updated, cmd = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+	if cmd != nil {
+		runCmd(t, cmd)
+	}
+
+	if model.selectedID.ID != "sonarr-id" {
+		t.Fatalf("selectedID = %v, want sonarr-id — tree did not jump to the newly created compose service", model.selectedID)
+	}
+	row := model.currentRow()
+	if row == nil || row.container == nil || row.container.ID.ID != "sonarr-id" {
+		t.Fatalf("cursor row = %+v, want it on the new sonarr container", row)
 	}
 }
 
