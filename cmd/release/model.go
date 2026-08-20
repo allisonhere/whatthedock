@@ -10,6 +10,7 @@ type screen int
 
 const (
 	screenVersion screen = iota
+	screenCommit
 	screenConfirm
 	screenRunning
 	screenDone
@@ -38,6 +39,12 @@ type model struct {
 
 	versionInput string
 	dryRun       bool
+
+	// screenCommit state — see handleKey's screenVersion "c" case and
+	// steps.go's gitStatusShort/commitAll.
+	commitMessage string
+	commitStatus  []string
+	commitErr     error
 
 	steps   []stepStatus
 	current int
@@ -164,9 +171,61 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.versionInput = m.versionInput[:len(m.versionInput)-1]
 			}
 			return m, nil
+		case "c":
+			// Only a dedicated command when there's something to commit —
+			// version strings never legitimately contain "c" past the
+			// leading "v" anyway, but falling through to plain typed
+			// input when not dirty keeps that possible if it ever did.
+			if m.dirty {
+				m.commitMessage = ""
+				m.commitErr = nil
+				m.commitStatus = gitStatusShort()
+				m.screen = screenCommit
+				return m, nil
+			}
+			if len(msg.Runes) > 0 {
+				m.versionInput += string(msg.Runes)
+			}
+			return m, nil
 		default:
 			if len(msg.Runes) > 0 {
 				m.versionInput += string(msg.Runes)
+			}
+			return m, nil
+		}
+
+	case screenCommit:
+		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "esc":
+			m.commitMessage = ""
+			m.commitErr = nil
+			m.screen = screenVersion
+			return m, nil
+		case "enter":
+			if m.commitMessage == "" {
+				return m, nil
+			}
+			if err := commitAll(m.commitMessage); err != nil {
+				m.commitErr = err
+				return m, nil
+			}
+			m.dirty = false
+			m.commitMessage = ""
+			m.commitStatus = nil
+			m.commitErr = nil
+			m.screen = screenVersion
+			return m, nil
+		case "backspace":
+			if len(m.commitMessage) > 0 {
+				m.commitMessage = m.commitMessage[:len(m.commitMessage)-1]
+			}
+			return m, nil
+		default:
+			if len(msg.Runes) > 0 {
+				m.commitMessage += string(msg.Runes)
 			}
 			return m, nil
 		}

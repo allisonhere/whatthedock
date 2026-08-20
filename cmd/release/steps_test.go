@@ -177,6 +177,65 @@ func TestRunAutoRefusesDirtyWorkingTree(t *testing.T) {
 	}
 }
 
+// initTestRepo creates and cd's into (t.Chdir) a fresh git repo for
+// gitStatusShort/commitAll to run against — both shell out to git in the
+// process's current directory (runCmd, like every other git call in this
+// package), so there's no lower-level way to inject a target dir.
+func initTestRepo(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+	} {
+		if _, err := runCmd("git", args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+}
+
+func TestGitStatusShortListsUntrackedAndModifiedFiles(t *testing.T) {
+	initTestRepo(t)
+	if err := os.WriteFile("new.txt", []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := gitStatusShort()
+	if len(got) != 1 || !strings.Contains(got[0], "new.txt") {
+		t.Fatalf("gitStatusShort() = %#v, want one line mentioning new.txt", got)
+	}
+}
+
+func TestGitStatusShortEmptyForCleanTree(t *testing.T) {
+	initTestRepo(t)
+	if got := gitStatusShort(); got != nil {
+		t.Fatalf("gitStatusShort() = %#v, want nil for a clean tree", got)
+	}
+}
+
+func TestCommitAllStagesAndCommitsEverything(t *testing.T) {
+	initTestRepo(t)
+	if err := os.WriteFile("new.txt", []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := commitAll("add new.txt"); err != nil {
+		t.Fatalf("commitAll() error = %v", err)
+	}
+	if got := gitStatusShort(); got != nil {
+		t.Fatalf("gitStatusShort() after commit = %#v, want nil (tree clean)", got)
+	}
+	subject, err := runCmd("git", "log", "-1", "--pretty=format:%s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "add new.txt" {
+		t.Fatalf("last commit subject = %q, want %q", subject, "add new.txt")
+	}
+}
+
 func TestGenKeyPrintsMatchingKeypair(t *testing.T) {
 	var buf bytes.Buffer
 	if err := genKey(&buf); err != nil {

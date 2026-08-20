@@ -185,6 +185,30 @@ func defaultIsDirty() bool {
 	return err == nil && out != ""
 }
 
+// gitStatusShort returns `git status --short`'s lines — shown on
+// screenCommit so committing from inside the tool is as transparent as
+// the rest of it (screenVersion already shows real commit log content
+// rather than a bare prompt, screenConfirm shows the real step plan).
+func gitStatusShort() []string {
+	out, err := runCmd("git", "status", "--short")
+	if err != nil || out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// commitAll stages everything (git add -A) and commits it with message —
+// screenCommit's action once a message is typed. Not used by -auto:
+// runAuto refuses a dirty tree outright rather than committing on a
+// human's behalf with nothing reviewing the file list.
+func commitAll(message string) error {
+	if _, err := runCmd("git", "add", "-A"); err != nil {
+		return err
+	}
+	_, err := runCmd("git", "commit", "-m", message)
+	return err
+}
+
 func latestTag() string {
 	out, err := runCmd("git", "tag", "--list", "v*")
 	if err != nil || out == "" {

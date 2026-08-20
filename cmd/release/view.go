@@ -21,6 +21,8 @@ func (m model) View() string {
 	switch m.screen {
 	case screenVersion:
 		body = m.versionView(width)
+	case screenCommit:
+		body = m.commitView(width)
 	case screenConfirm:
 		body = m.confirmView(width)
 	case screenRunning, screenDone:
@@ -60,9 +62,37 @@ func (m model) versionView(width int) string {
 	}
 
 	lines = append(lines, "", "Version to release:", renderer.Styles.InputFocused.Width(max(20, width-12)).Render(m.versionInput+"█"))
+	hints := []tideui.SoftHint{{Key: "enter", Label: "continue"}}
+	if m.dirty {
+		hints = append(hints, tideui.SoftHint{Key: "c", Label: "commit changes"})
+	}
+	hints = append(hints, tideui.SoftHint{Key: "esc", Label: "quit"})
+	lines = append(lines, "", renderer.RenderSoftHints(width-4, hints...))
+	return renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
+}
+
+// commitView is screenCommit's body: the same "show real content, not a
+// bare prompt" convention versionView/confirmView already use — the
+// git-status file list is what makes committing from inside the tool
+// transparent instead of a leap of faith.
+func (m model) commitView(width int) string {
+	meta := renderer.Styles.DetailMeta
+	var lines []string
+	if len(m.commitStatus) > 0 {
+		lines = append(lines, meta.Render("Changes to commit:"))
+		for _, s := range m.commitStatus {
+			lines = append(lines, "  "+meta.Render(s))
+		}
+	} else {
+		lines = append(lines, meta.Render("(nothing found — press esc)"))
+	}
+	if m.commitErr != nil {
+		lines = append(lines, "", renderer.Styles.StatusError.Render(" "+m.commitErr.Error()+" "))
+	}
+	lines = append(lines, "", "Commit message:", renderer.Styles.InputFocused.Width(max(20, width-12)).Render(m.commitMessage+"█"))
 	lines = append(lines, "", renderer.RenderSoftHints(width-4,
-		tideui.SoftHint{Key: "enter", Label: "continue"},
-		tideui.SoftHint{Key: "esc", Label: "quit"},
+		tideui.SoftHint{Key: "enter", Label: "commit"},
+		tideui.SoftHint{Key: "esc", Label: "back"},
 	))
 	return renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
 }
