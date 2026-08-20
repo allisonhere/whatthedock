@@ -126,6 +126,7 @@ Docker socket paths must be present.
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
 | `l` | Focus logs |
+| `L` in logs | Expand logs: shrink the tree/inspector panes to icon-only slivers and let logs fill nearly the whole width; press again to restore |
 | `p` | Show problems |
 | `a` in problems | Analyze the selected problem with AI |
 | `g` | Show stats graphs |
@@ -281,8 +282,10 @@ More detail:
   timestamps, severity, HTTP methods, and HTTP status codes.
 - Supports a live log filter (hides non-matching lines and highlights matches
   character-by-character as you type, no Enter needed), severity quick
-  filters, scrollback, follow-tail pause/resume (`Space`), and per-container
-  log view state.
+  filters, scrollback, follow-tail pause/resume (`Space`), an expanded
+  view (`L`) that shrinks the tree/inspector panes to icon-only slivers so
+  logs get nearly the full terminal width, and per-container log view
+  state.
 - Shows a problems view for unhealthy, restarting, stopped, dead, high-restart,
   unknown-health, and public-port containers, split into the problem list plus
   a lower panel with a rule-based, zero-network suggestion for whichever

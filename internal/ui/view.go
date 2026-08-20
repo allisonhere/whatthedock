@@ -35,15 +35,25 @@ func (m Model) View() string {
 	if selected := m.selectedContainer(); selected != nil {
 		inspectorTitle = "Inspector: " + containerTitle(*selected)
 	}
+	treeContent, inspectorContent := m.renderTree(renderer), m.renderInspector(renderer)
+	if m.logsExpanded {
+		// Skip the real (and, at sliver width, likely garbled) content
+		// entirely — just an icon indicating each pane is collapsed, not
+		// gone. See columnRatios' doc comment for why the width these
+		// render against comes from the same source as the Layout call
+		// below rather than a second guess at it.
+		treeContent = renderCollapsedPane(renderer, m.leftPaneWidth(), m.paneContentRows(), "▸")
+		inspectorContent = renderCollapsedPane(renderer, m.rightPaneWidth(), m.paneContentRows(), "◂")
+	}
 	panes := [3]tideui.Pane{
-		{Title: "Projects", Hint: "tree", Content: m.renderTree(renderer), Focused: m.focus == paneTree},
+		{Title: "Projects", Hint: "tree", Content: treeContent, Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
-		{Title: inspectorTitle, Hint: "details", Content: m.renderInspector(renderer), Focused: m.focus == paneInspector},
+		{Title: inspectorTitle, Hint: "details", Content: inspectorContent, Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
 	status := &tideui.StatusBar{
 		Left:  m.statusLeft(renderer),
-		Right: "j/k move  space expand  / filter  n create  l logs  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  A about  q quit",
+		Right: "j/k move  space expand  / filter  n create  l logs  L expand  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  A about  q quit",
 	}
 	return topbar + "\n" + renderer.Render(tideui.Layout{
 		Width:        m.width,
@@ -52,8 +62,25 @@ func (m Model) View() string {
 		Panes:        panes,
 		Status:       status,
 		Modal:        modal,
-		ColumnRatios: [3]float64{3, 5, 4},
+		ColumnRatios: m.columnRatios(),
 	})
+}
+
+// renderCollapsedPane is Tree/Inspector's content while logsExpanded —
+// just icon reusing the tree-row collapse/expand glyph language (▸/▾,
+// see the project-row collapse feature), vertically centered in a
+// background-filled column so the sliver still reads as "part of the
+// layout, temporarily shrunk" rather than an empty gap.
+func renderCollapsedPane(renderer tideui.Renderer, width, height int, icon string) string {
+	width, height = max(1, width), max(1, height)
+	blank := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Width(width).Render("")
+	iconLine := lipgloss.NewStyle().Background(renderer.Styles.Theme.Bg).Foreground(renderer.Styles.Theme.Dimmed).Width(width).Align(lipgloss.Center).Render(icon)
+	lines := make([]string, height)
+	for i := range lines {
+		lines[i] = blank
+	}
+	lines[height/2] = iconLine
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) activityHeader() (string, string) {
@@ -2454,6 +2481,7 @@ var helpLines = []string{
 	"o              open port, mount, or compose path",
 	"e              open shell in selected container",
 	"l              logs",
+	"L              expand logs: shrink tree/inspector to icons, fill width",
 	"/              live-filter logs as you type, hiding non-matches",
 	"e / w / i / a  log errors, warnings, info, all",
 	"Space          toggle live/paused log tail",
@@ -3652,12 +3680,29 @@ func short(value string, n int) string {
 	return value[:n]
 }
 
+// columnRatios is the single source of truth for the 3-column layout's
+// proportions — used both by View()'s tideui.Layout{ColumnRatios: ...}
+// and by leftPaneWidth/centerPaneWidth/rightPaneWidth below, so mouse
+// hit-testing and the Tree pane's content-wrap width can never drift out
+// of sync with what's actually rendered. They used to each hardcode
+// their own copy of the same {3,5,4} fractions independently; expanding
+// logs needed a second set of proportions, and duplicating the ratio a
+// third time was exactly the kind of drift this collapses instead.
+func (m Model) columnRatios() [3]float64 {
+	if m.logsExpanded {
+		return [3]float64{1, 18, 1} // Tree/Inspector reduced to icon-only slivers
+	}
+	return [3]float64{3, 5, 4}
+}
+
 func (m Model) leftPaneWidth() int {
-	return max(1, m.width*3/12)
+	r := m.columnRatios()
+	return max(1, int(float64(m.width)*r[0]/(r[0]+r[1]+r[2])))
 }
 
 func (m Model) centerPaneWidth() int {
-	return max(1, m.width*5/12)
+	r := m.columnRatios()
+	return max(1, int(float64(m.width)*r[1]/(r[0]+r[1]+r[2])))
 }
 
 func (m Model) rightPaneWidth() int {

@@ -1204,6 +1204,117 @@ func TestLogFollowKeyWorksFromAnyFocusWhileInLogs(t *testing.T) {
 	}
 }
 
+// TestLKeyExpandsLogsAndCollapsesTreeInspector covers the "expand logs"
+// request: L shrinks Tree/Inspector to icon-only slivers and lets
+// Activity fill nearly the whole width — reusing the existing 3-pane
+// layout via columnRatios, not a new overlay/window. The real property
+// under test is that Tree/Inspector's actual content (a project name, an
+// inspector field) stops appearing anywhere in the frame once collapsed,
+// not just that the flag flips.
+func TestLKeyExpandsLogsAndCollapsesTreeInspector(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 30
+	model.mode = activityLogs
+	model.logLines = []string{"line one"}
+
+	before := ansi.Strip(model.View())
+	if !strings.Contains(before, "media") || !strings.Contains(before, "RUNTIME") {
+		t.Fatalf("sanity check failed: expected Tree/Inspector content before expanding:\n%s", before)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	model = updated.(Model)
+	if !model.logsExpanded || model.focus != paneActivity {
+		t.Fatalf("logsExpanded/focus = %v/%v, want true/activity", model.logsExpanded, model.focus)
+	}
+
+	after := ansi.Strip(model.View())
+	if strings.Contains(after, "media") || strings.Contains(after, "RUNTIME") {
+		t.Fatalf("Tree/Inspector content still visible while expanded:\n%s", after)
+	}
+	if !strings.Contains(after, "▸") || !strings.Contains(after, "◂") {
+		t.Fatalf("expanded view missing the collapsed-pane icons:\n%s", after)
+	}
+	if !strings.Contains(after, "line one") {
+		t.Fatalf("expanded view missing log content:\n%s", after)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	model = updated.(Model)
+	if model.logsExpanded {
+		t.Fatal("logsExpanded = true after second L, want false (toggled back)")
+	}
+	restored := ansi.Strip(model.View())
+	if !strings.Contains(restored, "media") || !strings.Contains(restored, "RUNTIME") {
+		t.Fatalf("Tree/Inspector content missing after collapsing back:\n%s", restored)
+	}
+}
+
+// TestLKeyIsNoopOutsideLogsMode checks L is specifically a Logs
+// affordance — pressing it in Problems/Stats mode does nothing, matching
+// the "if view all log is select" scoping the feature was asked for.
+func TestLKeyIsNoopOutsideLogsMode(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 30
+	model.mode = activityProblems
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	model = updated.(Model)
+	if model.logsExpanded {
+		t.Fatal("logsExpanded = true outside Logs mode, want false")
+	}
+}
+
+// TestTabIsNoopWhileLogsExpanded checks focus can't cycle into a
+// collapsed, content-less sliver — the dedicated L toggle is the only way
+// in or out while expanded.
+func TestTabIsNoopWhileLogsExpanded(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 30
+	model.mode = activityLogs
+	model.focus = paneActivity
+	model.logsExpanded = true
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = updated.(Model)
+	if model.focus != paneActivity {
+		t.Fatalf("focus = %v after tab while expanded, want unchanged (activity)", model.focus)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	model = updated.(Model)
+	if model.focus != paneActivity {
+		t.Fatalf("focus = %v after shift+tab while expanded, want unchanged (activity)", model.focus)
+	}
+}
+
+// TestColumnRatiosReflectLogsExpanded pins the actual proportions behind
+// the visual change, and that leftPaneWidth/centerPaneWidth/rightPaneWidth
+// (used for mouse hit-testing and Tree content-wrap width) derive from
+// the same source rather than drifting out of sync with it.
+func TestColumnRatiosReflectLogsExpanded(t *testing.T) {
+	model := testModel()
+	model.width = 200
+
+	normal := model.columnRatios()
+	if normal != [3]float64{3, 5, 4} {
+		t.Fatalf("columnRatios() = %v, want {3,5,4}", normal)
+	}
+	normalLeft := model.leftPaneWidth()
+
+	model.logsExpanded = true
+	expanded := model.columnRatios()
+	if expanded == normal {
+		t.Fatal("columnRatios() unchanged when logsExpanded, want a skewed ratio")
+	}
+	if got := model.leftPaneWidth(); got >= normalLeft {
+		t.Fatalf("leftPaneWidth() = %d, want narrower than the unexpanded %d", got, normalLeft)
+	}
+	if model.centerPaneWidth() <= model.width/2 {
+		t.Fatalf("centerPaneWidth() = %d, want it to dominate the %d-wide layout while expanded", model.centerPaneWidth(), model.width)
+	}
+}
+
 // TestSpaceKeyTogglesLogFollow covers the space-as-live/paused-toggle
 // request: pressing space while following pauses at the current bottom
 // (not mid-scroll — a plain toggle, not a scroll), and pressing it again

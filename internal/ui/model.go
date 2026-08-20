@@ -283,6 +283,12 @@ type Model struct {
 	height int
 	focus  pane
 	mode   activityMode
+	// logsExpanded shrinks Tree/Inspector to icon-only slivers and lets
+	// the Activity pane fill nearly the whole width — toggled by L while
+	// in Logs mode (see columnRatios/renderCollapsedPane). Session-only
+	// view state, not persisted — same category as focus/logScroll, not
+	// a durable preference.
+	logsExpanded bool
 
 	loading         bool
 	snapshot        domain.Snapshot
@@ -1375,9 +1381,20 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cleanup()
 		return m, tea.Quit
 	case "tab":
-		m.focus = (m.focus + 1) % 3
+		if !m.logsExpanded {
+			m.focus = (m.focus + 1) % 3
+		}
 	case "shift+tab":
-		m.focus = (m.focus + 2) % 3
+		if !m.logsExpanded {
+			m.focus = (m.focus + 2) % 3
+		}
+	case "L":
+		if m.mode == activityLogs {
+			m.logsExpanded = !m.logsExpanded
+			if m.logsExpanded {
+				m.focus = paneActivity
+			}
+		}
 	case "j", "down":
 		switch {
 		case m.focus == paneActivity && m.mode == activityProblems:

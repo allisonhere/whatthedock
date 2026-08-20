@@ -80,6 +80,12 @@ func TestBackgroundStaysExplicitAcrossScreensAndThemes(t *testing.T) {
 			m.focus = paneActivity
 			m.logLines = []string{"2024-01-01T12:00:00Z GET /api/v3/queue 200 trailing plain text here"}
 		}},
+		{"logs expanded", func(m *Model) {
+			m.mode = activityLogs
+			m.focus = paneActivity
+			m.logsExpanded = true
+			m.logLines = []string{"2024-01-01T12:00:00Z GET /api/v3/queue 200 trailing plain text here"}
+		}},
 		{"problems", func(m *Model) { m.mode = activityProblems; m.focus = paneActivity }},
 		{"problems AI analyzing", func(m *Model) {
 			m.mode = activityProblems
