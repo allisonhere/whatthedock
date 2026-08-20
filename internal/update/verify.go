@@ -16,7 +16,7 @@ import (
 // ships baked into every already-installed binary, so it's the *old*,
 // already-trusted binary that verifies the new one, not anything fetched
 // alongside the download it's checking.
-const releasePublicKeyHex = "85a0af2f3f7d795d58a3aba9601cdbf7f0d4e0ff1005f76930a66623c556149a"
+const releasePublicKeyHex = "1df7ed51dea3d77c9c9cdda6b69806eac7438ca2b78f4c7e0ed6e79fcdb87447"
 
 // verificationPublicKey is releasePublicKeyHex parsed once at init. A var,
 // not a plain call site, so tests can swap it for a throwaway test key —
