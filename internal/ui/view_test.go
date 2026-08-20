@@ -313,3 +313,25 @@ func TestRenderSparklineGaugeEmptyWithNoHistory(t *testing.T) {
 		t.Fatalf("gauge bar with no history = %q, want an all-empty 10-wide bar", got)
 	}
 }
+
+// TestFormatMountsIsStableRegardlessOfInputOrder guards against a
+// regression where the Inspector's Mounts row visibly reshuffled every
+// time a container's details got refetched (a health check event, a
+// routine refresh) with nothing actually having changed — Docker's own
+// inspect.Mounts order isn't guaranteed stable between API calls, and
+// formatMounts rendered whatever order it was just given instead of
+// sorting the way Env/Labels (formatList/formatMap) already do.
+func TestFormatMountsIsStableRegardlessOfInputOrder(t *testing.T) {
+	a := []domain.Mount{
+		{Source: "/data/media", Destination: "/media"},
+		{Source: "/data/config", Destination: "/config"},
+	}
+	b := []domain.Mount{
+		{Source: "/data/config", Destination: "/config"},
+		{Source: "/data/media", Destination: "/media"},
+	}
+	gotA, gotB := formatMounts(a), formatMounts(b)
+	if gotA != gotB {
+		t.Fatalf("formatMounts gave different output for the same mounts in a different order:\n%q\n%q", gotA, gotB)
+	}
+}

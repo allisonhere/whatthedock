@@ -3747,6 +3747,12 @@ func formatPorts(ports []domain.Port) string {
 	return strings.Join(out, ", ")
 }
 
+// formatMounts sorts before rendering — Docker's own inspect.Mounts order
+// isn't guaranteed stable between API calls, so without sorting here the
+// same container's mount list visibly reshuffled every time its details
+// got refetched (a health check event, a routine refresh) with nothing
+// having actually changed. Env/Labels (formatList/formatMap, just below)
+// already sort for the same reason; this brought Mounts in line with them.
 func formatMounts(mounts []domain.Mount) string {
 	if len(mounts) == 0 {
 		return ""
@@ -3755,6 +3761,7 @@ func formatMounts(mounts []domain.Mount) string {
 	for _, mount := range mounts {
 		out = append(out, mount.Source+" -> "+mount.Destination)
 	}
+	sort.Strings(out)
 	return strings.Join(out, "\n")
 }
 
