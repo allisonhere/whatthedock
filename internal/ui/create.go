@@ -748,6 +748,17 @@ func (m Model) deleteComposeCmd(spec composeCreateSpec) tea.Cmd {
 	}
 }
 
+// deleteStackCmd is deleteComposeCmd's whole-project counterpart — see
+// defaultApplyComposeDeleteStack.
+func (m Model) deleteStackCmd(spec composeCreateSpec) tea.Cmd {
+	apply := applyComposeDeleteStack
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return actionDoneMsg{label: "delete stack " + spec.Project, err: apply(ctx, spec)}
+	}
+}
+
 func (m Model) replicateComposeCmd(spec composeCreateSpec) tea.Cmd {
 	apply := applyComposeReplicate
 	return func() tea.Msg {
@@ -1851,6 +1862,56 @@ func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error
 		return err
 	}
 	_, err = sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(spec.BaseFile), string(updated))
+	return err
+}
+
+// defaultApplyComposeDeleteStack permanently removes an entire project:
+// stops and removes every container spec.BaseFile defines (`docker
+// compose down` — deliberately no `-v`, named volumes are left alone,
+// matching `down`'s own default), removes any now-orphaned per-service
+// override file, then deletes the base file itself. The whole-stack
+// counterpart to defaultApplyComposeDelete's per-service symmetry: that
+// one doesn't just stop a container, it removes the service's own
+// definition (its override, or its block in the base file) — the
+// project-wide equivalent of "the service's definition" is the base file
+// itself, so it goes too, not just the containers it was running.
+func defaultApplyComposeDeleteStack(ctx context.Context, spec composeCreateSpec) error {
+	if spec.System.Kind == "ssh" {
+		return applyComposeDeleteStackRemote(ctx, spec)
+	}
+	baseContent, err := os.ReadFile(spec.BaseFile)
+	if err != nil {
+		return err
+	}
+	if err := composeCommand(ctx, spec, "down"); err != nil {
+		return err
+	}
+	for _, service := range allOverrideServiceNames(string(baseContent)) {
+		overridePath := filepath.Join(filepath.Dir(spec.BaseFile), "compose.whatthedock."+safeComposeFilename(service)+".yml")
+		if err := os.Remove(overridePath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.Remove(spec.BaseFile)
+}
+
+// applyComposeDeleteStackRemote is defaultApplyComposeDeleteStack's SSH
+// counterpart.
+func applyComposeDeleteStackRemote(ctx context.Context, spec composeCreateSpec) error {
+	baseContent, err := sshRun(ctx, spec.System, "cat "+systems.ShellQuote(spec.BaseFile), "")
+	if err != nil {
+		return err
+	}
+	if err := composeCommand(ctx, spec, "down"); err != nil {
+		return err
+	}
+	for _, service := range allOverrideServiceNames(string(baseContent)) {
+		overridePath := path.Join(path.Dir(spec.BaseFile), "compose.whatthedock."+safeComposeFilename(service)+".yml")
+		if _, err := sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(overridePath), ""); err != nil {
+			return err
+		}
+	}
+	_, err = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.BaseFile), "")
 	return err
 }
 

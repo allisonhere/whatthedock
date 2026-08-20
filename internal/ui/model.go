@@ -67,6 +67,8 @@ const (
 	overlayAppLog
 	overlayDashboard
 	overlayEditScope
+	overlayDeleteScope
+	overlayDeleteStackConfirm
 )
 
 type graphStyle int
@@ -608,6 +610,7 @@ var applyComposeCreate = defaultApplyComposeCreate
 var applyComposeAdopt = defaultApplyComposeAdopt
 var applyComposeStack = defaultApplyComposeStack
 var applyComposeDelete = defaultApplyComposeDelete
+var applyComposeDeleteStack = defaultApplyComposeDeleteStack
 var applyComposeReplicate = defaultApplyComposeReplicate
 var composeCommand = runDockerCompose
 
@@ -1636,7 +1639,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.loadStatsCmd(selected.ID)
 		}
 	case "D":
+		// Same two entry points "m" (edit) already has — see that case's
+		// own comment for the reasoning. Delete is more dangerous than
+		// edit (irreversible, removes real files), so if ambiguous scope
+		// was worth asking about there, it's worth at least as much here.
+		if row := m.currentRow(); row != nil && row.kind == rowProject {
+			m.overlay = overlayDeleteStackConfirm
+			return m, nil
+		}
 		if selected := m.selectedContainer(); selected != nil {
+			if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
+				m.overlay = overlayDeleteScope
+				return m, nil
+			}
 			m.overlay = overlayDelete
 		}
 	case "u":
@@ -1803,6 +1818,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleUpdateKey(msg)
 	case overlayEditScope:
 		return m.handleEditScopeKey(msg)
+	case overlayDeleteScope:
+		return m.handleDeleteScopeKey(msg)
+	case overlayDeleteStackConfirm:
+		return m.handleDeleteStackConfirmKey(msg)
 	}
 	return m, nil
 }
@@ -1840,6 +1859,58 @@ func (m Model) handleDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		m.overlay = overlayNone
 		return m.startDelete()
+	}
+	return m, nil
+}
+
+// deleteStackTargetProject resolves which project overlayDeleteScope/
+// overlayDeleteStackConfirm target: either the project/folder row the
+// cursor is still on (the direct entry point — the tree doesn't navigate
+// while an overlay is open, so this stays valid), or the currently
+// selected container's own project (reached via overlayDeleteScope's "s"
+// escalation) — same resolution shape handleEditScopeKey's "s" case
+// already uses.
+func (m Model) deleteStackTargetProject() string {
+	if row := m.currentRow(); row != nil && row.kind == rowProject {
+		return row.project
+	}
+	if selected := m.selectedContainer(); selected != nil {
+		return selected.Compose.Project
+	}
+	return ""
+}
+
+// handleDeleteScopeKey answers the warn-and-offer prompt shown when "D"
+// targets an individual container that's part of a multi-service project
+// — see the "D" case and defaultApplyComposeDeleteStack's doc comment.
+// enter/d proceeds exactly as a genuinely single-service project always
+// has (overlayDelete), "s" moves to the itemized whole-stack confirm
+// (overlayDeleteStackConfirm) rather than deleting immediately — a
+// second confirm step, not a shortcut past one, since this is
+// irreversible.
+func (m Model) handleDeleteScopeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.overlay = overlayNone
+	case "enter", "d":
+		m.overlay = overlayDelete
+	case "s":
+		m.overlay = overlayDeleteStackConfirm
+	}
+	return m, nil
+}
+
+// handleDeleteStackConfirmKey answers the itemized whole-stack delete
+// confirm (overlayDeleteStackConfirm) — reached either directly from the
+// project/folder row or via overlayDeleteScope's "s".
+func (m Model) handleDeleteStackConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "n", "q":
+		m.overlay = overlayNone
+	case "y":
+		project := m.deleteStackTargetProject()
+		m.overlay = overlayNone
+		return m.startDeleteStack(project)
 	}
 	return m, nil
 }
@@ -1885,6 +1956,27 @@ func (m Model) startDelete() (tea.Model, tea.Cmd) {
 		defer cancel()
 		return actionDoneMsg{label: label, err: provider.RemoveContainer(ctx, id, true)}
 	}
+}
+
+// startDeleteStack dispatches the whole-project delete — mirrors
+// startDelete's compose branch, but keyed on a project name rather than a
+// specific selected container's own service, since this is reached
+// either from the project/folder row directly (no container selected at
+// all) or from overlayDeleteScope's "s" escalation.
+func (m Model) startDeleteStack(project string) (tea.Model, tea.Cmd) {
+	composeFile := m.resolveProjectComposeFile(project)
+	if composeFile == "" {
+		m.status, m.statusErr = "delete stack "+project+": could not resolve a compose file", true
+		return m, nil
+	}
+	spec := composeCreateSpec{
+		Project:  project,
+		BaseFile: composeFile,
+		System:   m.activeSystemConfig(),
+	}
+	m.busy = true
+	m.status, m.statusErr = "deleting stack "+project+"…", false
+	return m, m.deleteStackCmd(spec)
 }
 
 // startReplicate dispatches to the Compose (pull + up -d) or standalone

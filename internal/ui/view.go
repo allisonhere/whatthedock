@@ -2031,6 +2031,10 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.updateOverlay(renderer)
 	case overlayEditScope:
 		return m.editScopeOverlay(renderer)
+	case overlayDeleteScope:
+		return m.deleteScopeOverlay(renderer)
+	case overlayDeleteStackConfirm:
+		return m.deleteStackConfirmOverlay(renderer)
 	default:
 		return nil
 	}
@@ -2058,6 +2062,73 @@ func (m Model) editScopeOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		),
 	}, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "edit scope", Content: content, Width: width})
+	return &overlay
+}
+
+// deleteScopeOverlay is editScopeOverlay's Delete counterpart, shown when
+// "D" targets an individual container that's part of a multi-service
+// project — see the "D" key handler. "s" here moves to
+// deleteStackConfirmOverlay rather than deleting immediately: this is
+// irreversible, so the escalation is itself just another prompt, not a
+// shortcut past one.
+func (m Model) deleteScopeOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	prompt := "No container selected."
+	if selected := m.selectedContainer(); selected != nil {
+		project := selected.Compose.Project
+		count := siblingServiceCount(m.snapshot, project)
+		prompt = fmt.Sprintf("Project %q has %d services. Delete just %s, or the whole stack?", project, count, selected.Compose.Service)
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter/d", Label: "this service"},
+			tideui.SoftHint{Key: "s", Label: "whole stack"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "delete scope", Content: content, Width: width})
+	return &overlay
+}
+
+// deleteStackConfirmOverlay is the itemized whole-project delete confirm
+// — reached either directly from the project/folder row or via
+// deleteScopeOverlay's "s". Names exactly what's being destroyed (service
+// count/list, and the compose file path that's about to be removed)
+// rather than a bare "are you sure", matching the same plain y/n every
+// other Delete/Replicate/Create confirm in this app already uses — the
+// itemization is the safety margin here, not extra confirmation friction
+// beyond that established precedent. Built entirely from m.snapshot (no
+// disk/SSH read at render time): service names/count come from
+// domain.Project.Services, already grouped from live Docker state, the
+// same source stack create's own confirm step uses.
+func (m Model) deleteStackConfirmOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	project := m.deleteStackTargetProject()
+	composeFile := m.resolveProjectComposeFile(project)
+	var names []string
+	for _, p := range m.snapshot.Projects {
+		if p.Name != project {
+			continue
+		}
+		for _, svc := range p.Services {
+			names = append(names, svc.Name)
+		}
+	}
+	prompt := fmt.Sprintf("Delete project %q? This stops and removes %d services (%s) and deletes %s. This cannot be undone.",
+		project, len(names), summarizeServiceNames(names, 6), short(composeFile, max(12, contentWidth-40)))
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: "delete stack"},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "delete stack", Content: content, Width: width})
 	return &overlay
 }
 
@@ -2590,6 +2661,8 @@ var helpLines = []string{
 	"Esc            clear active log filter",
 	"u              replicate: pull latest image, recreate",
 	"D              delete: real, permanent removal",
+	"               on a project row: deletes the whole stack + its file",
+	"               on a multi-service container: prompts service vs. stack",
 	"C              clone under a new name",
 	"m              edit in place; on a project row, edits the whole stack",
 	"               on a multi-service container: prompts service vs. stack",

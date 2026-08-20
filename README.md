@@ -119,7 +119,7 @@ Docker socket paths must be present.
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
 | `u` | Replicate: pull the latest image and recreate in place |
-| `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file) |
+| `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file). On a project/folder row, deletes the whole stack: stops and removes every container it defines and deletes its compose file; on a container that's part of a multi-service project, prompts to delete just that service or the whole stack |
 | `C` | Clone under a new name via the create overlay |
 | `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. On a project/folder row, edits the whole stack's base compose file directly; on a container that's part of a multi-service project, prompts to edit just that service or the whole stack |
 | `e` | Open a shell inside the selected running container |
@@ -397,6 +397,14 @@ More detail:
   definition everywhere WhatTheDock knows about it — the generated override,
   if any, and its block in the base compose file if the base file defines it
   (comment-preserving) — or a real `docker rm -f` for a standalone container.
+  Deleting a whole stack works the same way one level up: select the
+  project/folder row and press `D` for an itemized confirm naming every
+  service that will stop, then `docker compose down` (containers and
+  networks; named volumes are left alone) followed by deleting the base
+  compose file itself and any now-orphaned per-service override files.
+  Pressing `D` on one of that project's individual containers instead
+  prompts to choose between deleting just that service or the whole
+  stack.
   Replicate
   pulls a fresh copy of the image and recreates the same container/service in
   place under its existing identity. Clone opens the create overlay prefilled

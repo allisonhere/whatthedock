@@ -833,6 +833,71 @@ func TestApplyComposeCreateValidatesTempBeforePromote(t *testing.T) {
 	}
 }
 
+// TestDeleteStackRemovesContainersAndBaseFile checks
+// defaultApplyComposeDeleteStack's core behavior: `docker compose down`
+// (no -v — named volumes are left alone) runs against the whole project,
+// then the base compose file itself is deleted — the project-wide
+// equivalent of single-service Delete removing that service's own
+// definition (defaultApplyComposeDelete, tested above this file).
+func TestDeleteStackRemovesContainersAndBaseFile(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.BaseFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := composeCreateSpec{Project: "media", BaseFile: base}
+
+	if err := defaultApplyComposeDeleteStack(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeDeleteStack() error = %v", err)
+	}
+	if len(calls) != 1 || !strings.HasSuffix(calls[0], "down") {
+		t.Fatalf("compose calls = %#v, want exactly one call ending in \"down\"", calls)
+	}
+	if strings.Contains(calls[0], "-v") {
+		t.Fatalf("compose calls = %#v, want no -v (named volumes must be left alone)", calls)
+	}
+	if _, err := os.Stat(base); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("base compose file still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+// TestDeleteStackRemovesOrphanedPerServiceOverrides checks that any
+// compose.whatthedock.<service>.yml override files belonging to the
+// project's services get cleaned up too — they'd otherwise be orphaned,
+// referencing a base file that no longer exists.
+func TestDeleteStackRemovesOrphanedPerServiceOverrides(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	composeCommand = func(context.Context, composeCreateSpec, ...string) error { return nil }
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	webOverride := filepath.Join(dir, "compose.whatthedock.web.yml")
+	if err := os.WriteFile(webOverride, []byte("services:\n  web:\n    image: nginx:custom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := composeCreateSpec{Project: "media", BaseFile: base}
+	if err := defaultApplyComposeDeleteStack(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeDeleteStack() error = %v", err)
+	}
+	if _, err := os.Stat(webOverride); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("web's override file still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestDefaultApplyComposeCreateMergesIntoBaseWhenServiceAlreadyDefined(t *testing.T) {
 	original := composeCommand
 	defer func() { composeCommand = original }()

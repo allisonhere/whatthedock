@@ -3012,12 +3012,21 @@ func modelSelectingStandalone(name, image string) Model {
 }
 
 func TestPressDOpensDeleteOverlay(t *testing.T) {
-	model := testModelWithSelectedContainer()
+	model := testModelWithSelectedContainer() // radarr-1, project "media" (2 services — jellyfin too)
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
 	model = updated.(Model)
 	if cmd != nil {
 		t.Fatalf("D key returned cmd = %#v, want nil (opens a confirmation, doesn't act yet)", cmd)
 	}
+	// media has more than one service, so this container's own delete goes
+	// through the warn-and-offer prompt first (see handleDeleteScopeKey) —
+	// "enter" proceeds to the ordinary single-service delete confirm
+	// exactly as before.
+	if model.overlay != overlayDeleteScope {
+		t.Fatalf("overlay = %v, want overlayDeleteScope (media has 2 services)", model.overlay)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
 	if model.overlay != overlayDelete {
 		t.Fatalf("overlay = %v, want overlayDelete", model.overlay)
 	}
@@ -3205,6 +3214,139 @@ func TestEditWholeStackLoadsRealBaseFileContent(t *testing.T) {
 	}
 	if !model.createDraft.OverrideRawSet {
 		t.Fatal("OverrideRawSet = false, want true")
+	}
+}
+
+// TestDeleteWarnsWhenContainerRowHasSiblingServices mirrors
+// TestEditWarnsWhenContainerRowHasSiblingServices for "D": media has two
+// services (radarr, jellyfin), so pressing "D" on radarr-1 must show
+// overlayDeleteScope, not open the single-service delete overlay
+// directly.
+func TestDeleteWarnsWhenContainerRowHasSiblingServices(t *testing.T) {
+	model := testModelWithSelectedContainer() // radarr-1, project "media" (2 services)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	if model.overlay != overlayDeleteScope {
+		t.Fatalf("overlay = %v, want overlayDeleteScope", model.overlay)
+	}
+}
+
+// TestDeleteSkipsWarningForSingleServiceProject mirrors
+// TestEditSkipsWarningForSingleServiceProject for "D": a container whose
+// project has only one service goes straight to the ordinary
+// single-service delete overlay, exactly as before this feature.
+func TestDeleteSkipsWarningForSingleServiceProject(t *testing.T) {
+	host := domain.Host{ID: "local", Name: "local"}
+	containers := []domain.Container{{
+		ID:      domain.ResourceID{Host: "local", ID: "solo-1"},
+		Name:    "solo-1",
+		Image:   "solo",
+		State:   domain.StateRunning,
+		Compose: domain.ComposeRef{Project: "solo-project", Service: "solo", ConfigFiles: "/srv/solo/compose.yml"},
+		Labels:  map[string]string{"com.docker.compose.project": "solo-project", "com.docker.compose.service": "solo"},
+	}}
+	snapshot := domain.BuildSnapshot(host, containers, time.Now())
+	model := testModel()
+	model.snapshot = snapshot
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.container != nil {
+			model.cursor = i
+			model.selectedID = row.container.ID
+			model.selected = row.container
+			break
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	if model.overlay != overlayDelete {
+		t.Fatalf("overlay = %v, want overlayDelete directly, no warn prompt", model.overlay)
+	}
+}
+
+// TestDeleteOnProjectRowOpensStackConfirmDirectlyNoPrompt mirrors
+// TestEditOnProjectRowOpensWholeStackDirectlyNoPrompt for "D": putting
+// the cursor on the project/folder row and pressing "D" jumps straight
+// to the itemized whole-stack delete confirm, with no warn prompt.
+func TestDeleteOnProjectRowOpensStackConfirmDirectlyNoPrompt(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	for i, row := range model.rows {
+		if row.kind == rowProject {
+			model.cursor = i
+			break
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	if model.overlay != overlayDeleteStackConfirm {
+		t.Fatalf("overlay = %v, want overlayDeleteStackConfirm directly, no overlayDeleteScope prompt", model.overlay)
+	}
+}
+
+// TestDeleteStackConfirmDispatchesDeleteStackApply checks the confirm
+// step actually dispatches applyComposeDeleteStack — not the ordinary
+// single-service applyComposeDelete — targeting the right project, and
+// that "n"/"esc" take no action.
+func TestDeleteStackConfirmDispatchesDeleteStackApply(t *testing.T) {
+	original := applyComposeDeleteStack
+	defer func() { applyComposeDeleteStack = original }()
+	var calls int
+	var gotSpec composeCreateSpec
+	applyComposeDeleteStack = func(_ context.Context, spec composeCreateSpec) error {
+		calls++
+		gotSpec = spec
+		return nil
+	}
+
+	model := testModelWithSelectedContainer()
+	for pi := range model.snapshot.Projects {
+		for si := range model.snapshot.Projects[pi].Services {
+			for ci := range model.snapshot.Projects[pi].Services[si].Containers {
+				model.snapshot.Projects[pi].Services[si].Containers[ci].Compose.ConfigFiles = "/srv/media/compose.yml"
+			}
+		}
+	}
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.kind == rowProject {
+			model.cursor = i
+			break
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlayNone {
+		t.Fatalf("esc: overlay = %v, want overlayNone", model.overlay)
+	}
+	if calls != 0 {
+		t.Fatalf("esc dispatched delete, want no action taken")
+	}
+
+	for i, row := range model.rows {
+		if row.kind == rowProject {
+			model.cursor = i
+			break
+		}
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	model = updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("y returned nil cmd")
+	}
+	runCmd(t, cmd)
+
+	if calls != 1 {
+		t.Fatalf("applyComposeDeleteStack called %d times, want 1", calls)
+	}
+	if gotSpec.Project != "media" || gotSpec.BaseFile != "/srv/media/compose.yml" {
+		t.Fatalf("spec = %+v, want Project=media BaseFile=/srv/media/compose.yml", gotSpec)
 	}
 }
 
