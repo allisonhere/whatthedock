@@ -972,6 +972,34 @@ func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
 	}
 }
 
+// TestRenderLogMatchHighlightsOnlyTheMatchingSubstring is the regression
+// test for a live report: highlighting used to cover the *entire token*
+// whenever the query appeared anywhere in it, so typing a single common
+// letter like "f" highlighted every whole word containing an "f" — the
+// opposite of the intended "highlights grow character by character as
+// you type" behavior. Only the exact matched characters should be
+// highlighted, growing as the query does, with the rest of the token
+// (before and after the match) staying plain — checked here as: the
+// text immediately following the match in the raw output is a style
+// escape, not the literal next characters of the word directly appended
+// (which is exactly what the old whole-token span produced, since "f" and
+// "ailed" would both be inside the one span with nothing between them).
+func TestRenderLogMatchHighlightsOnlyTheMatchingSubstring(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	line := "container failed to start"
+
+	for _, query := range []string{"f", "fa", "fail"} {
+		rendered := renderLogLine(renderer, logColorFull, query, line)
+		if ansi.Strip(rendered) != line {
+			t.Fatalf("query %q: stripped text = %q, want unchanged %q", query, ansi.Strip(rendered), line)
+		}
+		matchEnd := strings.Index(rendered, query) + len(query)
+		if !strings.HasPrefix(rendered[matchEnd:], "\x1b[") {
+			t.Fatalf("query %q: no style boundary right after the match — looks like the whole word got highlighted instead of just %q:\n%q", query, query, rendered)
+		}
+	}
+}
+
 // TestLogFilterIsLiveWhileTyping covers the actual point of the redesign:
 // filtering and highlighting apply on every keystroke, before enter is
 // ever pressed — not only once a draft is committed. Typing "a" already

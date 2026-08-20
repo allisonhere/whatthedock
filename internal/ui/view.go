@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	sp "github.com/allisonhere/cli-spinners"
 	"github.com/allisonhere/tideui"
@@ -503,16 +504,21 @@ func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, f
 	}
 }
 
-// renderLogMatch highlights a filter-matched token via backgroundSpan
-// instead of a self-contained Style.Render() call — same fix, same
-// reasoning as renderLogToken's own doc comment, just for a span that
-// genuinely needs to change background (the match highlight), not only
-// foreground: backgroundSpan explicitly restores to the surrounding
-// line's own background/foreground afterward instead of emitting an
-// absolute reset. Any per-token color rendered already carried (from
-// renderLogToken) is deliberately dropped here — highlighting a token
-// that's also, say, an HTTP status code just shows it plain-highlighted,
-// not fighting two colors for the same characters.
+// renderLogMatch highlights just the matching characters within a
+// filter-matched token — not the whole token — via backgroundSpan instead
+// of a self-contained Style.Render() call: same fix, same reasoning as
+// renderLogToken's own doc comment, just for a span that genuinely needs
+// to change background (the match highlight), not only foreground:
+// backgroundSpan explicitly restores to the surrounding line's own
+// background/foreground afterward instead of emitting an absolute reset.
+// Whole-token highlighting was the original (and, reported live, wrong)
+// behavior: typing a single common letter like "f" highlighted every word
+// containing an "f" anywhere, in full, instead of just the "f" — the
+// opposite of what live, character-by-character highlighting is supposed
+// to show as you type. The non-matching prefix/suffix render plain (any
+// per-token color renderLogToken already carried is dropped for the whole
+// token, same as before this fix, just no longer forcibly extended across
+// characters that don't actually match).
 //
 // The purple/white pair is fixed, not theme-derived — the same choice
 // renderLogToken already makes for timestamps/HTTP methods/severity
@@ -521,13 +527,46 @@ func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, f
 // selected row instead of standing out against arbitrary log text.
 func renderLogMatch(renderer tideui.Renderer, query, token, rendered string) string {
 	query = strings.TrimSpace(query)
-	if query == "" || !strings.Contains(strings.ToLower(token), strings.ToLower(query)) {
+	if query == "" {
 		return rendered
 	}
+	tokenRunes, queryRunes := []rune(token), []rune(query)
+	start := runeIndexFold(tokenRunes, queryRunes)
+	if start < 0 {
+		return rendered
+	}
+	end := start + len(queryRunes)
 	const matchBg = lipgloss.Color("#a855f7")
 	const matchFg = lipgloss.Color("#ffffff")
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
-	return backgroundSpan(token, matchBg, matchFg, renderer.Styles.Theme.Bg, baseFg, true)
+	match := backgroundSpan(string(tokenRunes[start:end]), matchBg, matchFg, renderer.Styles.Theme.Bg, baseFg, true)
+	return string(tokenRunes[:start]) + match + string(tokenRunes[end:])
+}
+
+// runeIndexFold returns the index of needle's first case-insensitive
+// occurrence in haystack, both already decoded to runes — rune-based
+// rather than strings.Index on strings.ToLower'd text, so a match
+// position is never computed from a byte offset that could land inside a
+// multi-byte character if lowercasing ever changed a string's byte
+// length (rare, but real, for some non-ASCII casing). Returns -1 if
+// needle is empty or not found.
+func runeIndexFold(haystack, needle []rune) int {
+	if len(needle) == 0 || len(needle) > len(haystack) {
+		return -1
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j, r := range needle {
+			if unicode.ToLower(haystack[i+j]) != unicode.ToLower(r) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }
 
 func isLogSpace(char byte) bool {
