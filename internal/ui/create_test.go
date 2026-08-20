@@ -2042,3 +2042,38 @@ func TestComposePreviewOverflowDoesNotClipTheOverlay(t *testing.T) {
 		t.Fatal("expected a truncation notice pointing at ctrl+y once the preview overflows the budget")
 	}
 }
+
+// TestConfirmStepPreviewFitsOverlayBudget guards against the same class of
+// bug one screen later: the confirm step (alt+enter from the create form)
+// rendered the whole compose preview into RenderSoftBody with no height
+// cap of its own. Once the preview was taller than the overlay's real
+// budget, tideui's overlay compositor could no longer vertically center
+// the box and silently dropped any line landing at/past the terminal's
+// bottom edge (placeBoxAt) — cutting off the y/n confirm hints entirely,
+// with no error and no visible indication of what happened.
+func TestConfirmStepPreviewFitsOverlayBudget(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Project = "media"
+	model.createDraft.Service = "radarr"
+	model.createDraft.Image = "lscr.io/linuxserver/radarr:latest"
+	model.createDraft.Ports = "7878:7878"
+	var envLines []string
+	for i := 0; i < 60; i++ {
+		envLines = append(envLines, fmt.Sprintf("VAR_%d=value_%d", i, i))
+	}
+	model.createDraft.Env = strings.Join(envLines, "\n")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	if !model.createDraft.Confirming {
+		t.Fatal("alt+enter should have entered the confirm step")
+	}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "cancel") {
+		t.Fatal("cancel hint missing from the rendered confirm screen — the overlay overflowed and got clipped")
+	}
+}

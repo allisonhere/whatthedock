@@ -44,9 +44,30 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		if editing {
 			title = "confirm edit"
 		}
+		// Same unbounded-height bug as the form screen's preview column
+		// (see the budget comment below in the non-Confirming branch), one
+		// level up: this whole prompt+preview+hints block goes through
+		// RenderSoftBody with no cap of its own, so a service with enough
+		// env/labels grew past softOverlayBodyBudget and the overlay
+		// compositor silently dropped the bottom rows (placeBoxAt skips
+		// any line landing at/past the terminal's edge once the box can no
+		// longer be vertically centered) — cutting off the confirm/cancel
+		// hints entirely on a long enough preview. promptRendered's own
+		// line count is subtracted first since the confirmation prompt
+		// itself can wrap to more than one line (the "adopt" prompt).
+		promptRendered := renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt)
+		fixedRows := strings.Count(promptRendered, "\n") + 1 /* prompt */ + 1 /* blank above preview */ + 1 /* blank below preview */ + 1 /* hints */
+		previewBudget := max(3, m.softOverlayBodyBudget()-fixedRows)
+		previewLines := strings.Split(m.createDraft.Preview(), "\n")
+		previewText := m.createDraft.Preview()
+		if len(previewLines) > previewBudget {
+			hidden := len(previewLines) - (previewBudget - 1)
+			previewLines = append(previewLines[:previewBudget-1], fmt.Sprintf("… %d more lines — esc back, ctrl+y to review the full file", hidden))
+			previewText = strings.Join(previewLines, "\n")
+		}
 		content := renderer.RenderSoftBody(width,
-			renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt)+"\n\n"+
-				renderer.Styles.DetailBody.Width(contentWidth).Render(m.createDraft.Preview())+"\n\n"+
+			promptRendered+"\n\n"+
+				renderer.Styles.DetailBody.Width(contentWidth).Render(previewText)+"\n\n"+
 				renderer.RenderSoftHints(contentWidth,
 					tideui.SoftHint{Key: "y", Label: confirmLabel},
 					tideui.SoftHint{Key: "n/esc", Label: "cancel"},
