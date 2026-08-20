@@ -147,9 +147,34 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	right := fmt.Sprintf("Docker connected · %d projects · %d standalone · %d problems",
 		len(m.snapshot.Projects), len(m.snapshot.Standalone), len(m.snapshotProblems()))
 	if m.statusErr {
-		right = m.status
+		right = topbarStatusLine(m.status)
 	}
 	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, contentWidth))
+}
+
+// topbarStatusLine collapses a possibly multi-line status message (a
+// failed docker/compose command's raw combined output is often several
+// lines — a port conflict plus surrounding CLI context) down to the one
+// line the topbar actually has room for. Passing multi-line text straight
+// into alignText/Width().Render() below is exactly the shape of bug that
+// made the topbar itself wrap onto a second line — content measuring
+// wider (or, here, taller) than the box gets silently mangled rather than
+// erroring. The full message is still readable in full via the app log
+// (see recordAppLog), which is why this only needs to point there instead
+// of trying to cram everything in.
+func topbarStatusLine(status string) string {
+	lines := strings.Split(strings.TrimSpace(status), "\n")
+	first := strings.TrimSpace(lines[0])
+	extra := 0
+	for _, l := range lines[1:] {
+		if strings.TrimSpace(l) != "" {
+			extra++
+		}
+	}
+	if extra > 0 {
+		first += fmt.Sprintf("  (+%d more line(s) — settings > view app log)", extra)
+	}
+	return first
 }
 
 func (m Model) renderTree(renderer tideui.Renderer) string {

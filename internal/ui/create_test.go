@@ -2012,6 +2012,33 @@ func TestTopbarFitsInOneLine(t *testing.T) {
 	}
 }
 
+// TestTopbarCollapsesMultilineErrorStatus guards against a regression
+// where a failed docker/compose command's raw combined output — often
+// several lines — was passed straight into the topbar's right-side status
+// text, which the topbar can only render as a single line. Multi-line
+// content reaching alignText/Width().Render() there wrapped the topbar
+// onto extra lines the same way the earlier padding bug did, pushing the
+// whole app down and clipping the bottom off-screen ("that blip on the
+// status line" being unreadable was this same bug's symptom).
+func TestTopbarCollapsesMultilineErrorStatus(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 160, 34
+	model.status = "create wtd-web: docker compose up failed\nError response from daemon: driver failed programming external connectivity\nBind for 0.0.0.0:8080 failed: port is already allocated"
+	model.statusErr = true
+
+	view := ansi.Strip(model.View())
+	lines := strings.Split(view, "\n")
+	if len(lines) != model.height {
+		t.Fatalf("view height = %d, want exactly %d (topbar likely wrapped on the multi-line status)", len(lines), model.height)
+	}
+	if !strings.Contains(lines[0], "docker compose up failed") {
+		t.Fatalf("topbar = %q, want it to show the first line of the error", lines[0])
+	}
+	if !strings.Contains(lines[0], "app log") {
+		t.Fatalf("topbar = %q, want a pointer to the app log for the rest of a multi-line error", lines[0])
+	}
+}
+
 // TestComposePreviewOverflowDoesNotClipTheOverlay guards against a
 // regression where the Create overlay's compose-preview column had no
 // height bound at all — a service with enough env vars/labels grew the

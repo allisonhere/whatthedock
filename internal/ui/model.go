@@ -3200,13 +3200,35 @@ func (m *Model) recordAppLog(prevStatus string, prevErr bool) {
 	if m.statusErr {
 		level = "ERROR"
 	}
-	line := fmt.Sprintf("%s  %-5s  %s", time.Now().Format("15:04:05"), level, m.status)
-	m.appLogLines = append(m.appLogLines, line)
+	// A failed docker/compose command's raw combined output (the common
+	// source of an error status) is often several lines, not one — a port
+	// conflict plus the compose CLI's own surrounding context, for
+	// example. The app-log overlay (renderOverlay's overlayAppLog case)
+	// budgets and scrolls by *entries* on the assumption that one entry
+	// renders as exactly one row; a single entry with embedded newlines
+	// breaks that assumption and can push real rows silently off the
+	// bottom of the overlay the same way an unbounded preview did
+	// upstream of this. Splitting here instead keeps every entry genuinely
+	// one row, so the existing budget/scroll math keeps working without
+	// needing to special-case multi-line content at render time.
+	prefix := fmt.Sprintf("%s  %-5s  ", time.Now().Format("15:04:05"), level)
+	statusLines := strings.Split(strings.TrimRight(m.status, "\n"), "\n")
+	newLines := make([]string, 0, len(statusLines))
+	for i, text := range statusLines {
+		if i == 0 {
+			newLines = append(newLines, prefix+text)
+		} else {
+			newLines = append(newLines, strings.Repeat(" ", len(prefix))+text)
+		}
+	}
+	m.appLogLines = append(m.appLogLines, newLines...)
 	if len(m.appLogLines) > appLogMaxLines {
 		m.appLogLines = m.appLogLines[len(m.appLogLines)-appLogMaxLines:]
 	}
 	if m.settings.AppLog == appLogSave {
-		m.writeAppLogLine(line)
+		for _, line := range newLines {
+			m.writeAppLogLine(line)
+		}
 	}
 }
 

@@ -5326,6 +5326,29 @@ func TestRecordAppLogOnRecordsTransitionsOnly(t *testing.T) {
 	}
 }
 
+// TestRecordAppLogSplitsMultilineStatusIntoOneEntryPerLine guards against a
+// regression where a failed docker/compose command's raw combined output
+// (often several lines — a port conflict plus surrounding CLI context)
+// became a single appLogLines entry with embedded newlines. The app-log
+// overlay budgets/scrolls by entry count on the assumption that one entry
+// renders as exactly one row; a multi-line entry broke that and could push
+// real content silently off the bottom of the overlay.
+func TestRecordAppLogSplitsMultilineStatusIntoOneEntryPerLine(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "create wtd-web: docker compose up failed\nError response from daemon: driver failed programming external connectivity\nBind for 0.0.0.0:8080 failed: port is already allocated", true
+	model.recordAppLog("", false)
+
+	if len(model.appLogLines) != 3 {
+		t.Fatalf("appLogLines = %v, want exactly 3 entries (one per source line)", model.appLogLines)
+	}
+	if !strings.Contains(model.appLogLines[0], "ERROR") || !strings.Contains(model.appLogLines[0], "docker compose up failed") {
+		t.Fatalf("appLogLines[0] = %q, want it tagged ERROR and to contain the first line", model.appLogLines[0])
+	}
+	if !strings.Contains(model.appLogLines[2], "port is already allocated") {
+		t.Fatalf("appLogLines[2] = %q, want it to contain the third line", model.appLogLines[2])
+	}
+}
+
 // TestRecordAppLogSaveWritesFile checks save mode both keeps the in-memory
 // buffer (same as on) and appends to whatthedock.log next to settings.json.
 func TestRecordAppLogSaveWritesFile(t *testing.T) {
