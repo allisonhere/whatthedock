@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 )
@@ -104,6 +105,75 @@ func TestSignBinaryRejectsMalformedHexKey(t *testing.T) {
 func TestSignBinaryRejectsWrongLengthKey(t *testing.T) {
 	if _, err := signBinary(hex.EncodeToString([]byte("too short")), []byte("data")); err == nil {
 		t.Fatal("signBinary() error = nil, want an error for a wrong-length key")
+	}
+}
+
+// TestLoadSigningKeyPrefersEnvVarOverFile checks precedence: an explicit
+// export always wins over the local file, even when both are present —
+// e.g. CI, or a deliberate one-off override.
+func TestLoadSigningKeyPrefersEnvVarOverFile(t *testing.T) {
+	t.Setenv(signingKeyEnvVar, "env-key-value")
+	writeTempSigningKeyFile(t, "file-key-value")
+
+	got, err := loadSigningKey()
+	if err != nil {
+		t.Fatalf("loadSigningKey() error = %v", err)
+	}
+	if got != "env-key-value" {
+		t.Fatalf("loadSigningKey() = %q, want the env var value even though the file also exists", got)
+	}
+}
+
+// TestLoadSigningKeyFallsBackToFile checks the whole point of this
+// feature: with no env var set, a release still finds the key from the
+// local gitignored file instead of requiring it to be exported.
+func TestLoadSigningKeyFallsBackToFile(t *testing.T) {
+	t.Setenv(signingKeyEnvVar, "")
+	writeTempSigningKeyFile(t, "file-key-value")
+
+	got, err := loadSigningKey()
+	if err != nil {
+		t.Fatalf("loadSigningKey() error = %v", err)
+	}
+	if got != "file-key-value" {
+		t.Fatalf("loadSigningKey() = %q, want the file's content", got)
+	}
+}
+
+func TestLoadSigningKeyErrorsWhenNeitherIsSet(t *testing.T) {
+	t.Setenv(signingKeyEnvVar, "")
+	os.Remove(signingKeyFile) // in case a previous test left it behind
+	if _, err := loadSigningKey(); err == nil {
+		t.Fatal("loadSigningKey() error = nil, want an error when neither the env var nor the file is set")
+	}
+}
+
+func writeTempSigningKeyFile(t *testing.T, content string) {
+	t.Helper()
+	if err := os.WriteFile(signingKeyFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(signingKeyFile) })
+}
+
+// TestRunAutoRefusesDirtyWorkingTree checks the one safety rail -auto has
+// in place of the interactive path's human looking at screenVersion: a
+// dirty tree is a hard failure, checked (and failed) before
+// runReleaseCmd's real build/sign/tag/push/publish steps ever run — this
+// test would hang or touch real git/GitHub state if that ordering were
+// wrong, since isDirty is stubbed to true and nothing else in this test
+// is.
+func TestRunAutoRefusesDirtyWorkingTree(t *testing.T) {
+	original := isDirty
+	defer func() { isDirty = original }()
+	isDirty = func() bool { return true }
+
+	err := runAuto("v9.9.9", true)
+	if err == nil {
+		t.Fatal("runAuto() error = nil, want a refusal for a dirty working tree")
+	}
+	if !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("runAuto() error = %q, want it to mention the dirty tree", err.Error())
 	}
 }
 

@@ -111,12 +111,27 @@ func runReleaseCmd(version string, dryRun bool, events chan stepEvent) tea.Cmd {
 	}
 }
 
-// signReleaseBinary reads binPath, signs it with the private key in
-// signingKeyEnvVar, and writes the raw detached signature to sigPath.
+// loadSigningKey checks signingKeyEnvVar first — unchanged precedence for
+// anyone already exporting it (CI, a deliberate one-off override) — then
+// falls back to signingKeyFile so a local release doesn't need
+// re-exporting or re-pasting the key every time.
+func loadSigningKey() (string, error) {
+	if key := os.Getenv(signingKeyEnvVar); key != "" {
+		return key, nil
+	}
+	data, err := os.ReadFile(signingKeyFile)
+	if err != nil {
+		return "", fmt.Errorf("%s is not set and %s doesn't exist — run `go run ./cmd/release -genkey` once, then either export %s or save the key to %s", signingKeyEnvVar, signingKeyFile, signingKeyEnvVar, signingKeyFile)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// signReleaseBinary reads binPath, signs it with the private key from
+// loadSigningKey, and writes the raw detached signature to sigPath.
 func signReleaseBinary(binPath, sigPath string) (string, error) {
-	key := os.Getenv(signingKeyEnvVar)
-	if key == "" {
-		return "", fmt.Errorf("%s is not set — run `go run ./cmd/release -genkey` once, then export it", signingKeyEnvVar)
+	key, err := loadSigningKey()
+	if err != nil {
+		return "", err
 	}
 	data, err := os.ReadFile(binPath)
 	if err != nil {
@@ -160,7 +175,12 @@ func currentBranch() string {
 	return out
 }
 
-func isDirty() bool {
+// isDirty is a var (not a plain func) so runAuto's dirty-tree refusal is
+// testable without shelling out to git in a real repo — see
+// steps_test.go.
+var isDirty = defaultIsDirty
+
+func defaultIsDirty() bool {
 	out, err := runCmd("git", "status", "--porcelain")
 	return err == nil && out != ""
 }

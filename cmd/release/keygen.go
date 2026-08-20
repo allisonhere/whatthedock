@@ -13,6 +13,12 @@ import (
 // maintainer after running -genkey.
 const signingKeyEnvVar = "WHATTHEDOCK_SIGNING_KEY"
 
+// signingKeyFile is a local, gitignored fallback for signingKeyEnvVar (see
+// loadSigningKey in steps.go and the /.whatthedock-signing-key entry in
+// .gitignore) — lets a release run without re-exporting or re-pasting the
+// key every time, while an explicit export still always takes priority.
+const signingKeyFile = ".whatthedock-signing-key"
+
 // genKey generates a fresh ed25519 keypair for signing release binaries
 // and prints both halves with instructions — a one-time setup step, run
 // directly (`go run ./cmd/release -genkey`), never part of the regular
@@ -28,10 +34,15 @@ func genKey(w io.Writer) error {
 	fmt.Fprintln(w, "Public key — paste this into internal/update/verify.go's releasePublicKeyHex:")
 	fmt.Fprintln(w, "  "+hex.EncodeToString(pub))
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Private key — store it somewhere safe OUTSIDE this repo (password manager, a")
-	fmt.Fprintln(w, "local env file that's never committed, etc.), then export it before running a")
-	fmt.Fprintln(w, "real release:")
+	fmt.Fprintln(w, "Private key — store it somewhere safe (password manager, a local env file")
+	fmt.Fprintln(w, "that's never committed, etc.), then either export it before running a real")
+	fmt.Fprintln(w, "release:")
 	fmt.Fprintln(w, "  export "+signingKeyEnvVar+"="+hex.EncodeToString(priv))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "...or save it to "+signingKeyFile+" (already gitignored — see .gitignore) so")
+	fmt.Fprintln(w, "./release.sh / `go run ./cmd/release -auto` can just read it without exporting")
+	fmt.Fprintln(w, "anything each time:")
+	fmt.Fprintln(w, "  umask 077 && printf '%s' "+hex.EncodeToString(priv)+" > "+signingKeyFile)
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "This key never needs to touch GitHub, CI, or version control — only this")
 	fmt.Fprintln(w, "machine, at release time. Anyone who gets it can sign a binary whatthedock's")
