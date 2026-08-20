@@ -717,6 +717,14 @@ func (m *Model) saveCreateEditor() {
 	if m.createDraft.OverrideRawSet {
 		m.createDraft.applyOverrideFieldsFromYAML(value)
 		m.status, m.statusErr = "override YAML edited", false
+		// applyOverrideFieldsFromYAML leaves the Service field alone when
+		// the content doesn't unambiguously name one to sync from (e.g. a
+		// pasted multi-service block) — surface that mismatch now, at
+		// save time, instead of only failing at confirm with a bare
+		// "no such service" from the compose CLI (see Validate).
+		if err := m.createDraft.Validate(); err != nil {
+			m.status, m.statusErr = "override saved, but "+err.Error(), true
+		}
 	} else {
 		m.status, m.statusErr = "override YAML reset to generated", false
 	}
@@ -969,6 +977,30 @@ func (d createDraft) Validate() error {
 		}
 		if strings.TrimSpace(d.ComposeFile) == "" {
 			return errors.New("compose file is required")
+		}
+		// Hand-edited or loaded override content (OverrideRawSet) isn't
+		// generated from the Service field the way composeOverrideContent
+		// is, so the two can drift apart — most commonly, pasting a
+		// multi-service YAML block whose services don't include one
+		// matching the current Service field leaves that field
+		// untouched (applyOverrideFieldsFromYAML won't guess which one
+		// was meant) with no indication anything's now mismatched. Left
+		// unguarded, ComposeSpec would go on to write that content and
+		// run `docker compose up -d <Service>` against it, surfacing as
+		// a bare "no such service: <name>" from the compose CLI instead
+		// of a clear, actionable message here before it ever runs.
+		if d.OverrideRawSet {
+			var doc composeOverrideDoc
+			if err := yaml.Unmarshal([]byte(d.OverrideRaw), &doc); err == nil && len(doc.Services) > 0 {
+				if _, ok := doc.Services[strings.TrimSpace(d.Service)]; !ok {
+					names := make([]string, 0, len(doc.Services))
+					for name := range doc.Services {
+						names = append(names, name)
+					}
+					sort.Strings(names)
+					return fmt.Errorf("override content has no service named %q (found: %s) — set Service to match, or edit the override", d.Service, strings.Join(names, ", "))
+				}
+			}
 		}
 		return nil
 	}

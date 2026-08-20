@@ -1682,6 +1682,61 @@ func TestApplyOverrideFieldsFromYAMLLeavesDraftUnchangedWhenServiceNameIsAmbiguo
 	}
 }
 
+// TestValidateCatchesServiceNotDefinedInOverrideContent guards against a
+// regression where a draft could confirm and reach `docker compose up`
+// with a Service name that the override content it was about to write
+// doesn't actually define — the common trigger being
+// applyOverrideFieldsFromYAML leaving Service unchanged for an ambiguous
+// multi-service paste (see the test above). Before this check, that
+// surfaced as a bare, confusing "no such service: <name>" from the
+// compose CLI instead of a clear, actionable message in-app.
+func TestValidateCatchesServiceNotDefinedInOverrideContent(t *testing.T) {
+	d := createDraft{
+		Mode:           createModeCompose,
+		Project:        "default",
+		Service:        "new-service",
+		Image:          "image:tag",
+		ComposeFile:    "compose.yml",
+		OverrideRaw:    "services:\n  web:\n    image: nginx:alpine\n  api:\n    image: httpd\n",
+		OverrideRawSet: true,
+	}
+	err := d.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want an error — new-service isn't defined in the override content")
+	}
+	if !strings.Contains(err.Error(), "new-service") || !strings.Contains(err.Error(), "web") {
+		t.Fatalf("error = %q, want it to name the missing service and what's actually defined", err.Error())
+	}
+
+	d.Service = "web"
+	if err := d.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil once Service matches a service the override actually defines", err)
+	}
+}
+
+// TestSaveCreateEditorWarnsWhenServiceMismatchesOverride checks the same
+// mismatch is surfaced immediately at save time (ctrl+s in the raw
+// editor), not only much later at confirm.
+func TestSaveCreateEditorWarnsWhenServiceMismatchesOverride(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "new-service"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(Model)
+	model.createEditor.SetValue("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: httpd\n")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	model = updated.(Model)
+
+	if !model.statusErr {
+		t.Fatalf("statusErr = false after saving override content that doesn't define Service %q, want true", model.createDraft.Service)
+	}
+	if !strings.Contains(model.status, "new-service") {
+		t.Fatalf("status = %q, want it to name the mismatched service", model.status)
+	}
+}
+
 func TestOpenCreateOverlayLoadedOverrideSyncsFormFields(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "compose.yml")
