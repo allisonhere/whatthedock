@@ -38,18 +38,19 @@ all happen on the remote host, over the same `ssh` connection convention
 used for the Docker socket tunnel (see the system's SSH host/port/user in
 Settings → Systems) — nothing needs to exist locally.
 
-Opening create (`n`) for an already-selected, already-managed service
-checks whether it already has a WhatTheDock-generated
-`compose.whatthedock.<service>.yml` — locally this is checked immediately;
-for an SSH system it's one `ssh` round trip after the form opens. If found,
-that file's content is loaded as the draft's override (shown as `Override
-YAML  existing file loaded`) instead of silently offering to regenerate —
-and overwrite — it, and the structured fields (`Image`, `Ports`, `Mounts`,
-`Env`, `Restart`, `Command`) update to match what the loaded YAML actually
-contains. Hand-editing and saving via `Ctrl+Y` switches the label to
-`hand-edited` and syncs the fields the same way, from whatever you just
-saved. If the override defines more than one service and none matches the
-draft's `Service` field, the fields are left as-is rather than guessing.
+Editing (`m`) an already-selected, already-managed service checks whether it
+already has a WhatTheDock-generated `compose.whatthedock.<service>.yml` —
+locally this is checked immediately; for an SSH system it's one `ssh` round
+trip after the form opens. If found, that file's content is loaded as the
+draft's override (shown as `Override YAML  existing file loaded`) instead of
+silently offering to regenerate — and overwrite — it. If no override exists,
+WhatTheDock loads the selected service's base compose file instead. Either
+way, the structured fields (`Image`, `Ports`, `Mounts`, `Env`, `Restart`,
+`Command`) update to match the YAML that was loaded. Hand-editing and saving
+via `Ctrl+Y` switches the label to `hand-edited` and syncs the fields the
+same way, from whatever you just saved. If the loaded YAML defines more than
+one service and none matches the draft's `Service` field, the fields are left
+as-is rather than guessing.
 
 1. Press `n`.
 2. Make sure the `Compose service` tab is active (`[`/`]` to switch).
@@ -279,35 +280,43 @@ the existing container, then recreate it with an identical spec (same name,
 ports, mounts, env, restart policy, command). Confirm with `y`, cancel with
 `n`/`Esc`.
 
-The status bar reflects what's happening while Delete/Replicate/Create run,
-instead of going quiet until they finish. Standalone Replicate shows live
-per-layer pull progress (status and percentage) since it talks to the Docker
-API directly; Compose Delete/Replicate/Create show a spinner with a single
-phase label for the whole operation, since `docker compose` is shelled out
-to and doesn't expose structured progress the way the Docker API does.
+Create and Edit show progress inside the confirmation overlay after you press
+`y`, replacing the confirm/cancel hints with the current phase plus a smooth
+0–100% bar. The bar is deliberately cosmetic and takes about three seconds
+even when the real action finishes in half a second, so success never flashes
+past unreadably; failures still return immediately. The status bar stays out
+of that same operation while the overlay is open, and still reflects
+Delete/Replicate while they run. Standalone Docker API pulls show live
+per-layer pull progress (status and percentage); Compose Create/Edit show
+phase labels around validate/write/pull/up, since `docker compose` is shelled
+out to and doesn't expose structured progress the way the Docker API does.
 
 **Clone (`C`)** — duplicates the selected container/service under a *new*
 name. Opens the create overlay prefilled with the original's image, ports,
 mounts, env, restart policy, and command, with the identity field
 (`Service` or `Name`) suffixed `-clone` so you rename it before confirming.
-Unlike opening create for an already-managed service, Clone never loads an
-existing override — the original is left completely untouched, and
+Unlike editing an already-managed service, Clone never loads an existing
+override or base compose file — the original is left completely untouched, and
 confirming produces an independent second container/service.
 
 **Edit (`m`)** — opens the create overlay prefilled from the selected
 container/service under its *own* identity (not renamed), so confirming
 replaces it in place instead of creating something new. For a Compose
-service this is exactly what opening create (`n`) for an already-managed
-service already does — loads the existing override, lets you change any
-field, and re-applies via `docker compose up -d <service>` on confirm. For a
+service, Edit loads the existing override when one exists; otherwise it loads
+the selected service from the base compose file so the modify form reflects
+the Compose definition before you change it. It then re-applies via
+`docker compose up -d <service>` on confirm. Single-service Create/Edit forms
+also show `Image action`: `keep` leaves the local image cache alone, while
+`pull latest` runs `docker compose pull <service>` before `up -d`. For a
 standalone container, Edit prefills the full current shape (image, ports,
 mounts, env, restart policy, command) the same way Clone does, but confirming
 stops and removes the *existing* container and recreates it under the same
-name with your changes, instead of creating an independent second one.
+name with your changes, instead of creating an independent second one. Its
+`pull latest` action pulls the image before removing the existing container;
+if the pull fails, the existing container is left alone.
 `n` (Create) is deliberately left alone by this — it always defaults to a
-fresh draft (or, for an already-managed Compose service, its own
-load-existing-override behavior) and never silently overwrites a selected
-standalone container the way Edit intentionally does.
+fresh draft and never silently overwrites a selected container the way Edit
+intentionally does.
 
 ## Current Limits
 

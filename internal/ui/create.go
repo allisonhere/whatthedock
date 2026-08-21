@@ -38,6 +38,7 @@ const (
 	createFieldService
 	createFieldContainerName
 	createFieldImage
+	createFieldImageAction
 	createFieldCommand
 	createFieldPorts
 	createFieldMounts
@@ -62,6 +63,7 @@ type createDraft struct {
 	Service       string
 	ContainerName string
 	Image         string
+	ImageAction   string
 	Command       string
 	Ports         string
 	Mounts        string
@@ -100,8 +102,15 @@ type composeCreateSpec struct {
 	OverrideFile string
 	Content      string
 	FullBase     bool
+	PullBeforeUp bool
+	Progress     func(string)
 	System       config.System
 }
+
+const (
+	imageActionKeep = "keep"
+	imageActionPull = "pull latest"
+)
 
 type createFileEntry struct {
 	Name     string
@@ -364,6 +373,7 @@ func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
 	m.createField = m.visibleCreateFields()[0]
 	m.createCursor = len([]rune(m.createFieldValue()))
 	m.createEditingCompose = false
+	m.clearCreateNotice()
 	m.status, m.statusErr = "create draft ready", false
 }
 
@@ -433,6 +443,7 @@ func (m Model) defaultCreateDraft() createDraft {
 		Service:       "new-service",
 		ContainerName: "new-container",
 		Image:         "image:tag",
+		ImageAction:   imageActionKeep,
 		Restart:       "unless-stopped",
 		ComposeFile:   "compose.yml",
 	}
@@ -577,6 +588,9 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreateFileBrowserKey(msg)
 	}
 	if m.createDraft.Confirming {
+		if m.busy {
+			return m, nil
+		}
 		switch msg.String() {
 		case "esc", "n", "q":
 			m.createDraft.Confirming = false
@@ -590,20 +604,28 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.busy = true
+				m.actionProgressPercent = 0
+				m.createDoneReady = false
+				m.createDoneResult = createDoneMsg{}
+				progress := make(chan string, 16)
+				m.actionProgress = progress
 				if m.createDraft.IsStack() {
 					// No adopt/merge distinction for a stack — the whole
 					// file gets written either way (see
 					// defaultApplyComposeStack), whether or not
 					// spec.BaseFile already existed.
+					m.actionProgressText = "validating stack " + spec.Project + "…"
 					m.status, m.statusErr = "deploying stack "+spec.Project, false
-					return m, m.stackComposeCmd(spec)
+					return m, m.stackComposeCmd(spec, progress)
 				}
 				if m.createDraft.BaseFileMissing {
+					m.actionProgressText = "validating " + spec.Service + "…"
 					m.status, m.statusErr = "creating compose file for "+spec.Service, false
-					return m, m.adoptComposeCmd(spec)
+					return m, m.adoptComposeCmd(spec, progress)
 				}
+				m.actionProgressText = "validating " + spec.Service + "…"
 				m.status, m.statusErr = "applying compose service "+spec.Service, false
-				return m, m.createComposeCmd(spec)
+				return m, m.createComposeCmd(spec, progress)
 			}
 			spec, err := m.createDraft.ContainerSpec()
 			if err != nil {
@@ -612,12 +634,27 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.busy = true
+			m.actionProgressPercent = 0
+			m.createDoneReady = false
+			m.createDoneResult = createDoneMsg{}
+			progress := make(chan string, 16)
+			m.actionProgress = progress
 			if m.createDraft.Editing {
+				if m.createDraft.pullImageBeforeApply() {
+					m.actionProgressText = "pulling " + spec.Image + "…"
+				} else {
+					m.actionProgressText = "recreating " + spec.Name + "…"
+				}
 				m.status, m.statusErr = "updating "+spec.Name, false
-				return m, m.editContainerCmd(m.createDraft.EditingID, spec)
+				return m, m.editContainerCmd(m.createDraft.EditingID, spec, m.createDraft.pullImageBeforeApply(), progress)
+			}
+			if m.createDraft.pullImageBeforeApply() {
+				m.actionProgressText = "pulling " + spec.Image + "…"
+			} else {
+				m.actionProgressText = "creating " + spec.Name + "…"
 			}
 			m.status, m.statusErr = "creating "+spec.Name, false
-			return m, m.createContainerCmd(spec)
+			return m, m.createContainerCmd(spec, m.createDraft.pullImageBeforeApply(), progress)
 		}
 		return m, nil
 	}
@@ -797,6 +834,7 @@ func (m Model) handleCreateCatalogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		if err := m.saveCurrentDraftToCatalog(); err != nil {
 			m.createCatalogErr = err.Error()
+			m.setCreateNotice("catalog save: "+err.Error(), true)
 			return m, nil
 		}
 		m.createCatalogErr = ""
@@ -989,7 +1027,7 @@ func (m *Model) saveCurrentDraftToCatalog() error {
 			break
 		}
 	}
-	m.status, m.statusErr = "saved catalog entry "+entry.Name, false
+	m.setCreateNotice("saved catalog entry "+entry.Name, false)
 	return nil
 }
 
@@ -1000,36 +1038,55 @@ func defaultCatalogEntryName(d createDraft) string {
 	return emptyAs(d.Service, "Compose service")
 }
 
-func (m Model) createContainerCmd(spec app.ContainerCreateSpec) tea.Cmd {
+func (m Model) createContainerCmd(spec app.ContainerCreateSpec, pullFirst bool, progress chan string) tea.Cmd {
 	provider := m.provider
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+		if pullFirst {
+			onProgress := func(p app.PullProgress) {
+				sendActionProgress(progress, formatPullProgress(spec.Image, p))
+			}
+			if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
+				return createDoneMsg{name: spec.Name, err: err}
+			}
+		}
+		sendActionProgress(progress, "creating "+spec.Name+"…")
 		id, err := provider.CreateContainer(ctx, spec)
 		return createDoneMsg{name: spec.Name, id: id, err: err}
 	}
 }
 
 // editContainerCmd replaces id in place with a fresh container built from
-// spec — remove the current one, then create the edited one under the same
-// name. Mirrors startReplicate's standalone remove+create path (model.go),
-// minus the image pull: editing changes fields the user just typed, not
-// the image tag, so there's nothing to pull.
-func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSpec) tea.Cmd {
+// spec — optionally pull the image first, then remove the current one and
+// create the edited one under the same name. Pulling before remove avoids
+// deleting a working container when the registry request fails.
+func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) tea.Cmd {
 	provider := m.provider
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+		if pullFirst {
+			onProgress := func(p app.PullProgress) {
+				sendActionProgress(progress, formatPullProgress(spec.Image, p))
+			}
+			if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
+				return createDoneMsg{name: spec.Name, edited: true, err: err}
+			}
+		}
+		sendActionProgress(progress, "removing "+spec.Name+"…")
 		if err := provider.RemoveContainer(ctx, id, true); err != nil {
 			return createDoneMsg{name: spec.Name, edited: true, err: err}
 		}
+		sendActionProgress(progress, "creating "+spec.Name+"…")
 		newID, err := provider.CreateContainer(ctx, spec)
 		return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
 	}
 }
 
-func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
+func (m Model) createComposeCmd(spec composeCreateSpec, progress chan string) tea.Cmd {
 	apply := applyComposeCreate
+	spec.Progress = func(line string) { sendActionProgress(progress, line) }
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -1044,8 +1101,9 @@ func (m Model) createComposeCmd(spec composeCreateSpec) tea.Cmd {
 // createDoneMsg handler's tree-selection logic (pendingSelectProject)
 // knows to land on the project row rather than hunt for a container that
 // isn't any more "the" result than its siblings.
-func (m Model) stackComposeCmd(spec composeCreateSpec) tea.Cmd {
+func (m Model) stackComposeCmd(spec composeCreateSpec, progress chan string) tea.Cmd {
 	apply := applyComposeStack
+	spec.Progress = func(line string) { sendActionProgress(progress, line) }
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -1057,8 +1115,9 @@ func (m Model) stackComposeCmd(spec composeCreateSpec) tea.Cmd {
 // adoptComposeCmd is createComposeCmd's counterpart for a draft whose base
 // compose file doesn't exist yet (createDraft.BaseFileMissing) — see
 // applyComposeAdopt.
-func (m Model) adoptComposeCmd(spec composeCreateSpec) tea.Cmd {
+func (m Model) adoptComposeCmd(spec composeCreateSpec, progress chan string) tea.Cmd {
 	apply := applyComposeAdopt
+	spec.Progress = func(line string) { sendActionProgress(progress, line) }
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -1183,17 +1242,17 @@ func (m *Model) saveCreateEditor() {
 	m.createEditingCompose = false
 	if m.createDraft.OverrideRawSet {
 		m.createDraft.applyOverrideFieldsFromYAML(value)
-		m.status, m.statusErr = "override YAML edited", false
+		m.setCreateNotice("override YAML edited", false)
 		// applyOverrideFieldsFromYAML leaves the Service field alone when
 		// the content doesn't unambiguously name one to sync from (e.g. a
 		// pasted multi-service block) — surface that mismatch now, at
 		// save time, instead of only failing at confirm with a bare
 		// "no such service" from the compose CLI (see Validate).
 		if err := m.createDraft.Validate(); err != nil {
-			m.status, m.statusErr = "override saved, but "+err.Error(), true
+			m.setCreateNotice("override saved, but "+err.Error(), true)
 		}
 	} else {
-		m.status, m.statusErr = "override YAML reset to generated", false
+		m.setCreateNotice("override YAML reset to generated", false)
 	}
 	// Saving can change whether this draft is a stack (createDraft.
 	// IsStack), which changes visibleCreateFields() in both directions —
@@ -1417,11 +1476,21 @@ func (m Model) activeSystemConfig() config.System {
 
 func (m *Model) validateCreateDraft() bool {
 	if err := m.createDraft.Validate(); err != nil {
-		m.status, m.statusErr = "create: "+err.Error(), true
+		m.setCreateNotice("create: "+err.Error(), true)
 		return false
 	}
-	m.status, m.statusErr = "create draft validated", false
+	m.setCreateNotice("create draft validated", false)
 	return true
+}
+
+func (m *Model) setCreateNotice(message string, err bool) {
+	m.createNotice = message
+	m.createNoticeErr = err
+}
+
+func (m *Model) clearCreateNotice() {
+	m.createNotice = ""
+	m.createNoticeErr = false
 }
 
 // lintComposeYAML reports a syntax error in content, or nil if it parses as
@@ -1572,8 +1641,13 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		OverrideFile: override,
 		Content:      content,
 		FullBase:     d.OverrideRawBase,
+		PullBeforeUp: d.pullImageBeforeApply(),
 		System:       system,
 	}, nil
+}
+
+func (d createDraft) pullImageBeforeApply() bool {
+	return !d.IsStack() && strings.TrimSpace(d.ImageAction) == imageActionPull
 }
 
 func (d createDraft) composeOverrideContent() string {
@@ -1844,6 +1918,7 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if spec.System.Kind == "ssh" {
 		return applyComposeCreateRemote(ctx, spec)
 	}
+	composeProgress(spec, "validating "+spec.Service+"…")
 	baseContent, err := os.ReadFile(spec.BaseFile)
 	if err != nil {
 		return friendlyComposeBaseFileError(err, spec)
@@ -1854,6 +1929,7 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if err := os.MkdirAll(filepath.Dir(spec.OverrideFile), 0o755); err != nil {
 		return err
 	}
+	composeProgress(spec, "writing compose override for "+spec.Service+"…")
 	tempSpec := spec
 	tempSpec.OverrideFile = spec.OverrideFile + ".tmp"
 	if err := os.WriteFile(tempSpec.OverrideFile, []byte(spec.Content), 0o644); err != nil {
@@ -1867,7 +1943,7 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 		_ = os.Remove(tempSpec.OverrideFile)
 		return err
 	}
-	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+	return composeUpService(ctx, spec)
 }
 
 // defaultApplyComposeAdopt is defaultApplyComposeCreate's counterpart for a
@@ -1888,6 +1964,7 @@ func defaultApplyComposeAdopt(ctx context.Context, spec composeCreateSpec) error
 	if spec.System.Kind == "ssh" {
 		return applyComposeAdoptRemote(ctx, spec)
 	}
+	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	if err := os.MkdirAll(filepath.Dir(spec.BaseFile), 0o755); err != nil {
 		return err
 	}
@@ -1897,6 +1974,7 @@ func defaultApplyComposeAdopt(ctx context.Context, spec composeCreateSpec) error
 	if err := os.WriteFile(tempSpec.BaseFile, []byte(spec.Content), 0o644); err != nil {
 		return err
 	}
+	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_ = os.Remove(tempSpec.BaseFile)
 		return err
@@ -1907,7 +1985,7 @@ func defaultApplyComposeAdopt(ctx context.Context, spec composeCreateSpec) error
 	}
 	finalSpec := spec
 	finalSpec.OverrideFile = ""
-	return composeCommand(ctx, finalSpec, "up", "-d", spec.Service)
+	return composeUpService(ctx, finalSpec)
 }
 
 // applyComposeAdoptRemote is defaultApplyComposeAdopt's SSH counterpart,
@@ -1915,6 +1993,7 @@ func defaultApplyComposeAdopt(ctx context.Context, spec composeCreateSpec) error
 // promote) but writing spec.Content fresh instead of a merge result, and
 // with no pre-existing base file to have read in the first place.
 func applyComposeAdoptRemote(ctx context.Context, spec composeCreateSpec) error {
+	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.BaseFile)), ""); err != nil {
 		return err
 	}
@@ -1926,6 +2005,7 @@ func applyComposeAdoptRemote(ctx context.Context, spec composeCreateSpec) error 
 	}
 	tempSpec := finalSpec
 	tempSpec.BaseFile = tempBase
+	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
@@ -1934,7 +2014,7 @@ func applyComposeAdoptRemote(ctx context.Context, spec composeCreateSpec) error 
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
-	return composeCommand(ctx, finalSpec, "up", "-d", spec.Service)
+	return composeUpService(ctx, finalSpec)
 }
 
 // defaultApplyComposeStack writes spec.Content as the entire base compose
@@ -1958,6 +2038,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 	if spec.System.Kind == "ssh" {
 		return applyComposeStackRemote(ctx, spec)
 	}
+	composeProgress(spec, "writing stack "+spec.Project+"…")
 	if err := os.MkdirAll(filepath.Dir(spec.BaseFile), 0o755); err != nil {
 		return err
 	}
@@ -1967,6 +2048,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 	if err := os.WriteFile(tempSpec.BaseFile, []byte(spec.Content), 0o644); err != nil {
 		return err
 	}
+	composeProgress(spec, "validating stack "+spec.Project+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_ = os.Remove(tempSpec.BaseFile)
 		return err
@@ -1977,6 +2059,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 	}
 	finalSpec := spec
 	finalSpec.OverrideFile = ""
+	composeProgress(spec, "starting stack "+spec.Project+"…")
 	return composeCommand(ctx, finalSpec, "up", "-d")
 }
 
@@ -1984,6 +2067,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 // mirroring applyComposeAdoptRemote's shape exactly minus the trailing
 // service argument on the final up.
 func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error {
+	composeProgress(spec, "writing stack "+spec.Project+"…")
 	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.BaseFile)), ""); err != nil {
 		return err
 	}
@@ -1995,6 +2079,7 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 	}
 	tempSpec := finalSpec
 	tempSpec.BaseFile = tempBase
+	composeProgress(spec, "validating stack "+spec.Project+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
@@ -2003,6 +2088,7 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
+	composeProgress(spec, "starting stack "+spec.Project+"…")
 	return composeCommand(ctx, finalSpec, "up", "-d")
 }
 
@@ -2018,12 +2104,14 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
 		baseOnly := spec
 		baseOnly.OverrideFile = ""
+		composeProgress(spec, "writing compose file for "+spec.Service+"…")
 		tempBase := spec.BaseFile + ".tmp"
 		if err := os.WriteFile(tempBase, []byte(spec.Content), 0o644); err != nil {
 			return err
 		}
 		tempSpec := baseOnly
 		tempSpec.BaseFile = tempBase
+		composeProgress(spec, "validating "+spec.Service+"…")
 		if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 			_ = os.Remove(tempBase)
 			return err
@@ -2035,7 +2123,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 		if strings.TrimSpace(spec.OverrideFile) != "" {
 			_ = os.Remove(spec.OverrideFile)
 		}
-		return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+		return composeUpService(ctx, baseOnly)
 	}
 	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
 	if !ok {
@@ -2047,12 +2135,14 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	}
 	baseOnly := spec
 	baseOnly.OverrideFile = ""
+	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	tempBase := spec.BaseFile + ".tmp"
 	if err := os.WriteFile(tempBase, merged, 0o644); err != nil {
 		return err
 	}
 	tempSpec := baseOnly
 	tempSpec.BaseFile = tempBase
+	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_ = os.Remove(tempBase)
 		return err
@@ -2064,7 +2154,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	if strings.TrimSpace(spec.OverrideFile) != "" {
 		_ = os.Remove(spec.OverrideFile)
 	}
-	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	return composeUpService(ctx, baseOnly)
 }
 
 // applyComposeCreateRemote is defaultApplyComposeCreate's SSH-system
@@ -2073,6 +2163,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 // validating a temp override before promoting it, exactly like the local
 // path — just with `test`/`mkdir`/`cat >`/`mv` in place of the os package.
 func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error {
+	composeProgress(spec, "validating "+spec.Service+"…")
 	if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
 		return fmt.Errorf("compose file %s not found on %s (deployed via Portainer or another tool that manages it elsewhere?): %w", spec.BaseFile, spec.System.Name, err)
 	}
@@ -2086,6 +2177,7 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.OverrideFile)), ""); err != nil {
 		return err
 	}
+	composeProgress(spec, "writing compose override for "+spec.Service+"…")
 	tempSpec := spec
 	tempSpec.OverrideFile = spec.OverrideFile + ".tmp"
 	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempSpec.OverrideFile), spec.Content); err != nil {
@@ -2099,7 +2191,7 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
 		return err
 	}
-	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+	return composeUpService(ctx, spec)
 }
 
 // mergeComposeCreateIntoBaseRemote is mergeComposeCreateIntoBase's SSH
@@ -2109,12 +2201,14 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
 		baseOnly := spec
 		baseOnly.OverrideFile = ""
+		composeProgress(spec, "writing compose file for "+spec.Service+"…")
 		tempBase := spec.BaseFile + ".tmp"
 		if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
 			return err
 		}
 		tempSpec := baseOnly
 		tempSpec.BaseFile = tempBase
+		composeProgress(spec, "validating "+spec.Service+"…")
 		if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 			return err
@@ -2126,7 +2220,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 		if strings.TrimSpace(spec.OverrideFile) != "" {
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), "")
 		}
-		return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+		return composeUpService(ctx, baseOnly)
 	}
 	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
 	if !ok {
@@ -2138,12 +2232,14 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	}
 	baseOnly := spec
 	baseOnly.OverrideFile = ""
+	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	tempBase := spec.BaseFile + ".tmp"
 	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), string(merged)); err != nil {
 		return err
 	}
 	tempSpec := baseOnly
 	tempSpec.BaseFile = tempBase
+	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
@@ -2155,7 +2251,24 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	if strings.TrimSpace(spec.OverrideFile) != "" {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), "")
 	}
-	return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	return composeUpService(ctx, baseOnly)
+}
+
+func composeUpService(ctx context.Context, spec composeCreateSpec) error {
+	if spec.PullBeforeUp {
+		composeProgress(spec, "pulling "+spec.Service+"…")
+		if err := composeCommand(ctx, spec, "pull", spec.Service); err != nil {
+			return err
+		}
+	}
+	composeProgress(spec, "starting "+spec.Service+"…")
+	return composeCommand(ctx, spec, "up", "-d", spec.Service)
+}
+
+func composeProgress(spec composeCreateSpec, line string) {
+	if spec.Progress != nil {
+		spec.Progress(line)
+	}
 }
 
 // composeSpecForSelected builds a composeCreateSpec targeting selected's
@@ -2490,18 +2603,22 @@ func (m *Model) moveCreateField(delta int) {
 // modes directly from any field (see cycleCreateMode).
 func (m Model) visibleCreateFields() []createField {
 	if m.createDraft.Mode == createModeStandalone {
-		return []createField{createFieldMode, createFieldContainerName, createFieldImage, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart}
+		fields := []createField{createFieldMode, createFieldContainerName, createFieldImage}
+		fields = append(fields, createFieldImageAction)
+		return append(fields, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart)
 	}
 	if m.createDraft.IsStack() {
 		// No single Service/Image/Ports/etc. to edit — the pasted/loaded
 		// document itself is the content (see createDraft.IsStack, Preview).
 		return []createField{createFieldMode, createFieldProject, createFieldComposeFile}
 	}
-	return []createField{createFieldMode, createFieldProject, createFieldService, createFieldImage, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart, createFieldComposeFile}
+	fields := []createField{createFieldMode, createFieldProject, createFieldService, createFieldImage}
+	fields = append(fields, createFieldImageAction)
+	return append(fields, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart, createFieldComposeFile)
 }
 
 func (m Model) isCreateChoiceField() bool {
-	return m.createField == createFieldMode || m.createField == createFieldRestart
+	return m.createField == createFieldMode || m.createField == createFieldRestart || m.createField == createFieldImageAction
 }
 
 func (m *Model) cycleCreateChoice(direction int) {
@@ -2522,7 +2639,18 @@ func (m *Model) cycleCreateChoice(direction int) {
 			}
 		}
 		m.createDraft.Restart = options[modIndex(current+direction, len(options))]
+	case createFieldImageAction:
+		options := []string{imageActionKeep, imageActionPull}
+		current := 0
+		for i, option := range options {
+			if m.createDraft.ImageAction == option {
+				current = i
+				break
+			}
+		}
+		m.createDraft.ImageAction = options[modIndex(current+direction, len(options))]
 	}
+	m.clearCreateNotice()
 	m.createCursor = len([]rune(m.createFieldValue()))
 }
 
@@ -2540,6 +2668,7 @@ func (m *Model) cycleCreateMode() {
 	} else {
 		m.createDraft.Mode = createModeCompose
 	}
+	m.clearCreateNotice()
 	m.revalidateCreateField()
 }
 
@@ -2580,6 +2709,7 @@ func (m *Model) editCreateFieldBackspace() {
 	}
 	runes = append(runes[:m.createCursor-1], runes[m.createCursor:]...)
 	m.createCursor--
+	m.clearCreateNotice()
 	m.setCreateFieldValue(string(runes))
 }
 
@@ -2593,6 +2723,7 @@ func (m *Model) editCreateFieldDelete() {
 		return
 	}
 	runes = append(runes[:m.createCursor], runes[m.createCursor+1:]...)
+	m.clearCreateNotice()
 	m.setCreateFieldValue(string(runes))
 }
 
@@ -2607,6 +2738,7 @@ func (m *Model) editCreateFieldString(value string) {
 	updated = append(updated, insert...)
 	updated = append(updated, runes[m.createCursor:]...)
 	m.createCursor += len(insert)
+	m.clearCreateNotice()
 	m.setCreateFieldValue(string(updated))
 }
 
@@ -2629,6 +2761,8 @@ func (m Model) createFieldValue() string {
 		return m.createDraft.ContainerName
 	case createFieldImage:
 		return m.createDraft.Image
+	case createFieldImageAction:
+		return emptyAs(m.createDraft.ImageAction, imageActionKeep)
 	case createFieldCommand:
 		return m.createDraft.Command
 	case createFieldPorts:
@@ -2665,6 +2799,8 @@ func (m *Model) setCreateFieldValue(value string) {
 		m.createDraft.ContainerName = value
 	case createFieldImage:
 		m.createDraft.Image = value
+	case createFieldImageAction:
+		m.createDraft.ImageAction = value
 	case createFieldCommand:
 		m.createDraft.Command = value
 	case createFieldPorts:
@@ -2717,6 +2853,8 @@ func createFieldLabel(field createField) string {
 		return "Name"
 	case createFieldImage:
 		return "Image"
+	case createFieldImageAction:
+		return "Image action"
 	case createFieldCommand:
 		return "Command"
 	case createFieldPorts:

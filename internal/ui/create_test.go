@@ -20,6 +20,20 @@ import (
 	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
+func finishCreateDoneForTest(t *testing.T, model Model, msg createDoneMsg) (Model, tea.Cmd) {
+	t.Helper()
+	updated, cmd := model.Update(msg)
+	model = updated.(Model)
+	for i := 0; model.busy; i++ {
+		if i > 30 {
+			t.Fatalf("create progress did not finish after %d ticks: pct=%d ready=%v", i, model.actionProgressPercent, model.createDoneReady)
+		}
+		updated, cmd = model.Update(statusPulseTickMsg{})
+		model = updated.(Model)
+	}
+	return model, cmd
+}
+
 func TestCreateOverlayOpensFromShortcutAndRendersPreview(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.width, model.height = 120, 34
@@ -73,6 +87,7 @@ func TestCreateOverlayTextFieldsAcceptNavigationLetters(t *testing.T) {
 // that browsing/writing/applying all have SSH-aware paths.
 func TestCreateValidationAllowsRemoteComposeEditing(t *testing.T) {
 	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
 	model.systems = []config.System{{ID: "remote", Name: "remote", Kind: "ssh", SSHHost: "dock.example", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/whatthedock.sock"}}
 	model.activeSystem = "remote"
 	model.openCreateOverlay()
@@ -81,8 +96,14 @@ func TestCreateValidationAllowsRemoteComposeEditing(t *testing.T) {
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 
-	if model.statusErr || !strings.Contains(model.status, "validated") {
-		t.Fatalf("status/statusErr = %q/%v, want a successful validation", model.status, model.statusErr)
+	if model.createNoticeErr || !strings.Contains(model.createNotice, "validated") {
+		t.Fatalf("createNotice/createNoticeErr = %q/%v, want a successful validation notice", model.createNotice, model.createNoticeErr)
+	}
+	if strings.Contains(model.status, "validated") {
+		t.Fatalf("status = %q, want validation message kept local to the create overlay", model.status)
+	}
+	if !strings.Contains(ansi.Strip(model.View()), "create draft validated") {
+		t.Fatal("create overlay missing local validation notice")
 	}
 }
 
@@ -119,8 +140,7 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 		t.Fatal("busy = false right after dispatching create, want true")
 	}
 	msg := runCmd(t, cmd).(createDoneMsg)
-	updated, cmd = model.Update(msg)
-	model = updated.(Model)
+	model, cmd = finishCreateDoneForTest(t, model, msg)
 
 	if len(model.provider.(*fakeProvider).creates) != 1 {
 		t.Fatalf("creates = %d, want 1", len(model.provider.(*fakeProvider).creates))
@@ -133,6 +153,185 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("create completion returned nil cmd, want refresh")
+	}
+}
+
+func TestCreateConfirmOverlayRendersProgressWhileBusy(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+	model.actionProgressPercent = 40
+	model.actionProgressText = "pulling nginx:alpine — layer abc Downloading 42%"
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "pulling nginx:alpine") {
+		t.Fatalf("busy confirm overlay missing action progress:\n%s", view)
+	}
+	if !strings.Contains(view, "40%") || !strings.ContainsAny(view, "█░") {
+		t.Fatalf("busy confirm overlay missing smooth progress bar:\n%s", view)
+	}
+	if strings.Contains(view, "y create") || strings.Contains(view, "n/esc cancel") {
+		t.Fatalf("busy confirm overlay still shows pending confirm/cancel hints:\n%s", view)
+	}
+}
+
+func TestCreateDoneSuccessWaitsForProgressBarBeforeClosing(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+	model.actionProgressPercent = 40
+
+	updated, cmd := model.Update(createDoneMsg{name: "web"})
+	model = updated.(Model)
+	if !model.busy || model.overlay != overlayCreate || !model.createDoneReady {
+		t.Fatalf("create finalized early: busy=%v overlay=%v ready=%v", model.busy, model.overlay, model.createDoneReady)
+	}
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil while progress bar finishes", cmd)
+	}
+
+	for model.busy {
+		updated, cmd = model.Update(statusPulseTickMsg{})
+		model = updated.(Model)
+	}
+	if model.busy || model.overlay != overlayNone {
+		t.Fatalf("create did not finalize once progress reached 100: busy=%v overlay=%v", model.busy, model.overlay)
+	}
+	if !strings.Contains(model.status, "created web") {
+		t.Fatalf("status = %q, want created web", model.status)
+	}
+	if cmd == nil {
+		t.Fatal("cmd = nil, want refresh after delayed create completion")
+	}
+}
+
+func TestCreateDoneFailureDoesNotWaitForProgressBar(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+	model.actionProgressPercent = 40
+
+	updated, cmd := model.Update(createDoneMsg{name: "web", err: errors.New("port busy")})
+	model = updated.(Model)
+
+	if model.busy || model.createDraft.Confirming {
+		t.Fatalf("failure did not return to editable form immediately: busy=%v confirming=%v", model.busy, model.createDraft.Confirming)
+	}
+	if !model.statusErr || !strings.Contains(model.status, "port busy") {
+		t.Fatalf("status/statusErr = %q/%v, want immediate error", model.status, model.statusErr)
+	}
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil on create failure", cmd)
+	}
+}
+
+func TestCreateConfirmProgressDoesNotMirrorIntoStatusBar(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+	model.status = "Docker connected"
+	model.actionProgress = make(chan string, 1)
+	model.actionProgress <- "pulling nginx:alpine — layer abc Downloading 42%"
+
+	model.drainActionProgress()
+
+	if !strings.Contains(model.actionProgressText, "pulling nginx:alpine") {
+		t.Fatalf("actionProgressText = %q, want create overlay progress", model.actionProgressText)
+	}
+	if model.status != "Docker connected" {
+		t.Fatalf("status = %q, want create progress kept out of the global status bar", model.status)
+	}
+}
+
+func TestCreateConfirmOverlayRendersHintsWhenNotBusy(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "y create") || !strings.Contains(view, "n/esc cancel") {
+		t.Fatalf("non-busy confirm overlay missing confirm/cancel hints:\n%s", view)
+	}
+}
+
+func TestCreateConfirmIgnoresCancelWhileBusy(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Confirming = true
+	model.busy = true
+	model.actionProgressText = "creating radarr…"
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+
+	if cmd != nil {
+		t.Fatalf("cmd = %#v, want nil while busy confirm ignores keys", cmd)
+	}
+	if !model.createDraft.Confirming || model.overlay != overlayCreate || !model.busy {
+		t.Fatalf("state changed while busy: overlay=%v confirming=%v busy=%v", model.overlay, model.createDraft.Confirming, model.busy)
+	}
+}
+
+func TestCreateStandalonePullsImageWhenRequested(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.ContainerName = "web"
+	model.createDraft.Image = "nginx:alpine"
+	model.createDraft.ImageAction = imageActionPull
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err != nil {
+		t.Fatalf("createDoneMsg.err = %v, want nil", msg.err)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.pulled) != 1 || fp.pulled[0] != "nginx:alpine" {
+		t.Fatalf("pulled = %#v, want nginx:alpine pulled before create", fp.pulled)
+	}
+	if len(fp.creates) != 1 || fp.creates[0].Name != "web" {
+		t.Fatalf("creates = %#v, want web created after pull", fp.creates)
+	}
+	model.drainActionProgress()
+	if !strings.Contains(model.actionProgressText, "pulling nginx:alpine") {
+		t.Fatalf("actionProgressText = %q, want pull progress", model.actionProgressText)
+	}
+}
+
+func TestCreateStandalonePullFailureDoesNotCreate(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.provider.(*fakeProvider).pullErr = errors.New("pull failed")
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.ContainerName = "web"
+	model.createDraft.Image = "nginx:alpine"
+	model.createDraft.ImageAction = imageActionPull
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "pull failed") {
+		t.Fatalf("createDoneMsg.err = %v, want pull failed", msg.err)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.creates) != 0 {
+		t.Fatalf("creates = %#v, want no create after pull failure", fp.creates)
 	}
 }
 
@@ -175,6 +374,10 @@ func TestCreateFailureKeepsOverlayOpenAndPreservesDraft(t *testing.T) {
 	}
 	if !model.statusErr || !strings.Contains(model.status, "port is already allocated") {
 		t.Fatalf("status/statusErr = %q/%v, want the error surfaced", model.status, model.statusErr)
+	}
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "port is already allocated") {
+		t.Fatalf("create overlay missing failure near the draft:\n%s", view)
 	}
 	if model.busy {
 		t.Fatal("busy = true after createDoneMsg, want false")
@@ -283,6 +486,16 @@ func TestCreateCatalogSaveLoadRenameDeleteFlow(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name != "dash" {
 		t.Fatalf("entries = %#v, want saved dash entry", entries)
+	}
+	if model.createNoticeErr || !strings.Contains(model.createNotice, "saved catalog entry dash") {
+		t.Fatalf("createNotice/createNoticeErr = %q/%v, want local catalog save notice", model.createNotice, model.createNoticeErr)
+	}
+	view = ansi.Strip(model.View())
+	if !strings.Contains(view, "saved catalog entry dash") {
+		t.Fatalf("catalog overlay missing local save notice:\n%s", view)
+	}
+	if strings.Contains(model.status, "saved catalog entry") {
+		t.Fatalf("status = %q, want catalog save message kept local to overlay", model.status)
 	}
 	content, err := catalog.Read(dir, entries[0].ID)
 	if err != nil {
@@ -396,6 +609,36 @@ func TestCreateCatalogDoesNotOpenInStandaloneMode(t *testing.T) {
 
 	if model.createCatalogOpen {
 		t.Fatal("createCatalogOpen = true after ctrl+p in standalone mode, want false")
+	}
+}
+
+func TestImageActionAppearsForNonStackCreateDrafts(t *testing.T) {
+	composeModel := testModelWithSelectedContainer()
+	composeModel.openCreateOverlay()
+	if !containsCreateField(composeModel.visibleCreateFields(), createFieldImageAction) {
+		t.Fatal("fresh Compose service visible fields missing Image action")
+	}
+
+	standaloneModel := testModelWithSelectedContainer()
+	standaloneModel.openCreateOverlay()
+	standaloneModel.createDraft.Mode = createModeStandalone
+	if !containsCreateField(standaloneModel.visibleCreateFields(), createFieldImageAction) {
+		t.Fatal("fresh standalone visible fields missing Image action")
+	}
+
+	stackModel := testModelWithSelectedContainer()
+	stackModel.openCreateOverlay()
+	stackModel.createDraft.Mode = createModeCompose
+	stackModel.createDraft.OverrideRaw = "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	stackModel.createDraft.OverrideRawSet = true
+	if containsCreateField(stackModel.visibleCreateFields(), createFieldImageAction) {
+		t.Fatal("stack visible fields include Image action, want file-only stack fields")
+	}
+
+	standaloneModel.createField = createFieldImageAction
+	standaloneModel.cycleCreateChoice(1)
+	if standaloneModel.createDraft.ImageAction != imageActionPull {
+		t.Fatalf("ImageAction = %q, want %q after cycling", standaloneModel.createDraft.ImageAction, imageActionPull)
 	}
 }
 
@@ -649,8 +892,7 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 		t.Fatal("busy = false right after dispatching compose apply, want true")
 	}
 	msg := runCmd(t, cmd).(createDoneMsg)
-	updated, cmd = model.Update(msg)
-	model = updated.(Model)
+	model, cmd = finishCreateDoneForTest(t, model, msg)
 
 	if len(applied) != 1 {
 		t.Fatalf("applied = %d, want 1", len(applied))
@@ -723,8 +965,7 @@ func TestComposeCreateSelectsNewServiceInTree(t *testing.T) {
 	model = updated.(Model)
 	msg := runCmd(t, cmd).(createDoneMsg)
 
-	updated, cmd = model.Update(msg)
-	model = updated.(Model)
+	model, cmd = finishCreateDoneForTest(t, model, msg)
 	if cmd == nil {
 		t.Fatal("no refresh cmd returned")
 	}
@@ -825,8 +1066,7 @@ func TestStackCreateSelectsProjectRowInTree(t *testing.T) {
 		t.Fatalf("createDoneMsg.service = %q, want empty for a stack", msg.service)
 	}
 
-	updated, cmd = model.Update(msg)
-	model = updated.(Model)
+	model, cmd = finishCreateDoneForTest(t, model, msg)
 	if model.pendingSelectProject != "media" || model.pendingSelectService != "" {
 		t.Fatalf("pendingSelectProject/Service = %q/%q, want media/\"\"", model.pendingSelectProject, model.pendingSelectService)
 	}
@@ -1194,6 +1434,44 @@ func TestApplyComposeCreateValidatesTempBeforePromote(t *testing.T) {
 	}
 	if len(calls) != 2 || !strings.Contains(calls[0], ".tmp config") || !strings.Contains(calls[1], "up -d cache") || strings.Contains(calls[1], ".tmp") {
 		t.Fatalf("compose calls = %#v", calls)
+	}
+}
+
+func TestApplyComposeCreatePullsBeforeUpWhenRequested(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(base, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := composeCreateSpec{
+		Project:      "media",
+		Service:      "cache",
+		BaseFile:     base,
+		OverrideFile: filepath.Join(dir, "compose.whatthedock.cache.yml"),
+		Content:      "services:\n  cache:\n    image: redis:7\n",
+		PullBeforeUp: true,
+	}
+	var progress []string
+	spec.Progress = func(line string) { progress = append(progress, line) }
+
+	if err := defaultApplyComposeCreate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeCreate() error = %v", err)
+	}
+	if len(calls) != 3 || !strings.Contains(calls[0], ".tmp config") || !strings.Contains(calls[1], " pull cache") || !strings.Contains(calls[2], " up -d cache") {
+		t.Fatalf("compose calls = %#v, want config, pull, up", calls)
+	}
+	joinedProgress := strings.Join(progress, "\n")
+	for _, want := range []string{"validating cache", "writing compose override for cache", "pulling cache", "starting cache"} {
+		if !strings.Contains(joinedProgress, want) {
+			t.Fatalf("progress = %#v, missing %q", progress, want)
+		}
 	}
 }
 
@@ -2035,6 +2313,9 @@ func TestCreateEditorSaveSetsRawOverrideUsedByComposeSpec(t *testing.T) {
 	if !strings.Contains(model.createDraft.Preview(), "custom:tag") {
 		t.Fatalf("Preview() = %q, want it to reflect the hand-edited override", model.createDraft.Preview())
 	}
+	if model.createNoticeErr || !strings.Contains(model.createNotice, "override YAML edited") {
+		t.Fatalf("createNotice/createNoticeErr = %q/%v, want local editor save notice", model.createNotice, model.createNoticeErr)
+	}
 }
 
 func TestCreateEditorEscCancelsWithoutSettingOverride(t *testing.T) {
@@ -2351,8 +2632,8 @@ func TestSaveCreateEditorDerivesServiceFromMultiServicePaste(t *testing.T) {
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 
-	if model.statusErr {
-		t.Fatalf("statusErr = true, want false — Service should derive from the pasted content, not stay mismatched: %q", model.status)
+	if model.createNoticeErr {
+		t.Fatalf("createNoticeErr = true, want false — Service should derive from the pasted content, not stay mismatched: %q", model.createNotice)
 	}
 	if model.createDraft.Service != "web" || model.createDraft.Image != "nginx:alpine" {
 		t.Fatalf("Service/Image = %q/%q, want web/nginx:alpine (the first service in the pasted content)", model.createDraft.Service, model.createDraft.Image)

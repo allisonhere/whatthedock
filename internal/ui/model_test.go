@@ -3420,8 +3420,7 @@ func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
 		t.Fatal("createDoneMsg.edited = false, want true")
 	}
 
-	updated, _ = model.Update(msg)
-	model = updated.(Model)
+	model, _ = finishCreateDoneForTest(t, model, msg)
 	if !strings.Contains(model.status, "updated") {
 		t.Fatalf("status = %q, want it to say updated (not created)", model.status)
 	}
@@ -3432,6 +3431,55 @@ func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
 	}
 	if len(fp.creates) != 1 || fp.creates[0].Name != "grafana" || fp.creates[0].RestartPolicy != "unless-stopped" {
 		t.Fatalf("creates = %#v, want one create for grafana with the edited restart policy", fp.creates)
+	}
+}
+
+func TestConfirmEditStandalonePullsImageWhenRequested(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.ImageAction = imageActionPull
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err != nil {
+		t.Fatalf("createDoneMsg.err = %v, want nil", msg.err)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.pulled) != 1 || fp.pulled[0] != "grafana/grafana:latest" {
+		t.Fatalf("pulled = %#v, want edited image pulled first", fp.pulled)
+	}
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want old container removed after pull", fp.removed)
+	}
+	if len(fp.creates) != 1 || fp.creates[0].Name != "grafana" {
+		t.Fatalf("creates = %#v, want recreated grafana", fp.creates)
+	}
+}
+
+func TestConfirmEditStandaloneDoesNotRemoveWhenPullFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.provider.(*fakeProvider).pullErr = errors.New("pull failed")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.ImageAction = imageActionPull
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "pull failed") {
+		t.Fatalf("createDoneMsg.err = %v, want pull failed", msg.err)
+	}
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 0 || len(fp.creates) != 0 {
+		t.Fatalf("removed/creates = %#v/%#v, want no destructive edit after pull failure", fp.removed, fp.creates)
 	}
 }
 
@@ -3483,7 +3531,7 @@ func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) 
 	if done.err != nil {
 		t.Fatalf("actionDoneMsg.err = %v, want nil", done.err)
 	}
-	model.drainReplicateProgress()
+	model.drainActionProgress()
 	if !strings.Contains(model.status, "grafana/grafana:latest") {
 		t.Fatalf("status after draining progress = %q, want it to reflect the pull progress", model.status)
 	}
@@ -4216,10 +4264,17 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	model.overlay = overlayHelp
 
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"n              create container or Compose service", "e              open shell in selected container"} {
+	for _, want := range []string{
+		"n              create container or Compose service",
+		"Ctrl+P         compose catalog in create/edit",
+		"e              open shell in selected container",
+	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q:\n%s", want, view)
 		}
+	}
+	if !strings.Contains(helpText(), "Image action can pull latest before applying edits") {
+		t.Fatal("help text missing Image action line")
 	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})

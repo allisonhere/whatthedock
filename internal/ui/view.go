@@ -2571,8 +2571,8 @@ func (m Model) statusLeft(renderer tideui.Renderer) string {
 	if m.statusErr {
 		return renderer.Styles.StatusError.Render(prefix + m.status)
 	}
-	if m.busy {
-		// An in-flight action (delete/replicate/create-apply) is the most
+	if m.busy && !(m.overlay == overlayCreate && m.createDraft.Confirming) {
+		// An in-flight action without a local progress surface is the most
 		// relevant thing to show right after an outright error, since the
 		// user just triggered it and previously saw nothing at all here for
 		// up to two minutes.
@@ -2647,6 +2647,7 @@ var helpLines = []string{
 	"s              start/stop selected container",
 	"n              create container or Compose service",
 	"               paste a multi-service compose file to deploy a stack",
+	"Ctrl+P         compose catalog in create/edit",
 	"r              refresh",
 	"Alt+r          restart selected container",
 	"c              copy selected detail",
@@ -2666,6 +2667,7 @@ var helpLines = []string{
 	"C              clone under a new name",
 	"m              edit in place; on a project row, edits the whole stack",
 	"               on a multi-service container: prompts service vs. stack",
+	"               Image action can pull latest before applying edits",
 	"p              problems",
 	"a in problems  analyze the selected problem with AI",
 	"g              stats graphs",

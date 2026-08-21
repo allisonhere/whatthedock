@@ -65,7 +65,11 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		// line count is subtracted first since the confirmation prompt
 		// itself can wrap to more than one line (the "adopt" prompt).
 		promptRendered := renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt)
-		fixedRows := strings.Count(promptRendered, "\n") + 1 /* prompt */ + 1 /* blank above preview */ + 1 /* blank below preview */ + 1 /* hints */
+		progressRows := 1
+		if m.busy {
+			progressRows = 2
+		}
+		fixedRows := strings.Count(promptRendered, "\n") + 1 /* prompt */ + 1 /* blank above preview */ + 1 /* blank below preview */ + progressRows
 		previewBudget := max(3, m.softOverlayBodyBudget()-fixedRows)
 		previewLines := strings.Split(m.createDraft.Preview(), "\n")
 		previewText := m.createDraft.Preview()
@@ -74,13 +78,24 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			previewLines = append(previewLines[:previewBudget-1], fmt.Sprintf("… %d more lines — esc back, ctrl+y to review the full file", hidden))
 			previewText = strings.Join(previewLines, "\n")
 		}
+		actionRow := renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: confirmLabel},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		)
+		if m.busy {
+			progressText := strings.TrimSpace(m.actionProgressText)
+			if progressText == "" {
+				progressText = strings.TrimSpace(m.status)
+			}
+			if progressText == "" {
+				progressText = "working…"
+			}
+			actionRow = createActionProgressView(renderer, contentWidth, m.actionProgressPercent, progressText)
+		}
 		content := renderer.RenderSoftBody(width,
 			promptRendered+"\n\n"+
 				renderer.Styles.DetailBody.Width(contentWidth).Render(previewText)+"\n\n"+
-				renderer.RenderSoftHints(contentWidth,
-					tideui.SoftHint{Key: "y", Label: confirmLabel},
-					tideui.SoftHint{Key: "n/esc", Label: "cancel"},
-				))
+				actionRow)
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: title, Content: content, Width: width})
 		return &overlay
 	}
@@ -172,6 +187,8 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	validation := renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render("Draft looks good")
 	if err := m.createDraft.Validate(); err != nil {
 		validation = renderer.Styles.StatusError.Background(previewBG).Width(previewWidth).Render(short(err.Error(), previewWidth))
+	} else if m.statusErr && (strings.HasPrefix(m.status, "create ") || strings.HasPrefix(m.status, "update ")) {
+		validation = renderer.Styles.StatusError.Background(previewBG).Width(previewWidth).Render(short(m.status, previewWidth))
 	}
 	previewLines = append(previewLines, blankPreviewLine, validation)
 
@@ -220,8 +237,11 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			renderer.Styles.DetailMeta.Background(previewBG).Width(previewWidth).Render(fmt.Sprintf("▼ %d more — ctrl+y for the full file", hiddenPreview))
 		bodyRows = append(bodyRows, notice)
 	}
+	bodyRows = append(bodyRows, lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(""))
+	if notice := m.createNoticeView(renderer, contentWidth); notice != "" {
+		bodyRows = append(bodyRows, notice)
+	}
 	bodyRows = append(bodyRows,
-		lipgloss.NewStyle().Width(contentWidth).Background(panelBG).Render(""),
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "[/]", Label: "mode"},
 			tideui.SoftHint{Key: "tab", Label: "next"},
@@ -255,6 +275,9 @@ func confirmStepLabel(editing bool) string {
 func (m Model) createCatalogOverlay(renderer tideui.Renderer, width int, contentWidth int) *tideui.Overlay {
 	rows := []string{
 		renderer.Styles.DetailMeta.Width(contentWidth).Render("Catalog  " + short(m.catalogDir, max(12, contentWidth-10))),
+	}
+	if notice := m.createNoticeView(renderer, contentWidth); notice != "" {
+		rows = append(rows, notice)
 	}
 	if m.createCatalogFilter != "" {
 		rows = append(rows, renderer.Styles.DetailMeta.Width(contentWidth).Render("Filter   "+m.createCatalogFilter))
@@ -389,6 +412,7 @@ func (m Model) createEditorOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		"",
 		editorBody,
 		"",
+		m.createNoticeView(renderer, contentWidth),
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
 			tideui.SoftHint{Key: "esc", Label: "cancel"},
@@ -397,6 +421,27 @@ func (m Model) createEditorOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	content := renderer.RenderSoftBody(width, body)
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "edit override yaml", Content: content, Width: width})
 	return &overlay
+}
+
+func createActionProgressView(renderer tideui.Renderer, width int, pct int, text string) string {
+	width = max(12, width)
+	pct = clamp(pct, 0, 100)
+	label := fmt.Sprintf("%s  %d%%", strings.TrimSpace(text), pct)
+	return strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(width).Render(short(label, width)),
+		updateProgressBar(renderer, pct, width),
+	}, "\n")
+}
+
+func (m Model) createNoticeView(renderer tideui.Renderer, width int) string {
+	notice := strings.TrimSpace(m.createNotice)
+	if notice == "" {
+		return ""
+	}
+	if m.createNoticeErr {
+		return renderer.Styles.StatusError.Width(width).Render(short(notice, width))
+	}
+	return renderer.Styles.DetailMeta.Width(width).Render(short(notice, width))
 }
 
 // renderCreateModeTabs draws the Compose/standalone mode switch as a
@@ -503,5 +548,5 @@ func (m Model) createFieldValueForDisplay(field createField) string {
 }
 
 func (m Model) createChoiceField(field createField) bool {
-	return field == createFieldRestart
+	return field == createFieldRestart || field == createFieldImageAction
 }

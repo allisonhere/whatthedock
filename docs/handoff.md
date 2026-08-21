@@ -14,6 +14,16 @@ This branch adds a creation workflow to WhatTheDock:
   confirmation, against local or SSH systems.
 - Compose file selection has a TUI file browser, local or remote depending on
   the active system.
+- Single-service Create/Edit drafts show `Image action` (`keep` or
+  `pull latest`); stack drafts do not.
+- Create/Edit confirmation keeps the overlay open while work is running and
+  shows the current phase plus a smooth 0–100% progress bar near the confirmed
+  action, with no duplicate status-bar progress for the same operation. Fast
+  successful actions wait for the roughly three-second cosmetic bar to finish;
+  failures still return immediately.
+- `Ctrl+S` validation, catalog save, and override-YAML save feedback render as
+  create-local notices in the active create/catalog/editor overlay instead of
+  relying on the bottom status bar.
 - Opening create for an already-managed service detects and loads its
   existing override instead of regenerating it, and the form's fields sync to
   match whatever override content ends up loaded or hand-edited.
@@ -21,9 +31,15 @@ This branch adds a creation workflow to WhatTheDock:
   real-time lint feedback, syntax highlighting, and an optional persistent
   vim mode.
 
-Untracked local files at handoff:
+Local working tree at handoff:
 
-- `.claude/`
+- Branch `main`, ahead of `origin/main` by 2 commits.
+- Modified files are the current task surface:
+  `README.md`, `docs/creation.md`, `docs/handoff.md`,
+  `internal/ui/create.go`, `internal/ui/create_test.go`,
+  `internal/ui/create_view.go`, `internal/ui/model.go`,
+  `internal/ui/model_test.go`, and `internal/ui/view.go`.
+  No untracked files were present in the latest `git status --short --branch`.
 
 ## Main Code Paths
 
@@ -43,6 +59,9 @@ Untracked local files at handoff:
 - `internal/ui/model.go`
   - Owns general app state, top-level `Update` message routing, and settings
     (including the persistent vim-mode toggle for the override editor).
+    Create/Edit/Replicate progress now uses generalized
+    `actionProgress`/`actionProgressText` instead of the old
+    replicate-only channel.
 - `internal/ui/view.go`
   - Renders the main three-pane layout, overlays in general, and the `?`
     keyboard help text.
@@ -56,6 +75,9 @@ Untracked local files at handoff:
     its definition) and Replicate's pull-then-up-d functions (both
     local/SSH), and Clone's extended prefill (`defaultCloneDraft`, carrying
     Ports/Mounts/Env/Restart/Command that a fresh Create draft doesn't need).
+    Also owns create-local notices (`createNotice`) and the create/edit
+    command progress callbacks for standalone Docker API pulls and Compose
+    phase labels.
 - `internal/ui/compose_merge.go`
   - Comment- and format-preserving edits to Compose YAML via `yaml.v3`
     `Node`s: merging structured fields into an existing service's block
@@ -81,7 +103,10 @@ Untracked local files at handoff:
     whether to re-exec into a freshly installed binary.
 - `internal/ui/create_view.go`
   - Renders the create form, mode tabs, confirmation view, Compose file
-    browser, and the syntax-highlighted override preview/editor.
+    browser, and the syntax-highlighted override preview/editor. The
+    confirmation view renders `createActionProgressView`, a single
+    spinner-plus-progress row; form/catalog/editor overlays render
+    `createNoticeView` near their action hints.
 - `internal/ui/editor_area.go`
   - Adapts the [Ripple](https://github.com/allisonhere/ripple) editor
     component for the override-YAML editor: clipboard wiring, vim-mode setup,
@@ -105,23 +130,31 @@ Compose mode:
 
 1. Fill draft fields.
 2. Use `o` or `Ctrl+O` to browse for a local Compose file.
-3. `Ctrl+S` validates.
+3. `Ctrl+S` validates and shows an inline notice near the form actions.
 4. `Ctrl+Enter` or `Alt+Enter` opens confirmation.
-5. `y` writes the override and runs Compose.
+5. `y` writes the override and runs Compose while the confirmation overlay
+   shows progress.
 
 Standalone mode:
 
 1. Fill draft fields.
-2. `Ctrl+S` validates.
-3. `Ctrl+Enter` or `Alt+Enter` opens confirmation.
-4. `y` calls Docker create/start through `app.Provider`.
+2. Optionally set `Image action` to `pull latest`.
+3. `Ctrl+S` validates and shows an inline notice near the form actions.
+4. `Ctrl+Enter` or `Alt+Enter` opens confirmation.
+5. `y` calls Docker create/start through `app.Provider` while the
+   confirmation overlay shows progress.
 
 ## Safety Behavior
 
 - Destructive or mutating create actions require confirmation.
+- Once Create/Edit work is in flight, the confirmation overlay ignores cancel
+  keys until completion. No cancellation path exists yet.
 - Compose override creation validates a temporary file first.
 - Failed Compose validation removes the temporary override and does not promote
   the final override.
+- Standalone `pull latest` pulls the image before create/recreate. For Edit,
+  pull failure returns to the editable form without removing the existing
+  container.
 - Compose file browsing, override writing, and `docker compose` execution all
   work against SSH systems too, running each step on the remote host over the
   same `ssh` convention used for the Docker socket tunnel.
@@ -142,6 +175,7 @@ git status --short
 
 The latest pass completed successfully with:
 
+- `go test ./internal/ui`
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -150,6 +184,12 @@ The latest pass completed successfully with:
 - `git diff --check`
 
 ## Next Work
+
+- Reevaluate all status-bar messages. Recent create/edit work moved progress,
+  validation, and save feedback closer to the action that triggered it; the
+  rest of the app should get the same pass so transient confirmations and
+  recoverable errors appear in the active overlay/pane first, with the status
+  bar as a secondary fallback or log surface.
 
 Done since this doc was first written:
 
@@ -179,20 +219,23 @@ Done since this doc was first written:
   `tea.ExecProcess` terminal-handoff mechanism already used for the SSH
   password prompt, then resumes WhatTheDock. Works for SSH systems too, over
   the already-established socket tunnel (`systems.DockerHostFor`).
-- Delete/Replicate/Create-apply dispatch now sets `m.busy` and a status-bar
-  phase label immediately (previously Delete/Replicate showed nothing at
-  all until the final result, up to 2 minutes later for a slow pull). A
-  spinner animates from the shared `github.com/allisonhere/cli-spinners`
-  frame data, driven by the same tick that already animates the connected-
-  status dot (`m.statusPulseFrame`/`tickStatusPulse`). Standalone Replicate
-  additionally streams real Docker pull progress (`app.PullProgress`, via
-  `PullImage`'s `onProgress` callback) into `m.replicateProgress`, drained
-  one line per tick in the `statusPulseTickMsg` handler — Compose
-  Delete/Replicate/Create only get the spinner + a static phase label,
-  since `docker compose` is shelled out to and has no structured progress
-  to surface. If you touch dispatch for any of these actions again, keep
-  setting `m.busy`/the phase label there — it's easy to reintroduce a
-  silent fire-and-forget dispatch by accident.
+- Delete/Replicate/Create/Edit dispatch now sets `m.busy` and an immediate
+  phase label. A spinner animates from the shared
+  `github.com/allisonhere/cli-spinners` frame data, driven by the same tick
+  that already animates the connected-status dot
+  (`m.statusPulseFrame`/`tickStatusPulse`). Standalone Docker API pull paths
+  stream real pull progress (`app.PullProgress`, via `PullImage`'s
+  `onProgress` callback) into generalized `m.actionProgress`, drained one
+  line per tick in the `statusPulseTickMsg` handler. Create/Edit confirmation
+  renders that progress as a smooth percentage bar inside the overlay near the
+  confirmed action; the status bar intentionally does not mirror that same
+  progress while the overlay is open. The bar is deliberately fake on timing:
+  fast successes are held until it reaches 100%, while failures finalize
+  immediately. Compose Create/Edit emit deterministic phase labels around
+  write/validate/pull/up, because `docker compose` is shelled out to and has no
+  structured progress to surface. If you touch dispatch for any of these
+  actions again, keep setting `m.busy` and the local phase label there — it's
+  easy to reintroduce a silent fire-and-forget dispatch by accident.
 - Added `m` (edit) — opens the create overlay prefilled from the selected
   container/service under its own identity (not renamed, unlike Clone), so
   confirming replaces it in place. For Compose this is exactly
@@ -201,8 +244,8 @@ Done since this doc was first written:
   after calling it). Standalone gets a dedicated `defaultEditDraft`
   (`create.go`, full Ports/Mounts/Env/Restart/Command like `defaultCloneDraft`
   but keeping the real name) and a new `editContainerCmd` (remove + recreate
-  under the edited spec, mirroring `startReplicate`'s standalone path minus
-  the image pull). Deliberately does *not* change `n`/Create's behavior for a
+  under the edited spec, with optional pull-before-remove when `Image action`
+  is `pull latest`). Deliberately does *not* change `n`/Create's behavior for a
   selected standalone container — that was the first design considered and
   explicitly rejected: pressing Create must never silently overwrite what's
   selected, only Edit should.

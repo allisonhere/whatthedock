@@ -121,7 +121,7 @@ Docker socket paths must be present.
 | `u` | Replicate: pull the latest image and recreate in place |
 | `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file). On a project/folder row, deletes the whole stack: stops and removes every container it defines and deletes its compose file; on a container that's part of a multi-service project, prompts to delete just that service or the whole stack |
 | `C` | Clone under a new name via the create overlay |
-| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. On a project/folder row, edits the whole stack's base compose file directly; on a container that's part of a multi-service project, prompts to edit just that service or the whole stack |
+| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. Single-service create/edit forms include an Image action choice to keep the current image or pull latest before applying. On a project/folder row, edits the whole stack's base compose file directly; on a container that's part of a multi-service project, prompts to edit just that service or the whole stack |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -361,10 +361,10 @@ More detail:
   `docker compose config` first. Either way, `docker compose up -d <service>`
   runs after confirmation. This works against both local systems and SSH
   systems, running every step — reading/writing the compose file, and the
-  `docker compose` calls — on the remote host. Opening create for an
-  already-managed service detects and loads its existing override (if any)
-  instead of silently regenerating it, and the form's fields update to match
-  whatever override content is actually loaded or hand-edited. The Compose
+  `docker compose` calls — on the remote host. Editing an already-managed
+  service detects and loads its existing override (if any), otherwise it reads
+  the base compose file itself, and the form's fields update to match whatever
+  Compose content is actually loaded or hand-edited. The Compose
   file field includes a file browser (local or remote) for finding
   `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`, and
   `docker-compose*.yaml` files. Press `Ctrl+P` to open the local Compose
@@ -417,14 +417,16 @@ More detail:
   `-clone`-suffixed name, producing an independent second container/service.
   Edit opens the same overlay prefilled the same way but under the
   container/service's own identity, so confirming replaces it in place
-  instead of creating something new — `n` (Create) is left alone and always
-  defaults to a fresh draft, so it never surprises you by overwriting a
-  selection the way Edit intentionally does. The status bar shows a spinner
-  and phase text while Delete/Replicate/Create/Edit are running, instead of
-  going quiet until they finish — standalone Replicate shows real per-layer
-  pull progress (talking to the Docker API directly), Compose operations show
-  a phase label only (they shell out to `docker compose`, which has no
-  structured progress to surface).
+  instead of creating something new. Single-service Create/Edit forms also
+  show `Image action`: `keep` leaves the image cache alone, while `pull
+  latest` runs `docker compose pull <service>` before `up -d` for Compose
+  services, or pulls the standalone image before create/recreate. If a
+  standalone edit pull fails, the existing container is left running. After
+  confirmation, Create/Edit progress appears in the confirmation overlay as a
+  smooth 0–100% bar that takes about three seconds even when the real action
+  finishes faster; Delete/Replicate still use the status bar. Standalone
+  Docker API pulls show real per-layer pull progress, while Compose operations
+  show phase labels because they shell out to `docker compose`.
 - Opens an interactive shell inside the selected running container (`e`),
   handing the real terminal to `docker exec -it` (preferring `bash`, falling
   back to `sh`) and resuming WhatTheDock when the session ends. Works against

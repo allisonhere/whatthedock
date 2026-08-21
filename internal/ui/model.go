@@ -452,6 +452,8 @@ type Model struct {
 
 	createEditingCompose bool
 	createEditor         editorArea
+	createNotice         string
+	createNoticeErr      bool
 
 	aboutFrame      int
 	aboutSpotlights []aboutSpotlight
@@ -462,15 +464,18 @@ type Model struct {
 	// not scoped to any overlay.
 	statusPulseFrame int
 
-	// busy and replicateProgress drive the status-bar spinner. busy is set
-	// the moment a long-running action (compose apply/delete/replicate,
-	// standalone delete/replicate) dispatches and cleared when
-	// actionDoneMsg/createDoneMsg lands. replicateProgress carries real
-	// per-layer pull text for the one path with structured progress
-	// (standalone Replicate) — nil for every other busy action, which show
-	// the spinner with a static phase label only.
-	busy              bool
-	replicateProgress chan string
+	// busy and actionProgress drive progress for long-running actions. Create
+	// confirmation renders actionProgressText inside the overlay; actions
+	// without a local progress surface mirror it to the status bar. busy is
+	// set the moment a long-running action dispatches and cleared when
+	// actionDoneMsg/createDoneMsg lands. actionProgress carries latest-wins
+	// phase text from commands that can report more than one step.
+	busy                  bool
+	actionProgress        chan string
+	actionProgressText    string
+	actionProgressPercent int
+	createDoneReady       bool
+	createDoneResult      createDoneMsg
 
 	// eventsReconnecting mirrors the event-stream backoff loop so statusLeft
 	// can show it's happening instead of going silent for up to 30s.
@@ -1185,7 +1190,10 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickAbout()
 	case statusPulseTickMsg:
 		m.statusPulseFrame++
-		m.drainReplicateProgress()
+		m.drainActionProgress()
+		if done, ready := m.tickCreateActionProgress(); ready {
+			return m.finishCreateDone(done)
+		}
 		return m, tickStatusPulse()
 	case statsMsg:
 		if msg.stats.ID != m.selectedID {
@@ -1231,7 +1239,9 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.dashboardRefreshCmd()
 	case actionDoneMsg:
 		m.busy = false
-		m.replicateProgress = nil
+		m.actionProgress = nil
+		m.actionProgressText = ""
+		m.actionProgressPercent = 0
 		if msg.err != nil {
 			m.status, m.statusErr = msg.label+": "+friendlyDockerError(msg.err), true
 		} else {
@@ -1324,45 +1334,13 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.aiAnalysis = msg.result
 		return m, nil
 	case createDoneMsg:
-		m.busy = false
-		verb := "create"
-		if msg.edited {
-			verb = "update"
-		}
-		if msg.err != nil {
-			m.status, m.statusErr = verb+" "+msg.name+": "+friendlyDockerError(msg.err), true
-			// Stay on the form instead of dumping the user back to the
-			// main view — a failure here (a conflicting port is the
-			// common one) is often just one field away from working, and
-			// closing the overlay used to throw away everything they'd
-			// typed. Drop back out of the confirm step to the editable
-			// field list so they can fix it and retry; createDraft itself
-			// is untouched either way.
-			if m.overlay == overlayCreate {
-				m.createDraft.Confirming = false
-			}
+		if msg.err == nil && m.overlay == overlayCreate && m.createDraft.Confirming && m.actionProgressPercent < 100 {
+			m.createDoneReady = true
+			m.createDoneResult = msg
+			m.actionProgressText = "finishing " + msg.name + "…"
 			return m, nil
 		}
-		m.overlay = overlayNone
-		if msg.id.ID != "" {
-			m.selectedID = msg.id
-			m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
-		} else if msg.service != "" {
-			// Compose create/adopt has no container ID to select yet — see
-			// pendingSelectProject's doc comment — resolved once the
-			// refreshCmd dispatched below lands.
-			m.pendingSelectProject, m.pendingSelectService = msg.project, msg.service
-		} else if msg.project != "" {
-			// A stack create/edit (stackComposeCmd) — no single service
-			// either, land on the project row instead once refreshed.
-			m.pendingSelectProject = msg.project
-		}
-		if msg.edited {
-			m.status, m.statusErr = "updated "+msg.name, false
-		} else {
-			m.status, m.statusErr = "created "+msg.name, false
-		}
-		return m, m.refreshCmd()
+		return m.finishCreateDone(msg)
 	case ripple.SubmitMsg:
 		if m.createEditingCompose {
 			m.saveCreateEditor()
@@ -2034,11 +2012,9 @@ func (m Model) startDeleteStack(project string) (tea.Model, tea.Cmd) {
 }
 
 // startReplicate dispatches to the Compose (pull + up -d) or standalone
-// (pull + remove + recreate with an identical spec) path. Standalone is the
-// only path with direct Docker API access to real pull progress, so it
-// wires PullImage's onProgress callback into m.replicateProgress (drained
-// each statusPulseTickMsg tick, see drainReplicateProgress) instead of just
-// a static phase label.
+// (pull + remove + recreate with an identical spec) path. Standalone wires
+// PullImage's onProgress callback into actionProgress (drained each
+// statusPulseTickMsg tick, see drainActionProgress) for real pull detail.
 func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -2065,7 +2041,8 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	label := "replicate " + selected.DisplayName()
 	progress := make(chan string, 16)
 	m.busy = true
-	m.replicateProgress = progress
+	m.actionProgress = progress
+	m.actionProgressText = "pulling " + image + "…"
 	m.status, m.statusErr = "pulling "+image+"…", false
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
@@ -2079,6 +2056,7 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 		if err := provider.PullImage(ctx, image, onProgress); err != nil {
 			return actionDoneMsg{label: label, err: err}
 		}
+		sendActionProgress(progress, "recreating "+selected.DisplayName()+"…")
 		if err := provider.RemoveContainer(ctx, id, true); err != nil {
 			return actionDoneMsg{label: label, err: err}
 		}
@@ -4552,23 +4530,99 @@ func cleanDockerLogLine(line string) string {
 	return line
 }
 
-// drainReplicateProgress does a single non-blocking receive per call (not
-// drain-to-empty like drainLogs) — progress is a "latest wins" display, not
-// an append-only log, so grabbing at most one fresh line per
-// statusPulseTickMsg tick is correct and cheaper.
-func (m *Model) drainReplicateProgress() {
-	if m.replicateProgress == nil {
+func sendActionProgress(progress chan string, line string) {
+	if progress == nil || strings.TrimSpace(line) == "" {
 		return
 	}
 	select {
-	case line, ok := <-m.replicateProgress:
-		if !ok {
-			m.replicateProgress = nil
-			return
-		}
-		m.status = line
+	case progress <- line:
 	default:
 	}
+}
+
+const actionProgressStep = 5
+
+// drainActionProgress does a single non-blocking receive per call (not
+// drain-to-empty like drainLogs) — progress is a "latest wins" display, not
+// an append-only log, so grabbing at most one fresh line per
+// statusPulseTickMsg tick is correct and cheaper.
+func (m *Model) drainActionProgress() {
+	if m.actionProgress == nil {
+		return
+	}
+	select {
+	case line, ok := <-m.actionProgress:
+		if !ok {
+			m.actionProgress = nil
+			return
+		}
+		m.actionProgressText = line
+		if !(m.overlay == overlayCreate && m.createDraft.Confirming) {
+			m.status = line
+		}
+	default:
+	}
+}
+
+func (m *Model) tickCreateActionProgress() (createDoneMsg, bool) {
+	if !(m.busy && m.overlay == overlayCreate && m.createDraft.Confirming) {
+		return createDoneMsg{}, false
+	}
+	m.actionProgressPercent = min(100, m.actionProgressPercent+actionProgressStep)
+	if m.actionProgressPercent == 100 && m.createDoneReady {
+		done := m.createDoneResult
+		m.createDoneReady = false
+		m.createDoneResult = createDoneMsg{}
+		return done, true
+	}
+	return createDoneMsg{}, false
+}
+
+func (m Model) finishCreateDone(msg createDoneMsg) (tea.Model, tea.Cmd) {
+	m.busy = false
+	m.actionProgress = nil
+	m.actionProgressText = ""
+	m.actionProgressPercent = 0
+	m.createDoneReady = false
+	m.createDoneResult = createDoneMsg{}
+	verb := "create"
+	if msg.edited {
+		verb = "update"
+	}
+	if msg.err != nil {
+		m.status, m.statusErr = verb+" "+msg.name+": "+friendlyDockerError(msg.err), true
+		// Stay on the form instead of dumping the user back to the
+		// main view — a failure here (a conflicting port is the
+		// common one) is often just one field away from working, and
+		// closing the overlay used to throw away everything they'd
+		// typed. Drop back out of the confirm step to the editable
+		// field list so they can fix it and retry; createDraft itself
+		// is untouched either way.
+		if m.overlay == overlayCreate {
+			m.createDraft.Confirming = false
+		}
+		return m, nil
+	}
+	m.overlay = overlayNone
+	if msg.id.ID != "" {
+		m.selectedID = msg.id
+		m.focusedTreeKey = treeRowKey{valid: true, kind: rowContainer, containerID: msg.id}
+	} else if msg.service != "" {
+		// Compose create/adopt has no container ID to select yet — see
+		// pendingSelectProject's doc comment — resolved once the
+		// refreshCmd dispatched below lands.
+		m.pendingSelectProject, m.pendingSelectService = msg.project, msg.service
+	} else if msg.project != "" {
+		// A stack create/edit (stackComposeCmd) — no single service
+		// either, land on the project row instead once refreshed.
+		m.pendingSelectProject = msg.project
+	}
+	if msg.edited {
+		m.status, m.statusErr = "updated "+msg.name, false
+	} else {
+		m.status, m.statusErr = "created "+msg.name, false
+	}
+	return m, m.refreshCmd()
 }
 
 func (m *Model) drainLogs() {
