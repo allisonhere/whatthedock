@@ -60,11 +60,41 @@ draft's `Service` field, the fields are left as-is rather than guessing.
    letter into whatever field is focused — including `Compose file` itself,
    so you can type a path by hand — rather than opening the browser; only
    choice fields (`Mode`, `Restart`) treat bare `o` as a shortcut.
-5. Optionally press `Ctrl+Y` to hand-edit the generated override YAML
+5. Optionally press `Ctrl+P` to load or save a reusable Compose template from
+   the local catalog.
+6. Optionally press `Ctrl+Y` to hand-edit the generated override YAML
    directly (see Override YAML Editor below).
-6. Check the inline validation line, or press `Ctrl+S` to validate explicitly.
-7. Press `Ctrl+Enter` or `Alt+Enter` to review the confirmation.
-8. Press `y` to create, or `n`/`Esc` to cancel.
+7. Check the inline validation line, or press `Ctrl+S` to validate explicitly.
+8. Press `Ctrl+Enter` or `Alt+Enter` to review the confirmation.
+9. Press `y` to create, or `n`/`Esc` to cancel.
+
+## Compose Catalog
+
+Press `Ctrl+P` in Compose create/edit mode to open the local Compose catalog.
+Catalog entries are reusable YAML templates stored under WhatTheDock's config
+directory, separate from `settings.json`. They are available no matter which
+Docker system is active; applying one to an SSH system still writes and runs
+Compose on that remote host through the normal create flow.
+
+Catalog keys:
+
+| Key | Action |
+|---|---|
+| `j` / `Down` | Move down |
+| `k` / `Up` | Move up |
+| type text | Filter entries by name |
+| `Ctrl+U` | Clear the filter or rename text |
+| `Enter` | Load the selected template into the current draft |
+| `s` | Save the current draft/template into the catalog |
+| `r` | Rename the selected catalog entry |
+| `d` | Delete the selected catalog entry after confirmation |
+| `Esc` | Return to the create form |
+
+Loading a single-service template fills the left-side fields and keeps the raw
+YAML as the editor source so comments and keys outside the form's field list
+persist. Loading a multi-service template switches the draft into stack mode.
+Renaming or deleting a catalog entry only changes the local catalog; it never
+renames or deletes a deployed Compose file or container.
 
 ## Override YAML Editor
 

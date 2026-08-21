@@ -87,6 +87,9 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if m.createEditingCompose {
 		return m.createEditorOverlay(renderer)
 	}
+	if m.createCatalogOpen {
+		return m.createCatalogOverlay(renderer, width, contentWidth)
+	}
 	if m.createBrowsing {
 		return m.createFileBrowserOverlay(renderer, width, contentWidth)
 	}
@@ -226,6 +229,7 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			tideui.SoftHint{Key: "o/ctrl+o", Label: "browse"},
 		),
 		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "ctrl+p", Label: "catalog"},
 			tideui.SoftHint{Key: "ctrl+y", Label: "edit yaml"},
 			tideui.SoftHint{Key: "ctrl+s", Label: "validate"},
 			tideui.SoftHint{Key: "ctrl/alt+enter", Label: confirmStepLabel(m.createDraft.Editing)},
@@ -246,6 +250,96 @@ func confirmStepLabel(editing bool) string {
 		return "update"
 	}
 	return "create"
+}
+
+func (m Model) createCatalogOverlay(renderer tideui.Renderer, width int, contentWidth int) *tideui.Overlay {
+	rows := []string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render("Catalog  " + short(m.catalogDir, max(12, contentWidth-10))),
+	}
+	if m.createCatalogFilter != "" {
+		rows = append(rows, renderer.Styles.DetailMeta.Width(contentWidth).Render("Filter   "+m.createCatalogFilter))
+	}
+	if m.createCatalogErr != "" {
+		rows = append(rows, renderer.Styles.StatusError.Width(contentWidth).Render(m.createCatalogErr))
+	}
+	switch m.createCatalogMode {
+	case createCatalogRename:
+		entry, _ := m.currentCatalogEntry()
+		rows = append(rows,
+			"",
+			renderer.Styles.DetailMeta.Width(contentWidth).Render("Rename "+entry.Name),
+			renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     "Name",
+				Suffix:   m.createCatalogEditWithCaret(),
+				Selected: true,
+			}, contentWidth),
+			"",
+			renderer.RenderSoftHints(contentWidth,
+				tideui.SoftHint{Key: "enter", Label: "save"},
+				tideui.SoftHint{Key: "esc", Label: "cancel"},
+				tideui.SoftHint{Key: "ctrl+u", Label: "clear"},
+			),
+		)
+	case createCatalogDelete:
+		entry, _ := m.currentCatalogEntry()
+		rows = append(rows,
+			"",
+			renderer.Styles.DetailMeta.Width(contentWidth).Render("Delete catalog entry "+entry.Name+"?"),
+			"",
+			renderer.RenderSoftHints(contentWidth,
+				tideui.SoftHint{Key: "y", Label: "delete"},
+				tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+			),
+		)
+	default:
+		entries := m.filteredCatalogEntries()
+		if len(entries) == 0 {
+			message := "No catalog entries yet. Press s to save this draft."
+			if m.createCatalogFilter != "" {
+				message = "No catalog entries match this filter."
+			}
+			rows = append(rows, "", renderer.Styles.DetailMeta.Width(contentWidth).Render(message))
+		} else {
+			limit := max(4, min(len(entries), m.height-12))
+			start := 0
+			if m.createCatalogCursor >= limit {
+				start = m.createCatalogCursor - limit + 1
+			}
+			end := min(len(entries), start+limit)
+			rows = append(rows, "")
+			for i := start; i < end; i++ {
+				entry := entries[i]
+				rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
+					Prefix:   "  ",
+					Text:     entry.Name,
+					Suffix:   entry.ID,
+					Selected: i == m.createCatalogCursor,
+				}, contentWidth))
+			}
+		}
+		rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter", Label: "load"},
+			tideui.SoftHint{Key: "s", Label: "save current"},
+			tideui.SoftHint{Key: "r", Label: "rename"},
+			tideui.SoftHint{Key: "d", Label: "delete"},
+		), renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "type", Label: "filter"},
+			tideui.SoftHint{Key: "ctrl+u", Label: "clear"},
+			tideui.SoftHint{Key: "esc", Label: "back"},
+		))
+	}
+	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "compose catalog", Content: content, Width: width})
+	return &overlay
+}
+
+func (m Model) createCatalogEditWithCaret() string {
+	runes := []rune(m.createCatalogEdit)
+	cursor := clamp(m.createCatalogEditCursor, 0, len(runes))
+	withCaret := append([]rune{}, runes[:cursor]...)
+	withCaret = append(withCaret, '|')
+	withCaret = append(withCaret, runes[cursor:]...)
+	return string(withCaret)
 }
 
 // createEditorOverlay renders the raw override-YAML editor. Unlike the rest

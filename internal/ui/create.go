@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/catalog"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
@@ -192,12 +193,32 @@ func (m *Model) openEditOverlay() tea.Cmd {
 		m.openCreateOverlayWithDraft(m.selectionCreateDraft())
 		m.createDraft.Editing = true
 		cmd := m.checkComposeOverrideCmd()
-		return cmd
+		if m.createDraft.OverrideRawSet {
+			return cmd
+		}
+		return batchCreateCmds(cmd, m.loadSelectedComposeFileCmd(m.createDraft.ComposeFile))
 	}
 	m.openCreateOverlayWithDraft(m.defaultEditDraft())
 	m.createDraft.Editing = true
 	m.status, m.statusErr = "edit draft ready for "+selected.DisplayName(), false
 	return nil
+}
+
+func batchCreateCmds(cmds ...tea.Cmd) tea.Cmd {
+	filtered := make([]tea.Cmd, 0, len(cmds))
+	for _, cmd := range cmds {
+		if cmd != nil {
+			filtered = append(filtered, cmd)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return tea.Batch(filtered...)
+	}
 }
 
 // siblingServiceCount is how many services project's containers actually
@@ -549,6 +570,9 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.createEditingCompose {
 		return m.handleCreateEditorKey(msg)
 	}
+	if m.createCatalogOpen {
+		return m.handleCreateCatalogKey(msg)
+	}
 	if m.createBrowsing {
 		return m.handleCreateFileBrowserKey(msg)
 	}
@@ -675,6 +699,11 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openCreateEditor()
 			return m, nil
 		}
+	case "ctrl+p":
+		if m.createDraft.Mode == createModeCompose {
+			m.openCreateCatalog()
+			return m, nil
+		}
 	case "ctrl+s":
 		m.validateCreateDraft()
 	case "ctrl+enter", "alt+enter":
@@ -708,6 +737,267 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) openCreateCatalog() {
+	if m.catalogDir == "" {
+		m.status, m.statusErr = "compose catalog unavailable: settings path is not configured", true
+		return
+	}
+	entries, err := catalog.Load(m.catalogDir)
+	if err != nil {
+		m.status, m.statusErr = "compose catalog: "+err.Error(), true
+		return
+	}
+	m.createCatalogOpen = true
+	m.createCatalogMode = createCatalogList
+	m.createCatalogEntries = entries
+	m.createCatalogCursor = clamp(m.createCatalogCursor, 0, max(0, len(m.filteredCatalogEntries())-1))
+	m.createCatalogFilter = ""
+	m.createCatalogEdit = ""
+	m.createCatalogEditCursor = 0
+	m.createCatalogErr = ""
+	m.status, m.statusErr = "compose catalog", false
+}
+
+func (m Model) handleCreateCatalogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.createCatalogMode {
+	case createCatalogRename:
+		return m.handleCreateCatalogRenameKey(msg)
+	case createCatalogDelete:
+		return m.handleCreateCatalogDeleteKey(msg)
+	}
+	switch msg.String() {
+	case "esc", "q":
+		m.createCatalogOpen = false
+		m.createCatalogErr = ""
+	case "up", "k":
+		m.moveCreateCatalogCursor(-1)
+	case "down", "j", "tab":
+		m.moveCreateCatalogCursor(1)
+	case "home":
+		m.createCatalogCursor = 0
+	case "end":
+		m.createCatalogCursor = max(0, len(m.filteredCatalogEntries())-1)
+	case "backspace":
+		if m.createCatalogFilter != "" {
+			runes := []rune(m.createCatalogFilter)
+			m.createCatalogFilter = string(runes[:len(runes)-1])
+			m.createCatalogCursor = 0
+		}
+	case "ctrl+u":
+		m.createCatalogFilter = ""
+		m.createCatalogCursor = 0
+	case "enter", "l":
+		if err := m.loadCurrentCatalogEntry(); err != nil {
+			m.createCatalogErr = err.Error()
+			return m, nil
+		}
+		m.createCatalogOpen = false
+	case "s":
+		if err := m.saveCurrentDraftToCatalog(); err != nil {
+			m.createCatalogErr = err.Error()
+			return m, nil
+		}
+		m.createCatalogErr = ""
+	case "r":
+		if entry, ok := m.currentCatalogEntry(); ok {
+			m.createCatalogMode = createCatalogRename
+			m.createCatalogEdit = entry.Name
+			m.createCatalogEditCursor = len([]rune(entry.Name))
+			m.createCatalogErr = ""
+		}
+	case "d":
+		if _, ok := m.currentCatalogEntry(); ok {
+			m.createCatalogMode = createCatalogDelete
+			m.createCatalogErr = ""
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			m.createCatalogFilter += string(msg.Runes)
+			m.createCatalogCursor = 0
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleCreateCatalogRenameKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.createCatalogMode = createCatalogList
+		m.createCatalogEdit = ""
+		m.createCatalogEditCursor = 0
+	case "enter":
+		entry, ok := m.currentCatalogEntry()
+		if !ok {
+			m.createCatalogMode = createCatalogList
+			return m, nil
+		}
+		if err := catalog.Rename(m.catalogDir, entry.ID, m.createCatalogEdit); err != nil {
+			m.createCatalogErr = err.Error()
+			return m, nil
+		}
+		entries, err := catalog.Load(m.catalogDir)
+		if err != nil {
+			m.createCatalogErr = err.Error()
+			return m, nil
+		}
+		m.createCatalogEntries = entries
+		m.createCatalogMode = createCatalogList
+		m.createCatalogEdit = ""
+		m.createCatalogEditCursor = 0
+		m.createCatalogErr = ""
+		m.status, m.statusErr = "renamed catalog entry", false
+	case "left":
+		m.createCatalogEditCursor = max(0, m.createCatalogEditCursor-1)
+	case "right":
+		m.createCatalogEditCursor = min(len([]rune(m.createCatalogEdit)), m.createCatalogEditCursor+1)
+	case "home", "ctrl+a":
+		m.createCatalogEditCursor = 0
+	case "end", "ctrl+e":
+		m.createCatalogEditCursor = len([]rune(m.createCatalogEdit))
+	case "backspace":
+		runes := []rune(m.createCatalogEdit)
+		if m.createCatalogEditCursor > 0 && m.createCatalogEditCursor <= len(runes) {
+			runes = append(runes[:m.createCatalogEditCursor-1], runes[m.createCatalogEditCursor:]...)
+			m.createCatalogEdit = string(runes)
+			m.createCatalogEditCursor--
+		}
+	case "delete":
+		runes := []rune(m.createCatalogEdit)
+		if m.createCatalogEditCursor < len(runes) {
+			runes = append(runes[:m.createCatalogEditCursor], runes[m.createCatalogEditCursor+1:]...)
+			m.createCatalogEdit = string(runes)
+		}
+	case "ctrl+u":
+		m.createCatalogEdit = ""
+		m.createCatalogEditCursor = 0
+	default:
+		if len(msg.Runes) > 0 {
+			runes := []rune(m.createCatalogEdit)
+			cursor := clamp(m.createCatalogEditCursor, 0, len(runes))
+			merged := append([]rune{}, runes[:cursor]...)
+			merged = append(merged, msg.Runes...)
+			merged = append(merged, runes[cursor:]...)
+			m.createCatalogEdit = string(merged)
+			m.createCatalogEditCursor = cursor + len(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleCreateCatalogDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "n", "q":
+		m.createCatalogMode = createCatalogList
+	case "y":
+		entry, ok := m.currentCatalogEntry()
+		if !ok {
+			m.createCatalogMode = createCatalogList
+			return m, nil
+		}
+		if err := catalog.Delete(m.catalogDir, entry.ID); err != nil {
+			m.createCatalogErr = err.Error()
+			m.createCatalogMode = createCatalogList
+			return m, nil
+		}
+		entries, err := catalog.Load(m.catalogDir)
+		if err != nil {
+			m.createCatalogErr = err.Error()
+			m.createCatalogMode = createCatalogList
+			return m, nil
+		}
+		m.createCatalogEntries = entries
+		m.createCatalogCursor = clamp(m.createCatalogCursor, 0, max(0, len(m.filteredCatalogEntries())-1))
+		m.createCatalogMode = createCatalogList
+		m.createCatalogErr = ""
+		m.status, m.statusErr = "deleted catalog entry "+entry.Name, false
+	}
+	return m, nil
+}
+
+func (m *Model) moveCreateCatalogCursor(delta int) {
+	entries := m.filteredCatalogEntries()
+	if len(entries) == 0 {
+		m.createCatalogCursor = 0
+		return
+	}
+	m.createCatalogCursor = clamp(m.createCatalogCursor+delta, 0, len(entries)-1)
+}
+
+func (m Model) filteredCatalogEntries() []catalog.Entry {
+	filter := strings.ToLower(strings.TrimSpace(m.createCatalogFilter))
+	if filter == "" {
+		return m.createCatalogEntries
+	}
+	out := make([]catalog.Entry, 0, len(m.createCatalogEntries))
+	for _, entry := range m.createCatalogEntries {
+		if strings.Contains(strings.ToLower(entry.Name), filter) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func (m Model) currentCatalogEntry() (catalog.Entry, bool) {
+	entries := m.filteredCatalogEntries()
+	if len(entries) == 0 {
+		return catalog.Entry{}, false
+	}
+	return entries[clamp(m.createCatalogCursor, 0, len(entries)-1)], true
+}
+
+func (m *Model) loadCurrentCatalogEntry() error {
+	entry, ok := m.currentCatalogEntry()
+	if !ok {
+		return errors.New("no catalog entry selected")
+	}
+	content, err := catalog.Read(m.catalogDir, entry.ID)
+	if err != nil {
+		return err
+	}
+	m.createDraft.OverrideRaw = content
+	m.createDraft.OverrideRawSet = strings.TrimSpace(m.createDraft.OverrideRaw) != ""
+	m.createDraft.OverrideLoaded = true
+	m.createDraft.OverrideRawBase = true
+	m.createDraft.applyOverrideFieldsFromYAML(m.createDraft.OverrideRaw)
+	m.revalidateCreateField()
+	m.status, m.statusErr = "loaded catalog entry "+entry.Name, false
+	return nil
+}
+
+func (m *Model) saveCurrentDraftToCatalog() error {
+	content := m.createDraft.Preview()
+	if m.createDraft.Mode == createModeCompose && m.createDraft.OverrideRawSet {
+		content = m.createDraft.OverrideRaw
+	}
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	entry, err := catalog.Save(m.catalogDir, defaultCatalogEntryName(m.createDraft), content)
+	if err != nil {
+		return err
+	}
+	entries, err := catalog.Load(m.catalogDir)
+	if err != nil {
+		return err
+	}
+	m.createCatalogEntries = entries
+	for i, candidate := range m.filteredCatalogEntries() {
+		if candidate.ID == entry.ID {
+			m.createCatalogCursor = i
+			break
+		}
+	}
+	m.status, m.statusErr = "saved catalog entry "+entry.Name, false
+	return nil
+}
+
+func defaultCatalogEntryName(d createDraft) string {
+	if d.IsStack() {
+		return emptyAs(d.Project, "Compose stack")
+	}
+	return emptyAs(d.Service, "Compose service")
 }
 
 func (m Model) createContainerCmd(spec app.ContainerCreateSpec) tea.Cmd {

@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/allisonhere/whatthedock/internal/actions"
+	"github.com/allisonhere/whatthedock/internal/catalog"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 )
@@ -249,6 +250,152 @@ func TestCreateStandaloneSpecRejectsInvalidFields(t *testing.T) {
 				t.Fatalf("ContainerSpec() error = %v, want it to contain %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestCreateCatalogSaveLoadRenameDeleteFlow(t *testing.T) {
+	dir := t.TempDir()
+	model := testModelWithSelectedContainer()
+	model.catalogDir = dir
+	model.width, model.height = 120, 34
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Project = "dash"
+	model.createDraft.Service = "dash"
+	model.createDraft.Image = "ghcr.io/allisonhere/dash:latest"
+	model.createDraft.Env = "PORT=3939"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	model = updated.(Model)
+	if !model.createCatalogOpen {
+		t.Fatal("createCatalogOpen = false after ctrl+p in compose mode")
+	}
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "whatthedock · compose catalog") || !strings.Contains(view, "save current") {
+		t.Fatalf("catalog overlay missing expected UI:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	model = updated.(Model)
+	entries, err := catalog.Load(dir)
+	if err != nil {
+		t.Fatalf("catalog.Load() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "dash" {
+		t.Fatalf("entries = %#v, want saved dash entry", entries)
+	}
+	content, err := catalog.Read(dir, entries[0].ID)
+	if err != nil {
+		t.Fatalf("catalog.Read() error = %v", err)
+	}
+	if !strings.Contains(content, "ghcr.io/allisonhere/dash:latest") || !strings.Contains(content, "PORT=3939") {
+		t.Fatalf("saved content missing draft values:\n%s", content)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = updated.(Model)
+	if model.createCatalogMode != createCatalogRename {
+		t.Fatalf("createCatalogMode = %v, want rename", model.createCatalogMode)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = updated.(Model)
+	for _, r := range "Dash prod" {
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		model = updated.(Model)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	entries, err = catalog.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "Dash prod" {
+		t.Fatalf("entries after rename = %#v, want Dash prod", entries)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	if model.createCatalogMode != createCatalogDelete {
+		t.Fatalf("createCatalogMode = %v, want delete", model.createCatalogMode)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	entries, err = catalog.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries after delete = %#v, want empty", entries)
+	}
+}
+
+func TestCreateCatalogLoadSingleServicePopulatesDraft(t *testing.T) {
+	dir := t.TempDir()
+	content := "services:\n  dash:\n    image: ghcr.io/allisonhere/dash:latest\n    restart: unless-stopped\n    environment:\n      - PORT=3939\n"
+	if _, err := catalog.Save(dir, "Dash", content); err != nil {
+		t.Fatal(err)
+	}
+	model := testModelWithSelectedContainer()
+	model.catalogDir = dir
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "new-service"
+	model.createDraft.Image = "image:tag"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+
+	if model.createCatalogOpen {
+		t.Fatal("createCatalogOpen = true after loading, want returned to create form")
+	}
+	if model.createDraft.Service != "dash" || model.createDraft.Image != "ghcr.io/allisonhere/dash:latest" {
+		t.Fatalf("Service/Image = %q/%q, want loaded dash template", model.createDraft.Service, model.createDraft.Image)
+	}
+	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase || model.createDraft.OverrideRaw != content {
+		t.Fatalf("raw flags/content = %v/%v/%q, want catalog content as raw base", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase, model.createDraft.OverrideRaw)
+	}
+	if !strings.Contains(model.createDraft.Env, "PORT=3939") {
+		t.Fatalf("Env = %q, want PORT=3939 from template", model.createDraft.Env)
+	}
+}
+
+func TestCreateCatalogLoadMultiServiceTemplateBecomesStack(t *testing.T) {
+	dir := t.TempDir()
+	content := "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	if _, err := catalog.Save(dir, "Stack", content); err != nil {
+		t.Fatal(err)
+	}
+	model := testModelWithSelectedContainer()
+	model.catalogDir = dir
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+
+	if !model.createDraft.IsStack() {
+		t.Fatal("IsStack() = false after loading a multi-service catalog template")
+	}
+	if fields := model.visibleCreateFields(); containsCreateField(fields, createFieldService) {
+		t.Fatalf("visible fields = %#v, want stack fields without Service", fields)
+	}
+}
+
+func TestCreateCatalogDoesNotOpenInStandaloneMode(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.catalogDir = t.TempDir()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	model = updated.(Model)
+
+	if model.createCatalogOpen {
+		t.Fatal("createCatalogOpen = true after ctrl+p in standalone mode, want false")
 	}
 }
 
@@ -2564,6 +2711,59 @@ func TestOpenCreateOverlayLoadsExistingLocalOverride(t *testing.T) {
 	}
 	if spec.Content != overrideContent {
 		t.Fatalf("ComposeSpec content = %q, want the loaded override content, not a regenerated one", spec.Content)
+	}
+}
+
+func TestOpenEditOverlayLoadsBaseComposeWhenNoOverrideExists(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := `services:
+  dash:
+    image: ghcr.io/allisonhere/dash:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=3939
+      - OMARCHY_DIR=/omarchy
+    volumes:
+      - ./data:/config
+      - ./omarchy:/omarchy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+`
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("dash", "dash", base)
+	cmd := model.openEditOverlay()
+	if cmd == nil {
+		t.Fatal("openEditOverlay() returned nil, want base compose load command when no override exists")
+	}
+	msg := runCmd(t, cmd).(createSelectedComposeFileMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if !model.createDraft.Editing {
+		t.Fatal("Editing = false, want modify flow to stay marked as editing")
+	}
+	if model.createDraft.Service != "dash" || model.createDraft.Image != "ghcr.io/allisonhere/dash:latest" {
+		t.Fatalf("Service/Image = %q/%q, want dash compose file values", model.createDraft.Service, model.createDraft.Image)
+	}
+	if model.createDraft.Ports != "" {
+		t.Fatalf("Ports = %q, want empty because the compose file has no ports", model.createDraft.Ports)
+	}
+	for _, want := range []string{"PORT=3939", "OMARCHY_DIR=/omarchy"} {
+		if !strings.Contains(model.createDraft.Env, want) {
+			t.Fatalf("Env = %q, missing %q", model.createDraft.Env, want)
+		}
+	}
+	for _, want := range []string{"./data:/config", "./omarchy:/omarchy:ro", "/var/run/docker.sock:/var/run/docker.sock:ro"} {
+		if !strings.Contains(model.createDraft.Mounts, want) {
+			t.Fatalf("Mounts = %q, missing %q", model.createDraft.Mounts, want)
+		}
+	}
+	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase || model.createDraft.OverrideRaw != content {
+		t.Fatalf("OverrideRawSet/Base/Raw = %v/%v/%q, want exact base compose content loaded", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase, model.createDraft.OverrideRaw)
 	}
 }
 

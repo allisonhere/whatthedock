@@ -144,6 +144,7 @@ Docker socket paths must be present.
 | `Ctrl+S` in settings/forms | Save changes |
 | `[` / `]` in create form | Switch between Compose service and standalone container |
 | `o` / `Ctrl+O` in Compose create form | Browse for a Compose file, locally or on the active SSH system |
+| `Ctrl+P` in Compose create form | Open the saved Compose catalog |
 | `Ctrl+Y` in Compose create form | Hand-edit the override YAML in a full-size editor |
 | `Ctrl+Enter` / `Alt+Enter` in create form | Review the confirmation step |
 | `y` / `n` in create confirmation | Confirm or cancel |
@@ -366,8 +367,12 @@ More detail:
   whatever override content is actually loaded or hand-edited. The Compose
   file field includes a file browser (local or remote) for finding
   `compose*.yml`, `compose*.yaml`, `docker-compose*.yml`, and
-  `docker-compose*.yaml` files. Press `Ctrl+Y` to hand-edit the generated
-  override directly in a full-size [Ripple](https://github.com/allisonhere/ripple)
+  `docker-compose*.yaml` files. Press `Ctrl+P` to open the local Compose
+  catalog: save the current draft as a reusable YAML template, filter/load
+  saved templates into this create/edit flow, and rename or delete catalog
+  entries without touching any deployed stack. Press `Ctrl+Y` to hand-edit
+  the generated override directly in a full-size
+  [Ripple](https://github.com/allisonhere/ripple)
   editor, with real-time lint feedback and an optional persistent vim mode
   (Settings → Editor). An already-labeled container whose Compose file
   doesn't actually exist on disk — the signature of a stack deployed by a

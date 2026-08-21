@@ -24,6 +24,7 @@ import (
 
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
+	"github.com/allisonhere/whatthedock/internal/catalog"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
@@ -69,6 +70,14 @@ const (
 	overlayEditScope
 	overlayDeleteScope
 	overlayDeleteStackConfirm
+)
+
+type createCatalogMode int
+
+const (
+	createCatalogList createCatalogMode = iota
+	createCatalogRename
+	createCatalogDelete
 )
 
 type graphStyle int
@@ -431,6 +440,16 @@ type Model struct {
 	createFileErr     string
 	createFileLoading bool
 
+	createCatalogOpen       bool
+	createCatalogMode       createCatalogMode
+	createCatalogEntries    []catalog.Entry
+	createCatalogCursor     int
+	createCatalogFilter     string
+	createCatalogEdit       string
+	createCatalogEditCursor int
+	createCatalogErr        string
+	catalogDir              string
+
 	createEditingCompose bool
 	createEditor         editorArea
 
@@ -771,6 +790,7 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		settings:             settings,
 		settingsDraft:        settings,
 		settingsPath:         settingsPath,
+		catalogDir:           catalog.DirForSettings(settingsPath),
 		systems:              persisted.Systems,
 		activeSystem:         persisted.ActiveSystem,
 		providerFor:          factory,
