@@ -47,9 +47,9 @@ presentation primitives.
 
 ## Philosophy
 
-WhatTheDock treats Compose projects as first-class objects. The default view is not
-a flat dump of containers; it starts from projects and services, then keeps
-standalone containers in a separate section.
+WhatTheDock treats Compose stacks as first-class objects. The default view keeps
+single-container Compose apps looking like containers and groups multi-container
+Compose apps into collapsible stacks.
 
 The app should work with zero WhatTheDock-specific configuration. Running
 `whatthedock` honors Docker's normal environment and context defaults and connects
@@ -111,17 +111,17 @@ Docker socket paths must be present.
 |---|---|
 | `j` / `Down` | Move down |
 | `k` / `Up` | Move up |
-| `Enter` | Select/open, or expand/collapse Compose project |
-| `Space` | Expand/collapse Compose project |
-| `/` | Filter projects, services, and containers |
+| `Enter` | Select/open, or expand/collapse Compose stack |
+| `Space` | Expand/collapse Compose stack |
+| `/` | Filter stacks and containers |
 | `n` | Create container or Compose service draft |
 | `s` | Start/stop selected container |
 | `r` | Refresh Docker state |
 | `Alt+r` | Restart selected container |
 | `u` | Replicate: pull the latest image and recreate in place |
-| `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file). On a project/folder row, deletes the whole stack: stops and removes every container it defines and deletes its compose file; on a container that's part of a multi-service project, prompts to delete just that service or the whole stack |
+| `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file). On a stack row, deletes the whole stack: stops and removes every container it defines and deletes its compose file; on a container that's part of a multi-service stack, prompts to delete just that service or the whole stack |
 | `C` | Clone under a new name via the create overlay |
-| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. Single-service create/edit forms include an Image action choice to keep the current image or pull latest before applying. On a project/folder row, edits the whole stack's base compose file directly; on a container that's part of a multi-service project, prompts to edit just that service or the whole stack |
+| `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. Single-service create/edit forms include an Image action choice to keep the current image or pull latest before applying. On a stack row, edits the whole stack's base compose file directly; on a container that's part of a multi-service stack, prompts to edit just that service or the whole stack |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -275,9 +275,9 @@ More detail:
 ## Current Features
 
 - Connects through the official Docker Go client using Docker defaults.
-- Discovers Compose projects from standard Compose labels.
-- Shows standalone containers separately.
-- Supports project collapse/expand and fast substring filtering.
+- Discovers Compose stacks from standard Compose labels.
+- Shows single-container Compose apps and standalone containers as container rows.
+- Supports stack collapse/expand and fast substring filtering.
 - Displays useful selected-container details without dumping Docker JSON.
 - Streams selected-container logs through a cancellable reader with color-coded
   timestamps, severity, HTTP methods, and HTTP status codes.
@@ -386,13 +386,13 @@ More detail:
 - Pasting or loading a compose file that defines more than one service is
   detected automatically — no separate mode to pick. The form relabels
   itself "Compose stack (N)", the single-service fields (Image, Ports, ...)
-  give way to just Project and the compose file path, and confirming writes
+  give way to just Stack and the compose file path, and confirming writes
   the whole document as the base compose file and brings every service in
   it up with a single `docker compose up -d` (no service filter), instead
   of only starting whichever one service the draft happened to target.
   Trimming the content back down to one service reverts to the ordinary
   single-service form automatically. Editing an existing multi-service
-  project works the same way: select its folder/project row and press `m`
+  stack works the same way: select its stack row and press `m`
   to edit the whole stack's base file directly, or press `m` on one of its
   individual containers to get a prompt choosing between editing just that
   service or the whole stack.
@@ -403,11 +403,11 @@ More detail:
   if any, and its block in the base compose file if the base file defines it
   (comment-preserving) — or a real `docker rm -f` for a standalone container.
   Deleting a whole stack works the same way one level up: select the
-  project/folder row and press `D` for an itemized confirm naming every
+  stack row and press `D` for an itemized confirm naming every
   service that will stop, then `docker compose down` (containers and
   networks; named volumes are left alone) followed by deleting the base
   compose file itself and any now-orphaned per-service override files.
-  Pressing `D` on one of that project's individual containers instead
+  Pressing `D` on one of that stack's individual containers instead
   prompts to choose between deleting just that service or the whole
   stack.
   Replicate

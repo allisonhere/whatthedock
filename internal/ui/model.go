@@ -3068,7 +3068,7 @@ func (m Model) copyRows() []copyRow {
 	add("Name", ctr.DisplayName())
 	add("Image", ctr.Image)
 	add("Image ID", ctr.ImageID)
-	add("Compose project", ctr.Compose.Project)
+	add("Compose stack", ctr.Compose.Project)
 	add("Compose service", ctr.Compose.Service)
 	add("Compose number", ctr.Compose.ContainerNumber)
 	add("Compose config", ctr.Compose.ConfigFiles)
@@ -4203,38 +4203,38 @@ func (m Model) buildRows() []treeRow {
 	}
 	var rows []treeRow
 	for _, project := range m.snapshot.Projects {
-		projectRows := []treeRow{}
+		stackRows := []treeRow{}
 		for _, service := range project.Services {
-			serviceRows := []treeRow{}
 			for _, ctr := range service.Containers {
 				if matches(ctr) {
 					c := ctr
-					serviceRows = append(serviceRows, treeRow{kind: rowContainer, label: ctr.DisplayName(), project: project.Name, service: service.Name, container: &c, depth: 2})
+					stackRows = append(stackRows, treeRow{kind: rowContainer, label: ctr.DisplayName(), project: project.Name, service: service.Name, container: &c})
 				}
 			}
-			if len(serviceRows) > 0 {
-				projectRows = append(projectRows, treeRow{kind: rowService, label: service.Name, project: project.Name, service: service.Name, depth: 1, muted: true})
-				projectRows = append(projectRows, serviceRows...)
-			}
 		}
-		if len(projectRows) > 0 || query == "" {
+		switch len(stackRows) {
+		case 0:
+			if query == "" {
+				rows = append(rows, treeRow{kind: rowProject, label: project.Name, project: project.Name})
+			}
+		case 1:
+			rows = append(rows, stackRows[0])
+		default:
 			rows = append(rows, treeRow{kind: rowProject, label: project.Name, project: project.Name})
 			if !m.collapsed[project.Name] {
-				rows = append(rows, projectRows...)
+				for _, row := range stackRows {
+					row.depth = 1
+					rows = append(rows, row)
+				}
 			}
 		}
 	}
 	if len(m.snapshot.Standalone) > 0 {
-		sectionRows := []treeRow{}
 		for _, ctr := range m.snapshot.Standalone {
 			if matches(ctr) {
 				c := ctr
-				sectionRows = append(sectionRows, treeRow{kind: rowContainer, label: ctr.DisplayName(), container: &c, depth: 1})
+				rows = append(rows, treeRow{kind: rowContainer, label: ctr.DisplayName(), container: &c})
 			}
-		}
-		if len(sectionRows) > 0 || query == "" {
-			rows = append(rows, treeRow{kind: rowSection, label: "Standalone containers", muted: true})
-			rows = append(rows, sectionRows...)
 		}
 	}
 	return rows

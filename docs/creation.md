@@ -54,7 +54,7 @@ as-is rather than guessing.
 
 1. Press `n`.
 2. Make sure the `Compose service` tab is active (`[`/`]` to switch).
-3. Fill in `Project`, `Service`, `Image`, optional `Ports`, `Mounts`, `Env`,
+3. Fill in `Stack`, `Service`, `Image`, optional `Ports`, `Mounts`, `Env`,
    `Restart`, and `Compose file`.
 4. Use `Enter` or `Ctrl+O` on the `Compose file` field to browse for a file
    (local or, for an SSH system, on the remote host). Plain `o` types the

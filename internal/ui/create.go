@@ -1507,7 +1507,7 @@ func lintComposeYAML(content string) error {
 func (d createDraft) Validate() error {
 	if d.Mode == createModeCompose {
 		if strings.TrimSpace(d.Project) == "" {
-			return errors.New("project is required")
+			return errors.New("stack is required")
 		}
 		if strings.TrimSpace(d.ComposeFile) == "" {
 			return errors.New("compose file is required")
@@ -2846,7 +2846,7 @@ func createFieldLabel(field createField) string {
 	case createFieldMode:
 		return "Mode"
 	case createFieldProject:
-		return "Project"
+		return "Stack"
 	case createFieldService:
 		return "Service"
 	case createFieldContainerName:

@@ -172,19 +172,35 @@ func TestTreeShowsLoadingBeforeFirstSnapshot(t *testing.T) {
 func TestBuildRowsCollapseAndFilter(t *testing.T) {
 	model := testModel()
 	model.rows = model.buildRows()
-	if len(model.rows) != 5 {
-		t.Fatalf("rows = %d, want 5", len(model.rows))
+	if got := rowLabels(model.rows); strings.Join(got, ",") != "media,jellyfin-1,radarr-1" {
+		t.Fatalf("rows = %#v, want stack plus direct container children", got)
 	}
 	model.collapsed["media"] = true
 	model.rows = model.buildRows()
 	if len(model.rows) != 1 {
-		t.Fatalf("collapsed rows = %d, want project row only", len(model.rows))
+		t.Fatalf("collapsed rows = %d, want stack row only", len(model.rows))
 	}
 	model.collapsed["media"] = false
 	model.filter = "rad"
 	model.rows = model.buildRows()
-	if got := rowLabels(model.rows); strings.Join(got, ",") != "media,radarr,radarr-1" {
+	if got := rowLabels(model.rows); strings.Join(got, ",") != "radarr-1" {
 		t.Fatalf("filtered rows = %#v", got)
+	}
+}
+
+func TestBuildRowsFlattensSingleContainerComposeStack(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	provider := model.provider.(*fakeProvider)
+	only := provider.containers["1"]
+	model.snapshot = domain.BuildSnapshot(provider.host, []domain.Container{only}, time.Unix(2, 0))
+	model.rows = model.buildRows()
+
+	if got := rowLabels(model.rows); strings.Join(got, ",") != "radarr-1" {
+		t.Fatalf("rows = %#v, want only the container row for a single-container stack", got)
+	}
+	row := model.rows[0]
+	if row.kind != rowContainer || row.project != "media" || row.service != "radarr" || row.depth != 0 {
+		t.Fatalf("row = %+v, want flattened compose container with stack metadata", row)
 	}
 }
 
@@ -203,9 +219,13 @@ func TestSelectionMovementClamps(t *testing.T) {
 
 func TestTreeScrollsToKeepCursorVisible(t *testing.T) {
 	model := testModel()
+	provider := model.provider.(*fakeProvider)
+	extra := domain.Container{ID: domain.ResourceID{Host: "local", ID: "3"}, Name: "grafana", Image: "grafana/grafana", State: domain.StateRunning}
+	all := []domain.Container{provider.containers["1"], provider.containers["2"], extra}
+	model.snapshot = domain.BuildSnapshot(provider.host, all, time.Unix(3, 0))
 	model.rows = model.buildRows()
 	model.focus = paneTree
-	model.width, model.height = 100, 8 // treeVisibleRows() == 2
+	model.width, model.height = 100, 8 // treeVisibleRows() == 3
 
 	if got := len(model.rows); got <= model.treeVisibleRows() {
 		t.Fatalf("fixture has %d rows, want more than the %d visible rows for this test to be meaningful", got, model.treeVisibleRows())
@@ -221,8 +241,8 @@ func TestTreeScrollsToKeepCursorVisible(t *testing.T) {
 	if strings.Contains(view, "media") {
 		t.Fatalf("view still shows the scrolled-off top row 'media' after moving the cursor to the bottom row:\n%s", view)
 	}
-	if !strings.Contains(view, "jellyfin") {
-		t.Fatalf("view missing the now-selected bottom row 'jellyfin':\n%s", view)
+	if !strings.Contains(view, "grafana") {
+		t.Fatalf("view missing the now-selected bottom row 'grafana':\n%s", view)
 	}
 }
 
@@ -290,16 +310,11 @@ func TestSnapshotRefreshPreservesFocusedProjectRowOverSelectedContainer(t *testi
 	}
 }
 
-func TestSnapshotRefreshPreservesFocusedServiceRowOverSelectedContainer(t *testing.T) {
+func TestSnapshotRefreshPreservesFocusedStackRowOverSelectedContainer(t *testing.T) {
 	model := testModelWithSelectedContainer()
-	for i, row := range model.rows {
-		if row.kind == rowService && row.service == "radarr" {
-			model.cursor = i
-			break
-		}
-	}
-	if row := model.currentRow(); row == nil || row.kind != rowService {
-		t.Fatalf("currentRow = %#v, want service row fixture setup", row)
+	model.cursor = 0
+	if row := model.currentRow(); row == nil || row.kind != rowProject {
+		t.Fatalf("currentRow = %#v, want stack row fixture setup", row)
 	}
 	if model.selectedID.ID == "" {
 		t.Fatal("selectedID is empty, want prior container selection to reproduce refresh jump")
@@ -308,24 +323,30 @@ func TestSnapshotRefreshPreservesFocusedServiceRowOverSelectedContainer(t *testi
 	updated, cmd := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
 	model = updated.(Model)
 	if cmd != nil {
-		t.Fatalf("cmd = %#v, want nil because refresh kept focus on a non-container row", cmd)
+		t.Fatalf("cmd = %#v, want nil because refresh kept focus on a stack row", cmd)
 	}
-	if row := model.currentRow(); row == nil || row.kind != rowService || row.service != "radarr" {
-		t.Fatalf("currentRow = %#v, want refresh to preserve focused service row", row)
+	if row := model.currentRow(); row == nil || row.kind != rowProject || row.project != "media" {
+		t.Fatalf("currentRow = %#v, want refresh to preserve focused stack row", row)
 	}
 }
 
-func TestTreeHeaderFocusClearsContainerTarget(t *testing.T) {
+func TestTreeStackFocusClearsContainerTarget(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.focus = paneTree
+	for i, row := range model.rows {
+		if row.container != nil && row.container.ID.ID == "2" {
+			model.cursor = i
+			break
+		}
+	}
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	model = updated.(Model)
 	if cmd != nil {
-		t.Fatalf("cmd = %#v, want nil when moving onto a service header", cmd)
+		t.Fatalf("cmd = %#v, want nil when moving onto a stack header", cmd)
 	}
-	if row := model.currentRow(); row == nil || row.kind != rowService {
-		t.Fatalf("currentRow = %#v, want service header after moving up from container", row)
+	if row := model.currentRow(); row == nil || row.kind != rowProject {
+		t.Fatalf("currentRow = %#v, want stack header after moving up from container", row)
 	}
 	if model.selectedID.ID != "" || model.selected != nil {
 		t.Fatalf("selectedID/selected = %q/%#v, want cleared on header focus", model.selectedID.ID, model.selected)
@@ -4072,11 +4093,15 @@ func TestMouseWheelNoOpWhenInspectorFocused(t *testing.T) {
 
 func TestTreeMouseClickUsesScrolledVisibleRows(t *testing.T) {
 	model := testModel()
+	provider := model.provider.(*fakeProvider)
+	extra := domain.Container{ID: domain.ResourceID{Host: "local", ID: "3"}, Name: "grafana", Image: "grafana/grafana", State: domain.StateRunning}
+	all := []domain.Container{provider.containers["1"], provider.containers["2"], extra}
+	model.snapshot = domain.BuildSnapshot(provider.host, all, time.Unix(3, 0))
 	model.rows = model.buildRows()
-	model.width, model.height = 120, 8 // treeVisibleRows() == 2
+	model.width, model.height = 120, 8 // treeVisibleRows() == 3
 	model.focus = paneTree
 	for i, row := range model.rows {
-		if row.container != nil && row.container.ID.ID == "2" {
+		if row.container != nil && row.container.ID.ID == "3" {
 			model.cursor = i
 			break
 		}
@@ -4093,15 +4118,15 @@ func TestTreeMouseClickUsesScrolledVisibleRows(t *testing.T) {
 		Button: tea.MouseButtonLeft,
 	})
 	model = updated.(Model)
-	if row := model.currentRow(); row == nil || row.container == nil || row.container.ID.ID != "2" {
-		t.Fatalf("currentRow = %#v, want click on second visible scrolled row to select jellyfin", row)
+	if row := model.currentRow(); row == nil || row.container == nil || row.container.ID.ID != "1" {
+		t.Fatalf("currentRow = %#v, want click on second visible scrolled row to select radarr", row)
 	}
 	if cmd == nil {
 		t.Fatal("cmd is nil, want selected container load")
 	}
 	msg := runCmd(t, cmd).(detailMsg)
-	if msg.container.ID.ID != "2" {
-		t.Fatalf("loaded container = %q, want 2", msg.container.ID.ID)
+	if msg.container.ID.ID != "1" {
+		t.Fatalf("loaded container = %q, want 1", msg.container.ID.ID)
 	}
 }
 

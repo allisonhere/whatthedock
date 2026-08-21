@@ -47,7 +47,7 @@ func (m Model) View() string {
 		inspectorContent = renderCollapsedPane(renderer, m.rightPaneWidth(), m.paneContentRows(), "◂")
 	}
 	panes := [3]tideui.Pane{
-		{Title: "Projects", Hint: "tree", Content: treeContent, Focused: m.focus == paneTree},
+		{Title: "Containers", Hint: "tree", Content: treeContent, Focused: m.focus == paneTree},
 		{Title: activityTitle, Hint: activityHint, Content: m.renderActivity(renderer), Focused: m.focus == paneActivity},
 		{Title: inspectorTitle, Hint: "details", Content: inspectorContent, Focused: m.focus == paneInspector},
 	}
@@ -144,12 +144,22 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	// this used to be built from.
 	left := backgroundSpan("  WHAT THE DOCK?!  ", noticeBG, noticeFG, statusBarBG, statusBarFG, true) +
 		"  " + m.provider.Host().Name + " "
-	right := fmt.Sprintf("Docker connected · %d projects · %d standalone · %d problems",
-		len(m.snapshot.Projects), len(m.snapshot.Standalone), len(m.snapshotProblems()))
+	right := fmt.Sprintf("Docker connected · %d stacks · %d containers · %d problems",
+		len(m.snapshot.Projects), m.snapshotContainerCount(), len(m.snapshotProblems()))
 	if m.statusErr {
 		right = topbarStatusLine(m.status)
 	}
 	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, contentWidth))
+}
+
+func (m Model) snapshotContainerCount() int {
+	count := len(m.snapshot.Standalone)
+	for _, project := range m.snapshot.Projects {
+		for _, service := range project.Services {
+			count += len(service.Containers)
+		}
+	}
+	return count
 }
 
 // topbarStatusLine collapses a possibly multi-line status message (a
@@ -186,7 +196,7 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 			return renderer.Styles.DetailMeta.Render("Loading containers...")
 		}
 		if strings.TrimSpace(m.filter) != "" {
-			return renderer.Styles.DetailMeta.Render("No projects or containers match " + m.filter + ".")
+			return renderer.Styles.DetailMeta.Render("No stacks or containers match " + m.filter + ".")
 		}
 		return renderer.Styles.DetailMeta.Render("No containers found on this host.")
 	}
@@ -1500,7 +1510,7 @@ func problemInsight(row problemRow) string {
 	case ctr.Health == domain.HealthUnknown:
 		return name + " has a health check configured but hasn't reported a status yet — usually just means it's still starting (the check's start period hasn't elapsed), but worth a second look if it stays this way."
 	case ctr.Compose.Project == "" && hasPublicPorts(ctr):
-		return name + " is a standalone container publishing ports to the host. Not necessarily wrong, but confirm this is intentional — standalone containers with public ports are easy to lose track of outside a Compose project."
+		return name + " is a standalone container publishing ports to the host. Not necessarily wrong, but confirm this is intentional — standalone containers with public ports are easy to lose track of outside a Compose stack."
 	default:
 		return "No specific guidance for this problem yet."
 	}
@@ -1589,7 +1599,7 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 
 	if ctr.Compose.Project != "" {
 		addSection("Compose")
-		add("Project", ctr.Compose.Project, "c", "#80c990")
+		add("Stack", ctr.Compose.Project, "c", "#80c990")
 		add("Service", ctr.Compose.Service, "c", "#80c990")
 		add("Number", ctr.Compose.ContainerNumber, "c", "#9aa6b2")
 		add("Config", ctr.Compose.ConfigFiles, "c/o", "#9aa6b2")
@@ -2050,7 +2060,7 @@ func (m Model) editScopeOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if selected := m.selectedContainer(); selected != nil {
 		project := selected.Compose.Project
 		count := siblingServiceCount(m.snapshot, project)
-		prompt = fmt.Sprintf("Project %q has %d services. Edit just %s, or the whole stack?", project, count, selected.Compose.Service)
+		prompt = fmt.Sprintf("Stack %q has %d services. Edit just %s, or the whole stack?", project, count, selected.Compose.Service)
 	}
 	content := renderer.RenderSoftBody(width, strings.Join([]string{
 		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
@@ -2078,7 +2088,7 @@ func (m Model) deleteScopeOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if selected := m.selectedContainer(); selected != nil {
 		project := selected.Compose.Project
 		count := siblingServiceCount(m.snapshot, project)
-		prompt = fmt.Sprintf("Project %q has %d services. Delete just %s, or the whole stack?", project, count, selected.Compose.Service)
+		prompt = fmt.Sprintf("Stack %q has %d services. Delete just %s, or the whole stack?", project, count, selected.Compose.Service)
 	}
 	content := renderer.RenderSoftBody(width, strings.Join([]string{
 		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
@@ -2118,7 +2128,7 @@ func (m Model) deleteStackConfirmOverlay(renderer tideui.Renderer) *tideui.Overl
 			names = append(names, svc.Name)
 		}
 	}
-	prompt := fmt.Sprintf("Delete project %q? This stops and removes %d services (%s) and deletes %s. This cannot be undone.",
+	prompt := fmt.Sprintf("Delete stack %q? This stops and removes %d services (%s) and deletes %s. This cannot be undone.",
 		project, len(names), summarizeServiceNames(names, 6), short(composeFile, max(12, contentWidth-40)))
 	content := renderer.RenderSoftBody(width, strings.Join([]string{
 		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
@@ -2642,8 +2652,8 @@ var helpLines = []string{
 	"j / Down       next",
 	"k / Up         previous",
 	"Enter          select/open",
-	"Space          expand/collapse project",
-	"/              filter projects, services, containers",
+	"Space          expand/collapse stack",
+	"/              filter stacks and containers",
 	"s              start/stop selected container",
 	"n              create container or Compose service",
 	"               paste a multi-service compose file to deploy a stack",
@@ -2662,10 +2672,10 @@ var helpLines = []string{
 	"Esc            clear active log filter",
 	"u              replicate: pull latest image, recreate",
 	"D              delete: real, permanent removal",
-	"               on a project row: deletes the whole stack + its file",
+	"               on a stack row: deletes the whole stack + its file",
 	"               on a multi-service container: prompts service vs. stack",
 	"C              clone under a new name",
-	"m              edit in place; on a project row, edits the whole stack",
+	"m              edit in place; on a stack row, edits the whole stack",
 	"               on a multi-service container: prompts service vs. stack",
 	"               Image action can pull latest before applying edits",
 	"p              problems",
