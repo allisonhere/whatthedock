@@ -1360,6 +1360,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.createDraft.OverrideRaw = msg.content
 				m.createDraft.OverrideRawSet = true
 				m.createDraft.OverrideLoaded = true
+				m.createDraft.OverrideRawBase = false
 				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
 			}
@@ -1377,6 +1378,39 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.createDraft.OverrideRawSet = true
 		m.createDraft.OverrideLoaded = true
 		m.status, m.statusErr = "loaded "+msg.project+" for editing", false
+		return m, nil
+	case createSelectedComposeFileMsg:
+		if m.overlay != overlayCreate || m.createDraft.Mode != createModeCompose || m.createDraft.ComposeFile != msg.path {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.status, m.statusErr = "loading "+msg.path+": "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		if m.createDraft.OverrideRawSet {
+			return m, nil
+		}
+		serviceNames := allOverrideServiceNames(msg.content)
+		if len(serviceNames) == 1 {
+			m.createDraft.OverrideRaw = msg.content
+			m.createDraft.OverrideRawSet = true
+			m.createDraft.OverrideLoaded = true
+			m.createDraft.OverrideRawBase = true
+			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+			m.revalidateCreateField()
+			m.status, m.statusErr = "loaded compose service from "+filepath.Base(msg.path), false
+			return m, nil
+		}
+		if len(serviceNames) <= 1 {
+			return m, nil
+		}
+		m.createDraft.OverrideRaw = msg.content
+		m.createDraft.OverrideRawSet = true
+		m.createDraft.OverrideLoaded = true
+		m.createDraft.OverrideRawBase = true
+		m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+		m.revalidateCreateField()
+		m.status, m.statusErr = "loaded compose stack from "+filepath.Base(msg.path), false
 		return m, nil
 	case createFileBrowseMsg:
 		m.createFileLoading = false

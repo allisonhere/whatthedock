@@ -74,9 +74,10 @@ type createDraft struct {
 	// openCreateOverlay/checkRemoteOverrideCmd) or hand-edited via the
 	// Ripple editor opened with ctrl+y. OverrideLoaded distinguishes the
 	// two for the form's label; saving an edit in the editor clears it.
-	OverrideRaw    string
-	OverrideRawSet bool
-	OverrideLoaded bool
+	OverrideRaw     string
+	OverrideRawSet  bool
+	OverrideLoaded  bool
+	OverrideRawBase bool
 
 	// BaseFileMissing is set (see openCreateOverlay/checkRemoteOverrideCmd)
 	// when ComposeFile was already non-empty at form-open time — i.e. an
@@ -97,6 +98,7 @@ type composeCreateSpec struct {
 	BaseFile     string
 	OverrideFile string
 	Content      string
+	FullBase     bool
 	System       config.System
 }
 
@@ -147,6 +149,7 @@ func (m *Model) checkComposeOverrideCmd() tea.Cmd {
 		m.createDraft.OverrideRaw = content
 		m.createDraft.OverrideRawSet = true
 		m.createDraft.OverrideLoaded = true
+		m.createDraft.OverrideRawBase = false
 		m.createDraft.applyOverrideFieldsFromYAML(content)
 		m.status, m.statusErr = "loaded existing override for "+m.createDraft.Service, false
 	}
@@ -294,6 +297,41 @@ func checkStackFileCmd(system config.System, project, composeFile string) tea.Cm
 			return createStackFileCheckMsg{project: project, err: err}
 		}
 		return createStackFileCheckMsg{project: project, content: string(output)}
+	}
+}
+
+// createSelectedComposeFileMsg carries the content of a compose file picked
+// from the create overlay's browser. It is intentionally separate from
+// createStackFileCheckMsg: browsing while creating a new service should only
+// switch into whole-stack mode when the selected file itself defines multiple
+// services, and must not disturb the existing per-service override load path.
+type createSelectedComposeFileMsg struct {
+	path    string
+	content string
+	err     error
+}
+
+func (m Model) loadSelectedComposeFileCmd(composeFile string) tea.Cmd {
+	composeFile = strings.TrimSpace(composeFile)
+	if composeFile == "" {
+		return nil
+	}
+	system := m.activeSystemConfig()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if system.Kind == "ssh" {
+			output, err := sshRun(ctx, system, "cat "+systems.ShellQuote(composeFile), "")
+			if err != nil {
+				return createSelectedComposeFileMsg{path: composeFile, err: err}
+			}
+			return createSelectedComposeFileMsg{path: composeFile, content: string(output)}
+		}
+		data, err := os.ReadFile(composeFile)
+		if err != nil {
+			return createSelectedComposeFileMsg{path: composeFile, err: err}
+		}
+		return createSelectedComposeFileMsg{path: composeFile, content: string(data)}
 	}
 }
 
@@ -798,7 +836,7 @@ func (m Model) handleCreateFileBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.createCursor = len([]rune(m.createDraft.ComposeFile))
 		m.createBrowsing = false
 		m.status, m.statusErr = "compose file selected", false
-		return m, m.checkComposeOverrideCmd()
+		return m, tea.Batch(m.checkComposeOverrideCmd(), m.loadSelectedComposeFileCmd(entry.Path))
 	}
 	return m, nil
 }
@@ -851,6 +889,7 @@ func (m *Model) saveCreateEditor() {
 	m.createDraft.OverrideRaw = value
 	m.createDraft.OverrideRawSet = value != ""
 	m.createDraft.OverrideLoaded = false // now hand-edited this session, not just loaded
+	m.createDraft.OverrideRawBase = m.createDraft.OverrideRawBase && value != ""
 	m.createEditingCompose = false
 	if m.createDraft.OverrideRawSet {
 		m.createDraft.applyOverrideFieldsFromYAML(value)
@@ -1207,6 +1246,7 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 			Project:  strings.TrimSpace(d.Project),
 			BaseFile: strings.TrimSpace(d.ComposeFile),
 			Content:  d.OverrideRaw,
+			FullBase: true,
 			System:   system,
 		}, nil
 	}
@@ -1241,6 +1281,7 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		BaseFile:     base,
 		OverrideFile: override,
 		Content:      content,
+		FullBase:     d.OverrideRawBase,
 		System:       system,
 	}, nil
 }
@@ -1377,6 +1418,14 @@ func selectOverrideService(services map[string]composeOverrideService, preferred
 func firstOverrideServiceName(content string) string {
 	names := allOverrideServiceNames(content)
 	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+func singleComposeServiceName(content string) string {
+	names := allOverrideServiceNames(content)
+	if len(names) != 1 {
 		return ""
 	}
 	return names[0]
@@ -1676,6 +1725,28 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 // and drops any override left over from before this service existed in
 // base, so there's exactly one place the service is defined going forward.
 func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
+		baseOnly := spec
+		baseOnly.OverrideFile = ""
+		tempBase := spec.BaseFile + ".tmp"
+		if err := os.WriteFile(tempBase, []byte(spec.Content), 0o644); err != nil {
+			return err
+		}
+		tempSpec := baseOnly
+		tempSpec.BaseFile = tempBase
+		if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+			_ = os.Remove(tempBase)
+			return err
+		}
+		if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+			_ = os.Remove(tempBase)
+			return err
+		}
+		if strings.TrimSpace(spec.OverrideFile) != "" {
+			_ = os.Remove(spec.OverrideFile)
+		}
+		return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	}
 	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
 	if !ok {
 		return fmt.Errorf("could not read fields for service %q", spec.Service)
@@ -1745,6 +1816,28 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 // counterpart — every filesystem step runs remotely over sshRun instead of
 // the os package.
 func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
+		baseOnly := spec
+		baseOnly.OverrideFile = ""
+		tempBase := spec.BaseFile + ".tmp"
+		if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
+			return err
+		}
+		tempSpec := baseOnly
+		tempSpec.BaseFile = tempBase
+		if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+			return err
+		}
+		if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+			return err
+		}
+		if strings.TrimSpace(spec.OverrideFile) != "" {
+			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), "")
+		}
+		return composeCommand(ctx, baseOnly, "up", "-d", spec.Service)
+	}
 	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
 	if !ok {
 		return fmt.Errorf("could not read fields for service %q", spec.Service)

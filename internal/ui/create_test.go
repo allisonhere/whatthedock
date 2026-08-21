@@ -213,6 +213,45 @@ func TestCreateStandaloneSpecParsesFields(t *testing.T) {
 	}
 }
 
+func TestCreateStandaloneSpecRejectsInvalidFields(t *testing.T) {
+	base := createDraft{
+		Mode:          createModeStandalone,
+		ContainerName: "cache",
+		Image:         "redis:7",
+		Restart:       "unless-stopped",
+	}
+	tests := []struct {
+		name string
+		edit func(*createDraft)
+		want string
+	}{
+		{
+			name: "port",
+			edit: func(d *createDraft) { d.Ports = "6379" },
+			want: "must be host:container",
+		},
+		{
+			name: "mount",
+			edit: func(d *createDraft) { d.Mounts = "/data" },
+			want: "must be source:target",
+		},
+		{
+			name: "env",
+			edit: func(d *createDraft) { d.Env = "REDIS_APPENDONLY" },
+			want: "must be KEY=value",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			draft := base
+			tt.edit(&draft)
+			if _, err := draft.ContainerSpec(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ContainerSpec() error = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestCreateComposeSpecWritesOverrideBesideBaseFile(t *testing.T) {
 	draft := createDraft{
 		Mode:        createModeCompose,
@@ -241,6 +280,184 @@ func TestCreateComposeSpecWritesOverrideBesideBaseFile(t *testing.T) {
 			t.Fatalf("content missing %q:\n%s", want, spec.Content)
 		}
 	}
+}
+
+func TestLoadSelectedComposeFilePromotesMultiServiceFileToStackDraft(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n"
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.ComposeFile = base
+
+	msg := runCmd(t, model.loadSelectedComposeFileCmd(base)).(createSelectedComposeFileMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if !model.createDraft.IsStack() {
+		t.Fatal("IsStack() = false after loading a multi-service compose file, want true")
+	}
+	if model.createDraft.OverrideRaw != content || !model.createDraft.OverrideLoaded {
+		t.Fatalf("OverrideRaw/Loaded = %q/%v, want selected file content loaded", model.createDraft.OverrideRaw, model.createDraft.OverrideLoaded)
+	}
+	if fields := model.visibleCreateFields(); !containsCreateField(fields, createFieldComposeFile) || containsCreateField(fields, createFieldService) {
+		t.Fatalf("visible fields = %#v, want stack fields without single-service inputs", fields)
+	}
+}
+
+func TestLoadSelectedComposeFilePopulatesSingleServiceFields(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := `services:
+  dash:
+    # Published by .github/workflows/publish.yml on every push to master.
+    build: .
+    image: ghcr.io/allisonhere/dash:latest
+    container_name: dash
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=3939
+      # Read the bind-mounted omarchy folder below as if it were local.
+      - OMARCHY_DIR=/omarchy
+    volumes:
+      - ./data:/config
+      - ./omarchy:/omarchy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+`
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "new-service"
+	model.createDraft.Image = "image:tag"
+	model.createDraft.Ports = "8080:80"
+	model.createDraft.ComposeFile = base
+
+	msg := runCmd(t, model.loadSelectedComposeFileCmd(base)).(createSelectedComposeFileMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase || model.createDraft.OverrideRaw != content {
+		t.Fatalf("OverrideRawSet/Base/Raw = %v/%v/%q, want selected base file kept as raw editor content", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase, model.createDraft.OverrideRaw)
+	}
+	if model.createDraft.Service != "dash" {
+		t.Fatalf("Service = %q, want dash", model.createDraft.Service)
+	}
+	if model.createDraft.Image != "ghcr.io/allisonhere/dash:latest" || model.createDraft.Restart != "unless-stopped" {
+		t.Fatalf("Image/Restart = %q/%q, want dash image/unless-stopped", model.createDraft.Image, model.createDraft.Restart)
+	}
+	if model.createDraft.Ports != "" {
+		t.Fatalf("Ports = %q, want empty because the compose service uses host networking and no ports key", model.createDraft.Ports)
+	}
+	for _, want := range []string{"PORT=3939", "OMARCHY_DIR=/omarchy"} {
+		if !strings.Contains(model.createDraft.Env, want) {
+			t.Fatalf("Env = %q, missing %q", model.createDraft.Env, want)
+		}
+	}
+	for _, want := range []string{"./data:/config", "./omarchy:/omarchy:ro", "/var/run/docker.sock:/var/run/docker.sock:ro"} {
+		if !strings.Contains(model.createDraft.Mounts, want) {
+			t.Fatalf("Mounts = %q, missing %q", model.createDraft.Mounts, want)
+		}
+	}
+}
+
+func TestDefaultApplyComposeCreatePersistsRawSingleServiceBaseExactly(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	var calls []string
+	composeCommand = func(_ context.Context, spec composeCreateSpec, args ...string) error {
+		calls = append(calls, spec.BaseFile+"|"+spec.OverrideFile+" "+strings.Join(args, " "))
+		return nil
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	before := "services:\n  dash:\n    image: old\n"
+	if err := os.WriteFile(base, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content := `services:
+  dash:
+    # Published by .github/workflows/publish.yml on every push to master, so
+    # Portainer can re-pull/update this like any other container.
+    build: .
+    image: ghcr.io/allisonhere/dash:latest
+    container_name: dash
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=3939
+      # Read the bind-mounted omarchy folder below as if it were local.
+      - OMARCHY_DIR=/omarchy
+    volumes:
+      # All data + theme selection live here.
+      - ./data:/config
+      - ./omarchy:/omarchy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+`
+	spec := composeCreateSpec{
+		Project:      "dash",
+		Service:      "dash",
+		BaseFile:     base,
+		OverrideFile: filepath.Join(dir, "compose.whatthedock.dash.yml"),
+		Content:      content,
+		FullBase:     true,
+	}
+
+	if err := defaultApplyComposeCreate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeCreate() error = %v", err)
+	}
+	written, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != content {
+		t.Fatalf("base content was not persisted exactly:\n--- got ---\n%s\n--- want ---\n%s", written, content)
+	}
+	if len(calls) != 2 || !strings.Contains(calls[0], ".tmp| config") || !strings.Contains(calls[1], "compose.yml| up -d dash") {
+		t.Fatalf("compose calls = %#v, want temp config then base-only up -d dash", calls)
+	}
+}
+
+func TestLoadSelectedComposeFileDoesNotReplaceExistingOverride(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
+	model.createDraft.OverrideRaw = "services:\n  radarr:\n    image: radarr:custom\n"
+	model.createDraft.OverrideRawSet = true
+	model.createDraft.OverrideLoaded = true
+
+	msg := createSelectedComposeFileMsg{
+		path:    "/srv/media/compose.yml",
+		content: "services:\n  web:\n    image: nginx\n  api:\n    image: httpd\n",
+	}
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if model.createDraft.OverrideRaw != "services:\n  radarr:\n    image: radarr:custom\n" {
+		t.Fatalf("OverrideRaw was replaced by selected base content:\n%s", model.createDraft.OverrideRaw)
+	}
+	if model.createDraft.IsStack() {
+		t.Fatal("IsStack() = true, want existing per-service override to keep precedence")
+	}
+}
+
+func containsCreateField(fields []createField, want createField) bool {
+	for _, field := range fields {
+		if field == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
