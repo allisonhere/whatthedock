@@ -3225,6 +3225,28 @@ func TestTopbarFitsInOneLine(t *testing.T) {
 	}
 }
 
+func TestTopbarStackCountMatchesRenderedStackRows(t *testing.T) {
+	host := domain.Host{ID: "local", Name: "local"}
+	containers := []domain.Container{
+		{ID: domain.ResourceID{Host: "local", ID: "1"}, Name: "radarr-1", Image: "radarr", State: domain.StateRunning, Compose: domain.ComposeRef{Project: "media", Service: "radarr"}},
+		{ID: domain.ResourceID{Host: "local", ID: "2"}, Name: "jellyfin-1", Image: "jellyfin", State: domain.StateRunning, Compose: domain.ComposeRef{Project: "media", Service: "jellyfin"}},
+		{ID: domain.ResourceID{Host: "local", ID: "3"}, Name: "grafana-1", Image: "grafana", State: domain.StateRunning, Compose: domain.ComposeRef{Project: "monitoring", Service: "grafana"}},
+		{ID: domain.ResourceID{Host: "local", ID: "4"}, Name: "redis-1", Image: "redis", State: domain.StateRunning, Compose: domain.ComposeRef{Project: "cache", Service: "redis"}},
+	}
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.snapshot = domain.BuildSnapshot(host, containers, time.Unix(4, 0))
+	model.rows = model.buildRows()
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "Docker connected · 1 stacks · 4 containers") {
+		t.Fatalf("topbar did not count only rendered stack rows:\n%s", view)
+	}
+	if got := rowLabels(model.rows); strings.Join(got, ",") != "redis-1,media,jellyfin-1,radarr-1,grafana-1" {
+		t.Fatalf("rows = %#v, want one stack row plus flattened single-container compose apps", got)
+	}
+}
+
 // TestTopbarCollapsesMultilineErrorStatus guards against a regression
 // where a failed docker/compose command's raw combined output — often
 // several lines — was passed straight into the topbar's right-side status

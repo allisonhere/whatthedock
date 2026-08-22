@@ -145,11 +145,25 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	left := backgroundSpan("  WHAT THE DOCK?!  ", noticeBG, noticeFG, statusBarBG, statusBarFG, true) +
 		"  " + m.provider.Host().Name + " "
 	right := fmt.Sprintf("Docker connected · %d stacks · %d containers · %d problems",
-		len(m.snapshot.Projects), m.snapshotContainerCount(), len(m.snapshotProblems()))
+		m.snapshotStackRowCount(), m.snapshotContainerCount(), len(m.snapshotProblems()))
 	if m.statusErr {
 		right = topbarStatusLine(m.status)
 	}
 	return renderer.Styles.StatusBar.Width(width).Render(alignText(left, right, contentWidth))
+}
+
+func (m Model) snapshotStackRowCount() int {
+	count := 0
+	for _, project := range m.snapshot.Projects {
+		containers := 0
+		for _, service := range project.Services {
+			containers += len(service.Containers)
+		}
+		if containers > 1 {
+			count++
+		}
+	}
+	return count
 }
 
 func (m Model) snapshotContainerCount() int {
