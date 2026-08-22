@@ -17,6 +17,7 @@ const (
 	Delete         ID = "delete-container"
 	Replicate      ID = "replicate-container"
 	Clone          ID = "clone-container"
+	CurateImages   ID = "curate-images"
 	ExecShell      ID = "exec-shell"
 	FocusLogs      ID = "focus-logs"
 	ShowProblems   ID = "show-problems"
@@ -59,6 +60,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer},
 		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer},
 		{ID: Clone, Name: "Clone container or Compose service under a new name", Shortcut: "C", Aliases: []string{"duplicate", "copy container"}, Enabled: hasContainer},
+		{ID: CurateImages, Name: "Curate Docker images", Shortcut: "", Aliases: []string{"images", "unused images", "prune images", "cleanup images"}, Enabled: true},
 		{ID: ExecShell, Name: "Open a shell inside the selected container", Shortcut: "e", Aliases: []string{"exec", "shell", "terminal", "ssh into container"}, Enabled: canExec},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer},
 		{ID: ShowProblems, Name: "Show problems", Shortcut: "p", Aliases: []string{"issues", "health", "unhealthy", "restarting"}, Enabled: true},

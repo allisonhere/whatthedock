@@ -70,6 +70,7 @@ const (
 	overlayEditScope
 	overlayDeleteScope
 	overlayDeleteStackConfirm
+	overlayImageCuration
 )
 
 type createCatalogMode int
@@ -477,6 +478,15 @@ type Model struct {
 	createDoneReady       bool
 	createDoneResult      createDoneMsg
 
+	imageItems      []domain.Image
+	imageCursor     int
+	imageSelected   map[string]bool
+	imageLoading    bool
+	imageConfirming bool
+	imageRemoving   bool
+	imageError      string
+	imageResult     string
+
 	// eventsReconnecting mirrors the event-stream backoff loop so statusLeft
 	// can show it's happening instead of going silent for up to 30s.
 	eventsReconnecting bool
@@ -760,6 +770,16 @@ type createDoneMsg struct {
 	// empty for a standalone create/edit, which reports id instead.
 	project string
 	service string
+}
+
+type imageListMsg struct {
+	images []domain.Image
+	err    error
+}
+
+type imageRemoveDoneMsg struct {
+	removed  []string
+	failures []string
 }
 
 func NewModel(provider app.Provider) Model {
@@ -1334,13 +1354,45 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.aiAnalysis = msg.result
 		return m, nil
 	case createDoneMsg:
-		if msg.err == nil && m.overlay == overlayCreate && m.createDraft.Confirming && m.actionProgressPercent < 100 {
-			m.createDoneReady = true
-			m.createDoneResult = msg
-			m.actionProgressText = "finishing " + msg.name + "…"
+		// The real operation is complete here. Do not hold the modal open
+		// for the cosmetic progress bar: its pulse can be interrupted or
+		// starved, leaving a successful edit stuck at "finishing … 0%".
+		return m.finishCreateDone(msg)
+	case imageListMsg:
+		m.imageLoading = false
+		m.imageError = ""
+		if msg.err != nil {
+			m.imageError = friendlyDockerError(msg.err)
 			return m, nil
 		}
-		return m.finishCreateDone(msg)
+		sortImages(msg.images)
+		m.imageItems = msg.images
+		m.imageCursor = clamp(m.imageCursor, 0, max(0, len(m.imageItems)-1))
+		return m, nil
+	case imageRemoveDoneMsg:
+		m.imageRemoving = false
+		m.imageConfirming = false
+		removed := make(map[string]bool, len(msg.removed))
+		for _, ref := range msg.removed {
+			removed[ref] = true
+		}
+		remaining := m.imageItems[:0]
+		for _, image := range m.imageItems {
+			if !removed[image.ID.ID] {
+				remaining = append(remaining, image)
+			}
+		}
+		m.imageItems = remaining
+		m.imageCursor = clamp(m.imageCursor, 0, max(0, len(m.imageItems)-1))
+		m.imageSelected = map[string]bool{}
+		if len(msg.failures) > 0 {
+			m.imageResult = fmt.Sprintf("removed %d image(s); %d failed", len(msg.removed), len(msg.failures))
+			m.imageError = strings.Join(msg.failures, "; ")
+		} else {
+			m.imageResult = fmt.Sprintf("removed %d image(s)", len(msg.removed))
+			m.imageError = ""
+		}
+		return m, m.refreshCmd()
 	case ripple.SubmitMsg:
 		if m.createEditingCompose {
 			m.saveCreateEditor()
@@ -1854,6 +1906,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleDeleteScopeKey(msg)
 	case overlayDeleteStackConfirm:
 		return m.handleDeleteStackConfirmKey(msg)
+	case overlayImageCuration:
+		return m.handleImageCurationKey(msg)
 	}
 	return m, nil
 }
@@ -2916,6 +2970,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()
 		}
+	case actions.CurateImages:
+		return m.openImageCuration()
 	case actions.ExecShell:
 		if selected := m.selectedContainer(); selected != nil && selected.IsRunning() {
 			return m, m.execShellCmd(*selected)

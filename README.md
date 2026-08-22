@@ -122,6 +122,7 @@ Docker socket paths must be present.
 | `D` | Delete: stop and remove the container, and delete its definition (`docker rm` for a standalone container; for a Compose service, its override and/or its block in the base compose file). On a stack row, deletes the whole stack: stops and removes every container it defines and deletes its compose file; on a container that's part of a multi-service stack, prompts to delete just that service or the whole stack |
 | `C` | Clone under a new name via the create overlay |
 | `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. Single-service create/edit forms include an Image action choice to keep the current image or pull latest before applying. On a stack row, edits the whole stack's base compose file directly; on a container that's part of a multi-service stack, prompts to edit just that service or the whole stack |
+| `Ctrl+K` -> `Curate Docker images` | Review images on the active Docker system, select unused or dangling images, and confirm cleanup. In-use images are shown but cannot be selected. |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -427,6 +428,12 @@ More detail:
   finishes faster; Delete/Replicate still use the status bar. Standalone
   Docker API pulls show real per-layer pull progress, while Compose operations
   show phase labels because they shell out to `docker compose`.
+- Curates Docker images from the command palette. The inventory is scoped to
+  the active system and shows tags, short IDs, sizes, usage counts, and
+  dangling status. Select removable images with `Space`, press `d`, then use
+  `y` or `Enter` to continue; removed images disappear from the same modal
+  list, while image removal is never forced and individual failures remain
+  visible.
 - Opens an interactive shell inside the selected running container (`e`),
   handing the real terminal to `docker exec -it` (preferring `bash`, falling
   back to `sh`) and resuming WhatTheDock when the session ends. Works against

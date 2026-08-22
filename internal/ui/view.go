@@ -2059,6 +2059,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.deleteScopeOverlay(renderer)
 	case overlayDeleteStackConfirm:
 		return m.deleteStackConfirmOverlay(renderer)
+	case overlayImageCuration:
+		return m.imageCurationOverlay(renderer)
 	default:
 		return nil
 	}

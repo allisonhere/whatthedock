@@ -230,7 +230,9 @@ func (noopProvider) RemoveContainer(context.Context, domain.ResourceID, bool) er
 func (noopProvider) PullImage(context.Context, string, func(app.PullProgress)) error {
 	panic("not implemented")
 }
-func (noopProvider) Close() error { panic("not implemented") }
+func (noopProvider) Images(context.Context) ([]domain.Image, error) { panic("not implemented") }
+func (noopProvider) RemoveImage(context.Context, string) error      { panic("not implemented") }
+func (noopProvider) Close() error                                   { panic("not implemented") }
 
 // TestStartAIAnalysisNoProblemsIsNoop guards against a nil-pointer panic
 // when there's nothing to analyze (currentProblem returns nil).

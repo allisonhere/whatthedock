@@ -337,6 +337,34 @@ func (p *LocalProvider) PullImage(ctx context.Context, image string, onProgress 
 	}
 }
 
+func (p *LocalProvider) Images(ctx context.Context) ([]domain.Image, error) {
+	items, err := p.cli.ImageList(ctx, imagetypes.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	images := make([]domain.Image, 0, len(items))
+	for _, item := range items {
+		images = append(images, domain.Image{
+			ID:          domain.ResourceID{Host: p.host.ID, ID: item.ID},
+			RepoTags:    append([]string(nil), item.RepoTags...),
+			RepoDigests: append([]string(nil), item.RepoDigests...),
+			Size:        item.Size,
+			Created:     time.Unix(item.Created, 0),
+			Containers:  item.Containers,
+			Dangling:    len(item.RepoTags) == 0,
+		})
+	}
+	sort.Slice(images, func(i, j int) bool { return images[i].DisplayName() < images[j].DisplayName() })
+	return images, nil
+}
+
+// RemoveImage deliberately leaves Force false so Docker protects images that
+// are still referenced by a container or another image tag.
+func (p *LocalProvider) RemoveImage(ctx context.Context, ref string) error {
+	_, err := p.cli.ImageRemove(ctx, ref, imagetypes.RemoveOptions{})
+	return err
+}
+
 func (p *LocalProvider) Close() error {
 	if p.cli == nil {
 		return nil

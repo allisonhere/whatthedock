@@ -106,6 +106,34 @@ type Container struct {
 	HealthCheck   *HealthCheck
 }
 
+// Image describes one image in a Docker host's local image store.
+type Image struct {
+	ID          ResourceID
+	RepoTags    []string
+	RepoDigests []string
+	Size        int64
+	Created     time.Time
+	Containers  int64
+	Dangling    bool
+}
+
+func (i Image) ShortID() string {
+	id := i.ID.ID
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+func (i Image) DisplayName() string {
+	if len(i.RepoTags) > 0 {
+		return strings.Join(i.RepoTags, ", ")
+	}
+	return "<none>"
+}
+
+func (i Image) Removable() bool { return i.Containers == 0 }
+
 type ContainerStats struct {
 	ID          ResourceID
 	Read        time.Time

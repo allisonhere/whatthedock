@@ -178,7 +178,7 @@ func TestCreateConfirmOverlayRendersProgressWhileBusy(t *testing.T) {
 	}
 }
 
-func TestCreateDoneSuccessWaitsForProgressBarBeforeClosing(t *testing.T) {
+func TestCreateDoneSuccessClosesImmediately(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeStandalone
@@ -188,25 +188,14 @@ func TestCreateDoneSuccessWaitsForProgressBarBeforeClosing(t *testing.T) {
 
 	updated, cmd := model.Update(createDoneMsg{name: "web"})
 	model = updated.(Model)
-	if !model.busy || model.overlay != overlayCreate || !model.createDoneReady {
-		t.Fatalf("create finalized early: busy=%v overlay=%v ready=%v", model.busy, model.overlay, model.createDoneReady)
-	}
-	if cmd != nil {
-		t.Fatalf("cmd = %#v, want nil while progress bar finishes", cmd)
-	}
-
-	for model.busy {
-		updated, cmd = model.Update(statusPulseTickMsg{})
-		model = updated.(Model)
-	}
-	if model.busy || model.overlay != overlayNone {
-		t.Fatalf("create did not finalize once progress reached 100: busy=%v overlay=%v", model.busy, model.overlay)
+	if model.busy || model.overlay != overlayNone || model.createDoneReady {
+		t.Fatalf("create did not finalize immediately: busy=%v overlay=%v ready=%v", model.busy, model.overlay, model.createDoneReady)
 	}
 	if !strings.Contains(model.status, "created web") {
 		t.Fatalf("status = %q, want created web", model.status)
 	}
 	if cmd == nil {
-		t.Fatal("cmd = nil, want refresh after delayed create completion")
+		t.Fatal("cmd = nil, want refresh after create completion")
 	}
 }
 

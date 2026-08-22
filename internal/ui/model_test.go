@@ -26,22 +26,25 @@ import (
 )
 
 type fakeProvider struct {
-	host          domain.Host
-	snapshot      domain.Snapshot
-	containers    map[string]domain.Container
-	stats         map[string]domain.ContainerStats
-	pingErr       error
-	starts        int
-	stops         int
-	restarts      int
-	creates       []app.ContainerCreateSpec
-	removed       []domain.ResourceID
-	forced        []bool
-	pulled        []string
-	progressCalls []app.PullProgress
-	removeErr     error
-	pullErr       error
-	createErr     error
+	host           domain.Host
+	snapshot       domain.Snapshot
+	containers     map[string]domain.Container
+	stats          map[string]domain.ContainerStats
+	pingErr        error
+	starts         int
+	stops          int
+	restarts       int
+	creates        []app.ContainerCreateSpec
+	removed        []domain.ResourceID
+	forced         []bool
+	pulled         []string
+	progressCalls  []app.PullProgress
+	removeErr      error
+	pullErr        error
+	createErr      error
+	images         []domain.Image
+	imageRemoveErr error
+	removedImages  []string
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -101,6 +104,11 @@ func (f *fakeProvider) PullImage(_ context.Context, image string, onProgress fun
 		onProgress(p)
 	}
 	return f.pullErr
+}
+func (f *fakeProvider) Images(context.Context) ([]domain.Image, error) { return f.images, nil }
+func (f *fakeProvider) RemoveImage(_ context.Context, ref string) error {
+	f.removedImages = append(f.removedImages, ref)
+	return f.imageRemoveErr
 }
 func (f *fakeProvider) Close() error { return nil }
 

@@ -21,6 +21,8 @@ type Provider interface {
 	RestartContainer(context.Context, domain.ResourceID) error
 	RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error
 	PullImage(ctx context.Context, image string, onProgress func(PullProgress)) error
+	Images(context.Context) ([]domain.Image, error)
+	RemoveImage(context.Context, string) error
 	Close() error
 }
 

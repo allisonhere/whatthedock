@@ -299,6 +299,31 @@ func (p *Provider) PullImage(_ context.Context, _ string, onProgress func(app.Pu
 	return nil
 }
 
+func (p *Provider) Images(_ context.Context) ([]domain.Image, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := map[string]bool{}
+	images := make([]domain.Image, 0)
+	for _, ctr := range p.containers {
+		if seen[ctr.Image] {
+			continue
+		}
+		seen[ctr.Image] = true
+		images = append(images, domain.Image{
+			ID:         domain.ResourceID{Host: p.host.ID, ID: ctr.ImageID},
+			RepoTags:   []string{ctr.Image},
+			Created:    ctr.Created,
+			Containers: 1,
+		})
+	}
+	sort.Slice(images, func(i, j int) bool { return images[i].DisplayName() < images[j].DisplayName() })
+	return images, nil
+}
+
+func (p *Provider) RemoveImage(_ context.Context, ref string) error {
+	return fmt.Errorf("demo image %s is in use", ref)
+}
+
 func (p *Provider) Close() error { return nil }
 
 func (p *Provider) seed() {
