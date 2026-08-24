@@ -694,9 +694,9 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta), formatBytes(statsNetworkTx(stats)), "#8aadf4"),
 		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), "#e8c170"),
 		"",
-		renderStatRow(renderer, m.settings, width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
-		renderStatRow(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#9aa6b2"),
-		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#9aa6b2"),
+		renderStatRow(renderer, restartsRowSettings(m.settings), width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
+		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#c9a0f5", uptimeColor(ctr.Created)),
+		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#6fd6c9"),
 		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: containerTitle(*ctr)}, width),
 	}
 	if m.focus == paneActivity {
@@ -863,6 +863,19 @@ func staticStatGraph(value string, fallbackLevel int) statGraph {
 // byte of it here, with an explicit background, leaves alignRow nothing
 // unstyled to pad.
 func renderStatRow(renderer tideui.Renderer, settings appSettings, width int, label string, graph statGraph, suffix string, color lipgloss.Color) string {
+	// The suffix number defaults to the exact same color statHeatColor
+	// would give the graph itself (same level, same color input) — see
+	// renderStatRowSuffixColor's doc comment for the one row (Uptime)
+	// that needs a different signal here instead.
+	suffixColor := statHeatColor(settings, graphLevel(settings, graph), color, renderer)
+	return renderStatRowSuffixColor(renderer, settings, width, label, graph, suffix, color, suffixColor)
+}
+
+// renderStatRowSuffixColor is renderStatRow with an explicit suffix
+// color instead of the auto-derived one, for a row whose real signal
+// isn't the same thing driving its graph's level — see uptimeColor's
+// doc comment for why Uptime needs this.
+func renderStatRowSuffixColor(renderer tideui.Renderer, settings appSettings, width int, label string, graph statGraph, suffix string, color, suffixColor lipgloss.Color) string {
 	bg := renderer.Styles.Theme.Bg
 	const prefixWidth = 9
 	remaining := max(0, width-prefixWidth)
@@ -880,7 +893,7 @@ func renderStatRow(renderer tideui.Renderer, settings appSettings, width int, la
 	pad := lipgloss.NewStyle().Width(max(0, room-lipgloss.Width(text))).Background(bg).Render("")
 	line := text + pad
 	if suffix != "" {
-		line += lipgloss.NewStyle().Background(bg).Render(" ") + renderer.Styles.DetailBody.Render(suffix)
+		line += lipgloss.NewStyle().Background(bg).Render(" ") + renderer.Styles.DetailBody.Copy().Foreground(suffixColor).Render(suffix)
 	}
 	return renderer.RenderRow(tideui.Row{Prefix: fmt.Sprintf("%-9s", label), Text: line}, width)
 }
@@ -1077,6 +1090,54 @@ func graphValueLevel(settings appSettings, value, maxValue float64) int {
 	return clamp(level, 1, len(glyphs))
 }
 
+// heatColorFrom blends a metric's own "cold" identity color (t=0)
+// through yellow (t=0.5) and orange (t=0.7) to red (t>=0.9, flat
+// beyond) — so every metric keeps a distinct baseline color instead of
+// every graph converging on one shared green start, while still
+// escalating to the same universal "red = trouble" signal as it heats
+// up. Used by both the Dashboard's absolute-percentage graders and the
+// single-container Stats pane's statHeatColor/statGlyphColor (which
+// blend from the per-metric color those already receive, rather than
+// discarding it the way their old fixed green-based palette did).
+func heatColorFrom(base lipgloss.Color, t float64) lipgloss.Color {
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	stops := []struct {
+		at  float64
+		hex string
+	}{
+		{0.0, string(base)},
+		{0.5, "#e8c170"},
+		{0.7, "#edad75"},
+		{0.9, "#e06c75"},
+	}
+	if t <= stops[0].at {
+		return base
+	}
+	for i := 1; i < len(stops); i++ {
+		if t <= stops[i].at || i == len(stops)-1 {
+			from, err1 := colorful.Hex(stops[i-1].hex)
+			to, err2 := colorful.Hex(stops[i].hex)
+			if err1 != nil || err2 != nil {
+				return base
+			}
+			span := stops[i].at - stops[i-1].at
+			frac := 1.0
+			if span > 0 {
+				frac = (t - stops[i-1].at) / span
+			}
+			if frac > 1 {
+				frac = 1
+			}
+			return lipgloss.Color(from.BlendRgb(to, frac).Hex())
+		}
+	}
+	return "#e06c75"
+}
+
 func statHeatColor(settings appSettings, level int, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
 	switch settings.GraphColor {
 	case graphColorMetric:
@@ -1084,19 +1145,16 @@ func statHeatColor(settings appSettings, level int, color lipgloss.Color, render
 	case graphColorMono:
 		return renderer.Styles.Theme.Dimmed
 	}
-	colors := []lipgloss.Color{
-		"#80c990",
-		"#9dce7f",
-		"#bbd36f",
-		"#d8cb6f",
-		"#e8c170",
-		"#edad75",
-		"#f29a7a",
-		"#e06c75",
-	}
-	return colors[clamp(level, 1, len(colors))-1]
+	const levels = 8
+	return heatColorFrom(color, float64(clamp(level, 1, levels)-1)/float64(levels-1))
 }
 
+// statGlyphColor keeps the glyph-character switch (rather than a raw
+// level index) because it correctly encodes each glyph's intensity
+// ordinal independent of graphStyleWave's non-monotonic up-down shape —
+// the same character reappears at different sequence positions in a
+// wave, so indexing by position (instead of by which character it is)
+// would mis-color it.
 func statGlyphColor(settings appSettings, glyph string, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
 	switch settings.GraphColor {
 	case graphColorMetric:
@@ -1106,29 +1164,29 @@ func statGlyphColor(settings appSettings, glyph string, color lipgloss.Color, re
 	}
 	switch glyph {
 	case "▁":
-		return "#80c990"
+		return heatColorFrom(color, 0.0/7)
 	case "▂":
-		return "#a9d576"
+		return heatColorFrom(color, 1.0/7)
 	case "▃":
-		return "#d1cd70"
+		return heatColorFrom(color, 2.0/7)
 	case "▄":
-		return "#e8c170"
+		return heatColorFrom(color, 3.0/7)
 	case "▅":
-		return "#efaa76"
+		return heatColorFrom(color, 4.0/7)
 	case "▆":
-		return "#f28d78"
+		return heatColorFrom(color, 5.0/7)
 	case "▇":
-		return "#e97876"
+		return heatColorFrom(color, 6.0/7)
 	case "█":
-		return "#e06c75"
+		return heatColorFrom(color, 7.0/7)
 	case "⣀":
-		return "#80c990"
+		return heatColorFrom(color, 0.0/3)
 	case "⣤":
-		return "#d1cd70"
+		return heatColorFrom(color, 1.0/3)
 	case "⣶":
-		return "#efaa76"
+		return heatColorFrom(color, 2.0/3)
 	case "⣿":
-		return "#e06c75"
+		return heatColorFrom(color, 3.0/3)
 	default:
 		return "#9aa6b2"
 	}
@@ -1245,6 +1303,25 @@ func restartColor(count int) lipgloss.Color {
 	return "#80c990"
 }
 
+// restartsRowSettings forces the Restarts row's own color resolution
+// (statHeatColor/statGlyphColor's graphColorMetric branch) instead of
+// their default heatColorFrom blend, unless the user has chosen Mono
+// (which still applies normally). restartColor already returns a
+// correct, final green/yellow/red verdict for the current count;
+// blending it further via heatColorFrom using restartLevel — a level
+// picked only to vary the glyph's *shape* for visual interest, not
+// calibrated to restartColor's own 0/1-4/5+ bands — would distort it
+// (e.g. a count of 4, which restartColor correctly calls yellow, maps
+// to a restartLevel high enough to blend mostly into orange). Passing
+// this settings copy into renderStatRow keeps both the glyph and the
+// suffix number exactly at restartColor's own verdict.
+func restartsRowSettings(settings appSettings) appSettings {
+	if settings.GraphColor != graphColorMono {
+		settings.GraphColor = graphColorMetric
+	}
+	return settings
+}
+
 func uptimeLevel(created time.Time) int {
 	if created.IsZero() {
 		return 1
@@ -1259,6 +1336,28 @@ func uptimeLevel(created time.Time) int {
 		return 6
 	default:
 		return 12
+	}
+}
+
+// uptimeColor is the Uptime row's suffix color, used instead of the
+// generic graph-level-derived one (see renderStatRowSuffixColor).
+// uptimeLevel intentionally returns a *higher* level the *older* a
+// container is (so a stable container gets a taller decorative glyph),
+// but that would be the wrong direction for a health color — a
+// long-stable container would render hot/red. The real signal for
+// Uptime is freshness: a container that (re)started moments ago is the
+// suspicious state, not one that's been running for days.
+func uptimeColor(created time.Time) lipgloss.Color {
+	if created.IsZero() {
+		return "#9aa6b2"
+	}
+	switch age := time.Since(created); {
+	case age < 5*time.Minute:
+		return "#e06c75"
+	case age < time.Hour:
+		return "#e8c170"
+	default:
+		return "#c9a0f5"
 	}
 }
 
@@ -1890,41 +1989,36 @@ func styledInspectorValue(fieldKind, line string, plainFg, baseFg lipgloss.Color
 // currentInspectorFieldRow returns the field row under m.inspectorCursor,
 // or false if the Inspector currently has none (no container selected).
 func (m Model) currentInspectorFieldRow() (inspectorRow, bool) {
-	fieldOrdinal := -1
-	for _, row := range m.inspectorRows() {
-		if row.kind != inspectorRowField {
-			continue
-		}
-		fieldOrdinal++
-		if fieldOrdinal == m.inspectorCursor {
-			return row, true
-		}
+	rows := m.inspectorRows()
+	if m.inspectorCursor < 0 || m.inspectorCursor >= len(rows) {
+		return inspectorRow{}, false
+	}
+	row := rows[m.inspectorCursor]
+	if row.kind == inspectorRowField {
+		return row, true
 	}
 	return inspectorRow{}, false
 }
 
 // inspectorLineLayout returns, for each screen line renderInspector will
-// produce from rows, which field-row ordinal (0-based, among
-// inspectorRowField rows only) owns that line — -1 for section/title
-// lines. This depends only on how many "\n"-separated entries each
-// field's display value splits into, not on any renderer, so it can run
-// from handleKey's scroll-follow logic (model.go) as well as from
-// renderInspector, without duplicating the split in two places.
+// produce from rows, which inspectorRows index owns that line. This depends
+// only on how many "\n"-separated entries each field's display value splits
+// into, not on any renderer, so it can run from handleKey's scroll-follow
+// logic (model.go) as well as from renderInspector, without duplicating the
+// split in two places.
 func inspectorLineLayout(rows []inspectorRow) []int {
 	var lineRow []int
-	fieldOrdinal := -1
-	for _, row := range rows {
+	for index, row := range rows {
 		if row.kind != inspectorRowField {
-			lineRow = append(lineRow, -1)
+			lineRow = append(lineRow, index)
 			continue
 		}
-		fieldOrdinal++
 		value := strings.TrimSpace(row.display)
 		if value == "" {
 			value = "none"
 		}
 		for range strings.Split(value, "\n") {
-			lineRow = append(lineRow, fieldOrdinal)
+			lineRow = append(lineRow, index)
 		}
 	}
 	return lineRow
@@ -1953,18 +2047,19 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 
 	var lines []string
 	fieldOrdinal := -1
-	for _, row := range rows {
+	for index, row := range rows {
+		state := inspectorRowState{
+			selected: index == m.inspectorCursor,
+			alt:      index%2 == 1,
+			focused:  m.focus == paneInspector,
+		}
 		switch row.kind {
 		case inspectorRowTitle:
-			lines = append(lines, renderInspectorTitle(renderer, width, row.text))
+			lines = append(lines, renderInspectorTitleRow(renderer, width, row.text, state))
 		case inspectorRowSection:
-			lines = append(lines, renderInspectorSection(renderer, width, row.text))
+			lines = append(lines, renderInspectorSection(renderer, width, row.text, state))
 		case inspectorRowField:
 			fieldOrdinal++
-			state := inspectorRowState{
-				selected: fieldOrdinal == m.inspectorCursor,
-				alt:      fieldOrdinal%2 == 1,
-			}
 			lines = append(lines, renderInspectorFieldRow(renderer, width, labelWidth, row, state)...)
 		}
 	}
@@ -1975,20 +2070,34 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 	return m.withPaneActionStrip(renderer, paneInspector, width, strings.Join(lines[start:end], "\n"))
 }
 
-func renderInspectorSection(renderer tideui.Renderer, width int, title string) string {
-	return renderer.Styles.DetailMeta.Copy().
+func renderInspectorSection(renderer tideui.Renderer, width int, title string, state inspectorRowState) string {
+	style := renderer.Styles.DetailMeta.Copy().
 		Foreground(renderer.Styles.Theme.Fg).
 		Bold(true).
 		Italic(false).
-		Width(width).
-		Render(" " + strings.ToUpper(title))
+		Width(width)
+	if state.selected {
+		style = renderer.Styles.ItemSelected.Copy().Bold(true).Italic(false).Width(width)
+	} else if state.alt {
+		style = style.Background(stripedRowBackground(renderer, true, false))
+	}
+	return style.Render(inspectorRowMarker(state, renderer.Styles.Theme.BorderFocus) + strings.ToUpper(title))
 }
 
 func renderInspectorTitle(renderer tideui.Renderer, width int, title string) string {
-	return renderer.Styles.DetailBody.Copy().
+	return renderInspectorTitleRow(renderer, width, title, inspectorRowState{})
+}
+
+func renderInspectorTitleRow(renderer tideui.Renderer, width int, title string, state inspectorRowState) string {
+	style := renderer.Styles.DetailBody.Copy().
 		Bold(true).
-		Width(width).
-		Render(title)
+		Width(width)
+	if state.selected {
+		style = renderer.Styles.ItemSelected.Copy().Bold(true).Width(width)
+	} else if state.alt {
+		style = style.Background(stripedRowBackground(renderer, true, false))
+	}
+	return style.Render(inspectorRowMarker(state, renderer.Styles.Theme.BorderFocus) + title)
 }
 
 // inspectorRowState carries the two per-render visual states
@@ -2000,6 +2109,14 @@ func renderInspectorTitle(renderer tideui.Renderer, width int, title string) str
 type inspectorRowState struct {
 	selected bool
 	alt      bool
+	focused  bool
+}
+
+func inspectorRowMarker(state inspectorRowState, markerFg lipgloss.Color) string {
+	if state.selected && state.focused {
+		return foregroundSpan("> ", markerFg, markerFg, true)
+	}
+	return "  "
 }
 
 // renderInspectorFieldRow renders one field row's screen lines. It
@@ -2034,17 +2151,18 @@ func renderInspectorFieldRow(renderer tideui.Renderer, width, labelWidth int, ro
 	case state.selected:
 		style = renderer.Styles.ItemSelected
 	case muted:
-		style = renderer.Styles.ItemMuted
+		style = renderer.Styles.ItemMuted.Copy().Background(stripedRowBackground(renderer, state.alt, false))
 	case state.alt:
-		style = renderer.Styles.Item.Copy().Background(altRowBackground(renderer.Styles.Theme.Bg))
+		style = renderer.Styles.Item.Copy().Background(stripedRowBackground(renderer, true, false))
 	}
 
 	out := make([]string, 0, len(values))
 	for i, line := range values {
-		prefix := strings.Repeat(" ", labelWidth+1)
+		prefix := strings.Repeat(" ", labelWidth+3)
 		rowSuffix := ""
 		if i == 0 {
-			prefix = foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, row.label), renderer.Styles.Theme.BorderFocus, baseFg, true)
+			prefix = inspectorRowMarker(state, renderer.Styles.Theme.BorderFocus) +
+				foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, row.label), renderer.Styles.Theme.BorderFocus, baseFg, true)
 			if suffix != "" {
 				rowSuffix = foregroundSpan(suffix, renderer.Styles.Theme.Unread, baseFg, false)
 			}
@@ -2105,6 +2223,18 @@ func altRowBackground(bg lipgloss.Color) lipgloss.Color {
 		target = colorful.Color{R: 0, G: 0, B: 0}
 	}
 	return lipgloss.Color(base.BlendLuv(target, 0.07).Hex())
+}
+
+func stripedRowBackground(renderer tideui.Renderer, alt, selected bool) lipgloss.Color {
+	if selected {
+		if color, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
+			return color
+		}
+	}
+	if alt {
+		return altRowBackground(renderer.Styles.Theme.Bg)
+	}
+	return renderer.Styles.Theme.Bg
 }
 
 func foregroundSpan(text string, color, restore lipgloss.Color, bold bool) string {
@@ -2367,7 +2497,11 @@ func (m Model) paneActions(pane pane) []paneAction {
 			if m.logFollow {
 				follow = paneAction{key: "space", label: "pause"}
 			}
-			return []paneAction{follow, m.logFilterFieldAction()}
+			expand := paneAction{key: "L", label: "expand"}
+			if m.logsExpanded {
+				expand = paneAction{key: "L", label: "restore"}
+			}
+			return []paneAction{follow, m.logFilterFieldAction(), expand, {key: "c", label: "copy"}}
 		}
 	case paneInspector:
 		return []paneAction{
@@ -3110,6 +3244,7 @@ var helpSections = []helpSection{
 		Title: "Main",
 		Entries: []helpEntry{
 			{"Tab / Shift+Tab", "move focus between tree, activity, inspector"},
+			{"Left / Right", "move focus between panes"},
 			{"j / k or Up / Down", "move selection or scroll focused pane"},
 			{"Enter", "select/open focused row"},
 			{"Space", "expand/collapse stack row; pause/resume logs in Logs"},
@@ -3361,15 +3496,22 @@ func (m Model) dashboardListBudget() int {
 // percentages instead means low utilization reliably looks low no matter
 // how flat that container's own history happens to be.
 const (
-	dashboardWarnPct = 70.0
-	dashboardCritPct = 90.0
+	dashboardCautionPct = 50.0
+	dashboardWarnPct    = 70.0
+	dashboardCritPct    = 90.0
 )
 
 // dashboardThresholdColor is neutral below dashboardWarnPct, amber from
-// there to dashboardCritPct, and red at/above it — reusing the exact
-// colors statusLegendEntries already assigns to "restarting" and
-// "dead/unhealthy" so a hot CPU/memory number reads as the same kind of
-// trouble as a stopped container, not a different color language.
+// there to dashboardCritPct, and red at/above it — reusing the exact red
+// statusLegendEntries already assigns to "dead/unhealthy" so a critical
+// CPU/memory number reads as the same kind of trouble as a stopped
+// container, not a different color language. This is the two-band version
+// used for plain text (dashboardSummaryLine's RAM figure): text that stays
+// unstyled until it actually needs a warning reads calmer than text that's
+// always tinted something. dashboardGraphColor below is the four-band
+// green→yellow→orange→red version for the Dashboard's actual graphs (the
+// CPU sparkline, the memory meter), where a resting baseline color is the
+// point.
 func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color {
 	switch {
 	case pct >= dashboardCritPct:
@@ -3379,6 +3521,32 @@ func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color
 	default:
 		return neutral
 	}
+}
+
+// dashboardGraphColor grades a percentage into the Dashboard's CPU
+// gradient — heatColorFrom blended from CPU's own cyan identity color,
+// continuously through yellow/orange/red at exactly the
+// dashboardCautionPct/dashboardWarnPct/dashboardCritPct fractions of
+// 100, rather than the flat 4-band steps this used to snap between. The
+// CPU sparkline uses this instead of dashboardThresholdColor's
+// plain-text neutral/amber/red so a healthy container has a resting
+// baseline color to climb away from — the same green→red gradient
+// family the single-container Stats pane's statHeatColor uses, but
+// graded on the fleet-wide absolute cutoffs above rather than that
+// pane's per-container relative scale (see dashboardWarnPct's own doc
+// comment for why the Dashboard deliberately stays absolute).
+// dashboardMemColor below is Memory's own version of this, with a
+// distinct green identity color instead of sharing CPU's cyan.
+func dashboardGraphColor(pct float64) lipgloss.Color {
+	return heatColorFrom("#7dcfff", pct/100)
+}
+
+// dashboardMemColor is dashboardGraphColor's Memory counterpart — same
+// continuous grading, starting from Memory's own green identity color
+// instead of CPU's cyan, so the two rows read as distinct metrics
+// rather than sharing one baseline hue.
+func dashboardMemColor(pct float64) lipgloss.Color {
+	return heatColorFrom("#80c990", pct/100)
 }
 
 // dashboardStatusWords labels dashboardSummaryLine's per-status counts —
@@ -3483,6 +3651,7 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			tideui.SoftHint{Key: "esc/d/q", Label: "close"},
 			tideui.SoftHint{Key: "↑↓/jk", Label: "select"},
 			tideui.SoftHint{Key: "enter", Label: "open"},
+			tideui.SoftHint{Key: "←→", Label: "graph style"},
 		))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "dashboard", Content: content, Width: width})
 	return &overlay
@@ -3831,8 +4000,8 @@ func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
 // CPU and memory deliberately share the same "number, then a small
 // visualization" shape (a sparkline for CPU, a meter for memory) instead
 // of the old mismatched "near-empty line vs. huge heatmap" look, and
-// every color here comes from dashboardThresholdColor's absolute
-// percentage cutoffs rather than any per-container relative scale — see
+// every color here comes from dashboardGraphColor's absolute percentage
+// cutoffs rather than any per-container relative scale — see
 // dashboardWarnPct's doc comment for why that distinction is the point of
 // this redesign. Column layout: rail(2) name(nameWidth) gap(2) glyph(1)
 // gap(2) [cpuNum(pctWidth) [gap(2) cpuSpark]] gap(2) [memNum(pctWidth)
@@ -3878,11 +4047,11 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	name := plain.Render(padRunes(truncateEllipsis(ctr.DisplayName(), cols.nameWidth), cols.nameWidth))
 
 	cpuPct := statsCPU(stats)
-	cpuNum := plain.Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
+	cpuNum := lipgloss.NewStyle().Background(rowBg).Foreground(dashboardGraphColor(cpuPct)).
+		Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
 	cpuPart := cpuNum
 	if cols.cpuSparkW > 0 {
-		color := dashboardThresholdColor(cpuPct, "#7dcfff")
-		cpuPart += plain.Render("  ") + dashboardSpark(renderer, m.settings, cpuStatGraph(stats, history), color, cols.cpuSparkW, rowBg)
+		cpuPart += plain.Render("  ") + dashboardSpark(renderer, m.settings, cpuStatGraph(stats, history), dashboardGraphColor, cols.cpuSparkW, rowBg)
 	}
 
 	memPct, hasLimit, memText := 0.0, false, "n/a"
@@ -3894,7 +4063,11 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	case stats != nil:
 		memText = formatCompactBytes(stats.MemoryUsage)
 	}
-	memPart := plain.Render(rightAlignRunes(memText, cols.pctWidth))
+	memNumStyle := plain
+	if hasLimit {
+		memNumStyle = lipgloss.NewStyle().Background(rowBg).Foreground(dashboardMemColor(memPct))
+	}
+	memPart := memNumStyle.Render(rightAlignRunes(memText, cols.pctWidth))
 	if cols.memMeterW > 0 {
 		memPart += plain.Render("  ") + dashboardMemMeter(renderer, m.settings, memPct, hasLimit, cols.memMeterW, rowBg)
 	}
@@ -3911,8 +4084,10 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	if cols.splitNet {
 		rxGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(rx), formatByteDelta)
 		txGraph := uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(tx), formatByteDelta)
-		down := plain.Render("↓ " + rightAlignRunes(formatCompactBytes(rx), dashboardNetNumWidth))
-		up := plain.Render("↑ " + rightAlignRunes(formatCompactBytes(tx), dashboardNetNumWidth))
+		down := plain.Render("↓ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(rx)).
+			Render(rightAlignRunes(formatCompactBytes(rx), dashboardNetNumWidth))
+		up := plain.Render("↑ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(tx)).
+			Render(rightAlignRunes(formatCompactBytes(tx), dashboardNetNumWidth))
 		netPart = down + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, rxGraph, cols.netSparkW, rowBg) +
 			plain.Render("   ") + up + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, txGraph, cols.netSparkW, rowBg)
 	} else {
@@ -3967,8 +4142,8 @@ func dashboardGaugeBar(renderer tideui.Renderer, frac float64, color lipgloss.Co
 // and 2.7% land on 1 and 2 filled cells of 10 respectively, matching this
 // redesign's own worked examples) while still saturating sensibly as
 // usage climbs toward its limit. Either shape colors via
-// dashboardThresholdColor, never settings.GraphColor's relative gradient
-// (see dashboardWarnPct's doc comment). hasLimit false (no memory limit
+// dashboardMemColor, never settings.GraphColor's relative gradient (see
+// dashboardWarnPct's doc comment). hasLimit false (no memory limit
 // reported) falls back to a dim dashed line — the same "unknown, not
 // necessarily bad" treatment dashboardNetSpark gives zero traffic —
 // rather than guessing a color.
@@ -3981,7 +4156,7 @@ func dashboardMemMeter(renderer tideui.Renderer, settings appSettings, pct float
 	if !hasLimit {
 		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
 	}
-	color := dashboardThresholdColor(pct, "#80c990")
+	color := dashboardMemColor(pct)
 	if settings.GraphStyle == graphStyleGauge {
 		return dashboardGaugeBar(renderer, pct/100, color, width, bg)
 	}
@@ -3997,25 +4172,31 @@ func dashboardMemMeter(renderer tideui.Renderer, settings appSettings, pct float
 	return full + empty
 }
 
-// dashboardSpark renders graph's values as a compact, single-color
-// sparkline using the caller's Graph style (settings.GraphStyle) for
-// glyph shape/spacing — graphGlyphs/graphGlyphSpacing are the exact same
-// functions the single-container Stats pane's own sparkline uses, so
-// Blocks/Braille/Bars/(the default) Wave all look the same style the user
-// picked in Settings. graphStyleGauge instead collapses to a single
-// dashboardGaugeBar for the latest value, matching that style's meaning
-// everywhere else in the app.
+// dashboardSpark renders graph's values as a compact sparkline using the
+// caller's Graph style (settings.GraphStyle) for glyph shape/spacing —
+// graphGlyphs/graphGlyphSpacing are the exact same functions the single-
+// container Stats pane's own sparkline uses, so Blocks/Braille/Bars/(the
+// default) Wave all look the same style the user picked in Settings.
+// graphStyleGauge instead collapses to a single dashboardGaugeBar for the
+// latest value, matching that style's meaning everywhere else in the app.
 //
-// What deliberately does NOT carry over from the shared renderSparkline
-// path is its coloring: statHeatColor scales each glyph's color by that
-// sample's level *relative to the container's own historical max* — a
-// container sitting near its own usual plateau glows the same hot orange/
-// red as one actually maxed out, regardless of how small that plateau is
-// in absolute terms. Every glyph here gets the one caller-supplied color
-// instead (see dashboardWarnPct's doc comment for why), so only the glyph
-// shapes vary with the data — activity reads as movement, not a color
-// show — and settings.GraphColor is never consulted.
-func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, color lipgloss.Color, width int, bg lipgloss.Color) string {
+// Each glyph's color comes from calling colorFor on that glyph's own
+// sample value, so a real spike in the history — a tall bar — is also
+// colored hot, not whatever color the *current* value happens to be. This
+// is safe in a way the shared renderSparkline path's statHeatColor isn't:
+// statHeatColor scales a glyph's color by that sample's level *relative to
+// the container's own historical max*, so a container sitting near its
+// own usual plateau glows the same hot orange/red as one actually maxed
+// out, regardless of how small that plateau is in absolute terms (see
+// dashboardWarnPct's doc comment for why the Dashboard rejects that).
+// colorFor here is always one of the Dashboard's own absolute-threshold
+// graders (dashboardGraphColor, dashboardNetGraphColor's wrapper) — a
+// quiet container's flat history still grades entirely green because
+// green is an absolute cutoff, not "below this container's own max" — so
+// per-sample coloring carries none of that downside. settings.GraphColor
+// is never consulted; that setting only affects the single-container Stats
+// pane.
+func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, colorFor func(value float64) lipgloss.Color, width int, bg lipgloss.Color) string {
 	width = max(1, width)
 	if settings.GraphStyle == graphStyleGauge {
 		value, maxValue := 0.0, graph.maxValue
@@ -4025,7 +4206,7 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 		if maxValue <= 0 {
 			maxValue = 1
 		}
-		return dashboardGaugeBar(renderer, value/maxValue, color, width, bg)
+		return dashboardGaugeBar(renderer, value/maxValue, colorFor(value), width, bg)
 	}
 
 	glyphs := graphGlyphs(settings)
@@ -4048,7 +4229,7 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 	var b strings.Builder
 	for _, v := range values {
 		level := clamp(int(v/graph.maxValue*float64(len(glyphs)-1)+0.5), 0, len(glyphs)-1)
-		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(color).Render(glyphs[level]) + gap)
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(colorFor(v)).Render(glyphs[level]) + gap)
 	}
 	if pad := slots - len(values); pad > 0 {
 		b.WriteString(strings.Repeat(flatCell, pad))
@@ -4056,21 +4237,90 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 	return b.String()
 }
 
+// dashboardNetGraphColor grades a byte rate into the Dashboard's own
+// continuous heat gradient — heatColorFrom blended from Net's blue
+// identity color — landing on the same 32MB/128MB/512MB landmarks the
+// single-container Stats pane's byteLevel already uses to decide "how
+// hot does this many bytes look" for its Net In/Out and Disk IO rows,
+// rather than inventing a second, unrelated scale just for the
+// Dashboard, but interpolated continuously between them (see netHeatT)
+// instead of jumping in flat steps.
+func dashboardNetGraphColor(value uint64) lipgloss.Color {
+	return heatColorFrom("#8aadf4", netHeatT(value))
+}
+
+// netHeatT maps a byte rate to heatColorFrom's [0,1] domain, landing on
+// t=0/0.5/0.7/0.9 at 1MB/32MB/128MB/512MB respectively (matching
+// byteLevel's cutoffs) but interpolated in log2-byte space between each
+// pair of landmarks — bandwidth spans orders of magnitude, so a linear
+// byte scale would bunch almost every real-world value near zero.
+func netHeatT(value uint64) float64 {
+	points := []struct {
+		bytes float64
+		t     float64
+	}{
+		{float64(1 << 20), 0.0},
+		{float64(32 << 20), 0.5},
+		{float64(128 << 20), 0.7},
+		{float64(512 << 20), 0.9},
+	}
+	v := float64(value)
+	if v <= points[0].bytes {
+		return points[0].t
+	}
+	logV := math.Log2(v)
+	for i := 1; i < len(points); i++ {
+		if v <= points[i].bytes {
+			lo, hi := math.Log2(points[i-1].bytes), math.Log2(points[i].bytes)
+			frac := (logV - lo) / (hi - lo)
+			return points[i-1].t + frac*(points[i].t-points[i-1].t)
+		}
+	}
+	return 1.0
+}
+
 // dashboardNetSpark is dashboardSpark for network traffic specifically:
-// when the latest sample is zero (or there's no history yet), it renders
+// when there's no history yet, or every sample in it is zero, it renders
 // a flat dashed line instead of the style's own lowest glyph — "zero
 // traffic" and "very low but nonzero traffic" need to look different, and
 // a dim dash reads unambiguously as "quiet" rather than "chart with tiny
 // bars," regardless of which Graph style is selected (this also happens
 // to be exactly graphStyleGauge's own empty-bar look, so gauge style
 // needs no special-casing here at all).
+//
+// The quiet check deliberately looks at the *whole* history, not just the
+// latest sample: network traffic is bursty enough that any single 2-second
+// poll can easily land on exactly zero bytes even for an active
+// container, and an earlier version that blanked the whole line the
+// instant the latest sample hit zero made the sparkline visibly vanish
+// and redraw every time traffic paused for one tick — the opposite of the
+// smooth scrolling a sparkline is supposed to give. A momentarily-zero
+// latest sample now just renders as that one low glyph among its
+// neighbors, same as it already does for CPU.
+//
+// Once past that check, each sample is graded individually by
+// dashboardNetGraphColor (wrapped for dashboardSpark's per-value
+// colorFor), keeping Net in the same green-baseline-to-red family as the
+// CPU sparkline and memory meter, and letting a real historical spike
+// still read as a hot glyph even after traffic has since dropped back
+// down.
 func dashboardNetSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, width int, bg lipgloss.Color) string {
 	width = max(1, width)
-	quiet := len(graph.values) == 0 || graph.maxValue <= 0 || graph.values[len(graph.values)-1] == 0
+	quiet := len(graph.values) == 0 || graph.maxValue <= 0
+	if !quiet {
+		quiet = true
+		for _, v := range graph.values {
+			if v != 0 {
+				quiet = false
+				break
+			}
+		}
+	}
 	if quiet {
 		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(strings.Repeat("─", width))
 	}
-	return dashboardSpark(renderer, settings, graph, "#8aadf4", width, bg)
+	colorFor := func(v float64) lipgloss.Color { return dashboardNetGraphColor(uint64(v)) }
+	return dashboardSpark(renderer, settings, graph, colorFor, width, bg)
 }
 
 // dashboardProblemsRow is the Dashboard's bottom status/action row: a

@@ -1500,12 +1500,7 @@ func (m Model) composeCuratorRow(renderer tideui.Renderer, width, index int, row
 	if index == m.composeCuratorCursor {
 		marker = ">"
 	}
-	rowBG := renderer.Styles.Theme.Bg
-	if index == m.composeCuratorCursor {
-		if color, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
-			rowBG = color
-		}
-	}
+	rowBG := stripedRowBackground(renderer, index%2 == 1, index == m.composeCuratorCursor)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))
 	switch value := row.(type) {
 	case composeStackEntry:

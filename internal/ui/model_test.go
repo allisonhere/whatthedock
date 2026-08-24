@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	colorful "github.com/lucasb-eyer/go-colorful"
 	"github.com/muesli/termenv"
 
 	"github.com/allisonhere/tideui"
@@ -468,6 +469,78 @@ func TestInspectorCursorMovesWhileFocused(t *testing.T) {
 	}
 	if got.inspectorScroll != 0 {
 		t.Fatalf("inspectorScroll = %d, want 0 with the cursor back at the first row", got.inspectorScroll)
+	}
+}
+
+func TestArrowKeysCanFocusInspectorAndMoveRows(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+	model.focus = paneTree
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.focus != paneActivity {
+		t.Fatalf("focus after first Right = %v, want activity", model.focus)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.focus != paneInspector {
+		t.Fatalf("focus after second Right = %v, want inspector", model.focus)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.focus != paneInspector {
+		t.Fatalf("focus after Down = %v, want inspector", model.focus)
+	}
+	if model.inspectorCursor != 1 {
+		t.Fatalf("inspectorCursor after Down = %d, want 1 (Runtime header)", model.inspectorCursor)
+	}
+}
+
+func TestInspectorHeadersCanBeHighlighted(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+	model.focus = paneInspector
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.inspectorCursor != 1 {
+		t.Fatalf("inspectorCursor after Down = %d, want Runtime header at 1", model.inspectorCursor)
+	}
+	if row, ok := model.currentInspectorFieldRow(); ok {
+		t.Fatalf("currentInspectorFieldRow on a header = %#v/%v, want no field action", row, ok)
+	}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "> RUNTIME") {
+		t.Fatalf("Inspector header is not visibly highlighted:\n%s", view)
+	}
+}
+
+func TestClickingInspectorFocusesItForKeyboardMovement(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
+	model.focus = paneTree
+
+	updated, _ := model.Update(tea.MouseMsg{
+		X:      model.leftPaneWidth() + model.centerPaneWidth() + 2,
+		Y:      5,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model = updated.(Model)
+	if model.focus != paneInspector {
+		t.Fatalf("focus after Inspector click = %v, want inspector", model.focus)
+	}
+	if model.inspectorCursor != 2 {
+		t.Fatalf("inspectorCursor after clicking Status row = %d, want 2", model.inspectorCursor)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.inspectorCursor != 3 {
+		t.Fatalf("inspectorCursor after Down = %d, want 3", model.inspectorCursor)
 	}
 }
 
@@ -1950,45 +2023,113 @@ func TestRenderStatRowFillsGapWithThemedBackground(t *testing.T) {
 	}
 }
 
+// TestStatHeatColorFollowsSmoothRamp checks statHeatColor now blends
+// from the per-metric color it's given (e.g. CPU's cyan) rather than
+// discarding it for a fixed green-based palette — level 1 (t=0) must
+// equal the passed color exactly, level 8 (t=1) must land on the shared
+// red danger color exactly, and every level in between must be a
+// distinct color from its neighbor (proving a continuous ramp, not a
+// step that repeats the same color across several levels).
 func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	for _, tc := range []struct {
-		name  string
-		level int
-		want  lipgloss.Color
-	}{
-		{"bottom", 1, "#80c990"},
-		{"low mid", 3, "#bbd36f"},
-		{"middle", 5, "#e8c170"},
-		{"high mid", 7, "#f29a7a"},
-		{"top", 8, "#e06c75"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := statHeatColor(defaultSettings(), tc.level, lipgloss.Color("#7dcfff"), renderer); got != tc.want {
-				t.Fatalf("statHeatColor(%d) = %q, want %q", tc.level, got, tc.want)
-			}
-		})
+	cpuColor := lipgloss.Color("#7dcfff")
+
+	if got := statHeatColor(defaultSettings(), 1, cpuColor, renderer); got != cpuColor {
+		t.Fatalf("statHeatColor(1) = %q, want %q (the passed-in color, unblended at t=0)", got, cpuColor)
+	}
+	if got := statHeatColor(defaultSettings(), 8, cpuColor, renderer); got != lipgloss.Color("#e06c75") {
+		t.Fatalf("statHeatColor(8) = %q, want #e06c75 (the shared red danger color at t=1)", got)
+	}
+
+	var prev lipgloss.Color
+	for level := 1; level <= 8; level++ {
+		got := statHeatColor(defaultSettings(), level, cpuColor, renderer)
+		if _, err := colorful.Hex(string(got)); err != nil {
+			t.Fatalf("statHeatColor(%d) = %q is not a valid hex color: %v", level, got, err)
+		}
+		if level > 1 && got == prev {
+			t.Fatalf("statHeatColor(%d) = %q, same as level %d — want a continuously distinct ramp", level, got, level-1)
+		}
+		prev = got
 	}
 }
 
+// TestStatGlyphColorFollowsSmoothHeightRamp is
+// TestStatHeatColorFollowsSmoothRamp's counterpart for the per-glyph
+// path — same contract, keyed by glyph character instead of level.
 func TestStatGlyphColorFollowsSmoothHeightRamp(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	for _, tc := range []struct {
-		glyph string
-		want  lipgloss.Color
+	cpuColor := lipgloss.Color("#7dcfff")
+
+	if got := statGlyphColor(defaultSettings(), "▁", cpuColor, renderer); got != cpuColor {
+		t.Fatalf("statGlyphColor(▁) = %q, want %q (the passed-in color, unblended at t=0)", got, cpuColor)
+	}
+	if got := statGlyphColor(defaultSettings(), "█", cpuColor, renderer); got != lipgloss.Color("#e06c75") {
+		t.Fatalf("statGlyphColor(█) = %q, want #e06c75 (the shared red danger color at t=1)", got)
+	}
+
+	glyphs := []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
+	var prev lipgloss.Color
+	for i, glyph := range glyphs {
+		got := statGlyphColor(defaultSettings(), glyph, cpuColor, renderer)
+		if _, err := colorful.Hex(string(got)); err != nil {
+			t.Fatalf("statGlyphColor(%q) = %q is not a valid hex color: %v", glyph, got, err)
+		}
+		if i > 0 && got == prev {
+			t.Fatalf("statGlyphColor(%q) = %q, same as %q — want a continuously distinct ramp", glyph, got, glyphs[i-1])
+		}
+		prev = got
+	}
+}
+
+// TestHeatColorFromAnchors checks heatColorFrom's exact anchor
+// contract: t=0 returns base untouched, t=0.5/0.7/0.9+ land on the
+// shared yellow/orange/red anchors regardless of base, and values
+// strictly between anchors differ from both neighbors (a real blend,
+// not a snap to one side).
+func TestHeatColorFromAnchors(t *testing.T) {
+	base := lipgloss.Color("#7dcfff")
+	cases := []struct {
+		t    float64
+		want lipgloss.Color
 	}{
-		{"▁", "#80c990"},
-		{"▂", "#a9d576"},
-		{"▃", "#d1cd70"},
-		{"▄", "#e8c170"},
-		{"▅", "#efaa76"},
-		{"▆", "#f28d78"},
-		{"▇", "#e97876"},
-		{"█", "#e06c75"},
-	} {
-		t.Run(tc.glyph, func(t *testing.T) {
-			if got := statGlyphColor(defaultSettings(), tc.glyph, lipgloss.Color("#7dcfff"), renderer); got != tc.want {
-				t.Fatalf("statGlyphColor(%q) = %q, want %q", tc.glyph, got, tc.want)
+		{0.0, base},
+		{0.5, "#e8c170"},
+		{0.7, "#edad75"},
+		{0.9, "#e06c75"},
+		{1.0, "#e06c75"},
+	}
+	for _, c := range cases {
+		if got := heatColorFrom(base, c.t); got != c.want {
+			t.Fatalf("heatColorFrom(base, %v) = %q, want %q", c.t, got, c.want)
+		}
+	}
+	mid := heatColorFrom(base, 0.25)
+	if mid == base || mid == lipgloss.Color("#e8c170") {
+		t.Fatalf("heatColorFrom(base, 0.25) = %q, want a distinct blend strictly between base and yellow", mid)
+	}
+}
+
+// TestUptimeColorBands checks uptimeColor's freshness bands: a
+// container that just (re)started is the suspicious/hot state, unlike
+// uptimeLevel (which intentionally runs the opposite direction for the
+// glyph's decorative shape — see uptimeColor's own doc comment).
+func TestUptimeColorBands(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name    string
+		created time.Time
+		want    lipgloss.Color
+	}{
+		{"zero value", time.Time{}, "#9aa6b2"},
+		{"just started", now.Add(-30 * time.Second), "#e06c75"},
+		{"fresh", now.Add(-30 * time.Minute), "#e8c170"},
+		{"stable", now.Add(-48 * time.Hour), "#c9a0f5"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := uptimeColor(c.created); got != c.want {
+				t.Fatalf("uptimeColor(%s) = %q, want %q", c.name, got, c.want)
 			}
 		})
 	}

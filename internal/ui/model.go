@@ -1746,6 +1746,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.logsExpanded {
 			m.focus = (m.focus + 2) % 3
 		}
+	case "left":
+		if !m.logsExpanded {
+			m.focus = (m.focus + 2) % 3
+		}
+	case "right":
+		if !m.logsExpanded {
+			m.focus = (m.focus + 1) % 3
+		}
 	case "L":
 		if m.mode == activityLogs {
 			m.logsExpanded = !m.logsExpanded
@@ -1903,6 +1911,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.status, m.statusErr = "copied "+strings.ToLower(row.label)+" "+short(row.value, 48), false
 				return m, copyTextCmd(row.value)
 			}
+		}
+		if m.focus == paneActivity && m.mode == activityLogs {
+			lines := m.visibleLogLines()
+			if len(lines) == 0 {
+				m.status, m.statusErr = "no log lines to copy", true
+				return m, nil
+			}
+			text := strings.Join(lines, "\n")
+			m.status, m.statusErr = fmt.Sprintf("copied %d log line(s)", len(lines)), false
+			return m, copyTextCmd(text)
 		}
 		m.openCopyOverlay()
 	case "o":
@@ -2106,6 +2124,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.dashboardOpenSelected()
 		case "p":
 			return m.dashboardOpenProblems()
+		case "left", "h":
+			m.cycleDashboardGraphStyle(-1)
+		case "right", "l":
+			m.cycleDashboardGraphStyle(1)
 		}
 	case overlayCommandPalette:
 		return m.handleCommandPaletteKey(msg)
@@ -3650,6 +3672,22 @@ func (m Model) firstSettingsRow() int {
 	return 0
 }
 
+// cycleDashboardGraphStyle lets the Dashboard overlay's left/right keys
+// change Graph style directly, without a trip through the Settings
+// screen. Unlike cycleSetting (which stages changes in m.settingsDraft
+// until the user hits ctrl+s), this mutates the live m.settings and
+// persists immediately — the Dashboard has no draft/staging concept of
+// its own, and openSettingsOverlay always re-copies m.settingsDraft from
+// m.settings on open, so a later Settings-screen visit picks this up
+// automatically. Mirrors the theme picker's own confirm path (see
+// overlayThemePicker's case in handleOverlayKey) for that same
+// change-live-setting-and-persist-immediately shape.
+func (m *Model) cycleDashboardGraphStyle(direction int) {
+	m.settings.GraphStyle = graphStyle(modIndex(int(m.settings.GraphStyle)+direction, 5))
+	m.saveSettings()
+	m.status, m.statusErr = "graph style: "+m.settings.GraphStyle.String(), false
+}
+
 func (m *Model) cycleSetting(index, direction int) {
 	if direction == 0 {
 		direction = 1
@@ -4146,6 +4184,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		switch {
+		case m.mouseInInspector(msg):
+			m.focus = paneInspector
+			m.moveInspectorCursor(-1)
 		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(-1)
 		case m.focus == paneActivity && m.mode == activityLogs:
@@ -4158,6 +4199,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.MouseButtonWheelDown:
 		switch {
+		case m.mouseInInspector(msg):
+			m.focus = paneInspector
+			m.moveInspectorCursor(1)
 		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(1)
 		case m.focus == paneInspector:
@@ -4179,8 +4223,35 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.focus = paneActivity
 			return m.selectProblem(msg.Y - 4)
 		}
+		if m.mouseInInspector(msg) {
+			m.focus = paneInspector
+			if cursor, ok := m.inspectorCursorAtScreenY(msg.Y); ok {
+				m.inspectorCursor = cursor
+				m.clampInspectorScroll(m.inspectorRows())
+			}
+			return m, nil
+		}
 	}
 	return m, nil
+}
+
+func (m Model) mouseInInspector(msg tea.MouseMsg) bool {
+	rightStart := m.leftPaneWidth() + m.centerPaneWidth()
+	return msg.X >= rightStart && msg.X < m.width
+}
+
+func (m Model) inspectorCursorAtScreenY(y int) (int, bool) {
+	rowOffset := y - 3
+	budget := max(1, m.inspectorVisibleRows()-m.paneActionStripRows(paneInspector))
+	if rowOffset < 0 || rowOffset >= budget {
+		return 0, false
+	}
+	layout := inspectorLineLayout(m.inspectorRows())
+	line := m.inspectorScroll + rowOffset
+	if line < 0 || line >= len(layout) || layout[line] < 0 {
+		return 0, false
+	}
+	return layout[line], true
 }
 
 // handleDashboardMouse mirrors handleMouse's wheel-scroll/left-click
@@ -4213,33 +4284,26 @@ func (m Model) handleDashboardMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// moveInspectorCursor moves the Inspector pane's row cursor among field
-// rows only (section headers and the title aren't addressable), clamping
-// to the current container's field count, then keeps inspectorScroll
-// positioned so the cursor's row stays visible.
+// moveInspectorCursor moves the Inspector pane's row cursor through the same
+// logical rows renderInspector shows, including the title and section headers,
+// then keeps inspectorScroll positioned so the cursor's row stays visible.
 func (m *Model) moveInspectorCursor(delta int) {
 	rows := m.inspectorRows()
-	fields := 0
-	for _, row := range rows {
-		if row.kind == inspectorRowField {
-			fields++
-		}
-	}
-	if fields == 0 {
+	if len(rows) == 0 {
 		m.inspectorCursor = 0
 		m.inspectorScroll = 0
 		return
 	}
-	m.inspectorCursor = clamp(m.inspectorCursor+delta, 0, fields-1)
+	m.inspectorCursor = clamp(m.inspectorCursor+delta, 0, len(rows)-1)
 	m.clampInspectorScroll(rows)
 }
 
 // clampInspectorScroll keeps inspectorScroll positioned so the cursor's
-// field row is fully visible within the pane's current row budget. A
-// field can span multiple screen lines (Env/Labels join entries with
-// literal newlines), so this can't just clamp a single line index the way
-// a 1:1 row-to-line pane would — it uses inspectorLineLayout to find the
-// cursor row's full screen-line span first.
+// logical row is fully visible within the pane's current row budget. A field
+// can span multiple screen lines (Env/Labels join entries with literal
+// newlines), so this can't just clamp a single line index the way a 1:1 row-to-
+// line pane would — it uses inspectorLineLayout to find the cursor row's full
+// screen-line span first.
 func (m *Model) clampInspectorScroll(rows []inspectorRow) {
 	lineRow := inspectorLineLayout(rows)
 	budget := max(1, m.inspectorVisibleRows()-m.paneActionStripRows(paneInspector))

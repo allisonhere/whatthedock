@@ -195,6 +195,34 @@ func TestDashboardOverlayCloseKeys(t *testing.T) {
 	}
 }
 
+// TestDashboardLeftRightCyclesGraphStyle checks that left/right cycle
+// m.settings.GraphStyle directly while the Dashboard overlay is open
+// (cycleDashboardGraphStyle), wrapping via modIndex the same way the
+// Settings screen's own left/right graph-style cycling does, and without
+// closing the overlay.
+func TestDashboardLeftRightCyclesGraphStyle(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayDashboard
+	model.settings.GraphStyle = graphStyleWave
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	next := updated.(Model)
+	if next.settings.GraphStyle != graphStyleBlocks {
+		t.Fatalf("after right: GraphStyle = %v, want graphStyleBlocks", next.settings.GraphStyle)
+	}
+	if next.overlay != overlayDashboard {
+		t.Fatalf("after right: overlay = %v, want overlayDashboard (still open)", next.overlay)
+	}
+
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	next = updated.(Model)
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	next = updated.(Model)
+	if next.settings.GraphStyle != graphStyleGauge {
+		t.Fatalf("after right,left,left: GraphStyle = %v, want graphStyleGauge (wrapped)", next.settings.GraphStyle)
+	}
+}
+
 func TestDashboardOverlayShowsSummaryAndRunningContainer(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 120, 34
@@ -423,6 +451,80 @@ func TestDashboardThresholdColorBoundaries(t *testing.T) {
 	}
 }
 
+// TestDashboardGraphColorBoundaries checks dashboardGraphColor's anchor
+// points land exactly on CPU's own cyan identity color at 0%, and on the
+// shared yellow/orange/red anchors at dashboardCautionPct/dashboardWarnPct/
+// dashboardCritPct — the Dashboard's CPU sparkline always has a resting
+// cyan baseline (not dashboardThresholdColor's per-caller neutral) that
+// climbs continuously rather than jumping between flat bands.
+func TestDashboardGraphColorBoundaries(t *testing.T) {
+	cases := []struct {
+		pct  float64
+		want lipgloss.Color
+	}{
+		{0, "#7dcfff"},
+		{50, "#e8c170"},
+		{70, "#edad75"},
+		{90, "#e06c75"},
+		{100, "#e06c75"},
+	}
+	for _, c := range cases {
+		if got := dashboardGraphColor(c.pct); got != c.want {
+			t.Fatalf("dashboardGraphColor(%v) = %v, want %v", c.pct, got, c.want)
+		}
+	}
+	// Between anchors the color is continuously interpolated, not a flat
+	// step — two points either side of the old 50% band boundary must
+	// differ, unlike the pre-redesign flat-band behavior.
+	if dashboardGraphColor(49) == dashboardGraphColor(51) {
+		t.Fatalf("dashboardGraphColor(49) and (51) are identical, want a continuous gradient either side of 50%%")
+	}
+}
+
+// TestDashboardMemColorHasItsOwnIdentity checks dashboardMemColor starts
+// from Memory's own green identity color, distinct from CPU's cyan
+// dashboardGraphColor, at the same percentage — the point of splitting
+// them was to give each metric its own baseline hue.
+func TestDashboardMemColorHasItsOwnIdentity(t *testing.T) {
+	if got := dashboardMemColor(0); got != "#80c990" {
+		t.Fatalf("dashboardMemColor(0) = %v, want #80c990 (Memory's green identity)", got)
+	}
+	if dashboardMemColor(10) == dashboardGraphColor(10) {
+		t.Fatalf("dashboardMemColor(10) and dashboardGraphColor(10) are identical, want distinct per-metric baseline colors")
+	}
+	// Both still converge on the same red danger color once critical.
+	if got := dashboardMemColor(90); got != "#e06c75" {
+		t.Fatalf("dashboardMemColor(90) = %v, want #e06c75 (shared red danger color)", got)
+	}
+}
+
+// TestDashboardNetGraphColorBoundaries checks dashboardNetGraphColor's
+// anchor points land on Net's own blue identity color and the same
+// byteLevel-matching landmarks (32MB/128MB/512MB) the old flat-band
+// version used, so a Net sparkline lands in the same green→red gradient
+// family as CPU/Memory rather than a scale unique to network traffic —
+// but interpolated continuously (in log-byte space) between them.
+func TestDashboardNetGraphColorBoundaries(t *testing.T) {
+	cases := []struct {
+		value uint64
+		want  lipgloss.Color
+	}{
+		{1 << 20, "#8aadf4"},
+		{32 << 20, "#e8c170"},
+		{128 << 20, "#edad75"},
+		{512 << 20, "#e06c75"},
+		{1 << 30, "#e06c75"},
+	}
+	for _, c := range cases {
+		if got := dashboardNetGraphColor(c.value); got != c.want {
+			t.Fatalf("dashboardNetGraphColor(%v) = %v, want %v", c.value, got, c.want)
+		}
+	}
+	if dashboardNetGraphColor(2<<20) == dashboardNetGraphColor(16<<20) {
+		t.Fatalf("dashboardNetGraphColor(2MB) and (16MB) are identical, want a continuous gradient between the 1MB and 32MB landmarks")
+	}
+}
+
 // TestDashboardMemMeterSqrtScaling is the regression test for the
 // redesign's own worked examples: 0.4% and 2.7% utilization must land on
 // 1 and 2 filled cells of a 10-wide meter respectively — a plain linear
@@ -489,7 +591,8 @@ func TestDashboardSparkGaugeStyleUsesGaugeBar(t *testing.T) {
 	settings.GraphStyle = graphStyleGauge
 
 	graph := statGraph{values: []float64{10, 20, 50}, maxValue: 100}
-	out := ansi.Strip(dashboardSpark(renderer, settings, graph, "#7dcfff", 10, "#000000"))
+	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
+	out := ansi.Strip(dashboardSpark(renderer, settings, graph, flatColor, 10, "#000000"))
 	if strings.ContainsAny(out, "▁▂▃▄▅▆▇█") {
 		t.Fatalf("dashboardSpark(gauge style) = %q, want the gauge bar's ━/╸/─ glyphs, not per-sample block glyphs", out)
 	}
@@ -513,13 +616,41 @@ func TestDashboardSparkHonorsGraphStyleGlyphSet(t *testing.T) {
 	braille := defaultSettings()
 	braille.GraphStyle = graphStyleBraille
 
-	blocksOut := ansi.Strip(dashboardSpark(renderer, blocks, graph, "#7dcfff", 10, "#000000"))
-	brailleOut := ansi.Strip(dashboardSpark(renderer, braille, graph, "#7dcfff", 10, "#000000"))
+	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
+	blocksOut := ansi.Strip(dashboardSpark(renderer, blocks, graph, flatColor, 10, "#000000"))
+	brailleOut := ansi.Strip(dashboardSpark(renderer, braille, graph, flatColor, 10, "#000000"))
 	if strings.ContainsAny(blocksOut, "⣀⣤⣶⣿") {
 		t.Fatalf("dashboardSpark(blocks style) = %q, want block glyphs (▁-█), not Braille", blocksOut)
 	}
 	if !strings.ContainsAny(brailleOut, "⣀⣤⣶⣿") {
 		t.Fatalf("dashboardSpark(braille style) = %q, want at least one Braille glyph (⣀⣤⣶⣿)", brailleOut)
+	}
+}
+
+// TestDashboardSparkColorsEachGlyphByItsOwnValue is the regression test
+// for a spike getting flattened to whatever color the *latest* sample
+// grades to: a historical spike sitting among quiet neighbors must render
+// its own glyph in its own (hotter) color, not the line's single most
+// recent value's color — see dashboardSpark's doc comment for why that's
+// safe now that colorFor grades on absolute thresholds.
+func TestDashboardSparkColorsEachGlyphByItsOwnValue(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	graph := statGraph{values: []float64{2, 2, 95, 2}, maxValue: 100}
+
+	out := dashboardSpark(renderer, defaultSettings(), graph, dashboardGraphColor, 10, "#000000")
+
+	sgrFor := func(color lipgloss.Color) string {
+		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
+		return rendered[:strings.Index(rendered, "x")]
+	}
+	redSGR := sgrFor("#e06c75")
+	greenSGR := sgrFor("#80c990")
+
+	if !strings.Contains(out, redSGR) {
+		t.Fatalf("dashboardSpark output = %q, want the spike sample's own red foreground SGR (%q)", out, redSGR)
+	}
+	if !strings.Contains(out, greenSGR) {
+		t.Fatalf("dashboardSpark output = %q, want a quiet neighbor sample's own green foreground SGR (%q)", out, greenSGR)
 	}
 }
 
@@ -548,9 +679,9 @@ func TestDashboardGraphColorSettingDoesNotAffectDashboardColors(t *testing.T) {
 
 // TestDashboardNetSparkQuietWhenZero is the regression test for goal #4's
 // "zero traffic should appear visually quiet": a container with no
-// network history, or whose latest sample is exactly zero, must render a
-// flat dashed line rather than a row of "▁" glyphs indistinguishable from
-// genuinely tiny (but nonzero) traffic.
+// network history, or whose *entire* visible history is zero, must render
+// a flat dashed line rather than a row of "▁" glyphs indistinguishable
+// from genuinely tiny (but nonzero) traffic.
 func TestDashboardNetSparkQuietWhenZero(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 
@@ -559,14 +690,31 @@ func TestDashboardNetSparkQuietWhenZero(t *testing.T) {
 		t.Fatalf("dashboardNetSpark(no history) = %q, want 6 dashes", empty)
 	}
 
-	zeroLatest := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{40, 0}, maxValue: 100}, 6, "#000000"))
-	if zeroLatest != strings.Repeat("─", 6) {
-		t.Fatalf("dashboardNetSpark(latest=0) = %q, want 6 dashes", zeroLatest)
+	allZero := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{0, 0}, maxValue: 100}, 6, "#000000"))
+	if allZero != strings.Repeat("─", 6) {
+		t.Fatalf("dashboardNetSpark(all zero) = %q, want 6 dashes", allZero)
 	}
 
 	active := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{10, 40}, maxValue: 100}, 6, "#000000"))
 	if active == strings.Repeat("─", 6) {
 		t.Fatalf("dashboardNetSpark(latest=40) = %q, want real sparkline glyphs, not dashes", active)
+	}
+}
+
+// TestDashboardNetSparkStaysDrawnThroughAMomentaryZeroSample is the
+// regression test for the sparkline vanishing and redrawing every time a
+// single poll landed on exactly zero bytes: a latest sample of zero with
+// real nonzero traffic earlier in the same window must keep rendering the
+// scrolling sparkline, not fall back to the flat dashed placeholder —
+// that fallback is reserved for a window that's genuinely all zero (see
+// TestDashboardNetSparkQuietWhenZero and dashboardNetSpark's own doc
+// comment).
+func TestDashboardNetSparkStaysDrawnThroughAMomentaryZeroSample(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	out := ansi.Strip(dashboardNetSpark(renderer, defaultSettings(), statGraph{values: []float64{40, 0}, maxValue: 100}, 6, "#000000"))
+	if out == strings.Repeat("─", 6) {
+		t.Fatalf("dashboardNetSpark(latest=0, earlier=40) = %q, want real sparkline glyphs (a momentary zero shouldn't blank a line with real recent activity)", out)
 	}
 }
 

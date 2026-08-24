@@ -158,7 +158,7 @@ func (m Model) networkCurationOverlay(renderer tideui.Renderer) *tideui.Overlay 
 			if m.networkSelected[network.ID] {
 				selected = "x"
 			}
-			lines = append(lines, networkTableRow(renderer, contentWidth, marker, i == m.networkCursor, selected, network))
+			lines = append(lines, networkTableRow(renderer, contentWidth, i, marker, i == m.networkCursor, selected, network))
 		}
 	}
 	// Keep this summary row present even with no selection so choosing the
@@ -214,7 +214,7 @@ func networkTableHeader(width int) string {
 		imageTableCell("STATE", stateWidth) + "  " + imageTableCell("ID", idWidth)
 }
 
-func networkTableRow(renderer tideui.Renderer, width int, marker string, highlighted bool, selected string, network domain.Network) string {
+func networkTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, network domain.Network) string {
 	nameWidth, subnetWidth, stateWidth, idWidth := networkColumnWidths(width)
 	state := "USED"
 	stateColor := lipgloss.Color("#80c990")
@@ -225,12 +225,7 @@ func networkTableRow(renderer tideui.Renderer, width int, marker string, highlig
 		state = "BUILT-IN"
 		stateColor = lipgloss.Color("#7f92a8")
 	}
-	rowBG := renderer.Styles.Theme.Bg
-	if highlighted {
-		if color, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
-			rowBG = color
-		}
-	}
+	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))
 	stateCell := base.Foreground(stateColor).Bold(true).Render(imageTableCell(state, stateWidth))
 	row := base.Render(imageTableCell(marker, 1)) + base.Render(" ") + base.Render(imageTableCell("["+selected+"]", 3)) + base.Render(" ") +

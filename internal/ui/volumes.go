@@ -158,7 +158,7 @@ func (m Model) volumeCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			if m.volumeSelected[volume.Name] {
 				selected = "x"
 			}
-			lines = append(lines, volumeTableRow(renderer, contentWidth, marker, i == m.volumeCursor, selected, volume))
+			lines = append(lines, volumeTableRow(renderer, contentWidth, i, marker, i == m.volumeCursor, selected, volume))
 		}
 	}
 	// Keep this summary row present even with no selection so choosing the
@@ -207,7 +207,7 @@ func volumeTableHeader(width int) string {
 		imageTableCell("STATE", stateWidth)
 }
 
-func volumeTableRow(renderer tideui.Renderer, width int, marker string, highlighted bool, selected string, volume domain.Volume) string {
+func volumeTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, volume domain.Volume) string {
 	nameWidth, mountWidth, stateWidth := volumeColumnWidths(width)
 	state := "USED"
 	stateColor := lipgloss.Color("#80c990")
@@ -215,12 +215,7 @@ func volumeTableRow(renderer tideui.Renderer, width int, marker string, highligh
 		state = "UNUSED"
 		stateColor = lipgloss.Color("#e06c75")
 	}
-	rowBG := renderer.Styles.Theme.Bg
-	if highlighted {
-		if color, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
-			rowBG = color
-		}
-	}
+	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))
 	stateCell := base.Foreground(stateColor).Bold(true).Render(imageTableCell(state, stateWidth))
 	row := base.Render(imageTableCell(marker, 1)) + base.Render(" ") + base.Render(imageTableCell("["+selected+"]", 3)) + base.Render(" ") +

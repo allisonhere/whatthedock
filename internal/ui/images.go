@@ -168,7 +168,7 @@ func (m Model) imageCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			if m.imageSelected[image.ID.ID] {
 				selected = "x"
 			}
-			lines = append(lines, imageTableRow(renderer, contentWidth, marker, i == m.imageCursor, selected, image))
+			lines = append(lines, imageTableRow(renderer, contentWidth, i, marker, i == m.imageCursor, selected, image))
 		}
 	}
 	// Keep this summary row present even with no selection so choosing the
@@ -232,7 +232,7 @@ func imageTableHeader(width int) string {
 		imageTableCell("STATE", stateWidth) + "  " + imageTableCell("ID", idWidth)
 }
 
-func imageTableRow(renderer tideui.Renderer, width int, marker string, highlighted bool, selected string, image domain.Image) string {
+func imageTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, image domain.Image) string {
 	nameWidth, sizeWidth, stateWidth, idWidth := imageColumnWidths(width)
 	state := "USED"
 	stateColor := lipgloss.Color("#80c990")
@@ -240,12 +240,7 @@ func imageTableRow(renderer tideui.Renderer, width int, marker string, highlight
 		state = "UNUSED"
 		stateColor = lipgloss.Color("#e06c75")
 	}
-	rowBG := renderer.Styles.Theme.Bg
-	if highlighted {
-		if color, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
-			rowBG = color
-		}
-	}
+	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))
 	stateCell := base.Foreground(stateColor).Bold(true).Render(imageTableCell(state, stateWidth))
 	row := base.Render(imageTableCell(marker, 1)) + base.Render(" ") + base.Render(imageTableCell("["+selected+"]", 3)) + base.Render(" ") +

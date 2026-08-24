@@ -98,6 +98,7 @@ That is usually faster than remembering every key.
 |---|---|
 | `j` / `k` or `Up` / `Down` | Move around |
 | `Tab` / `Shift+Tab` | Move between panes |
+| `Left` / `Right` | Move between panes |
 | `Enter` | Open/select the focused item |
 | `Space` | Expand/collapse a stack row; pause/resume logs in Logs |
 | `/` | Filter containers and stacks; in Logs, filter log lines |
