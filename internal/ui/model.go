@@ -366,6 +366,8 @@ type Model struct {
 	inspectorScroll      int
 	inspectorCursor      int
 	helpScroll           int
+	helpSearchActive     bool
+	helpSearch           string
 
 	// inspectorDetail* back the Enter-triggered expand/select-to-copy
 	// overlay (overlayInspectorDetail, inspector_detail.go) for whichever
@@ -1879,6 +1881,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.overlay = overlayHelp
 		m.helpScroll = 0
+		m.helpSearchActive = false
+		m.helpSearch = ""
 	case "A":
 		return m.openAboutOverlay()
 	case "d":
@@ -2024,9 +2028,38 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case overlayHelp:
+		if m.helpSearchActive {
+			switch msg.String() {
+			case "esc":
+				m.helpSearchActive = false
+				m.helpSearch = ""
+				m.helpScroll = 0
+			case "enter":
+				m.helpSearchActive = false
+			case "backspace":
+				if len(m.helpSearch) > 0 {
+					runes := []rune(m.helpSearch)
+					m.helpSearch = string(runes[:len(runes)-1])
+					m.helpScroll = 0
+				}
+			case "ctrl+u":
+				m.helpSearch = ""
+				m.helpScroll = 0
+			default:
+				if len(msg.Runes) > 0 {
+					m.helpSearch += string(msg.Runes)
+					m.helpScroll = 0
+				}
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "esc", "q", "?":
 			m.overlay = overlayNone
+		case "/":
+			m.helpSearchActive = true
+			m.helpSearch = ""
+			m.helpScroll = 0
 		case "j", "down":
 			m.scrollHelp(1)
 		case "k", "up":
@@ -2036,9 +2069,9 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "pgup":
 			m.scrollHelp(-max(1, m.helpBodyBudget()-1))
 		case "g", "home":
-			m.scrollHelp(-len(helpLines))
+			m.scrollHelp(-len(m.visibleHelpLines()))
 		case "G", "end":
-			m.scrollHelp(len(helpLines))
+			m.scrollHelp(len(m.visibleHelpLines()))
 		}
 	case overlayAppLog:
 		switch msg.String() {
@@ -4237,7 +4270,7 @@ func (m *Model) clampInspectorScroll(rows []inspectorRow) {
 }
 
 func (m *Model) scrollHelp(delta int) {
-	maxScroll := max(0, len(helpLines)-m.helpBodyBudget())
+	maxScroll := max(0, len(m.visibleHelpLines())-m.helpBodyBudget())
 	m.helpScroll = clamp(m.helpScroll+delta, 0, maxScroll)
 }
 

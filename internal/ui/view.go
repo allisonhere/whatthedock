@@ -2393,13 +2393,24 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	case overlayHelp:
 		width := min(72, max(40, m.width-8))
 		budget := m.helpBodyBudget()
-		scroll := clamp(m.helpScroll, 0, max(0, len(helpLines)-budget))
-		end := min(len(helpLines), scroll+budget)
-		hints := []tideui.SoftHint{{Key: "esc/?/q", Label: "close"}}
-		if len(helpLines) > budget {
-			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(helpLines))})
+		lines := m.visibleHelpLines()
+		scroll := clamp(m.helpScroll, 0, max(0, len(lines)-budget))
+		end := min(len(lines), scroll+budget)
+		searchLabel := "search"
+		if m.helpSearch != "" || m.helpSearchActive {
+			searchLabel = "/" + m.helpSearch
+			if m.helpSearchActive {
+				searchLabel += "|"
+			}
 		}
-		content := renderer.RenderSoftBody(width, strings.Join(helpLines[scroll:end], "\n")+"\n\n"+
+		hints := []tideui.SoftHint{
+			{Key: "esc/?/q", Label: "close"},
+			{Key: "/", Label: searchLabel},
+		}
+		if len(lines) > budget {
+			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(lines))})
+		}
+		content := renderer.RenderSoftBody(width, strings.Join(lines[scroll:end], "\n")+"\n\n"+
 			strings.Join(statusLegendLines(renderer), "\n")+"\n\n"+
 			renderer.RenderSoftHints(width-4, hints...))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
@@ -3080,59 +3091,182 @@ func spinnerGlyph(frame int) string {
 	return busySpinnerFrames[frame%len(busySpinnerFrames)]
 }
 
-// helpLines is the full keyboard-help content. It's kept as a slice (not
-// just a joined string) so the help overlay can window it against the
-// terminal's actual height instead of relying on renderOverlay's silent
-// bottom-truncation, which drops any line past the terminal edge (see
-// placeBoxAt in tideui/layout.go: target >= totalHeight just skips the
-// line, with no indication anything was cut).
-var helpLines = []string{
-	"j / Down       next",
-	"k / Up         previous",
-	"Enter          select/open",
-	"Space          expand/collapse stack",
-	"/              filter stacks and containers",
-	"s              start/stop selected container",
-	"n              create container or Compose service",
-	"               paste a multi-service compose file to deploy a stack",
-	"Ctrl+P         compose catalog in create/edit",
-	"r              refresh",
-	"Alt+r          restart selected container",
-	"c              copy selected detail",
-	"o              open port, mount, or compose path",
-	"e              open shell in selected container",
-	"l              logs",
-	"L              expand logs: shrink tree/inspector to icons, fill width",
-	"/              live-filter logs as you type, hiding non-matches",
-	"e / w / i / a  log errors, warnings, info, all",
-	"Space          toggle live/paused log tail",
-	"f / End        jump to end (live)",
-	"Esc            clear active log filter",
-	"u              replicate: pull latest image, recreate",
-	"D              delete: real, permanent removal",
-	"               on a stack row: deletes the whole stack + its file",
-	"               on a multi-service container: prompts service vs. stack",
-	"C              clone under a new name",
-	"m              edit in place; on a stack row, edits the whole stack",
-	"               on a multi-service container: prompts service vs. stack",
-	"               Image action can pull latest before applying edits",
-	"p              problems",
-	"a in problems  analyze the selected problem with AI",
-	"g              stats graphs",
-	"T              theme picker",
-	",              settings",
-	"Ctrl+S         save settings/forms",
-	"S              systems",
-	"Systems: enter switch, t test, a add, e edit, d delete",
-	"Ctrl+K         command palette",
-	"?              keyboard help",
-	"A              about screen",
-	"d              dashboard: fleet summary and every container's stats",
-	"q              quit",
+type helpEntry struct {
+	Key  string
+	Text string
+}
+
+type helpSection struct {
+	Title   string
+	Entries []helpEntry
+}
+
+// helpSections is the full keyboard-help content. The render path turns it
+// into lines so the help overlay can window it against the terminal height
+// instead of relying on renderOverlay's silent bottom-truncation, which drops
+// any line past the terminal edge.
+var helpSections = []helpSection{
+	{
+		Title: "Main",
+		Entries: []helpEntry{
+			{"Tab / Shift+Tab", "move focus between tree, activity, inspector"},
+			{"j / k or Up / Down", "move selection or scroll focused pane"},
+			{"Enter", "select/open focused row"},
+			{"Space", "expand/collapse stack row; pause/resume logs in Logs"},
+			{"/", "filter stacks and containers; in Logs, live-filter logs"},
+			{"r", "refresh Docker state"},
+			{"Alt+r", "restart selected container"},
+			{"s", "start/stop selected container"},
+			{"n", "create container or Compose service"},
+			{"m", "edit selected service; on stack row, edit whole stack"},
+			{"C", "clone selected container or Compose service under a new name"},
+			{"D", "delete selected container/service; stack row deletes stack + file"},
+			{"u", "replicate: pull latest image and recreate in place"},
+			{"c", "copy selected detail; inspector focus copies current row"},
+			{"o", "open selected port, mount, or compose path"},
+			{"e", "open shell in selected running container"},
+			{"q / Ctrl+C", "quit"},
+		},
+	},
+	{
+		Title: "Activity",
+		Entries: []helpEntry{
+			{"l", "show logs for the selected container"},
+			{"L", "expand logs across the width"},
+			{"e / w / i / a", "filter logs to errors, warnings, info, or all"},
+			{"f / End", "jump logs to end and follow live output"},
+			{"Home / PgUp / PgDn", "move through logs"},
+			{"Esc", "clear the active log filter"},
+			{"p", "show problems"},
+			{"a", "analyze selected problem with AI while Problems is focused"},
+			{"g", "show stats graphs"},
+		},
+	},
+	{
+		Title: "Create And Edit",
+		Entries: []helpEntry{
+			{"[ / ]", "cycle standalone, Compose service, and Compose stack modes"},
+			{"Up / Down / Tab", "move between fields"},
+			{"h / l or Left / Right", "change choices or move the text cursor"},
+			{"Enter", "advance field; on Compose file field, browse"},
+			{"Ctrl+O", "browse for a Compose file"},
+			{"Ctrl+Y", "edit Compose YAML in the embedded editor"},
+			{"Ctrl+P", "open the create/edit Compose catalog picker"},
+			{"Ctrl+S", "validate or save form/editor changes"},
+			{"Ctrl+Enter / Alt+Enter", "confirm create/apply/deploy"},
+			{"Esc / q", "close or cancel"},
+		},
+	},
+	{
+		Title: "Compose Catalog Curator",
+		Entries: []helpEntry{
+			{"Ctrl+K", "open command palette, then run Curate Compose files"},
+			{"Tab", "switch library, live, and unused views"},
+			{"j / k", "move catalog selection"},
+			{"f", "filter catalog entries"},
+			{"A", "add draft from URL or path"},
+			{"B", "browse for a Compose file and add it as a draft"},
+			{"N", "create a blank draft"},
+			{"Enter / l", "preview catalog entry"},
+			{"e", "edit catalog entry in the Compose editor"},
+			{"c", "create a runnable draft from a live stack"},
+			{"S", "save a live stack as a draft"},
+			{"M / p", "make catalog entry live"},
+			{"s", "status: draft, live, or archived"},
+			{"m", "toggle missing/unused review"},
+			{"n / t", "edit note or tags; notes are kept as Compose comments"},
+			{"a", "archive or unarchive"},
+			{"D", "delete catalog entry"},
+		},
+	},
+	{
+		Title: "Curators",
+		Entries: []helpEntry{
+			{"Ctrl+K", "open image, network, volume, or Compose curators"},
+			{"j / k", "move through images, networks, or volumes"},
+			{"Space", "select removable image, network, or volume"},
+			{"r", "reload curator data"},
+			{"d", "delete selected removable items"},
+			{"y / Enter", "confirm curator deletion"},
+			{"n / Esc", "cancel curator deletion"},
+		},
+	},
+	{
+		Title: "Overlays",
+		Entries: []helpEntry{
+			{"Ctrl+K", "command palette; type to search commands, Enter runs"},
+			{"?", "keyboard help"},
+			{"/", "search inside Help while Help is open"},
+			{"d", "dashboard: fleet summary and container stats"},
+			{"Dashboard Enter", "open highlighted container"},
+			{"Dashboard p", "jump from dashboard to Problems"},
+			{"T", "theme picker"},
+			{", / Ctrl+,", "settings"},
+			{"S", "systems"},
+			{"A", "about screen"},
+			{"Esc / q", "close the current overlay"},
+		},
+	},
+	{
+		Title: "Settings And Systems",
+		Entries: []helpEntry{
+			{"Settings Enter / Space", "edit text rows, trigger actions, or change choices"},
+			{"Settings h / l", "change choice rows"},
+			{"Settings Ctrl+S", "save settings"},
+			{"Systems Enter", "switch to selected Docker system"},
+			{"Systems t", "test selected system"},
+			{"Systems a / e", "add or edit a system"},
+			{"Systems d", "delete inactive system"},
+			{"System edit Ctrl+S", "save system"},
+		},
+	},
 }
 
 func helpText() string {
-	return strings.Join(helpLines, "\n")
+	return strings.Join(helpLines(), "\n")
+}
+
+func helpLines() []string {
+	return helpLinesForSearch("")
+}
+
+func (m Model) visibleHelpLines() []string {
+	return helpLinesForSearch(m.helpSearch)
+}
+
+func helpLinesForSearch(query string) []string {
+	query = strings.ToLower(strings.TrimSpace(query))
+	lines := []string{}
+	for i, section := range helpSections {
+		sectionMatches := query != "" && strings.Contains(strings.ToLower(section.Title), query)
+		entries := make([]helpEntry, 0, len(section.Entries))
+		for _, entry := range section.Entries {
+			if query == "" || sectionMatches || strings.Contains(strings.ToLower(entry.Key+" "+entry.Text), query) {
+				entries = append(entries, entry)
+			}
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		if len(lines) > 0 && i > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, section.Title+":")
+		for _, entry := range entries {
+			lines = append(lines, formatHelpEntry(entry))
+		}
+	}
+	if len(lines) == 0 {
+		return []string{"No help entries match " + strconv.Quote(query)}
+	}
+	return lines
+}
+
+func formatHelpEntry(entry helpEntry) string {
+	if entry.Key == "" {
+		return "  " + entry.Text
+	}
+	return fmt.Sprintf("  %-18s %s", entry.Key, entry.Text)
 }
 
 // statusLegendEntries mirrors inspectorStatusColor/statusGlyph exactly —

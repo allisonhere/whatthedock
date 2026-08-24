@@ -4318,21 +4318,31 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 
 func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 	model := testModel()
-	model.width, model.height = 100, 30
+	model.width, model.height = 100, 42
 	model.overlay = overlayHelp
 
 	view := ansi.Strip(model.View())
 	for _, want := range []string{
-		"n              create container or Compose service",
-		"Ctrl+P         compose catalog in create/edit",
-		"e              open shell in selected container",
+		"Main:",
+		"create container or Compose service",
+		"open shell in selected running container",
+		"Activity:",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q:\n%s", want, view)
 		}
 	}
-	if !strings.Contains(helpText(), "Image action can pull latest before applying edits") {
-		t.Fatal("help text missing Image action line")
+	for _, want := range []string{
+		"open the create/edit Compose catalog picker",
+		"add draft from URL or path",
+		"browse for a Compose file and add it as a draft",
+		"create a blank draft",
+		"Curators:",
+		"Settings And Systems:",
+	} {
+		if !strings.Contains(helpText(), want) {
+			t.Fatalf("help text missing %q", want)
+		}
 	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
@@ -4341,10 +4351,60 @@ func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
 		t.Fatal("helpScroll = 0 after G, want scrolled to bottom")
 	}
 	view = ansi.Strip(model.View())
-	for _, want := range []string{"Ctrl+S         save settings/forms", "S              systems", "Systems: enter switch, t test, a add, e edit, d delete", "A              about screen"} {
+	for _, want := range []string{"Settings Ctrl+S", "Systems Enter", "Systems a / e", "System edit Ctrl+S"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("help view missing %q after scrolling to bottom:\n%s", want, view)
 		}
+	}
+}
+
+func TestHelpOverlaySearchFiltersSections(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 24
+	model.overlay = overlayHelp
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	model = updated.(Model)
+	if !model.helpSearchActive {
+		t.Fatal("helpSearchActive = false after /, want active search")
+	}
+	for _, r := range "catalog" {
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		model = updated.(Model)
+	}
+	if model.helpSearch != "catalog" {
+		t.Fatalf("helpSearch = %q, want catalog", model.helpSearch)
+	}
+
+	view := ansi.Strip(model.View())
+	for _, want := range []string{
+		"/catalog|",
+		"Compose Catalog Curator:",
+		"add draft from URL or path",
+		"open the create/edit Compose catalog picker",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("filtered help missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "Curators:") {
+		t.Fatalf("filtered help included unrelated Curators section:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	model = updated.(Model)
+	if model.helpSearch != "catalo" {
+		t.Fatalf("helpSearch after backspace = %q, want catalo", model.helpSearch)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = updated.(Model)
+	if model.helpSearch != "" || !model.helpSearchActive {
+		t.Fatalf("after ctrl+u helpSearch/helpSearchActive = %q/%v, want empty/active", model.helpSearch, model.helpSearchActive)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.helpSearchActive || model.overlay != overlayHelp {
+		t.Fatalf("after esc searchActive/overlay = %v/%v, want false/overlayHelp", model.helpSearchActive, model.overlay)
 	}
 }
 
@@ -4391,8 +4451,8 @@ func TestHelpOverlayScrollsWithJK(t *testing.T) {
 	model.width, model.height = 100, 20
 	model.overlay = overlayHelp
 
-	if budget := model.helpBodyBudget(); budget >= len(helpLines) {
-		t.Fatalf("helpBodyBudget() = %d, want < %d so this test actually exercises scrolling", budget, len(helpLines))
+	if budget := model.helpBodyBudget(); budget >= len(helpLines()) {
+		t.Fatalf("helpBodyBudget() = %d, want < %d so this test actually exercises scrolling", budget, len(helpLines()))
 	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
