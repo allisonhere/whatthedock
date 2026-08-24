@@ -1,6 +1,6 @@
 # WhatTheDock Agent Notes
 
-- Work in this repository only: `/home/allieb/Projects/tidedock`.
+- Work in this repository only: `/home/allieb/Projects/whatthedock`.
 - Do not edit sibling Tide repositories such as `../tideui` or `../tidemail` unless the user explicitly asks for cross-repo work.
 - WhatTheDock remote is `https://github.com/allisonhere/whatthedock.git` on branch `main`.
 - The user originally provided `git@github.com:allisonhere/whatthedock.git`, but SSH failed locally because of system SSH config permissions. HTTPS is the working remote.

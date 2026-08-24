@@ -26,25 +26,31 @@ import (
 )
 
 type fakeProvider struct {
-	host           domain.Host
-	snapshot       domain.Snapshot
-	containers     map[string]domain.Container
-	stats          map[string]domain.ContainerStats
-	pingErr        error
-	starts         int
-	stops          int
-	restarts       int
-	creates        []app.ContainerCreateSpec
-	removed        []domain.ResourceID
-	forced         []bool
-	pulled         []string
-	progressCalls  []app.PullProgress
-	removeErr      error
-	pullErr        error
-	createErr      error
-	images         []domain.Image
-	imageRemoveErr error
-	removedImages  []string
+	host             domain.Host
+	snapshot         domain.Snapshot
+	containers       map[string]domain.Container
+	stats            map[string]domain.ContainerStats
+	pingErr          error
+	starts           int
+	stops            int
+	restarts         int
+	creates          []app.ContainerCreateSpec
+	removed          []domain.ResourceID
+	forced           []bool
+	pulled           []string
+	progressCalls    []app.PullProgress
+	removeErr        error
+	pullErr          error
+	createErr        error
+	images           []domain.Image
+	imageRemoveErr   error
+	removedImages    []string
+	networks         []domain.Network
+	networkRemoveErr error
+	removedNetworks  []string
+	volumes          []domain.Volume
+	volumeRemoveErr  error
+	removedVolumes   []string
 }
 
 func (f *fakeProvider) Host() domain.Host          { return f.host }
@@ -109,6 +115,16 @@ func (f *fakeProvider) Images(context.Context) ([]domain.Image, error) { return 
 func (f *fakeProvider) RemoveImage(_ context.Context, ref string) error {
 	f.removedImages = append(f.removedImages, ref)
 	return f.imageRemoveErr
+}
+func (f *fakeProvider) Networks(context.Context) ([]domain.Network, error) { return f.networks, nil }
+func (f *fakeProvider) RemoveNetwork(_ context.Context, id string) error {
+	f.removedNetworks = append(f.removedNetworks, id)
+	return f.networkRemoveErr
+}
+func (f *fakeProvider) Volumes(context.Context) ([]domain.Volume, error) { return f.volumes, nil }
+func (f *fakeProvider) RemoveVolume(_ context.Context, name string) error {
+	f.removedVolumes = append(f.removedVolumes, name)
+	return f.volumeRemoveErr
 }
 func (f *fakeProvider) Close() error { return nil }
 
@@ -428,26 +444,30 @@ func TestCollapseTogglesOnlyWhenTreeFocused(t *testing.T) {
 	}
 }
 
-func TestInspectorScrollsWhileFocused(t *testing.T) {
+func TestInspectorCursorMovesWhileFocused(t *testing.T) {
 	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 30
 	model.focus = paneInspector
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	got := updated.(Model)
-	if got.inspectorScroll != 1 {
-		t.Fatalf("inspectorScroll = %d, want 1 after down", got.inspectorScroll)
+	if got.inspectorCursor != 1 {
+		t.Fatalf("inspectorCursor = %d, want 1 after down", got.inspectorCursor)
 	}
 
 	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	got = updated.(Model)
-	if got.inspectorScroll != 0 {
-		t.Fatalf("inspectorScroll = %d, want 0 after up", got.inspectorScroll)
+	if got.inspectorCursor != 0 {
+		t.Fatalf("inspectorCursor = %d, want 0 after up", got.inspectorCursor)
 	}
 
 	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	got = updated.(Model)
+	if got.inspectorCursor != 0 {
+		t.Fatalf("inspectorCursor = %d, want clamped at 0, not negative", got.inspectorCursor)
+	}
 	if got.inspectorScroll != 0 {
-		t.Fatalf("inspectorScroll = %d, want clamped at 0, not negative", got.inspectorScroll)
+		t.Fatalf("inspectorScroll = %d, want 0 with the cursor back at the first row", got.inspectorScroll)
 	}
 }
 
@@ -455,6 +475,7 @@ func TestInspectorScrollResetsOnSelectionChange(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.focus = paneInspector
 	model.inspectorScroll = 3
+	model.inspectorCursor = 3
 	model.rows = model.buildRows()
 	for i, row := range model.rows {
 		if row.container != nil && row.container.ID.ID == "2" {
@@ -467,6 +488,9 @@ func TestInspectorScrollResetsOnSelectionChange(t *testing.T) {
 	got := updated.(Model)
 	if got.inspectorScroll != 0 {
 		t.Fatalf("inspectorScroll = %d, want reset to 0 after selection changed", got.inspectorScroll)
+	}
+	if got.inspectorCursor != 0 {
+		t.Fatalf("inspectorCursor = %d, want reset to 0 after selection changed", got.inspectorCursor)
 	}
 }
 
@@ -923,7 +947,7 @@ func TestFocusedPaneActionStripIsContextual(t *testing.T) {
 
 	model.focus = paneInspector
 	inspectorView := ansi.Strip(model.View())
-	if !strings.Contains(inspectorView, "alt+r restart") || !strings.Contains(inspectorView, "o open") {
+	if !strings.Contains(inspectorView, "alt+r restart") || !strings.Contains(inspectorView, "enter expand") {
 		t.Fatalf("inspector action strip missing container actions:\n%s", inspectorView)
 	}
 	if strings.Contains(inspectorView, "space fold") {
@@ -3804,9 +3828,10 @@ func TestInspectorFieldRowsUseOnlyPaneBackgroundInLavenderTheme(t *testing.T) {
 	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
 
 	renderer := tideui.NewRenderer(tideui.LavenderFieldsForever, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	rows := renderInspectorField(renderer, 44, "Image", "radarr", "c", "#7dcfff")
+	row := inspectorRow{kind: inspectorRowField, label: "Image", display: "radarr", value: "radarr", suffix: "c", color: "#7dcfff"}
+	rows := renderInspectorFieldRow(renderer, 44, 8, row, inspectorRowState{})
 	if len(rows) == 0 {
-		t.Fatal("renderInspectorField returned no rows")
+		t.Fatal("renderInspectorFieldRow returned no rows")
 	}
 	backgrounds := trueColorBackgrounds(rows[0])
 	if len(backgrounds) == 0 {

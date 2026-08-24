@@ -232,7 +232,15 @@ func (noopProvider) PullImage(context.Context, string, func(app.PullProgress)) e
 }
 func (noopProvider) Images(context.Context) ([]domain.Image, error) { panic("not implemented") }
 func (noopProvider) RemoveImage(context.Context, string) error      { panic("not implemented") }
-func (noopProvider) Close() error                                   { panic("not implemented") }
+func (noopProvider) Networks(context.Context) ([]domain.Network, error) {
+	panic("not implemented")
+}
+func (noopProvider) RemoveNetwork(context.Context, string) error { panic("not implemented") }
+func (noopProvider) Volumes(context.Context) ([]domain.Volume, error) {
+	panic("not implemented")
+}
+func (noopProvider) RemoveVolume(context.Context, string) error { panic("not implemented") }
+func (noopProvider) Close() error                               { panic("not implemented") }
 
 // TestStartAIAnalysisNoProblemsIsNoop guards against a nil-pointer panic
 // when there's nothing to analyze (currentProblem returns nil).

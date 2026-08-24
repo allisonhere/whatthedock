@@ -15,6 +15,8 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	networktypes "github.com/docker/docker/api/types/network"
+	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/go-connections/nat"
@@ -363,6 +365,85 @@ func (p *LocalProvider) Images(ctx context.Context) ([]domain.Image, error) {
 func (p *LocalProvider) RemoveImage(ctx context.Context, ref string) error {
 	_, err := p.cli.ImageRemove(ctx, ref, imagetypes.RemoveOptions{})
 	return err
+}
+
+// Networks inspects each listed network before deriving attachment counts.
+// The Docker client currently aliases network.Summary to network.Inspect,
+// but its own docs allow list responses to diverge from full inspect data;
+// removable/delete UI should not trust a possibly-sparse list response.
+func (p *LocalProvider) Networks(ctx context.Context) ([]domain.Network, error) {
+	items, err := p.cli.NetworkList(ctx, networktypes.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	networks := make([]domain.Network, 0, len(items))
+	for _, item := range items {
+		inspect, err := p.cli.NetworkInspect(ctx, item.ID, networktypes.InspectOptions{Verbose: true})
+		if err != nil {
+			return nil, err
+		}
+		subnet := ""
+		if len(inspect.IPAM.Config) > 0 {
+			subnet = inspect.IPAM.Config[0].Subnet
+		}
+		networks = append(networks, domain.Network{
+			ID:         inspect.ID,
+			Name:       inspect.Name,
+			Driver:     inspect.Driver,
+			Scope:      inspect.Scope,
+			Containers: len(inspect.Containers),
+			Subnet:     subnet,
+		})
+	}
+	sort.Slice(networks, func(i, j int) bool { return networks[i].Name < networks[j].Name })
+	return networks, nil
+}
+
+func (p *LocalProvider) RemoveNetwork(ctx context.Context, id string) error {
+	return p.cli.NetworkRemove(ctx, id)
+}
+
+// Volumes cross-references VolumeList against a fresh ContainerList (whose
+// summary Mounts already carry each mount's Type and volume Name) to derive
+// InUse, rather than trusting VolumeList's own usage data, which Docker only
+// populates when explicitly requested and can be slow to compute.
+func (p *LocalProvider) Volumes(ctx context.Context) ([]domain.Volume, error) {
+	resp, err := p.cli.VolumeList(ctx, volumetypes.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	containers, err := p.cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	inUse := map[string]bool{}
+	for _, ctr := range containers {
+		for _, m := range ctr.Mounts {
+			if m.Type == mount.TypeVolume && m.Name != "" {
+				inUse[m.Name] = true
+			}
+		}
+	}
+	volumes := make([]domain.Volume, 0, len(resp.Volumes))
+	for _, item := range resp.Volumes {
+		if item == nil {
+			continue
+		}
+		volumes = append(volumes, domain.Volume{
+			Name:       item.Name,
+			Driver:     item.Driver,
+			Mountpoint: item.Mountpoint,
+			InUse:      inUse[item.Name],
+		})
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+	return volumes, nil
+}
+
+// RemoveVolume deliberately leaves force false, matching RemoveImage's
+// default, so Docker protects volumes still referenced by a container.
+func (p *LocalProvider) RemoveVolume(ctx context.Context, name string) error {
+	return p.cli.VolumeRemove(ctx, name, false)
 }
 
 func (p *LocalProvider) Close() error {

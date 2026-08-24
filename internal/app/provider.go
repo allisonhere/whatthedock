@@ -23,6 +23,10 @@ type Provider interface {
 	PullImage(ctx context.Context, image string, onProgress func(PullProgress)) error
 	Images(context.Context) ([]domain.Image, error)
 	RemoveImage(context.Context, string) error
+	Networks(context.Context) ([]domain.Network, error)
+	RemoveNetwork(context.Context, string) error
+	Volumes(context.Context) ([]domain.Volume, error)
+	RemoveVolume(context.Context, string) error
 	Close() error
 }
 

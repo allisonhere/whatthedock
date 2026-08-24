@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	colorful "github.com/lucasb-eyer/go-colorful"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
@@ -1587,50 +1588,385 @@ func (m Model) fleetSummary() dashboardSummary {
 	return summary
 }
 
+type inspectorRowKind int
+
+const (
+	inspectorRowSection inspectorRowKind = iota
+	inspectorRowTitle
+	inspectorRowField
+)
+
+// inspectorRow is one logical row of the Inspector pane's detail list —
+// not necessarily one screen line: a field row's value can itself contain
+// literal newlines (see the Env/Labels fields below), which splits into
+// several screen lines sharing one inspectorRow. display is what the
+// inline pane shows (width-truncated at render time); value is the full
+// underlying value used for copy and the Enter expand/select overlay —
+// the same string as display for every field except Env/Labels, where
+// display is deliberately capped (see inspectorRows).
+type inspectorRow struct {
+	kind    inspectorRowKind
+	text    string // section header / title text; kind != inspectorRowField
+	label   string
+	display string
+	value   string
+	suffix  string
+	color   lipgloss.Color
+	// valueKind names the recognizable shape of this field's value — "kv"
+	// (Env/Labels: "KEY=VALUE" lines), "path" (Config), "mounts"
+	// ("source -> dest" lines), "ports" ("N -> N/proto" lists), "digest"
+	// (Image ID: "sha256:…"), "image" (Image: "repo/name:tag" or
+	// "repo/name@sha256:…"), or "" for fields with nothing structured to
+	// recognize (Status, Uptime, Restart, names, …), which keep their
+	// existing single-color treatment. Drives inspectorValueTokenKinds,
+	// shared by this pane's inline rendering and the Enter overlay so the
+	// same coloring appears in both places.
+	valueKind string
+}
+
+// inspectorRows builds the Inspector pane's row list for the selected
+// container — the single source of truth renderInspector, the row-cursor
+// logic in model.go, and the copy/expand overlay in inspector_detail.go
+// all consume, so they can never drift out of sync the way copyRows()
+// (openCopyOverlay's separately-built field list) has from this pane's
+// own visible order.
+func (m Model) inspectorRows() []inspectorRow {
+	if m.selected == nil {
+		return nil
+	}
+	ctr := *m.selected
+	var rows []inspectorRow
+	addTitle := func(text string) { rows = append(rows, inspectorRow{kind: inspectorRowTitle, text: text}) }
+	addSection := func(text string) { rows = append(rows, inspectorRow{kind: inspectorRowSection, text: text}) }
+	addField := func(label, value, suffix string, color lipgloss.Color, valueKind string) {
+		rows = append(rows, inspectorRow{kind: inspectorRowField, label: label, display: value, value: value, suffix: suffix, color: color, valueKind: valueKind})
+	}
+	// addFieldFull is addField for a value whose inline display is capped —
+	// formatList/formatMap (Env/Labels, below) silently drop entries past
+	// their limit and splice in a "... N more" line, so today's value is
+	// already truncated. display keeps that capped string (what the pane
+	// shows inline); value is a separate, uncapped recompute, so copy and
+	// the Enter overlay actually surface every entry, not just the first
+	// several.
+	addFieldFull := func(label, display, value, suffix string, color lipgloss.Color, valueKind string) {
+		rows = append(rows, inspectorRow{kind: inspectorRowField, label: label, display: display, value: value, suffix: suffix, color: color, valueKind: valueKind})
+	}
+
+	addTitle(containerTitle(ctr))
+	addSection("Runtime")
+	addField("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr), "")
+	addField("Uptime", formatDuration(ctr.Created), "", "#9aa6b2", "")
+	addField("Restart", ctr.RestartPolicy, "", "", "")
+	addField("Restarts", fmt.Sprintf("%d", ctr.RestartCount), "", restartCountColor(ctr.RestartCount), "")
+
+	addSection("Image")
+	addField("Image", ctr.Image, "c", "#7dcfff", "image")
+	addFieldFull("Image ID", short(ctr.ImageID, 20), ctr.ImageID, "c", "#9aa6b2", "digest")
+
+	if ctr.Compose.Project != "" {
+		addSection("Compose")
+		addField("Stack", ctr.Compose.Project, "c", "#80c990", "")
+		addField("Service", ctr.Compose.Service, "c", "#80c990", "")
+		addField("Number", ctr.Compose.ContainerNumber, "c", "#9aa6b2", "")
+		addField("Config", ctr.Compose.ConfigFiles, "c/o", "#9aa6b2", "path")
+	}
+
+	addSection("Network")
+	addField("Ports", formatPorts(ctr.Ports), detailHint(len(ctr.Ports) > 0, true), "#e5c07b", "ports")
+	addField("Networks", strings.Join(ctr.Networks, ", "), "", "#7dcfff", "")
+
+	addSection("Files")
+	addField("Mounts", formatMounts(ctr.Mounts), detailHint(len(ctr.Mounts) > 0, true), "#c678dd", "mounts")
+
+	addSection("Metadata")
+	addFieldFull("Env", formatList(ctr.Env, 8), formatList(ctr.Env, len(ctr.Env)), "", "#9aa6b2", "kv")
+	addFieldFull("Labels", formatMap(ctr.Labels, 8), formatMap(ctr.Labels, len(ctr.Labels)), detailHint(len(ctr.Labels) > 0, false), "#9aa6b2", "kv")
+	if ctr.HealthCheck != nil {
+		addField("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr), "")
+	}
+	return rows
+}
+
+// inspectorTokenColor maps a value-token kind (from inspectorValueTokenKinds)
+// to its foreground color — shared by this pane's inline rendering
+// (styledInspectorValue) and the Enter overlay (inspectorTokenStyle,
+// inspector_detail.go), so a label's key or a port number reads the same
+// color in both places. "" (no recognized kind) returns "", telling the
+// caller to keep the field's own single color instead.
+func inspectorTokenColor(kind string) lipgloss.Color {
+	switch kind {
+	case "key":
+		return "#7dcfff"
+	case "string":
+		return "#e0af68"
+	case "path":
+		return "#c678dd"
+	case "num":
+		return "#98c379"
+	case "proto":
+		return "#9aa6b2"
+	case "digest":
+		return "#e5c07b"
+	case "tag":
+		return "#98c379"
+	case "comment":
+		return "#565f89"
+	default:
+		return ""
+	}
+}
+
+// inspectorValueTokenKinds classifies each rune of a single display line
+// by syntax kind, driven by which field it came from (fieldKind, an
+// inspectorRow.valueKind) rather than sniffing the rendered text —
+// Mounts/Ports/Env/Labels/Image/Image ID have known, fixed shapes, so
+// this is a small set of per-field parsers, not a general-purpose
+// scanner. Every rune is "" (no recognized kind) when fieldKind is
+// unrecognized or the line doesn't match that field's expected shape.
+func inspectorValueTokenKinds(fieldKind, line string) []string {
+	runes := []rune(line)
+	kinds := make([]string, len(runes))
+	if strings.HasPrefix(line, "... ") && strings.HasSuffix(line, " more") {
+		for i := range kinds {
+			kinds[i] = "comment"
+		}
+		return kinds
+	}
+	switch fieldKind {
+	case "kv":
+		if i := strings.IndexByte(line, '='); i > 0 {
+			keyEnd := len([]rune(line[:i]))
+			for k := 0; k < keyEnd; k++ {
+				kinds[k] = "key"
+			}
+			for k := keyEnd + 1; k < len(kinds); k++ {
+				kinds[k] = "string"
+			}
+		}
+	case "path":
+		for i := range kinds {
+			kinds[i] = "path"
+		}
+	case "mounts":
+		if i := strings.Index(line, " -> "); i >= 0 {
+			leftEnd := len([]rune(line[:i]))
+			rightStart := leftEnd + 4
+			for k := 0; k < leftEnd; k++ {
+				kinds[k] = "path"
+			}
+			for k := rightStart; k < len(kinds); k++ {
+				kinds[k] = "path"
+			}
+		} else {
+			for i := range kinds {
+				kinds[i] = "path"
+			}
+		}
+	case "ports":
+		markInspectorPortRunes(runes, kinds)
+	case "digest":
+		markInspectorDigestRunes(line, kinds)
+	case "image":
+		markInspectorImageRunes(line, kinds)
+	}
+	return kinds
+}
+
+// inspectorValueTokens is inspectorValueTokenKinds for a full, possibly
+// multi-line value (Env/Labels join entries with literal "\n") — it
+// tokenizes each line independently (a mounts/ports/kv field's shape
+// applies per entry, not to the whole blob) and stitches the results
+// back into one rune-indexed slice, for ripple.Options.StyleKey in the
+// Enter overlay (inspector_detail.go), which indexes by offset into the
+// whole document.
+func inspectorValueTokens(fieldKind, value string) []string {
+	runes := []rune(value)
+	kinds := make([]string, len(runes))
+	lineStart := 0
+	for i := 0; i <= len(runes); i++ {
+		if i == len(runes) || runes[i] == '\n' {
+			copy(kinds[lineStart:i], inspectorValueTokenKinds(fieldKind, string(runes[lineStart:i])))
+			lineStart = i + 1
+		}
+	}
+	return kinds
+}
+
+func markInspectorPortRunes(runes []rune, kinds []string) {
+	i := 0
+	for i < len(runes) {
+		if runes[i] >= '0' && runes[i] <= '9' {
+			j := i
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+			for k := i; k < j; k++ {
+				kinds[k] = "num"
+			}
+			i = j
+			continue
+		}
+		if runes[i] == '/' {
+			j := i + 1
+			for j < len(runes) && runes[j] >= 'a' && runes[j] <= 'z' {
+				j++
+			}
+			if j > i+1 {
+				for k := i; k < j; k++ {
+					kinds[k] = "proto"
+				}
+				i = j
+				continue
+			}
+		}
+		i++
+	}
+}
+
+func markInspectorDigestRunes(line string, kinds []string) {
+	const prefix = "sha256:"
+	if strings.HasPrefix(line, prefix) {
+		n := len([]rune(prefix))
+		for i := 0; i < n && i < len(kinds); i++ {
+			kinds[i] = "key"
+		}
+		for i := n; i < len(kinds); i++ {
+			kinds[i] = "digest"
+		}
+		return
+	}
+	for i := range kinds {
+		kinds[i] = "digest"
+	}
+}
+
+func markInspectorImageRunes(line string, kinds []string) {
+	if at := strings.LastIndexByte(line, '@'); at >= 0 {
+		start := len([]rune(line[:at]))
+		for i := start; i < len(kinds); i++ {
+			kinds[i] = "digest"
+		}
+		return
+	}
+	if c := strings.LastIndexByte(line, ':'); c > 0 {
+		start := len([]rune(line[:c]))
+		tag := line[c+1:]
+		if tag != "" && !strings.ContainsAny(tag, " /") {
+			for i := start; i < len(kinds); i++ {
+				kinds[i] = "tag"
+			}
+		}
+	}
+}
+
+// styledInspectorValue renders one display line with per-token foreground
+// coloring from inspectorValueTokenKinds(fieldKind, line) layered over
+// plainFg — runs with no recognized kind keep the field's existing single
+// color (plainFg), so a field with nothing to recognize (Status, a name,
+// …) looks exactly as it did before this.
+func styledInspectorValue(fieldKind, line string, plainFg, baseFg lipgloss.Color) string {
+	runes := []rune(line)
+	if len(runes) == 0 {
+		return ""
+	}
+	kinds := inspectorValueTokenKinds(fieldKind, line)
+	var b strings.Builder
+	i := 0
+	for i < len(runes) {
+		j := i
+		for j < len(runes) && kinds[j] == kinds[i] {
+			j++
+		}
+		fg := plainFg
+		if c := inspectorTokenColor(kinds[i]); c != "" {
+			fg = c
+		}
+		b.WriteString(foregroundSpan(string(runes[i:j]), fg, baseFg, false))
+		i = j
+	}
+	return b.String()
+}
+
+// currentInspectorFieldRow returns the field row under m.inspectorCursor,
+// or false if the Inspector currently has none (no container selected).
+func (m Model) currentInspectorFieldRow() (inspectorRow, bool) {
+	fieldOrdinal := -1
+	for _, row := range m.inspectorRows() {
+		if row.kind != inspectorRowField {
+			continue
+		}
+		fieldOrdinal++
+		if fieldOrdinal == m.inspectorCursor {
+			return row, true
+		}
+	}
+	return inspectorRow{}, false
+}
+
+// inspectorLineLayout returns, for each screen line renderInspector will
+// produce from rows, which field-row ordinal (0-based, among
+// inspectorRowField rows only) owns that line — -1 for section/title
+// lines. This depends only on how many "\n"-separated entries each
+// field's display value splits into, not on any renderer, so it can run
+// from handleKey's scroll-follow logic (model.go) as well as from
+// renderInspector, without duplicating the split in two places.
+func inspectorLineLayout(rows []inspectorRow) []int {
+	var lineRow []int
+	fieldOrdinal := -1
+	for _, row := range rows {
+		if row.kind != inspectorRowField {
+			lineRow = append(lineRow, -1)
+			continue
+		}
+		fieldOrdinal++
+		value := strings.TrimSpace(row.display)
+		if value == "" {
+			value = "none"
+		}
+		for range strings.Split(value, "\n") {
+			lineRow = append(lineRow, fieldOrdinal)
+		}
+	}
+	return lineRow
+}
+
+func inspectorLabelWidth(rows []inspectorRow) int {
+	width := 0
+	for _, row := range rows {
+		if row.kind != inspectorRowField {
+			continue
+		}
+		if w := lipgloss.Width(row.label); w > width {
+			width = w
+		}
+	}
+	return max(1, width)
+}
+
 func (m Model) renderInspector(renderer tideui.Renderer) string {
 	if m.selected == nil {
 		return renderer.Styles.DetailMeta.Render("No container selected.")
 	}
-	ctr := *m.selected
 	width := max(12, m.rightPaneWidth()-4)
+	rows := m.inspectorRows()
+	labelWidth := inspectorLabelWidth(rows)
+
 	var lines []string
-	addSection := func(title string) {
-		lines = append(lines, renderInspectorSection(renderer, width, title))
-	}
-	add := func(label, value, suffix string, color lipgloss.Color) {
-		lines = append(lines, renderInspectorField(renderer, width, label, value, suffix, color)...)
-	}
-	lines = append(lines, renderInspectorTitle(renderer, width, containerTitle(ctr)))
-	addSection("Runtime")
-	add("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr))
-	add("Uptime", formatDuration(ctr.Created), "", "#9aa6b2")
-	add("Restart", ctr.RestartPolicy, "", "")
-	add("Restarts", fmt.Sprintf("%d", ctr.RestartCount), "", restartCountColor(ctr.RestartCount))
-
-	addSection("Image")
-	add("Image", ctr.Image, "c", "#7dcfff")
-	add("Image ID", short(ctr.ImageID, 20), "c", "#9aa6b2")
-
-	if ctr.Compose.Project != "" {
-		addSection("Compose")
-		add("Stack", ctr.Compose.Project, "c", "#80c990")
-		add("Service", ctr.Compose.Service, "c", "#80c990")
-		add("Number", ctr.Compose.ContainerNumber, "c", "#9aa6b2")
-		add("Config", ctr.Compose.ConfigFiles, "c/o", "#9aa6b2")
-	}
-
-	addSection("Network")
-	add("Ports", formatPorts(ctr.Ports), detailHint(len(ctr.Ports) > 0, true), "#e5c07b")
-	add("Networks", strings.Join(ctr.Networks, ", "), "", "#7dcfff")
-
-	addSection("Files")
-	add("Mounts", formatMounts(ctr.Mounts), detailHint(len(ctr.Mounts) > 0, true), "#c678dd")
-
-	addSection("Metadata")
-	add("Env", formatList(ctr.Env, 8), "", "#9aa6b2")
-	add("Labels", formatMap(ctr.Labels, 8), detailHint(len(ctr.Labels) > 0, false), "#9aa6b2")
-	if ctr.HealthCheck != nil {
-		add("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr))
+	fieldOrdinal := -1
+	for _, row := range rows {
+		switch row.kind {
+		case inspectorRowTitle:
+			lines = append(lines, renderInspectorTitle(renderer, width, row.text))
+		case inspectorRowSection:
+			lines = append(lines, renderInspectorSection(renderer, width, row.text))
+		case inspectorRowField:
+			fieldOrdinal++
+			state := inspectorRowState{
+				selected: fieldOrdinal == m.inspectorCursor,
+				alt:      fieldOrdinal%2 == 1,
+			}
+			lines = append(lines, renderInspectorFieldRow(renderer, width, labelWidth, row, state)...)
+		}
 	}
 
 	budget := max(1, m.inspectorVisibleRows()-m.paneActionStripRows(paneInspector))
@@ -1655,10 +1991,29 @@ func renderInspectorTitle(renderer tideui.Renderer, width int, title string) str
 		Render(title)
 }
 
-func renderInspectorField(renderer tideui.Renderer, width int, label, value, suffix string, color lipgloss.Color) []string {
-	const labelWidth = 8
-	value = strings.TrimSpace(value)
+// inspectorRowState carries the two per-render visual states
+// renderInspectorFieldRow needs beyond a plain field row: whether it's
+// under the row cursor, and whether it falls on the "odd" side of the
+// alternating-background stripe (computed from the field's ordinal among
+// field rows, not its raw screen-line index, so a multi-line field like
+// Labels keeps one consistent stripe color across all its lines).
+type inspectorRowState struct {
+	selected bool
+	alt      bool
+}
+
+// renderInspectorFieldRow renders one field row's screen lines. It
+// deliberately does not use tideui's RenderRow/Row: that type's style
+// pick (Item/ItemMuted/ItemSelected) has no fourth slot for "every other
+// row, alternating" (layout.go), and its underlying alignRow truncates
+// with an empty ellipsis argument — long values get hard-cut with no "…"
+// at all. Neither is patchable here (tideui is an external, shared
+// module), so this composes the row locally instead, reusing alignRow's
+// exact width math (alignInspectorRow, below) with a real ellipsis.
+func renderInspectorFieldRow(renderer tideui.Renderer, width, labelWidth int, row inspectorRow, state inspectorRowState) []string {
+	value := strings.TrimSpace(row.display)
 	muted := false
+	suffix := row.suffix
 	if value == "" {
 		value = "none"
 		muted = true
@@ -1667,11 +2022,21 @@ func renderInspectorField(renderer tideui.Renderer, width int, label, value, suf
 	values := strings.Split(value, "\n")
 	baseFg := styleForeground(renderer.Styles.Item, renderer.Styles.Theme.Fg)
 	valueFg := renderer.Styles.Theme.Fg
-	if color != "" {
-		valueFg = color
+	if row.color != "" {
+		valueFg = row.color
 	}
 	if muted {
 		valueFg = renderer.Styles.Theme.Dimmed
+	}
+
+	style := renderer.Styles.Item
+	switch {
+	case state.selected:
+		style = renderer.Styles.ItemSelected
+	case muted:
+		style = renderer.Styles.ItemMuted
+	case state.alt:
+		style = renderer.Styles.Item.Copy().Background(altRowBackground(renderer.Styles.Theme.Bg))
 	}
 
 	out := make([]string, 0, len(values))
@@ -1679,19 +2044,67 @@ func renderInspectorField(renderer tideui.Renderer, width int, label, value, suf
 		prefix := strings.Repeat(" ", labelWidth+1)
 		rowSuffix := ""
 		if i == 0 {
-			prefix = foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, label), renderer.Styles.Theme.BorderFocus, baseFg, true)
+			prefix = foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, row.label), renderer.Styles.Theme.BorderFocus, baseFg, true)
 			if suffix != "" {
 				rowSuffix = foregroundSpan(suffix, renderer.Styles.Theme.Unread, baseFg, false)
 			}
 		}
-		out = append(out, renderer.RenderRow(tideui.Row{
-			Prefix: prefix,
-			Text:   foregroundSpan(line, valueFg, baseFg, false),
-			Suffix: rowSuffix,
-			Muted:  muted,
-		}, width))
+		aligned := alignInspectorRow(prefix, styledInspectorValue(row.valueKind, line, valueFg, baseFg), rowSuffix, width)
+		out = append(out, style.Width(width).Render(aligned))
 	}
 	return out
+}
+
+// alignInspectorRow lays out prefix+text+suffix left-to-right within
+// width exactly like tideui's own (unexported) alignRow — truncating
+// prefix first, then suffix, then text — except text is truncated with a
+// real "…" instead of alignRow's bare cut.
+func alignInspectorRow(prefix, text, suffix string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	prefix = ansi.Truncate(prefix, width, "")
+	remaining := max(0, width-lipgloss.Width(prefix))
+
+	suffixBudget := remaining
+	if suffix != "" {
+		suffixBudget = max(0, remaining-1)
+	}
+	suffix = ansi.Truncate(suffix, suffixBudget, "")
+	suffixWidth := lipgloss.Width(suffix)
+
+	gap := 0
+	if suffix != "" {
+		gap = 1
+	}
+	textWidth := max(0, remaining-suffixWidth-gap)
+	text = ansi.Truncate(text, textWidth, "…")
+
+	line := prefix + text + strings.Repeat(" ", max(0, textWidth-lipgloss.Width(text)))
+	if suffix != "" {
+		line += " " + suffix
+	}
+	return line + strings.Repeat(" ", max(0, width-lipgloss.Width(line)))
+}
+
+// altRowBackground derives a subtle alternating-row background from bg by
+// blending it toward white or black depending on bg's own perceived
+// lightness — lightening dark themes, darkening light ones. tideui's
+// Theme has no alt/stripe token, and several built-in themes are light
+// (catppuccin-latte, gruvbox-light, tokyo-night-day, rose-pine-dawn), so a
+// hardcoded hex would look wrong under at least one of them; this reacts
+// to whatever the live theme picker (T) has set instead. Computed fresh
+// per render rather than cached for the same reason.
+func altRowBackground(bg lipgloss.Color) lipgloss.Color {
+	base, err := colorful.Hex(string(bg))
+	if err != nil {
+		return bg
+	}
+	target := colorful.Color{R: 1, G: 1, B: 1}
+	if _, _, l := base.Hsl(); l > 0.5 {
+		target = colorful.Color{R: 0, G: 0, B: 0}
+	}
+	return lipgloss.Color(base.BlendLuv(target, 0.07).Hex())
 }
 
 func foregroundSpan(text string, color, restore lipgloss.Color, bold bool) string {
@@ -1961,6 +2374,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 			{key: "s", label: "start/stop"},
 			{key: "alt+r", label: "restart"},
 			{key: "l", label: "logs"},
+			{key: "enter", label: "expand"},
 			{key: "c", label: "copy"},
 			{key: "o", label: "open"},
 			{key: "e", label: "shell"},
@@ -2061,6 +2475,14 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.deleteStackConfirmOverlay(renderer)
 	case overlayImageCuration:
 		return m.imageCurationOverlay(renderer)
+	case overlayNetworkCuration:
+		return m.networkCurationOverlay(renderer)
+	case overlayVolumeCuration:
+		return m.volumeCurationOverlay(renderer)
+	case overlayComposeCuration:
+		return m.composeCurationOverlay(renderer)
+	case overlayInspectorDetail:
+		return m.inspectorDetailOverlay(renderer)
 	default:
 		return nil
 	}
@@ -3884,10 +4306,7 @@ func formatRateCompact(value uint64) string {
 }
 
 func short(value string, n int) string {
-	if len(value) <= n {
-		return value
-	}
-	return value[:n]
+	return ansi.Truncate(value, n, "…")
 }
 
 // columnRatios is the single source of truth for the 3-column layout's

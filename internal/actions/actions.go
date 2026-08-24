@@ -18,6 +18,9 @@ const (
 	Replicate      ID = "replicate-container"
 	Clone          ID = "clone-container"
 	CurateImages   ID = "curate-images"
+	CurateNetworks ID = "curate-networks"
+	CurateVolumes  ID = "curate-volumes"
+	CurateCompose  ID = "curate-compose"
 	ExecShell      ID = "exec-shell"
 	FocusLogs      ID = "focus-logs"
 	ShowProblems   ID = "show-problems"
@@ -61,6 +64,9 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer},
 		{ID: Clone, Name: "Clone container or Compose service under a new name", Shortcut: "C", Aliases: []string{"duplicate", "copy container"}, Enabled: hasContainer},
 		{ID: CurateImages, Name: "Curate Docker images", Shortcut: "", Aliases: []string{"images", "unused images", "prune images", "cleanup images"}, Enabled: true},
+		{ID: CurateNetworks, Name: "Curate Docker networks", Shortcut: "", Aliases: []string{"networks", "unused networks", "prune networks", "address pool", "cleanup networks"}, Enabled: true},
+		{ID: CurateVolumes, Name: "Curate Docker volumes", Shortcut: "", Aliases: []string{"volumes", "unused volumes", "prune volumes", "cleanup volumes"}, Enabled: true},
+		{ID: CurateCompose, Name: "Curate Compose files", Shortcut: "", Aliases: []string{"compose files", "compose catalog", "stacks", "unused compose", "deploy compose"}, Enabled: true},
 		{ID: ExecShell, Name: "Open a shell inside the selected container", Shortcut: "e", Aliases: []string{"exec", "shell", "terminal", "ssh into container"}, Enabled: canExec},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer},
 		{ID: ShowProblems, Name: "Show problems", Shortcut: "p", Aliases: []string{"issues", "health", "unhealthy", "restarting"}, Enabled: true},

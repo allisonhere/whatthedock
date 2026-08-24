@@ -134,6 +134,44 @@ func (i Image) DisplayName() string {
 
 func (i Image) Removable() bool { return i.Containers == 0 }
 
+// Network describes one Docker network on a host.
+type Network struct {
+	ID         string
+	Name       string
+	Driver     string
+	Scope      string
+	Containers int
+	Subnet     string
+}
+
+func (n Network) ShortID() string {
+	if len(n.ID) > 12 {
+		return n.ID[:12]
+	}
+	return n.ID
+}
+
+// Removable reports whether n can be safely pruned: not one of Docker's
+// three built-in networks, which always exist and can't be removed, and
+// with no containers currently attached.
+func (n Network) Removable() bool {
+	switch n.Name {
+	case "bridge", "host", "none":
+		return false
+	}
+	return n.Containers == 0
+}
+
+// Volume describes one Docker volume on a host.
+type Volume struct {
+	Name       string
+	Driver     string
+	Mountpoint string
+	InUse      bool
+}
+
+func (v Volume) Removable() bool { return !v.InUse }
+
 type ContainerStats struct {
 	ID          ResourceID
 	Read        time.Time

@@ -123,6 +123,7 @@ Docker socket paths must be present.
 | `C` | Clone under a new name via the create overlay |
 | `m` | Edit in place: prefill the create overlay from the selection under its own identity, replacing it on confirm. Single-service create/edit forms include an Image action choice to keep the current image or pull latest before applying. On a stack row, edits the whole stack's base compose file directly; on a container that's part of a multi-service stack, prompts to edit just that service or the whole stack |
 | `Ctrl+K` -> `Curate Docker images` | Review images on the active Docker system, select unused or dangling images, and confirm cleanup. In-use images are shown but cannot be selected. |
+| `Ctrl+K` -> `Curate Compose files` | Save running Compose stack files into the local WhatTheDock catalog, edit library YAML/notes/tags, filter by state, save draft copies, or Make Live on a local/SSH system. |
 | `e` | Open a shell inside the selected running container |
 | `c` | Copy selected container details |
 | `o` | Open selected container ports, mounts, or Compose paths |
@@ -158,6 +159,25 @@ Docker socket paths must be present.
 
 Mouse row selection and wheel navigation are enabled where the terminal and
 Bubble Tea support them.
+
+## Compose catalog
+
+The Compose curator preserves actual Compose files referenced by running
+containers' Docker Compose labels. Running stacks are treated as live sources:
+`Enter`/`e` saves them to the local library if needed, then opens the catalog
+copy in a Ripple-backed YAML editor. Live files are not changed until a
+catalog entry is made live.
+
+For multi-file stacks, every referenced file is stored together in one local
+WhatTheDock catalog entry. Notes are kept in catalog metadata and mirrored
+into a WhatTheDock-managed comment block at the top of the primary Compose
+file. Catalog entries can be tagged, filtered by draft/saved/applied/active/
+unused/archived state, previewed with `Enter`, edited with `e`, added from a
+URL/path with `A`, added from the file browser with `B`, started as a blank
+draft with `N`, duplicated as drafts with `S`, loaded into Create with `c`,
+archived, deleted, or made live with `M`. Make Live asks for a destination
+path, shows any existing files it would overwrite, and then writes the files
+to the active local or SSH system before running `docker compose up -d`.
 
 ## Install
 

@@ -47,9 +47,9 @@ type Settings struct {
 	// UpdateIgnoredVersion is the release tag (e.g. "v0.1.5") the user last
 	// dismissed an update prompt for — the automatic check won't prompt
 	// again for that same version, but a later release will since it's a
-	// different tag. UpdateLastCheck (RFC 3339) throttles the automatic
-	// on-launch check to once per day; "Check for update" in Settings
-	// always bypasses it.
+	// different tag. UpdateLastCheck (RFC 3339) records the last completed
+	// check for Settings display; automatic launch checks are intentionally
+	// not throttled, and "Check for update" in Settings always checks now.
 	UpdateIgnoredVersion string `json:"updateIgnoredVersion,omitempty"`
 	UpdateLastCheck      string `json:"updateLastCheck,omitempty"`
 }

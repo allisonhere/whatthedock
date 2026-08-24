@@ -172,7 +172,15 @@ func (e editorArea) View() string {
 		// block that still shows the glyph underneath.
 		opts.CursorRune = func(s string) string { return e.CursorStyle.Render(s) }
 	}
-	return e.ed.View(opts)
+	view := e.ed.View(opts)
+	if e.w <= 0 {
+		return view
+	}
+	style := lipgloss.NewStyle().Width(e.w).Background(composeEditorBG)
+	if e.h > 0 {
+		style = style.Height(e.h)
+	}
+	return style.Render(view)
 }
 
 // barCursor renders a thin vertical bar for Insert mode by reusing the block

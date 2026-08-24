@@ -71,6 +71,10 @@ const (
 	overlayDeleteScope
 	overlayDeleteStackConfirm
 	overlayImageCuration
+	overlayNetworkCuration
+	overlayVolumeCuration
+	overlayComposeCuration
+	overlayInspectorDetail
 )
 
 type createCatalogMode int
@@ -79,6 +83,40 @@ const (
 	createCatalogList createCatalogMode = iota
 	createCatalogRename
 	createCatalogDelete
+)
+
+type composeCuratorTab int
+
+const (
+	composeCuratorRunning composeCuratorTab = iota
+	composeCuratorCatalog
+)
+
+type composeCuratorMode int
+
+const (
+	composeCuratorList composeCuratorMode = iota
+	composeCuratorNote
+	composeCuratorTags
+	composeCuratorAddSource
+	composeCuratorBrowse
+	composeCuratorPreview
+	composeCuratorDeploy
+	composeCuratorConflict
+	composeCuratorEditFile
+	composeCuratorDelete
+)
+
+type composeStatusFilter int
+
+const (
+	composeStatusAll composeStatusFilter = iota
+	composeStatusDraft
+	composeStatusSaved
+	composeStatusApplied
+	composeStatusActive
+	composeStatusUnused
+	composeStatusArchived
 )
 
 type graphStyle int
@@ -326,7 +364,20 @@ type Model struct {
 	filter               string
 	filterDraft          string
 	inspectorScroll      int
+	inspectorCursor      int
 	helpScroll           int
+
+	// inspectorDetail* back the Enter-triggered expand/select-to-copy
+	// overlay (overlayInspectorDetail, inspector_detail.go) for whichever
+	// Inspector row inspectorCursor pointed at when it opened.
+	// inspectorDetailEditor is a real ripple.Model (the same editor
+	// component the Compose YAML editor uses, editor_area.go) — real vim
+	// or plain-mode motions/selection/clipboard for free, kept read-only
+	// by handleInspectorDetailKey vetoing anything that would actually
+	// change its Value().
+	inspectorDetailLabel  string
+	inspectorDetailKind   string
+	inspectorDetailEditor ripple.Model
 
 	logLines          []string
 	logFilter         string
@@ -486,6 +537,48 @@ type Model struct {
 	imageRemoving   bool
 	imageError      string
 	imageResult     string
+
+	networkItems      []domain.Network
+	networkCursor     int
+	networkSelected   map[string]bool
+	networkLoading    bool
+	networkConfirming bool
+	networkRemoving   bool
+	networkError      string
+	networkResult     string
+
+	volumeItems      []domain.Volume
+	volumeCursor     int
+	volumeSelected   map[string]bool
+	volumeLoading    bool
+	volumeConfirming bool
+	volumeRemoving   bool
+	volumeError      string
+	volumeResult     string
+
+	composeCuratorTab         composeCuratorTab
+	composeCuratorMode        composeCuratorMode
+	composeRunning            []composeStackEntry
+	composeCatalogEntries     []catalog.Entry
+	composeCuratorCursor      int
+	composeCuratorFilter      string
+	composeCuratorMessage     string
+	composeCuratorErr         string
+	composeCuratorEdit        string
+	composeCuratorEditCursor  int
+	composeCuratorEditor      editorArea
+	composeCuratorEditEntryID string
+	composeCuratorEditFile    string
+	composeCuratorStatus      composeStatusFilter
+	composeBrowseDir          string
+	composeBrowseFiles        []createFileEntry
+	composeBrowseCursor       int
+	composeBrowseErr          string
+	composeBrowseLoading      bool
+	composeDeployConflicts    []string
+	composeDeployPendingEntry catalog.Entry
+	composeDeployPendingPath  string
+	composeDeployPath         string
 
 	// eventsReconnecting mirrors the event-stream backoff loop so statusLeft
 	// can show it's happening instead of going silent for up to 30s.
@@ -778,6 +871,26 @@ type imageListMsg struct {
 }
 
 type imageRemoveDoneMsg struct {
+	removed  []string
+	failures []string
+}
+
+type networkListMsg struct {
+	networks []domain.Network
+	err      error
+}
+
+type networkRemoveDoneMsg struct {
+	removed  []string
+	failures []string
+}
+
+type volumeListMsg struct {
+	volumes []domain.Volume
+	err     error
+}
+
+type volumeRemoveDoneMsg struct {
 	removed  []string
 	failures []string
 }
@@ -1122,6 +1235,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logErr = nil
 			m.logReplaceOnDrain = false
 			m.inspectorScroll = 0
+			m.inspectorCursor = 0
 		}
 		m.restoreLogViewState(msg.container.ID)
 		if m.mode == activityStats {
@@ -1393,12 +1507,96 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.imageError = ""
 		}
 		return m, m.refreshCmd()
+	case networkListMsg:
+		m.networkLoading = false
+		m.networkError = ""
+		if msg.err != nil {
+			m.networkError = friendlyDockerError(msg.err)
+			return m, nil
+		}
+		sortNetworks(msg.networks)
+		m.networkItems = msg.networks
+		m.networkCursor = clamp(m.networkCursor, 0, max(0, len(m.networkItems)-1))
+		return m, nil
+	case networkRemoveDoneMsg:
+		m.networkRemoving = false
+		m.networkConfirming = false
+		removed := make(map[string]bool, len(msg.removed))
+		for _, id := range msg.removed {
+			removed[id] = true
+		}
+		remaining := m.networkItems[:0]
+		for _, network := range m.networkItems {
+			if !removed[network.ID] {
+				remaining = append(remaining, network)
+			}
+		}
+		m.networkItems = remaining
+		m.networkCursor = clamp(m.networkCursor, 0, max(0, len(m.networkItems)-1))
+		m.networkSelected = map[string]bool{}
+		if len(msg.failures) > 0 {
+			m.networkResult = fmt.Sprintf("removed %d network(s); %d failed", len(msg.removed), len(msg.failures))
+			m.networkError = strings.Join(msg.failures, "; ")
+		} else {
+			m.networkResult = fmt.Sprintf("removed %d network(s)", len(msg.removed))
+			m.networkError = ""
+		}
+		return m, m.refreshCmd()
+	case volumeListMsg:
+		m.volumeLoading = false
+		m.volumeError = ""
+		if msg.err != nil {
+			m.volumeError = friendlyDockerError(msg.err)
+			return m, nil
+		}
+		sortVolumes(msg.volumes)
+		m.volumeItems = msg.volumes
+		m.volumeCursor = clamp(m.volumeCursor, 0, max(0, len(m.volumeItems)-1))
+		return m, nil
+	case volumeRemoveDoneMsg:
+		m.volumeRemoving = false
+		m.volumeConfirming = false
+		removed := make(map[string]bool, len(msg.removed))
+		for _, name := range msg.removed {
+			removed[name] = true
+		}
+		remaining := m.volumeItems[:0]
+		for _, volume := range m.volumeItems {
+			if !removed[volume.Name] {
+				remaining = append(remaining, volume)
+			}
+		}
+		m.volumeItems = remaining
+		m.volumeCursor = clamp(m.volumeCursor, 0, max(0, len(m.volumeItems)-1))
+		m.volumeSelected = map[string]bool{}
+		if len(msg.failures) > 0 {
+			m.volumeResult = fmt.Sprintf("removed %d volume(s); %d failed", len(msg.removed), len(msg.failures))
+			m.volumeError = strings.Join(msg.failures, "; ")
+		} else {
+			m.volumeResult = fmt.Sprintf("removed %d volume(s)", len(msg.removed))
+			m.volumeError = ""
+		}
+		return m, m.refreshCmd()
+	case composeLibraryOpenMsg:
+		return m.handleComposeLibraryOpenMsg(msg)
+	case composeCatalogImportMsg:
+		return m.handleComposeCatalogImportMsg(msg)
+	case composeCatalogBrowseMsg:
+		return m.handleComposeCatalogBrowseMsg(msg)
 	case ripple.SubmitMsg:
+		if m.overlay == overlayComposeCuration && m.composeCuratorMode == composeCuratorEditFile {
+			m.saveComposeCatalogEditor()
+			return m, nil
+		}
 		if m.createEditingCompose {
 			m.saveCreateEditor()
 		}
 		return m, nil
 	case ripple.CancelMsg:
+		if m.overlay == overlayComposeCuration && m.composeCuratorMode == composeCuratorEditFile {
+			m.cancelComposeCatalogEditor()
+			return m, nil
+		}
 		if m.createEditingCompose {
 			m.cancelCreateEditor()
 		}
@@ -1560,7 +1758,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(1)
 		case m.focus == paneInspector:
-			m.scrollInspector(1)
+			m.moveInspectorCursor(1)
 		case m.focus == paneTree:
 			return m, m.focusTreeIndex(m.cursor + 1)
 		}
@@ -1572,7 +1770,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(-1)
 		case m.focus == paneInspector:
-			m.scrollInspector(-1)
+			m.moveInspectorCursor(-1)
 		case m.focus == paneTree:
 			return m, m.focusTreeIndex(m.cursor - 1)
 		}
@@ -1627,6 +1825,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.focus == paneActivity && m.mode == activityProblems {
 			return m.selectProblem(m.problemCursor)
+		}
+		if m.focus == paneInspector {
+			return m.openInspectorDetail()
 		}
 		if m.focus == paneTree {
 			if row := m.currentRow(); row != nil {
@@ -1693,6 +1894,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.commandFilter = ""
 		m.commandCursor = 0
 	case "c":
+		if m.focus == paneInspector {
+			if row, ok := m.currentInspectorFieldRow(); ok {
+				m.status, m.statusErr = "copied "+strings.ToLower(row.label)+" "+short(row.value, 48), false
+				return m, copyTextCmd(row.value)
+			}
+		}
 		m.openCopyOverlay()
 	case "o":
 		m.openOpenOverlay()
@@ -1908,6 +2115,14 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleDeleteStackConfirmKey(msg)
 	case overlayImageCuration:
 		return m.handleImageCurationKey(msg)
+	case overlayNetworkCuration:
+		return m.handleNetworkCurationKey(msg)
+	case overlayVolumeCuration:
+		return m.handleVolumeCurationKey(msg)
+	case overlayComposeCuration:
+		return m.handleComposeCurationKey(msg)
+	case overlayInspectorDetail:
+		return m.handleInspectorDetailKey(msg)
 	}
 	return m, nil
 }
@@ -2894,6 +3109,7 @@ func (m *Model) resetDockerState() {
 	m.selectedID = domain.ResourceID{}
 	m.selected = nil
 	m.inspectorScroll = 0
+	m.inspectorCursor = 0
 	m.logLines = nil
 	m.logChan = nil
 	m.logCancel = nil
@@ -2972,6 +3188,12 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		}
 	case actions.CurateImages:
 		return m.openImageCuration()
+	case actions.CurateNetworks:
+		return m.openNetworkCuration()
+	case actions.CurateVolumes:
+		return m.openVolumeCuration()
+	case actions.CurateCompose:
+		return m.openComposeCuration()
 	case actions.ExecShell:
 		if selected := m.selectedContainer(); selected != nil && selected.IsRunning() {
 			return m, m.execShellCmd(*selected)
@@ -3896,7 +4118,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(-1)
 		case m.focus == paneInspector:
-			m.scrollInspector(-1)
+			m.moveInspectorCursor(-1)
 		case m.focus == paneTree:
 			return m, m.focusTreeIndex(m.cursor - 1)
 		}
@@ -3906,7 +4128,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case m.focus == paneActivity && m.mode == activityProblems:
 			m.moveProblemCursor(1)
 		case m.focus == paneInspector:
-			m.scrollInspector(1)
+			m.moveInspectorCursor(1)
 		case m.focus == paneActivity && m.mode == activityLogs:
 			m.scrollLogs(1)
 		case m.focus == paneTree:
@@ -3958,8 +4180,60 @@ func (m Model) handleDashboardMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) scrollInspector(delta int) {
-	m.inspectorScroll = max(0, m.inspectorScroll+delta)
+// moveInspectorCursor moves the Inspector pane's row cursor among field
+// rows only (section headers and the title aren't addressable), clamping
+// to the current container's field count, then keeps inspectorScroll
+// positioned so the cursor's row stays visible.
+func (m *Model) moveInspectorCursor(delta int) {
+	rows := m.inspectorRows()
+	fields := 0
+	for _, row := range rows {
+		if row.kind == inspectorRowField {
+			fields++
+		}
+	}
+	if fields == 0 {
+		m.inspectorCursor = 0
+		m.inspectorScroll = 0
+		return
+	}
+	m.inspectorCursor = clamp(m.inspectorCursor+delta, 0, fields-1)
+	m.clampInspectorScroll(rows)
+}
+
+// clampInspectorScroll keeps inspectorScroll positioned so the cursor's
+// field row is fully visible within the pane's current row budget. A
+// field can span multiple screen lines (Env/Labels join entries with
+// literal newlines), so this can't just clamp a single line index the way
+// a 1:1 row-to-line pane would — it uses inspectorLineLayout to find the
+// cursor row's full screen-line span first.
+func (m *Model) clampInspectorScroll(rows []inspectorRow) {
+	lineRow := inspectorLineLayout(rows)
+	budget := max(1, m.inspectorVisibleRows()-m.paneActionStripRows(paneInspector))
+	total := len(lineRow)
+	if total == 0 {
+		m.inspectorScroll = 0
+		return
+	}
+	first, last := -1, -1
+	for i, r := range lineRow {
+		if r != m.inspectorCursor {
+			continue
+		}
+		if first == -1 {
+			first = i
+		}
+		last = i
+	}
+	if first >= 0 {
+		if first < m.inspectorScroll {
+			m.inspectorScroll = first
+		}
+		if last >= m.inspectorScroll+budget {
+			m.inspectorScroll = last - budget + 1
+		}
+	}
+	m.inspectorScroll = clamp(m.inspectorScroll, 0, max(0, total-budget))
 }
 
 func (m *Model) scrollHelp(delta int) {
@@ -4153,6 +4427,7 @@ func (m *Model) clearSelectedContainer() {
 	m.statsLoading = false
 	m.statsErr = nil
 	m.inspectorScroll = 0
+	m.inspectorCursor = 0
 	if m.logCancel != nil {
 		m.logCancel()
 		m.logCancel = nil
@@ -4752,6 +5027,8 @@ func friendlyDockerError(err error) string {
 		return "Docker permission denied; check access to the Docker socket"
 	case strings.Contains(text, "Cannot connect to the Docker daemon"), strings.Contains(text, "connection refused"):
 		return "Docker is unavailable; start Docker and refresh"
+	case strings.Contains(text, "predefined address pools have been fully subnetted"):
+		return "Docker's network address pool is full — press Ctrl+K → Curate Docker networks to remove unused ones (each stack's default network claims a whole address block; leftover ones from removed stacks add up)"
 	default:
 		return text
 	}

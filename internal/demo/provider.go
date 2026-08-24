@@ -19,6 +19,8 @@ type Provider struct {
 	containers map[string]domain.Container
 	logs       map[string][]string
 	statsTicks map[string]int
+	networks   []domain.Network
+	volumes    []domain.Volume
 }
 
 func NewProvider() *Provider {
@@ -30,6 +32,7 @@ func NewProvider() *Provider {
 		statsTicks: map[string]int{},
 	}
 	provider.seed()
+	provider.seedNetworksAndVolumes()
 	return provider
 }
 
@@ -324,7 +327,69 @@ func (p *Provider) RemoveImage(_ context.Context, ref string) error {
 	return fmt.Errorf("demo image %s is in use", ref)
 }
 
+func (p *Provider) Networks(_ context.Context) ([]domain.Network, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]domain.Network, len(p.networks))
+	copy(out, p.networks)
+	return out, nil
+}
+
+func (p *Provider) RemoveNetwork(_ context.Context, id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, net := range p.networks {
+		if net.ID == id {
+			p.networks = append(p.networks[:i], p.networks[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("demo network %s not found", id)
+}
+
+func (p *Provider) Volumes(_ context.Context) ([]domain.Volume, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]domain.Volume, len(p.volumes))
+	copy(out, p.volumes)
+	return out, nil
+}
+
+func (p *Provider) RemoveVolume(_ context.Context, name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, vol := range p.volumes {
+		if vol.Name == name {
+			p.volumes = append(p.volumes[:i], p.volumes[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("demo volume %s not found", name)
+}
+
 func (p *Provider) Close() error { return nil }
+
+// seedNetworksAndVolumes gives the demo homelab a mix of in-use and
+// orphaned networks/volumes, so Curate Docker networks/volumes has
+// something real to show both branches of Removable() without a live
+// Docker daemon — including a couple of networks sitting in the
+// 172.x/16 range, the same shape as the address-pool exhaustion this
+// feature exists to help with.
+func (p *Provider) seedNetworksAndVolumes() {
+	p.networks = []domain.Network{
+		{ID: "demo0bridge00", Name: "bridge", Driver: "bridge", Scope: "local", Containers: 0},
+		{ID: "demo0media0001", Name: "media-stack_default", Driver: "bridge", Scope: "local", Containers: 4, Subnet: "172.18.0.0/16"},
+		{ID: "demo0monitor01", Name: "monitoring_default", Driver: "bridge", Scope: "local", Containers: 2, Subnet: "172.19.0.0/16"},
+		{ID: "demo0orphan001", Name: "old-stack_default", Driver: "bridge", Scope: "local", Containers: 0, Subnet: "172.20.0.0/16"},
+		{ID: "demo0orphan002", Name: "test_default", Driver: "bridge", Scope: "local", Containers: 0, Subnet: "172.21.0.0/16"},
+	}
+	p.volumes = []domain.Volume{
+		{Name: "media-stack_postgres-data", Driver: "local", Mountpoint: "/var/lib/docker/volumes/media-stack_postgres-data/_data", InUse: true},
+		{Name: "monitoring_grafana-data", Driver: "local", Mountpoint: "/var/lib/docker/volumes/monitoring_grafana-data/_data", InUse: true},
+		{Name: "old-stack_config", Driver: "local", Mountpoint: "/var/lib/docker/volumes/old-stack_config/_data", InUse: false},
+		{Name: "leftover-cache", Driver: "local", Mountpoint: "/var/lib/docker/volumes/leftover-cache/_data", InUse: false},
+	}
+}
 
 func (p *Provider) seed() {
 	now := time.Now().Add(-36 * time.Hour)

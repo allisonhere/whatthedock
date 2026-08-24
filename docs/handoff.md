@@ -84,6 +84,17 @@ Local working tree at handoff:
     (`mergeComposeServiceFields`) and removing a service's block entirely
     (`removeComposeService`), used by Create/Edit and Delete respectively
     whenever the base compose file already defines the target service.
+- `internal/catalog` + `internal/ui/compose_curator.go`
+  - Local Compose catalog storage and the command-palette Compose curator:
+    captures actual local/SSH Compose source file sets from running stacks,
+    preserves notes as a managed header comment on the primary file, marks
+    catalog entries unused when the active snapshot no longer references
+    their source paths, supports draft/saved/applied status plus tags/status
+    filters, adds entries from URLs/paths/file browser/blank drafts, previews
+    catalog entries on Enter, edits primary Compose YAML through Ripple, loads
+    entries into Create explicitly, duplicates entries as drafts, and makes
+    catalog entries live with an overwrite summary before existing target
+    files are replaced.
 - `internal/update/update.go`
   - Pure, UI-independent logic for the self-update feature: fetching the
     latest GitHub release tag (`LatestRelease`), comparing versions
@@ -279,9 +290,9 @@ Done since this doc was first written:
   merge-aware editing above was added.
 - Added a self-update feature: `internal/update` (pure GitHub-release-check
   and download/install logic) plus `internal/ui/update.go` (wiring it into
-  the model — an automatic once-a-day check on launch, throttled/cached via
-  a new `updateLastCheck` persisted setting; a "Check for update" row in
-  Settings that always bypasses the throttle; and an "update available"
+  the model — an automatic check on every launch, a `updateLastCheck`
+  persisted setting used only to display the last completed check in
+  Settings, a "Check for update" row in Settings; and an "update available"
   confirm overlay whose "ignore" persists per-version via a new
   `updateIgnoredVersion` setting, so a later release still prompts).
   Confirming downloads the matching release asset, atomically replaces the
@@ -304,6 +315,227 @@ Remaining:
 - Remote (SSH) Compose operations are one `ssh` invocation per step rather
   than a shared multiplexed connection — noticeable latency, not correctness,
   but worth revisiting if it becomes annoying in practice.
+
+## Planned: Inspector Pane Row Cursor, Copy & Expand
+
+Done — implemented in the same session this was drafted, following the
+prompt below step by step. Left here as a design reference: `inspectorRow`/
+`inspectorRows()` (view.go), the row cursor (`inspectorCursor`,
+`moveInspectorCursor`/`clampInspectorScroll` in model.go), the ellipsis and
+`labelWidth` fixes, alternating-row backgrounds (`altRowBackground`), and
+the Enter-triggered expand/select-to-copy overlay
+(`internal/ui/inspector_detail.go`) all match this plan as written, with
+one correction found during implementation: `model.go` mouse-wheel
+handling (`handleMouse`) had its own pair of `scrollInspector` call sites
+this prompt's file/line references didn't mention — those were updated to
+`moveInspectorCursor` too, same as the j/k branches.
+
+~~~
+The Inspector pane (the right-hand detail column showing the selected
+container's Status/Image/Compose/Network/Files/Metadata) is currently
+passive: j/k while focused there only scrolls the whole rendered block
+(scrollInspector, model.go — a single int offset), with no concept of
+"which row." Implement row-level navigation, copy, and expand for it.
+Confirmed scope: read-only. Nothing here mutates container/host data —
+"editable" means select-and-copy only.
+
+Do this in order, running `make check` after each step:
+
+1. Row-list refactor. Replace renderInspector's closures-that-append-
+   strings (view.go, ~1590-1640: addSection/add building a flat []string)
+   with a structured row list built once per frame:
+
+     type inspectorRowKind int
+     const (
+         inspectorRowSection inspectorRowKind = iota
+         inspectorRowTitle
+         inspectorRowField
+     )
+     type inspectorRow struct {
+         kind             inspectorRowKind
+         section, title   string
+         label            string          // field rows only
+         display          string          // capped/formatted value shown inline
+         value            string          // FULL value — copy/expand source of truth
+         suffix           string          // existing "c"/"c/o" hint from detailHint
+         color            lipgloss.Color
+         muted            bool
+     }
+     func (m Model) inspectorRows() []inspectorRow
+
+   Important: formatList/formatMap (view.go ~3800-3833, used for the Env
+   and Labels rows) take a `limit` and bake a "... N more" line into the
+   string they return once a container has more than 8 entries — today's
+   value is already silently truncated. For those two fields only, compute
+   `display` with the existing capped call (what the inline pane shows) and
+   `value` with an uncapped call (formatList(ctr.Env, len(ctr.Env)) /
+   formatMap(ctr.Labels, len(ctr.Labels))) so expand/copy later actually
+   surface every entry, not just the already-capped 8. Every other field
+   (Image, Ports, Mounts, etc. — none of these are capped) uses the same
+   string for both.
+
+   Also important: renderInspectorField (view.go 1658-1695) already splits
+   a field's value on "\n" and renders one screen line per entry, so one
+   logical field (e.g. Labels with 6 entries) can span multiple physical
+   screen lines. inspectorRows() entries are NOT 1:1 with screen lines.
+   Build, alongside the row list, the existing flat []string of rendered
+   screen lines plus a parallel []int (lineRow) recording which
+   inspectorRows() field-row index (-1 for section/title lines) each
+   screen line belongs to — every later step (highlight, alt-stripe,
+   scroll-follow) needs this mapping and must NOT assume one row equals
+   one screen line. Do not reuse tideui's visibleRange (view.go:265,
+   built for the tree pane, which is 1:1 row-to-line) directly against
+   inspectorRows() — it will mis-budget/mis-scroll against multi-line
+   rows. Instead extend the existing start/end clamp at view.go:1637-1638
+   to look at the cursor row's full screen-line span via lineRow.
+
+   Verify this step renders byte-identical output to today (no cursor, no
+   stripes yet) before moving on — check internal/ui/view_test.go for
+   existing Inspector coverage to diff against.
+
+2. Formatting fixes, on top of the now-structured renderer:
+   - Ellipsis: renderer.RenderRow -> tideui's alignRow (external module,
+     layout.go 377-410) calls ansi.Truncate(_, _, "") — an EMPTY ellipsis
+     argument, so long lines are hard-cut with no "…" at all, unlike other
+     truncations in this same file (view.go 316, 369, 3269, which
+     correctly pass "…"). Do not patch the shared tideui module. Instead
+     pre-truncate each split line locally with ansi.Truncate(line,
+     maxWidth, "…") before it reaches RenderRow, computing maxWidth the
+     same way alignRow does (layout.go 397-406) so the two agree and
+     tideui's own truncation becomes a no-op.
+   - labelWidth := 8 (view.go:1659) is a hardcoded const too narrow for
+     some labels ("Restart Policy"-length ones). Compute it once per
+     renderInspector call from the actual labels in use
+     (lipgloss.Width over every label in inspectorRows()).
+   - short() (view.go:3890, used for Image ID at view.go:1612) does a raw
+     value[:n] byte slice — unsafe on non-ASCII digests, no truncation
+     indicator. Fix that one call site to ansi.Truncate(value, n, "…").
+     Leave short()'s other call site (handleCopyKey's status message,
+     model.go:2253) alone.
+
+3. Row cursor + scroll-follow + highlight. New Model field
+   `inspectorCursor int` (near inspectorScroll, model.go:330), indexing
+   only inspectorRowField rows:
+
+     func (m *Model) moveInspectorCursor(delta int) {
+         fields := m.inspectorFieldRowCount()
+         if fields == 0 { m.inspectorCursor = 0; return }
+         m.inspectorCursor = clamp(m.inspectorCursor+delta, 0, fields-1)
+     }
+
+   Wire into the three `case m.focus == paneInspector:` arms currently
+   calling scrollInspector (model.go 1672-1673/1684-1685 for j/k;
+   4016-4017/4026-4027 for pgup/pgdown, page-sized). Delete
+   scrollInspector (model.go:4079) once unused. Reset
+   `m.inspectorCursor = 0` everywhere `m.inspectorScroll = 0` already is
+   (model.go 1164, 3010, 4273 — container-selection changes). Highlight
+   background: reuse `renderer.Styles.ItemSelected.GetBackground()`, the
+   same lookup the image/network/volume curation overlays already use for
+   their cursor row (internal/ui/images.go and networks.go/volumes.go) —
+   one highlight color throughout the app.
+
+4. Row-level quick copy. copyTextCmd(value string) tea.Cmd (model.go
+   3305-3311, OSC52 write to clipboardWriter) is already a pure,
+   overlay-independent primitive — reuse it directly. Change the global
+   `c` handler (model.go 1805-1806, currently unconditional
+   m.openCopyOverlay()) to check focus first:
+
+     case "c":
+         if m.focus == paneInspector {
+             if row, ok := m.currentInspectorFieldRow(); ok {
+                 m.status, m.statusErr = "copied "+strings.ToLower(row.label)+" "+short(row.value, 48), false
+                 return m, copyTextCmd(row.value)
+             }
+         }
+         m.openCopyOverlay()
+
+   Only overrides when focus is actually on Inspector with a valid row
+   under the cursor — tree/activity focus must keep today's Copy overlay
+   unchanged; verify that explicitly.
+
+5. Alternating row backgrounds. tideui.Theme (theme.go 13-27) has no
+   alt/stripe token — don't add one to the shared module. Derive a subtle
+   variant of Theme.Bg locally: go-colorful is already an indirect
+   dependency (via tideui); promote it to a direct import and add
+
+     func altRowBackground(bg lipgloss.Color) lipgloss.Color
+
+   blending Theme.Bg a small fixed amount toward white or black depending
+   on the theme's own perceived lightness (lighten dark themes, darken
+   light ones). Compute per-render, not cached — several built-in themes
+   are light (catppuccin-latte, gruvbox-light, tokyo-night-day,
+   rose-pine-dawn, per theme.go's BuiltinThemes) and the live theme picker
+   (T key) can swap themes at runtime, so a hardcoded hex would look wrong
+   under at least one theme. Stripe parity keys off the field row's
+   ordinal among field rows (via lineRow from step 1), not raw screen-line
+   index, so a multi-line row stays one consistent stripe color. Selected-
+   row highlight always wins over the stripe.
+
+6. Enter -> expand + select-a-portion overlay. One overlay for both "show
+   the full value" and "select a substring to copy":
+
+   New overlayMode value `overlayInspectorDetail` (append after
+   overlayVolumeCuration, model.go ~75), wired into the same two switches
+   that dispatch every other overlay (model.go ~2023 region for keys,
+   view.go ~2066 region for rendering).
+
+   New flat Model fields (matching how settingsEditCursor/systemCursor are
+   already flat fields, not a sub-struct):
+
+     inspectorDetailLabel  string
+     inspectorDetailValue  []rune  // snapshotted full value when opened
+     inspectorDetailCursor int     // caret, rune index
+     inspectorDetailAnchor int     // selection anchor, rune index; -1 = none
+
+   `enter` while m.focus == paneInspector (new branch alongside the
+   existing enter cases, model.go 1737-1753) snapshots the current row
+   into these fields and sets m.overlay = overlayInspectorDetail.
+
+   New key handler, shaped like handleCopyKey (model.go 2236-2257) for
+   top-level actions, with left/right/shift+arrow caret movement adapted
+   from the existing Systems-editor caret pattern
+   (settingsEditValueWithCaret, model.go 2413-2423, and
+   systemFieldValueWithCaret, model.go:2764) minus every mutation branch
+   (no backspace/insert — read-only):
+   - left/right: move caret, clamp [0, len(value)], collapse any selection.
+   - shift+left/shift+right: if no anchor yet, set
+     inspectorDetailAnchor = inspectorDetailCursor first (lazy-start,
+     matching Ripple's own shift+arrow selection convention), then move.
+   - home/end: jump caret to start/end.
+   - c or enter: copy the selection if inspectorDetailAnchor != -1
+     (substring between min/max of anchor and cursor), else the whole
+     value, via copyTextCmd; status message mirrors step 4's phrasing;
+     close the overlay.
+   - esc: close, row cursor position in the main pane unchanged.
+
+   Rendering (new method inspectorDetailBody, living together with this
+   step's state/key logic in a new internal/ui/inspector_detail.go rather
+   than growing view.go/model.go further): word-wrap the value to the
+   overlay's inner width (check internal/ui/editor_area.go first for an
+   existing wrap helper already used by the YAML editor before writing a
+   new one), walk the wrapped lines to map each rune index to a
+   line/column, then either splice a literal `|` at the caret's wrapped
+   position (no selection — same idiom as systemFieldValueWithCaret, just
+   per-line) or wrap the selected range using backgroundSpan
+   (view.go:1714, already built for "highlight a substring without
+   clobbering the row's own background"), sourced from the same
+   ItemSelected highlight color as the row cursor. Assemble with
+   tideui.SoftPanelOverlay — the same primitive the image/network/volume
+   curation overlays already use, no new chrome. Hints row: "←/→ move ·
+   shift+←/→ select · c/enter copy · esc close".
+
+Verification: make check after each step. Then a pty-scripted --demo smoke
+test: Tab into Inspector, confirm j/k moves a highlighted row (not a raw
+scroll), confirm the alt-stripe is visible, confirm a long value shows "…"
+instead of a hard cut, press c on a short field and confirm the status bar
+shows "copied <label> …" with no overlay, press Enter on a truncated/long
+row and confirm the full value renders wrapped with a caret, move the caret
+with arrows, shift+arrow to select a substring, copy it, confirm the status
+message reflects the selection (not the whole value), Esc back and confirm
+the row cursor position was preserved. Confirm switching the selected
+container resets inspectorCursor to 0. Confirm c on the tree/activity panes
+still opens the original Copy overlay unchanged.
+~~~
 
 ## Known Constraints
 
