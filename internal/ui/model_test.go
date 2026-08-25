@@ -1102,6 +1102,32 @@ func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
 	}
 }
 
+// TestCleanDockerLogLineStripsEmbeddedANSI is the regression test for a
+// live report: some containers (Portainer among them) colorize their own
+// log output, and those raw ANSI codes were flowing straight through into
+// the TUI's own line rendering — a reset sequence in the container's own
+// text ended whatthedock's outer background style early, showing the
+// terminal's raw default background for everything after it (reported as
+// a stray background appearing right after a log line's timestamp).
+// cleanDockerLogLine now strips embedded ANSI codes the same way it
+// already strips the Docker multiplexed-stream framing header.
+func TestCleanDockerLogLineStripsEmbeddedANSI(t *testing.T) {
+	line := "2026-08-12T12:00:00Z \x1b[32mINFO\x1b[0m server started"
+	if got := cleanDockerLogLine(line); got != "2026-08-12T12:00:00Z INFO server started" {
+		t.Fatalf("cleanDockerLogLine(%q) = %q, want ANSI codes stripped", line, got)
+	}
+}
+
+// TestCleanDockerLogLineStripsHeaderAndANSITogether checks both cleanups
+// compose correctly on a line that has the Docker stream header AND
+// embedded ANSI codes from the container's own colorized output.
+func TestCleanDockerLogLineStripsHeaderAndANSITogether(t *testing.T) {
+	line := "\x01\x00\x00\x00\x00\x00\x00\x08\x1b[31mERROR\x1b[0m failed"
+	if got := cleanDockerLogLine(line); got != "ERROR failed" {
+		t.Fatalf("cleanDockerLogLine(%q) = %q, want %q", line, got, "ERROR failed")
+	}
+}
+
 // TestRenderLogMatchHighlightsOnlyTheMatchingSubstring is the regression
 // test for a live report: highlighting used to cover the *entire token*
 // whenever the query appeared anywhere in it, so typing a single common

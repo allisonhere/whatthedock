@@ -21,6 +21,7 @@ import (
 	"github.com/allisonhere/tideui"
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
@@ -4951,11 +4952,24 @@ func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.Canc
 	}
 }
 
+// cleanDockerLogLine strips the Docker multiplexed-stream framing header
+// (the 8 raw bytes non-TTY log streams prefix each line with) and any
+// ANSI escape codes the container's own process wrote into its output —
+// many apps (Portainer among them) colorize their own logs. Left in,
+// those raw codes flow straight into renderLogLine's tokenizer and the
+// final styled line; an embedded reset sequence from the container's own
+// text ends whatthedock's own outer background style early, not just its
+// own span, showing the terminal's raw default background for everything
+// after it — reported live as a stray background color appearing right
+// after a log line's timestamp. Stripping here, once, at the single
+// choke point every log line passes through before display, is cheaper
+// and more robust than trying to make the renderer coexist with
+// arbitrary embedded ANSI state.
 func cleanDockerLogLine(line string) string {
 	if len(line) > 8 && line[0] < ' ' {
-		return line[8:]
+		line = line[8:]
 	}
-	return line
+	return ansi.Strip(line)
 }
 
 func sendActionProgress(progress chan string, line string) {
