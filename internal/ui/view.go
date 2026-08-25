@@ -3619,16 +3619,16 @@ func (m Model) dashboardBodyPlan() (shown []domain.Container, more, stopped, sta
 // that only turns into a warning when something actually needs attention
 // (see dashboardProblemsRow) — deliberately sized far wider than every
 // other overlay (m.width-4 instead of the usual m.width-8-ish cap) since
-// the point of this screen is showing as much of the fleet at once as the
-// terminal actually allows, not a small centered dialog.
+// the point of this screen is showing as much of the fleet at once as is still
+// comfortable to scan, not stretching every rule and row across huge monitors.
 func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
-	width := max(70, m.width-4)
+	width := dashboardPanelWidth(m.width)
 	contentWidth := width - 4
 	summary := m.fleetSummary()
 
 	lines := []string{
 		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
-		renderer.Styles.DetailMeta.Render(strings.Repeat("─", contentWidth)),
+		dashboardDividerLine(renderer, contentWidth),
 		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
 	}
 
@@ -3670,7 +3670,7 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 // anchor, not everything above it.
 func (m Model) dashboardHitTest(msg tea.MouseMsg) (rowIndex int, isStatusRow, ok bool) {
 	shown, _, _, statusLineIdx, _ := m.dashboardBodyPlan()
-	panelWidth := max(70, m.width-4)
+	panelWidth := dashboardPanelWidth(m.width)
 	contentWidth := panelWidth - 4
 
 	boxTop, boxLeft := -1, -1
@@ -3701,6 +3701,13 @@ func (m Model) dashboardHitTest(msg tea.MouseMsg) (rowIndex int, isStatusRow, ok
 	return 0, false, false
 }
 
+const dashboardMaxOverlayWidth = 160
+const dashboardMaxPanelWidth = dashboardMaxOverlayWidth - 2
+
+func dashboardPanelWidth(screenWidth int) int {
+	return min(dashboardMaxPanelWidth, max(70, screenWidth-4))
+}
+
 // dashboardPadLine is the belt-and-suspenders fix for a bug reported live
 // twice: every line dashboardOverlay builds is supposed to end up exactly
 // contentWidth visible columns wide (dashboardColumnsFor's own width math
@@ -3722,6 +3729,21 @@ func dashboardPadLine(renderer tideui.Renderer, line string, width int) string {
 		line += lipgloss.NewStyle().Background(bg).Foreground(fg).Render(strings.Repeat(" ", pad))
 	}
 	return line
+}
+
+const dashboardDividerMaxWidth = 120
+
+func dashboardDividerLine(renderer tideui.Renderer, width int) string {
+	ruleWidth := min(width, dashboardDividerMaxWidth)
+	left := max(0, (width-ruleWidth)/2)
+	right := max(0, width-ruleWidth-left)
+	bg := renderer.Styles.Theme.Bg
+	fg := styleForeground(renderer.Styles.DetailMeta, renderer.Styles.Theme.Dimmed)
+	return lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Width(width).
+		Render(strings.Repeat(" ", left) + strings.Repeat("─", ruleWidth) + strings.Repeat(" ", right))
 }
 
 // dashboardSummaryLine is the Dashboard's header: status counts (running

@@ -354,6 +354,52 @@ func TestDashboardPadLineReachesExactWidth(t *testing.T) {
 	}
 }
 
+func TestDashboardDividerCapsRuleOnWideDisplays(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	got := ansi.Strip(dashboardDividerLine(renderer, 220))
+	if visible := len([]rune(got)); visible != 220 {
+		t.Fatalf("dashboardDividerLine visible width = %d, want 220", visible)
+	}
+	if dashCount := strings.Count(got, "─"); dashCount != dashboardDividerMaxWidth {
+		t.Fatalf("dashboardDividerLine dash count = %d, want capped at %d", dashCount, dashboardDividerMaxWidth)
+	}
+	if !strings.HasPrefix(got, strings.Repeat(" ", 50)) || !strings.HasSuffix(got, strings.Repeat(" ", 50)) {
+		t.Fatalf("dashboardDividerLine should center capped dashes in wide line, got %q", got)
+	}
+}
+
+func TestDashboardPanelWidthIsConstrainedOnWideDisplays(t *testing.T) {
+	if got := dashboardPanelWidth(240); got != dashboardMaxPanelWidth {
+		t.Fatalf("dashboardPanelWidth(240) = %d, want cap %d", got, dashboardMaxPanelWidth)
+	}
+	if got := dashboardPanelWidth(120); got != 116 {
+		t.Fatalf("dashboardPanelWidth(120) = %d, want terminal width minus margin", got)
+	}
+}
+
+func TestDashboardOverlayIsConstrainedOnWideDisplays(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 240, 34
+	model.overlay = overlayDashboard
+
+	for _, line := range strings.Split(model.View(), "\n") {
+		plain := ansi.Strip(line)
+		if !strings.Contains(plain, "whatthedock · dashboard") {
+			continue
+		}
+		left := strings.Index(plain, "╭")
+		right := strings.LastIndex(plain, "╮")
+		if left < 0 || right < left {
+			t.Fatalf("dashboard title row missing overlay corners:\n%q", plain)
+		}
+		if got := lipgloss.Width(plain[left : right+len("╮")]); got != dashboardMaxOverlayWidth {
+			t.Fatalf("dashboard overlay box width = %d, want constrained width %d:\n%q", got, dashboardMaxOverlayWidth, plain)
+		}
+		return
+	}
+	t.Fatal("rendered wide dashboard missing title row")
+}
+
 // TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth is a direct
 // regression test against the real failure mode: dashboardColumnsFor's
 // width math (nameWidth + fixed prefix + 3 metric columns) previously

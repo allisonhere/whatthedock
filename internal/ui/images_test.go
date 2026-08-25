@@ -4,8 +4,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/allisonhere/tideui"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -15,6 +18,25 @@ func TestImageColumnsFillModalWidth(t *testing.T) {
 	name, size, state, id := imageColumnWidths(80)
 	if got := name + 38; got != 80 {
 		t.Fatalf("column width = %d, want 80 (name=%d size=%d state=%d id=%d)", got, name, size, state, id)
+	}
+}
+
+func TestCustomCuratorRowsAlternateBackgrounds(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	image := domain.Image{ID: domain.ResourceID{Host: "local", ID: "sha256:abc"}, RepoTags: []string{"demo:latest"}}
+	even := imageTableRow(renderer, 80, 0, " ", false, " ", image)
+	odd := imageTableRow(renderer, 80, 1, " ", false, " ", image)
+	evenBGs := trueColorBackgrounds(even)
+	oddBGs := trueColorBackgrounds(odd)
+	if len(evenBGs) == 0 || len(oddBGs) == 0 {
+		t.Fatalf("curator rows missing explicit backgrounds:\neven=%q\nodd=%q", even, odd)
+	}
+	if evenBGs[0] == oddBGs[0] {
+		t.Fatalf("curator row backgrounds did not alternate: even=%s odd=%s", evenBGs[0], oddBGs[0])
 	}
 }
 
