@@ -217,6 +217,9 @@ func (noopProvider) Logs(context.Context, domain.ResourceID, app.LogOptions) (io
 func (noopProvider) CreateContainer(context.Context, app.ContainerCreateSpec) (domain.ResourceID, error) {
 	panic("not implemented")
 }
+func (noopProvider) RenameContainer(context.Context, domain.ResourceID, string) error {
+	panic("not implemented")
+}
 func (noopProvider) StartContainer(context.Context, domain.ResourceID) error {
 	panic("not implemented")
 }

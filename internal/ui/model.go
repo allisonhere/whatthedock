@@ -1605,7 +1605,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case createOverrideCheckMsg:
-		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service {
+		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service && m.createDraft.ComposeFile == msg.base {
 			m.createDraft.BaseFileMissing = msg.baseFileMissing
 			if msg.found {
 				m.createDraft.OverrideRaw = msg.content

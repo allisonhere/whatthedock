@@ -241,6 +241,23 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	if notice := m.createNoticeView(renderer, contentWidth); notice != "" {
 		bodyRows = append(bodyRows, notice)
 	}
+	// ctrl+p (catalog) and ctrl+y (edit yaml) both only do anything in
+	// Compose mode (see handleCreateKey) — a standalone container has no
+	// catalog entry or override YAML to open. Advertising them
+	// unconditionally used to leave them in this row for a standalone
+	// draft too, where pressing either is a silent no-op.
+	secondRow := []tideui.SoftHint{}
+	if m.createDraft.Mode == createModeCompose {
+		secondRow = append(secondRow,
+			tideui.SoftHint{Key: "ctrl+p", Label: "catalog"},
+			tideui.SoftHint{Key: "ctrl+y", Label: "edit yaml"},
+		)
+	}
+	secondRow = append(secondRow,
+		tideui.SoftHint{Key: "ctrl+s", Label: "validate"},
+		tideui.SoftHint{Key: "ctrl/alt+enter", Label: confirmStepLabel(m.createDraft.Editing)},
+		tideui.SoftHint{Key: "esc", Label: "cancel"},
+	)
 	bodyRows = append(bodyRows,
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "[/]", Label: "mode"},
@@ -248,13 +265,7 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			tideui.SoftHint{Key: "h/l", Label: "change"},
 			tideui.SoftHint{Key: "o/ctrl+o", Label: "browse"},
 		),
-		renderer.RenderSoftHints(contentWidth,
-			tideui.SoftHint{Key: "ctrl+p", Label: "catalog"},
-			tideui.SoftHint{Key: "ctrl+y", Label: "edit yaml"},
-			tideui.SoftHint{Key: "ctrl+s", Label: "validate"},
-			tideui.SoftHint{Key: "ctrl/alt+enter", Label: confirmStepLabel(m.createDraft.Editing)},
-			tideui.SoftHint{Key: "esc", Label: "cancel"},
-		),
+		renderer.RenderSoftHints(contentWidth, secondRow...),
 	)
 	content := renderer.RenderSoftBody(width, tabs+"\n\n"+strings.Join(bodyRows, "\n"))
 	title := "create"

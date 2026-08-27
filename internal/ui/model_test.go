@@ -36,6 +36,7 @@ type fakeProvider struct {
 	stops            int
 	restarts         int
 	creates          []app.ContainerCreateSpec
+	renamed          []string
 	removed          []domain.ResourceID
 	forced           []bool
 	pulled           []string
@@ -43,6 +44,7 @@ type fakeProvider struct {
 	removeErr        error
 	pullErr          error
 	createErr        error
+	renameErr        error
 	images           []domain.Image
 	imageRemoveErr   error
 	removedImages    []string
@@ -89,10 +91,24 @@ func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCrea
 		return domain.ResourceID{}, f.createErr
 	}
 	id := domain.ResourceID{Host: f.host.ID, ID: "created-" + spec.Name}
-	ctr := domain.Container{ID: id, Name: spec.Name, Image: spec.Image, State: domain.StateRunning, Status: "Up 1 second", Labels: map[string]string{}}
+	state, status := domain.StateStopped, "Created"
+	if spec.Start {
+		state, status = domain.StateRunning, "Up 1 second"
+	}
+	ctr := domain.Container{ID: id, Name: spec.Name, Image: spec.Image, State: state, Status: status, Labels: map[string]string{}}
 	f.containers[id.ID] = ctr
 	f.snapshot.Standalone = append(f.snapshot.Standalone, ctr)
 	return id, nil
+}
+func (f *fakeProvider) RenameContainer(_ context.Context, id domain.ResourceID, name string) error {
+	f.renamed = append(f.renamed, id.ID+"="+name)
+	if f.renameErr != nil {
+		return f.renameErr
+	}
+	ctr := f.containers[id.ID]
+	ctr.Name = name
+	f.containers[id.ID] = ctr
+	return nil
 }
 func (f *fakeProvider) RemoveContainer(_ context.Context, id domain.ResourceID, force bool) error {
 	f.removed = append(f.removed, id)
@@ -3649,8 +3665,14 @@ func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
 	if len(fp.removed) != 1 || fp.removed[0] != oldID {
 		t.Fatalf("removed = %#v, want a single call for %v", fp.removed, oldID)
 	}
-	if len(fp.creates) != 1 || fp.creates[0].Name != "grafana" || fp.creates[0].RestartPolicy != "unless-stopped" {
-		t.Fatalf("creates = %#v, want one create for grafana with the edited restart policy", fp.creates)
+	if len(fp.creates) != 1 || !strings.HasPrefix(fp.creates[0].Name, "whatthedock-edit-grafana-") || fp.creates[0].Start || fp.creates[0].RestartPolicy != "unless-stopped" {
+		t.Fatalf("creates = %#v, want one stopped replacement create with the edited restart policy", fp.creates)
+	}
+	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
+		t.Fatalf("renamed = %#v, want replacement renamed to grafana", fp.renamed)
+	}
+	if fp.starts != 1 {
+		t.Fatalf("starts = %d, want replacement started after rename", fp.starts)
 	}
 }
 
@@ -3677,8 +3699,11 @@ func TestConfirmEditStandalonePullsImageWhenRequested(t *testing.T) {
 	if len(fp.removed) != 1 || fp.removed[0] != oldID {
 		t.Fatalf("removed = %#v, want old container removed after pull", fp.removed)
 	}
-	if len(fp.creates) != 1 || fp.creates[0].Name != "grafana" {
-		t.Fatalf("creates = %#v, want recreated grafana", fp.creates)
+	if len(fp.creates) != 1 || !strings.HasPrefix(fp.creates[0].Name, "whatthedock-edit-grafana-") || fp.creates[0].Start {
+		t.Fatalf("creates = %#v, want stopped replacement created after pull", fp.creates)
+	}
+	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") || fp.starts != 1 {
+		t.Fatalf("renamed/starts = %#v/%d, want replacement renamed and started", fp.renamed, fp.starts)
 	}
 }
 
@@ -3700,6 +3725,67 @@ func TestConfirmEditStandaloneDoesNotRemoveWhenPullFails(t *testing.T) {
 	fp := model.provider.(*fakeProvider)
 	if len(fp.removed) != 0 || len(fp.creates) != 0 {
 		t.Fatalf("removed/creates = %#v/%#v, want no destructive edit after pull failure", fp.removed, fp.creates)
+	}
+}
+
+func TestConfirmEditStandaloneDoesNotRemoveWhenReplacementCreateFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.provider.(*fakeProvider).createErr = errors.New("invalid mount config")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "invalid mount config") {
+		t.Fatalf("createDoneMsg.err = %v, want invalid mount config", msg.err)
+	}
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 0 || len(fp.renamed) != 0 || fp.starts != 0 {
+		t.Fatalf("removed/renamed/starts = %#v/%#v/%d, want original untouched after replacement create failure", fp.removed, fp.renamed, fp.starts)
+	}
+	if len(fp.creates) != 1 || !strings.HasPrefix(fp.creates[0].Name, "whatthedock-edit-grafana-") || fp.creates[0].Start {
+		t.Fatalf("creates = %#v, want exactly one stopped replacement attempt", fp.creates)
+	}
+}
+
+func TestConfirmEditStandaloneKeepsReplacementWhenRenameFailsAfterRemoval(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selectedContainer().ID
+	model.provider.(*fakeProvider).renameErr = errors.New("container name already in use")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "already in use") {
+		t.Fatalf("createDoneMsg.err = %v, want the rename error", msg.err)
+	}
+	fp := model.provider.(*fakeProvider)
+	// The original was already removed by the time rename failed — the
+	// replacement (still under its temp name) must survive that failure
+	// instead of being cleaned up, or the user is left with no container
+	// at all.
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	}
+	if len(fp.renamed) != 1 {
+		t.Fatalf("renamed = %#v, want one rename attempt", fp.renamed)
+	}
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want one replacement create", fp.creates)
+	}
+	replacementID := "created-" + fp.creates[0].Name
+	if _, ok := fp.containers[replacementID]; !ok {
+		t.Fatalf("replacement container %s was removed after rename failure, want it kept", replacementID)
+	}
+	if fp.starts != 0 {
+		t.Fatalf("starts = %d, want no start attempt after rename failure", fp.starts)
 	}
 }
 
@@ -4015,6 +4101,29 @@ func TestInspectorFieldRowsUseOnlyPaneBackgroundInLavenderTheme(t *testing.T) {
 	}
 }
 
+func TestSelectedInspectorFieldRowUsesSelectedForegroundForValueColors(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+
+	renderer := tideui.NewRenderer(tideui.LavenderFieldsForever, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	row := inspectorRow{kind: inspectorRowField, label: "Ports", display: "7878 -> 7878/tcp", value: "7878 -> 7878/tcp", suffix: "c", color: "#e5c07b", valueKind: "ports"}
+	rows := renderInspectorFieldRow(renderer, 44, 8, row, inspectorRowState{selected: true})
+	if len(rows) == 0 {
+		t.Fatal("renderInspectorFieldRow returned no rows")
+	}
+
+	for _, color := range []lipgloss.Color{"#e5c07b", "#98c379", "#9aa6b2"} {
+		if strings.Contains(rows[0], "38;2;"+trueColorTriplet(t, color)) {
+			t.Fatalf("selected inspector row still uses low-contrast value/token color %s instead of selected foreground:\n%q", color, rows[0])
+		}
+	}
+	selectedFg := styleForeground(renderer.Styles.ItemSelected, renderer.Styles.Theme.Fg)
+	if !strings.Contains(rows[0], "38;2;"+trueColorTriplet(t, selectedFg)) {
+		t.Fatalf("selected inspector row missing selected foreground %s:\n%q", selectedFg, rows[0])
+	}
+}
+
 func trueColorBackgrounds(value string) []string {
 	matches := regexp.MustCompile(`\x1b\[[0-9;]*48;2;([0-9]+;[0-9]+;[0-9]+)[0-9;]*m`).FindAllStringSubmatch(value, -1)
 	out := make([]string, 0, len(matches))
@@ -4022,6 +4131,15 @@ func trueColorBackgrounds(value string) []string {
 		out = append(out, match[1])
 	}
 	return out
+}
+
+func trueColorTriplet(t *testing.T, color lipgloss.Color) string {
+	t.Helper()
+	parsed, err := colorful.Hex(string(color))
+	if err != nil {
+		t.Fatalf("parsing color %q: %v", color, err)
+	}
+	return fmt.Sprintf("%d;%d;%d", int(parsed.R*255+0.5), int(parsed.G*255+0.5), int(parsed.B*255+0.5))
 }
 
 func hasMidRowReset(value string) bool {

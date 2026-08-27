@@ -2266,6 +2266,32 @@ func TestCreateEditorIgnoredInStandaloneMode(t *testing.T) {
 	}
 }
 
+// TestCreateFormHidesComposeOnlyHintsInStandaloneMode guards against the
+// bottom hint row advertising ctrl+p/ctrl+y in standalone mode, where both
+// are a silent no-op (see TestCreateEditorIgnoredInStandaloneMode and
+// handleCreateKey) — a standalone container has no catalog entry or
+// override YAML for either key to act on.
+func TestCreateFormHidesComposeOnlyHintsInStandaloneMode(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.width, model.height = 120, 36
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+
+	view := ansi.Strip(model.View())
+	if strings.Contains(view, "ctrl+p") || strings.Contains(view, "catalog") {
+		t.Fatalf("standalone create form advertises ctrl+p (catalog), want it hidden:\n%s", view)
+	}
+	if strings.Contains(view, "ctrl+y") || strings.Contains(view, "edit yaml") {
+		t.Fatalf("standalone create form advertises ctrl+y (edit yaml), want it hidden:\n%s", view)
+	}
+
+	model.createDraft.Mode = createModeCompose
+	view = ansi.Strip(model.View())
+	if !strings.Contains(view, "catalog") || !strings.Contains(view, "edit yaml") {
+		t.Fatalf("compose create form missing ctrl+p/ctrl+y hints:\n%s", view)
+	}
+}
+
 func TestCreateEditorSaveSetsRawOverrideUsedByComposeSpec(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
@@ -2748,9 +2774,10 @@ func TestCreateOverrideCheckMsgSyncsFormFields(t *testing.T) {
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeCompose
 	model.createDraft.Service = "radarr"
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
 
 	overrideContent := "services:\n  radarr:\n    image: \"radarr:custom\"\n"
-	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", content: overrideContent, found: true})
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", base: "/srv/media/compose.yml", content: overrideContent, found: true})
 	model = updated.(Model)
 
 	if model.createDraft.Image != "radarr:custom" {
@@ -3045,8 +3072,9 @@ func TestCreateOverrideCheckMsgSetsBaseFileMissingEvenWhenOverrideNotFound(t *te
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeCompose
 	model.createDraft.Service = "radarr"
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
 
-	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", found: false, baseFileMissing: true})
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", base: "/srv/media/compose.yml", found: false, baseFileMissing: true})
 	model = updated.(Model)
 
 	if !model.createDraft.BaseFileMissing {
@@ -3188,12 +3216,34 @@ func TestCreateOverrideCheckMsgIgnoredIfServiceChangedBeforeItArrived(t *testing
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeCompose
 	model.createDraft.Service = "a-different-service" // user changed it before the ssh round trip landed
+	model.createDraft.ComposeFile = "/srv/media/compose.yml"
 
-	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", content: "stale content", found: true})
+	updated, _ := model.Update(createOverrideCheckMsg{service: "radarr", base: "/srv/media/compose.yml", content: "stale content", found: true})
 	model = updated.(Model)
 
 	if model.createDraft.OverrideRawSet {
 		t.Fatal("a stale override-check result was applied after the draft's service changed")
+	}
+}
+
+func TestCreateOverrideCheckMsgIgnoredIfComposeFileChangedBeforeItArrived(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeCompose
+	model.createDraft.Service = "radarr"
+	model.createDraft.ComposeFile = "/srv/new/compose.yml" // same service, different file before the ssh result landed
+	model.createDraft.BaseFileMissing = false
+
+	updated, _ := model.Update(createOverrideCheckMsg{
+		service: "radarr",
+		base:    "/srv/old/compose.yml",
+		content: "services:\n  radarr:\n    image: stale\n",
+		found:   true,
+	})
+	model = updated.(Model)
+
+	if model.createDraft.OverrideRawSet || model.createDraft.BaseFileMissing {
+		t.Fatal("a stale override-check result was applied after the draft's compose file changed")
 	}
 }
 

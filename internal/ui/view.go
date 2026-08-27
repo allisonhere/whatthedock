@@ -2137,15 +2137,6 @@ func renderInspectorFieldRow(renderer tideui.Renderer, width, labelWidth int, ro
 		suffix = ""
 	}
 	values := strings.Split(value, "\n")
-	baseFg := styleForeground(renderer.Styles.Item, renderer.Styles.Theme.Fg)
-	valueFg := renderer.Styles.Theme.Fg
-	if row.color != "" {
-		valueFg = row.color
-	}
-	if muted {
-		valueFg = renderer.Styles.Theme.Dimmed
-	}
-
 	style := renderer.Styles.Item
 	switch {
 	case state.selected:
@@ -2155,11 +2146,26 @@ func renderInspectorFieldRow(renderer tideui.Renderer, width, labelWidth int, ro
 	case state.alt:
 		style = renderer.Styles.Item.Copy().Background(stripedRowBackground(renderer, true, false))
 	}
+	baseFg := styleForeground(style, renderer.Styles.Theme.Fg)
+	valueFg := renderer.Styles.Theme.Fg
+	if row.color != "" {
+		valueFg = row.color
+	}
+	if muted {
+		valueFg = renderer.Styles.Theme.Dimmed
+	}
+	if state.selected {
+		valueFg = baseFg
+	}
 
 	out := make([]string, 0, len(values))
 	for i, line := range values {
 		prefix := strings.Repeat(" ", labelWidth+3)
 		rowSuffix := ""
+		valueKind := row.valueKind
+		if state.selected {
+			valueKind = ""
+		}
 		if i == 0 {
 			prefix = inspectorRowMarker(state, renderer.Styles.Theme.BorderFocus) +
 				foregroundSpan(fmt.Sprintf("%-*s ", labelWidth, row.label), renderer.Styles.Theme.BorderFocus, baseFg, true)
@@ -2167,7 +2173,7 @@ func renderInspectorFieldRow(renderer tideui.Renderer, width, labelWidth int, ro
 				rowSuffix = foregroundSpan(suffix, renderer.Styles.Theme.Unread, baseFg, false)
 			}
 		}
-		aligned := alignInspectorRow(prefix, styledInspectorValue(row.valueKind, line, valueFg, baseFg), rowSuffix, width)
+		aligned := alignInspectorRow(prefix, styledInspectorValue(valueKind, line, valueFg, baseFg), rowSuffix, width)
 		out = append(out, style.Width(width).Render(aligned))
 	}
 	return out

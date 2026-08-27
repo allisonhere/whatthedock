@@ -16,6 +16,7 @@ type Provider interface {
 	ContainerStats(context.Context, domain.ResourceID) (domain.ContainerStats, error)
 	Logs(context.Context, domain.ResourceID, LogOptions) (io.ReadCloser, error)
 	CreateContainer(context.Context, ContainerCreateSpec) (domain.ResourceID, error)
+	RenameContainer(context.Context, domain.ResourceID, string) error
 	StartContainer(context.Context, domain.ResourceID) error
 	StopContainer(context.Context, domain.ResourceID) error
 	RestartContainer(context.Context, domain.ResourceID) error

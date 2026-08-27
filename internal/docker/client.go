@@ -177,6 +177,10 @@ func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerC
 	return id, nil
 }
 
+func (p *LocalProvider) RenameContainer(ctx context.Context, id domain.ResourceID, name string) error {
+	return p.cli.ContainerRename(ctx, id.ID, name)
+}
+
 func createPortBindings(bindings []app.PortBinding) (nat.PortSet, nat.PortMap, error) {
 	exposed := nat.PortSet{}
 	ports := nat.PortMap{}

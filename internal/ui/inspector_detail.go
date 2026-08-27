@@ -57,20 +57,42 @@ func (m Model) handleInspectorDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	before := m.inspectorDetailEditor
 	updated, cmd := before.Update(msg)
 
-	if updated.Value() != before.Value() || updated.Mode() == "INSERT" || updated.Mode() == "COMMAND" {
-		return m, cmd
+	if msg.String() == "esc" {
+		// ripple has no notion of "cancel" outside vim mode — a plain-mode
+		// Esc is always a no-op inside the editor itself (handlePlainKey
+		// matches no keymap entry for it, and the default case swallows
+		// it), so it's unambiguously this overlay's own close key.
+		if before.InputMode() != ripple.ModeVim {
+			m.overlay = overlayNone
+			return m, nil
+		}
+		// In vim mode, whether this Esc had "nothing to cancel" can't be
+		// read off Mode()/CursorIndex()/SelectedText(): Mode() reports
+		// "NORMAL" whether or not a count/operator is pending, so a
+		// pending "d" (say) cleared by this Esc looks identical, by those
+		// three, to an already-idle Esc — comparing them (the previous
+		// version of this check) closed the overlay in both cases, when
+		// only the idle one should. ripple itself already tracks the
+		// distinction: a truly clean Esc (no pending count/operator, not
+		// in Visual) is the only case where it returns a cmd producing
+		// ripple.CancelMsg (vimNormalKey) — clearing a pending
+		// count/operator, or leaving Visual mode, both return a nil cmd
+		// instead. Calling cmd here to check is safe: for the Esc key
+		// ripple only ever returns nil or that one pure message
+		// constructor, never one with a side effect like a clipboard
+		// write.
+		if cmd != nil {
+			if _, cancel := cmd().(ripple.CancelMsg); cancel {
+				m.overlay = overlayNone
+				return m, nil
+			}
+		}
+		m.inspectorDetailEditor = updated
+		return m, nil
 	}
 
-	// Esc that had no effect inside the editor itself (nothing to cancel —
-	// no active selection, no pending vim operator/count) is this
-	// overlay's own close key instead, so Esc/Esc (clear selection, then
-	// close) reads the same way it does in a real vim buffer.
-	if msg.String() == "esc" &&
-		updated.Mode() == before.Mode() &&
-		updated.CursorIndex() == before.CursorIndex() &&
-		updated.SelectedText() == before.SelectedText() {
-		m.overlay = overlayNone
-		return m, nil
+	if updated.Value() != before.Value() || updated.Mode() == "INSERT" || updated.Mode() == "COMMAND" {
+		return m, cmd
 	}
 
 	m.inspectorDetailEditor = updated

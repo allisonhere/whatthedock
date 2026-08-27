@@ -399,6 +399,7 @@ func existingOverrideContent(base, service string) (string, bool) {
 // trip finished.
 type createOverrideCheckMsg struct {
 	service         string
+	base            string
 	content         string
 	found           bool
 	baseFileMissing bool
@@ -420,9 +421,9 @@ func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd 
 		}
 		output, err := sshRun(ctx, system, "cat "+systems.ShellQuote(overridePath), "")
 		if err != nil {
-			return createOverrideCheckMsg{service: service, found: false, baseFileMissing: baseMissing}
+			return createOverrideCheckMsg{service: service, base: base, found: false, baseFileMissing: baseMissing}
 		}
-		return createOverrideCheckMsg{service: service, content: string(output), found: true, baseFileMissing: baseMissing}
+		return createOverrideCheckMsg{service: service, base: base, content: string(output), found: true, baseFileMissing: baseMissing}
 	}
 }
 
@@ -1058,9 +1059,11 @@ func (m Model) createContainerCmd(spec app.ContainerCreateSpec, pullFirst bool, 
 }
 
 // editContainerCmd replaces id in place with a fresh container built from
-// spec — optionally pull the image first, then remove the current one and
-// create the edited one under the same name. Pulling before remove avoids
-// deleting a working container when the registry request fails.
+// spec. Pulling and creating a stopped replacement happen before removing
+// the current container, so a registry failure or create-time validation
+// failure does not delete the user's still-working original. Starting still
+// happens after removal because Docker cannot run two containers with the
+// same published ports/name at once.
 func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) tea.Cmd {
 	provider := m.provider
 	return func() tea.Msg {
@@ -1074,14 +1077,45 @@ func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSp
 				return createDoneMsg{name: spec.Name, edited: true, err: err}
 			}
 		}
+		tempSpec := spec
+		tempSpec.Name = editReplacementName(spec.Name)
+		tempSpec.Start = false
+		sendActionProgress(progress, "creating replacement for "+spec.Name+"…")
+		newID, err := provider.CreateContainer(ctx, tempSpec)
+		if err != nil {
+			return createDoneMsg{name: spec.Name, edited: true, err: err}
+		}
+		cleanupReplacement := true
+		defer func() {
+			if cleanupReplacement {
+				_ = provider.RemoveContainer(context.Background(), newID, true)
+			}
+		}()
 		sendActionProgress(progress, "removing "+spec.Name+"…")
 		if err := provider.RemoveContainer(ctx, id, true); err != nil {
 			return createDoneMsg{name: spec.Name, edited: true, err: err}
 		}
-		sendActionProgress(progress, "creating "+spec.Name+"…")
-		newID, err := provider.CreateContainer(ctx, spec)
-		return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
+		// The original is gone as of here, so the replacement must never be
+		// cleaned up past this point no matter what fails next — deleting
+		// it once the original is already gone would leave the user with
+		// neither container. cleanupReplacement exists only to undo the
+		// replacement create itself, while the original is still safely in
+		// place.
+		cleanupReplacement = false
+		sendActionProgress(progress, "renaming replacement to "+spec.Name+"…")
+		if err := provider.RenameContainer(ctx, newID, spec.Name); err != nil {
+			return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
+		}
+		sendActionProgress(progress, "starting "+spec.Name+"…")
+		if err := provider.StartContainer(ctx, newID); err != nil {
+			return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
+		}
+		return createDoneMsg{name: spec.Name, id: newID, edited: true}
 	}
+}
+
+func editReplacementName(name string) string {
+	return "whatthedock-edit-" + safeComposeFilename(name) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 func (m Model) createComposeCmd(spec composeCreateSpec, progress chan string) tea.Cmd {

@@ -237,6 +237,19 @@ func (p *Provider) CreateContainer(_ context.Context, spec app.ContainerCreateSp
 	return ctr.ID, nil
 }
 
+func (p *Provider) RenameContainer(_ context.Context, id domain.ResourceID, name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ctr, ok := p.containers[id.ID]
+	if !ok {
+		return fmt.Errorf("demo container %s no longer exists", id.ID)
+	}
+	ctr.Name = strings.TrimSpace(name)
+	p.containers[id.ID] = ctr
+	p.logs[id.ID] = append(p.logs[id.ID], "container renamed from WhatTheDock")
+	return nil
+}
+
 func (p *Provider) StopContainer(_ context.Context, id domain.ResourceID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
