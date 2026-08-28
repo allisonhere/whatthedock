@@ -429,6 +429,7 @@ type Model struct {
 	appLogLines  []string
 	appLogFile   *os.File
 	appLogScroll int
+	appLogCopied bool
 
 	// lastStatusText/statusSince back the minimum-hold guard in the
 	// snapshotMsg handler: an explicit status (success or error) must stay
@@ -2230,6 +2231,14 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "q":
 			m.overlay = overlayNone
+		case "c":
+			if len(m.appLogLines) == 0 {
+				m.status, m.statusErr = "nothing in app log to copy", true
+				return m, nil
+			}
+			m.appLogCopied = true
+			m.status, m.statusErr = "copied app log", false
+			return m, copyTextCmd(strings.Join(m.appLogLines, "\n"))
 		case "j", "down":
 			m.scrollAppLog(1)
 		case "k", "up":
@@ -2602,6 +2611,7 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case settingsActionViewAppLog:
 			m.overlay = overlayAppLog
 			m.appLogScroll = max(0, len(m.appLogLines)-m.appLogBodyBudget())
+			m.appLogCopied = false
 			return m, nil
 		}
 		if row.kind == settingsRowText || row.kind == settingsRowSecretText {

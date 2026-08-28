@@ -2567,7 +2567,14 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		}
 		scroll := clamp(m.appLogScroll, 0, max(0, len(lines)-budget))
 		end := min(len(lines), scroll+budget)
-		hints := []tideui.SoftHint{{Key: "esc/q", Label: "close"}}
+		copyLabel := "copy all"
+		if m.appLogCopied {
+			copyLabel = "copied!"
+		}
+		hints := []tideui.SoftHint{
+			{Key: "c", Label: copyLabel},
+			{Key: "esc/q", Label: "close"},
+		}
 		if len(lines) > budget {
 			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(lines))})
 		}

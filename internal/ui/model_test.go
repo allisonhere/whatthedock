@@ -6242,6 +6242,7 @@ func TestCycleSettingAppLog(t *testing.T) {
 func TestSettingsViewAppLogOpensOverlay(t *testing.T) {
 	model := testModel()
 	model.overlay = overlaySettings
+	model.appLogCopied = true
 	rows := model.settingsRows()
 	for i, row := range rows {
 		if row.label == "View app log" {
@@ -6253,5 +6254,75 @@ func TestSettingsViewAppLogOpensOverlay(t *testing.T) {
 	next := updated.(Model)
 	if next.overlay != overlayAppLog {
 		t.Fatalf("overlay = %v after selecting View app log, want overlayAppLog", next.overlay)
+	}
+	if next.appLogCopied {
+		t.Fatal("appLogCopied remained true when app log was reopened")
+	}
+}
+
+func TestAppLogOverlayCopiesEntireLog(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 40
+	model.overlay = overlayAppLog
+	model.appLogLines = []string{"first debug line", "second debug line", "third debug line"}
+	model.appLogScroll = 1
+
+	var out bytes.Buffer
+	originalWriter := clipboardWriter
+	clipboardWriter = &out
+	defer func() { clipboardWriter = originalWriter }()
+
+	updated, cmd := model.handleOverlayKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	next := updated.(Model)
+	if next.overlay != overlayAppLog {
+		t.Fatalf("overlay = %v after copy, want overlayAppLog", next.overlay)
+	}
+	if !next.appLogCopied {
+		t.Fatal("appLogCopied = false after copy")
+	}
+	if next.status != "copied app log" || next.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want copied app log/false", next.status, next.statusErr)
+	}
+	if cmd == nil {
+		t.Fatal("copy command is nil")
+	}
+	cmd()
+
+	sequence := out.String()
+	if !strings.Contains(sequence, "Zmlyc3QgZGVidWcgbGluZQpzZWNvbmQgZGVidWcgbGluZQp0aGlyZCBkZWJ1ZyBsaW5l") {
+		t.Fatalf("clipboard output does not contain the complete app log: %q", sequence)
+	}
+	view := ansi.Strip(next.View())
+	if !strings.Contains(view, "c copied!") {
+		t.Fatalf("app-log overlay missing copied confirmation:\n%s", view)
+	}
+}
+
+func TestAppLogOverlayCopyEmptyReportsError(t *testing.T) {
+	model := testModel()
+	model.overlay = overlayAppLog
+
+	updated, cmd := model.handleOverlayKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	next := updated.(Model)
+	if cmd != nil {
+		t.Fatalf("copy command = %#v, want nil", cmd)
+	}
+	if next.overlay != overlayAppLog {
+		t.Fatalf("overlay = %v after empty copy, want overlayAppLog", next.overlay)
+	}
+	if next.status != "nothing in app log to copy" || !next.statusErr {
+		t.Fatalf("status/statusErr = %q/%v, want empty-copy error", next.status, next.statusErr)
+	}
+}
+
+func TestAppLogOverlayShowsCopyHint(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 40
+	model.overlay = overlayAppLog
+	model.appLogLines = []string{"debug line"}
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "c copy all") {
+		t.Fatalf("app-log overlay missing copy hint:\n%s", view)
 	}
 }
