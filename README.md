@@ -14,6 +14,7 @@ It is meant for the stuff you do all the time:
 - keep a small library of Compose files you can edit, save, and make live
 - yank a container's configuration on one host, switch hosts, and paste it
   onto another (the Container Clipboard — see below)
+- gracefully shut down or reboot a host, right from the app
 
 It uses Docker's normal defaults. If `docker ps` works on your machine,
 `whatthedock` should have a decent shot at working too.
@@ -227,6 +228,29 @@ The keys are the same in each one:
 
 In-use items are shown, but they cannot be selected for removal.
 
+## Shut Down / Reboot Host
+
+Open from `Ctrl+K`:
+
+- `Shut down host machine`
+- `Reboot host machine`
+
+Both gracefully stop every running container on the current host first,
+then run the actual OS-level shutdown/reboot — locally or over SSH,
+matching whatever system you're currently connected to. An itemized
+confirm screen lists exactly which containers will be stopped before
+anything happens.
+
+The OS command runs non-interactively (`sudo -n ...`) so it never hangs
+waiting for a password on a terminal that isn't there. If the host needs
+one, WhatTheDock asks for it in-app — a masked prompt, never a terminal
+handoff — and retries with it piped to `sudo -S`. Wrong password just
+reopens the prompt; `Esc` always cancels. If you'd rather never be asked,
+configure passwordless `sudo` for `shutdown` on the host once and this
+never comes up again.
+
+Not available in demo mode — there's no real host behind it.
+
 ## Systems
 
 Press `S` to manage Docker systems.
@@ -299,6 +323,7 @@ vars — and shows a review screen before anything happens:
 |---|---|
 | `Enter` | Open the paste for editing (name, ports, mounts, env, networks) before deploying |
 | `d` | Deploy as-is (refused if there's a blocking conflict, e.g. a name collision) |
+| `t` | Redirect any missing bind-mount source(s) to a placeholder directory, so a deploy isn't blocked on them |
 | `Esc` | Cancel — the clipboard item is kept, so you can try again |
 
 This is a **configuration clone, not a data migration**: named volumes are
@@ -306,6 +331,18 @@ created if needed, but volume and bind-mount *contents* are never copied
 between hosts, and the source container is never touched. Env vars that
 look like secrets (passwords, tokens, keys, ...) are flagged and their
 values are never shown in the review screen.
+
+A bind mount whose source directory doesn't exist on the destination is a
+blocking conflict by default — Docker refuses to create a container with a
+missing bind source. Press `t` to redirect it instead: WhatTheDock creates
+an empty placeholder directory under
+`~/.local/share/whatthedock/paste-placeholders/<container>/<mount>` on the
+destination, points the mount at it so the deploy can proceed, and records
+the *original* path as a label on the created container
+(`com.whatthedock.paste.original-bind-source:<path-in-container>`) — visible
+later via `docker inspect` or the Inspector, not just a one-time message.
+The placeholder is empty: no data is migrated into it, and the confirm
+screen says so again right before you deploy.
 
 ## Settings
 

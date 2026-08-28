@@ -3448,6 +3448,7 @@ var helpSections = []helpSection{
 			{"P", "paste the yanked container onto the current host"},
 			{"Enter", "on the paste review screen: open it for editing before deploying"},
 			{"d", "on the paste review screen: deploy without further edits"},
+			{"t", "on the paste review screen: redirect missing bind-mount paths to a placeholder"},
 			{"Esc", "on the paste review screen: cancel (the clipboard item is kept)"},
 		},
 	},
@@ -3478,6 +3479,7 @@ var helpSections = []helpSection{
 			{"Systems a / e", "add or edit a system"},
 			{"Systems d", "delete inactive system"},
 			{"System edit Ctrl+S", "save system"},
+			{"Ctrl+K", "shut down or reboot the current host (stops containers first, not available in demo mode)"},
 		},
 	},
 }
