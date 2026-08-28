@@ -196,17 +196,50 @@ func (p *Provider) CreateContainer(_ context.Context, spec app.ContainerCreateSp
 	if name == "" {
 		name = id
 	}
+	networks := make([]string, 0, len(spec.Networks))
+	aliases := map[string][]string{}
+	for _, n := range spec.Networks {
+		networks = append(networks, n.Name)
+		if len(n.Aliases) > 0 {
+			aliases[n.Name] = append([]string(nil), n.Aliases...)
+		}
+	}
+	labels := spec.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
 	ctr := domain.Container{
-		ID:            domain.ResourceID{Host: p.host.ID, ID: id},
-		Name:          name,
-		Image:         spec.Image,
-		Command:       strings.Join(spec.Command, " "),
-		Created:       time.Now(),
-		State:         domain.StateStopped,
-		Status:        "Created",
-		Env:           append([]string(nil), spec.Env...),
-		RestartPolicy: spec.RestartPolicy,
-		Labels:        map[string]string{},
+		ID:             domain.ResourceID{Host: p.host.ID, ID: id},
+		Name:           name,
+		Image:          spec.Image,
+		Command:        domain.JoinShellWords(spec.Command),
+		Entrypoint:     domain.JoinShellWords(spec.Entrypoint),
+		Created:        time.Now(),
+		State:          domain.StateStopped,
+		Status:         "Created",
+		Env:            append([]string(nil), spec.Env...),
+		RestartPolicy:  spec.RestartPolicy,
+		Labels:         labels,
+		Hostname:       spec.Hostname,
+		WorkingDir:     spec.WorkingDir,
+		User:           spec.User,
+		Privileged:     spec.Privileged,
+		CapAdd:         append([]string(nil), spec.CapAdd...),
+		CapDrop:        append([]string(nil), spec.CapDrop...),
+		MemoryBytes:    spec.MemoryBytes,
+		NanoCPUs:       spec.NanoCPUs,
+		StopSignal:     spec.StopSignal,
+		StopTimeout:    spec.StopTimeout,
+		DNS:            append([]string(nil), spec.DNS...),
+		DNSSearch:      append([]string(nil), spec.DNSSearch...),
+		ReadonlyRootfs: spec.ReadonlyRootfs,
+		SecurityOpt:    append([]string(nil), spec.SecurityOpt...),
+		LogDriver:      spec.LogDriver,
+		LogOptions:     spec.LogOptions,
+		Tmpfs:          spec.Tmpfs,
+		Networks:       networks,
+		NetworkAliases: aliases,
+		HealthCheck:    spec.Healthcheck,
 	}
 	if spec.Start {
 		ctr.State = domain.StateRunning
@@ -358,6 +391,23 @@ func (p *Provider) RemoveNetwork(_ context.Context, id string) error {
 		}
 	}
 	return fmt.Errorf("demo network %s not found", id)
+}
+
+func (p *Provider) CreateNetwork(_ context.Context, name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, net := range p.networks {
+		if net.Name == name {
+			return fmt.Errorf("network with name %s already exists", name)
+		}
+	}
+	p.networks = append(p.networks, domain.Network{
+		ID:     "demo-net-" + strings.ReplaceAll(strings.ToLower(name), " ", "-"),
+		Name:   name,
+		Driver: "bridge",
+		Scope:  "local",
+	})
+	return nil
 }
 
 func (p *Provider) Volumes(_ context.Context) ([]domain.Volume, error) {

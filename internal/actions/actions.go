@@ -17,6 +17,8 @@ const (
 	Delete         ID = "delete-container"
 	Replicate      ID = "replicate-container"
 	Clone          ID = "clone-container"
+	Yank           ID = "yank-container"
+	Paste          ID = "paste-container"
 	CurateImages   ID = "curate-images"
 	CurateNetworks ID = "curate-networks"
 	CurateVolumes  ID = "curate-volumes"
@@ -36,6 +38,8 @@ const (
 	OpenSettings   ID = "open-settings"
 	OpenSystems    ID = "open-systems"
 	CommandPalette ID = "command-palette"
+	ShutdownHost   ID = "shutdown-host"
+	RebootHost     ID = "reboot-host"
 	Quit           ID = "quit"
 )
 
@@ -63,6 +67,8 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer},
 		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer},
 		{ID: Clone, Name: "Clone container or Compose service under a new name", Shortcut: "C", Aliases: []string{"duplicate", "copy container"}, Enabled: hasContainer},
+		{ID: Yank, Name: "Yank container configuration (Container Clipboard)", Shortcut: "y", Aliases: []string{"clipboard", "copy container config", "migrate"}, Enabled: hasContainer},
+		{ID: Paste, Name: "Paste yanked container onto this host (Container Clipboard)", Shortcut: "P", Aliases: []string{"clipboard", "deploy yanked", "migrate"}, Enabled: true},
 		{ID: CurateImages, Name: "Curate Docker images", Shortcut: "", Aliases: []string{"images", "unused images", "prune images", "cleanup images"}, Enabled: true},
 		{ID: CurateNetworks, Name: "Curate Docker networks", Shortcut: "", Aliases: []string{"networks", "unused networks", "prune networks", "address pool", "cleanup networks"}, Enabled: true},
 		{ID: CurateVolumes, Name: "Curate Docker volumes", Shortcut: "", Aliases: []string{"volumes", "unused volumes", "prune volumes", "cleanup volumes"}, Enabled: true},
@@ -82,6 +88,8 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: OpenSettings, Name: "Open settings", Shortcut: ",", Aliases: []string{"preferences", "options", "config"}, Enabled: true},
 		{ID: OpenSystems, Name: "Manage systems", Shortcut: "S", Aliases: []string{"hosts", "profiles", "docker hosts", "remote"}, Enabled: true},
 		{ID: CommandPalette, Name: "Command palette", Shortcut: "ctrl+k", Aliases: []string{"commands"}, Enabled: true},
+		{ID: ShutdownHost, Name: "Shut down host machine", Shortcut: "", Aliases: []string{"power off", "poweroff", "halt", "shutdown server"}, Enabled: true},
+		{ID: RebootHost, Name: "Reboot host machine", Shortcut: "", Aliases: []string{"restart host", "restart server", "reboot server"}, Enabled: true},
 		{ID: Quit, Name: "Quit WhatTheDock", Shortcut: "q", Aliases: []string{"exit"}, Enabled: true},
 	}
 }

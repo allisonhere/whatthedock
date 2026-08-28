@@ -12,6 +12,8 @@ It is meant for the stuff you do all the time:
 - start, stop, restart, edit, clone, delete, or recreate containers
 - manage local and remote Docker hosts
 - keep a small library of Compose files you can edit, save, and make live
+- yank a container's configuration on one host, switch hosts, and paste it
+  onto another (the Container Clipboard — see below)
 
 It uses Docker's normal defaults. If `docker ps` works on your machine,
 `whatthedock` should have a decent shot at working too.
@@ -108,6 +110,8 @@ That is usually faster than remembering every key.
 | `n` | Create a container or Compose service |
 | `m` | Edit the selected service; on a stack row, edit the whole stack |
 | `C` | Clone the selected container/service |
+| `y` | Yank the selected container's configuration (Container Clipboard) |
+| `P` | Paste the yanked container onto the current host |
 | `D` | Delete the selected container/service; on a stack row, delete the whole stack |
 | `u` | Pull latest image and recreate in place |
 | `e` | Open a shell in the selected running container |
@@ -265,6 +269,43 @@ Settings live in your platform config directory. On Linux that is usually:
 ```text
 ~/.config/whatthedock/settings.json
 ```
+
+## Container Clipboard
+
+Yank a container's configuration on one Docker host, switch hosts, paste it
+on another — the vim-flavored `y` / `P` workflow:
+
+```text
+select container
+y
+switch host
+P
+review conflicts
+deploy
+```
+
+`y` captures a container's full configuration (image, command, entrypoint,
+env, ports, mounts, networks, restart policy, healthcheck, resource limits,
+and more) into an in-session clipboard — shown as `[YANK: name]` in the
+status bar. It persists while you switch between systems, and keeps a
+short history of your last few yanks.
+
+`P` checks the yanked container against whatever host you're currently on
+— name/port collisions, whether the image needs pulling, whether a network
+needs creating, bind-mount paths that don't exist there, secret-like env
+vars — and shows a review screen before anything happens:
+
+| Key | What it does |
+|---|---|
+| `Enter` | Open the paste for editing (name, ports, mounts, env, networks) before deploying |
+| `d` | Deploy as-is (refused if there's a blocking conflict, e.g. a name collision) |
+| `Esc` | Cancel — the clipboard item is kept, so you can try again |
+
+This is a **configuration clone, not a data migration**: named volumes are
+created if needed, but volume and bind-mount *contents* are never copied
+between hosts, and the source container is never touched. Env vars that
+look like secrets (passwords, tokens, keys, ...) are flagged and their
+values are never shown in the review screen.
 
 ## Settings
 

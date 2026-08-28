@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/allisonhere/ripple"
 	"github.com/allisonhere/tideui"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -17,6 +18,9 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		var prompt string
 		confirmLabel := confirmStepLabel(editing)
 		switch {
+		case m.createDraft.Pasting:
+			prompt = "Paste " + name + " onto " + m.provider.Host().Name + "?"
+			confirmLabel = "deploy"
 		case editing && m.createDraft.Mode != createModeCompose:
 			prompt = "Replace standalone container " + name + " with these changes?"
 		case m.createDraft.Mode == createModeCompose && m.createDraft.IsStack():
@@ -50,7 +54,10 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			prompt = "Create and start standalone container " + name + "?"
 		}
 		title := "confirm create"
-		if editing {
+		switch {
+		case m.createDraft.Pasting:
+			title = "confirm paste"
+		case editing:
 			title = "confirm edit"
 		}
 		// Same unbounded-height bug as the form screen's preview column
@@ -121,18 +128,27 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		if field == createFieldMode {
 			continue // shown as the tab pills above, not a row
 		}
-		value := m.createFieldValueForDisplay(field)
-		if field == m.createField && !m.createChoiceField(field) {
-			value = m.createFieldValueWithCaret()
+		focused := field == m.createField
+		budget := max(12, formWidth-18)
+		hint := ""
+		if field == createFieldComposeFile && focused {
+			budget = max(12, formWidth-24)
+			hint = "  enter/browse"
 		}
-		suffix := short(value, max(12, formWidth-18))
-		if field == createFieldComposeFile && field == m.createField {
-			suffix = short(value, max(12, formWidth-24)) + "  enter/browse"
+		var suffix string
+		if focused && !m.createChoiceField(field) {
+			// The real embedded editor (createFieldEditor), not a plain
+			// string — gives this row a real cursor, selection, and OS
+			// clipboard copy/paste instead of the "|" spliced into a
+			// string this used to be.
+			suffix = m.createFieldEditorSuffix(renderer, budget) + hint
+		} else {
+			suffix = short(m.createFieldValueForDisplay(field), budget) + hint
 		}
 		formRows = append(formRows, renderer.RenderSoftRow(tideui.SoftRow{
 			Text:     createFieldLabel(field),
 			Suffix:   suffix,
-			Selected: field == m.createField,
+			Selected: focused,
 		}, formWidth))
 	}
 	if m.createDraft.IsStack() {
@@ -560,4 +576,83 @@ func (m Model) createFieldValueForDisplay(field createField) string {
 
 func (m Model) createChoiceField(field createField) bool {
 	return field == createFieldRestart || field == createFieldImageAction
+}
+
+// createFieldEditorSuffix renders the focused field's embedded editor as
+// this row's Suffix — a real terminal cursor and (for a genuine shift/vim
+// selection) a highlighted span, plain foreground color otherwise (no
+// syntax highlighting; these are ordinary values, not Compose YAML).
+//
+// Every span here is built with foregroundSpanDefault, never a raw
+// lipgloss.Style.Render() call, and never touches background at all. A
+// plain Style.Render() ends in an absolute reset ("\x1b[0m") — fine in
+// isolation, but this Suffix is only ever one piece of a larger row string
+// that RenderSoftRow wraps in its own Background(...) *after* everything
+// here is already assembled; that reset doesn't "expire" at the end of
+// this span, it wipes the row's background out for everything from that
+// point rightward, for the rest of the row. That's exactly what happened
+// with the first version of this function (raw Reverse()-based cursor/
+// selection styles): the row's focus highlight only ever showed up to the
+// left of the cursor, because the plain-text span just before the cursor
+// was the first thing here to emit that reset. foregroundSpanDefault
+// (already used elsewhere in this file for exactly this reason) only ever
+// touches foreground, restoring to the terminal's own default afterward —
+// the row's actual background, set once by RenderSoftRow's own wrap, is
+// never emitted here at all, so there's nothing for these spans to
+// clobber. The cursor and selection are rendered as a distinct foreground
+// color/weight (not a background flip) for the same reason — a
+// foreground-only distinction can't erase the row's background because it
+// never expresses an opinion about it.
+func (m Model) createFieldEditorSuffix(renderer tideui.Renderer, width int) string {
+	ed := m.createFieldEditor
+	ed.SetSize(fieldEditorRenderWidth(ed, width), 1)
+	fg := styleForeground(renderer.Styles.ItemSelected, renderer.Styles.Theme.Fg)
+	accent := renderer.Styles.Theme.BorderFocus
+	if accent == "" {
+		accent = fg
+	}
+	opts := ripple.Options{
+		Selected: func(s string) string { return foregroundSpanDefault(s, accent, true, false) },
+		Style:    func(_, text string) string { return foregroundSpanDefault(text, fg, false, false) },
+	}
+	switch ed.Mode() {
+	case "INSERT":
+		opts.Cursor = foregroundSpanDefault("▏", accent, true, false)
+	case "":
+		opts.Cursor = foregroundSpanDefault("▊", accent, true, false)
+	default:
+		opts.CursorRune = func(s string) string { return foregroundSpanDefault(s, accent, true, false) }
+	}
+	return ed.View(opts)
+}
+
+// fieldEditorRenderWidth is a workaround for an upstream ripple edge case,
+// not something wrong on whatthedock's side: ripple's own line-wrapping
+// (appendWrapped, ripple.go) appends one extra, genuinely empty trailing
+// visual line whenever a logical line's length divides evenly by the
+// configured width (its own "lineWidth == width" check after the wrap
+// loop). When the cursor sits at the very end of the text — the normal
+// resting place after SetValue, i.e. every time a field is first focused —
+// and that end position lands exactly on such a width boundary,
+// ensureCursorVisible scrolls the viewport to that phantom empty line
+// instead of the previous one that actually holds the last visible
+// characters: the field renders as if it were blank apart from the
+// cursor, even though it has real content. Confirmed by direct
+// reproduction (a 70-rune value renders empty at width 35 = 70/2, but
+// correctly at 34 or 36) — not guesswork. Ripple has no public API to set
+// its viewport directly, so this can't be corrected after the fact from
+// outside the package; the only lever available here is the width handed
+// to SetSize, which is otherwise a free (if narrow) choice, so nudging it
+// by one column exactly when this specific boundary condition would occur
+// sidesteps ripple's bug entirely without perceptibly changing how much
+// of the field is visible. Report/fix upstream in ripple's own repo too —
+// this same trap exists for any other host that lands a cursor at the end
+// of a value whose length happens to divide its render width evenly.
+func fieldEditorRenderWidth(ed ripple.Model, width int) int {
+	width = max(1, width)
+	length := len([]rune(ed.Value()))
+	if width > 1 && length > 0 && ed.CursorIndex() == length && length%width == 0 {
+		return width - 1
+	}
+	return width
 }

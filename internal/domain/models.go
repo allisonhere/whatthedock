@@ -84,11 +84,19 @@ type HealthCheck struct {
 	StartPeriod time.Duration
 }
 
+// Device is one host device mapped into a container (HostConfig.Devices).
+type Device struct {
+	PathOnHost        string
+	PathInContainer   string
+	CgroupPermissions string
+}
+
 type Container struct {
 	ID            ResourceID
 	Name          string
 	Image         string
 	ImageID       string
+	ImageDigest   string
 	Command       string
 	Created       time.Time
 	State         ContainerState
@@ -104,6 +112,34 @@ type Container struct {
 	RestartPolicy string
 	Compose       ComposeRef
 	HealthCheck   *HealthCheck
+
+	// The fields below are only ever populated by a full inspect (see
+	// docker.FromInspect) — Snapshot()'s list-summary path (FromSummary)
+	// has no cheap way to get them for every container at once, so they're
+	// zero-valued there. Added for the Container Clipboard (yank/paste)
+	// feature, which always fetches a single container's full inspect
+	// before capturing it — see clipboard.FromContainer.
+	Hostname       string
+	Entrypoint     string // space-joined, same display/edit convention as Command (see splitCommand)
+	WorkingDir     string
+	User           string
+	Privileged     bool
+	CapAdd         []string
+	CapDrop        []string
+	Devices        []Device
+	ExposedPorts   []Port              // container-side only, no host binding (Public is always 0)
+	NetworkAliases map[string][]string // network name -> aliases
+	MemoryBytes    int64
+	NanoCPUs       int64
+	StopSignal     string
+	StopTimeout    *int
+	DNS            []string
+	DNSSearch      []string
+	ReadonlyRootfs bool
+	SecurityOpt    []string
+	LogDriver      string
+	LogOptions     map[string]string
+	Tmpfs          map[string]string // mount target -> options string (e.g. "size=64m")
 }
 
 // Image describes one image in a Docker host's local image store.

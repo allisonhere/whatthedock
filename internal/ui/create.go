@@ -12,12 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/allisonhere/ripple"
 	tea "github.com/charmbracelet/bubbletea"
 	"gopkg.in/yaml.v3"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/catalog"
+	"github.com/allisonhere/whatthedock/internal/clipboard"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
@@ -45,6 +48,12 @@ const (
 	createFieldEnv
 	createFieldRestart
 	createFieldComposeFile
+	// createFieldNetworks is only ever visible on a paste draft (see
+	// visibleCreateFields) — plain standalone create has never exposed
+	// network selection in the form; Paste is the first feature that
+	// actually captures a source container's networks and needs a place
+	// to remap them for the destination.
+	createFieldNetworks
 )
 
 type createDraft struct {
@@ -70,6 +79,22 @@ type createDraft struct {
 	Env           string
 	Restart       string
 	ComposeFile   string
+	// Networks is a comma-joined list of destination network names, editable
+	// only on a paste draft (see visibleCreateFields) — a plain standalone
+	// create has no field for it at all; every other field a yanked
+	// container carried (privileged, capabilities, healthcheck, resource
+	// limits, ...) rides along unedited on PastePlan.Spec, which
+	// ContainerSpec starts from instead of a blank spec when Pasting.
+	Networks string
+
+	// Pasting and PastePlan mark a draft opened from the paste review
+	// screen (see draftFromPastePlan, paste.go) rather than a fresh Create
+	// (n), Clone (C), or Edit (e/m) — confirming this draft applies through
+	// pasteApplyCmd instead of the plain create path, since a paste may
+	// first need to create a destination network the plan flagged as
+	// missing.
+	Pasting   bool
+	PastePlan *clipboard.PastePlan
 
 	// OverrideRaw, when OverrideRawSet, is override YAML that takes
 	// precedence over the generated composeOverrideContent for this draft —
@@ -371,7 +396,7 @@ func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
 	m.createDraft = draft
 	m.overlay = overlayCreate
 	m.createField = m.visibleCreateFields()[0]
-	m.createCursor = len([]rune(m.createFieldValue()))
+	m.syncCreateFieldEditor()
 	m.createEditingCompose = false
 	m.clearCreateNotice()
 	m.status, m.statusErr = "create draft ready", false
@@ -494,7 +519,7 @@ func (m Model) defaultCloneDraft() createDraft {
 	}
 	draft.Ports = formatDraftPorts(selected.Ports)
 	draft.Mounts = formatDraftMounts(selected.Mounts)
-	draft.Env = strings.Join(selected.Env, ", ")
+	draft.Env = formatEnvEntries(selected.Env)
 	if selected.RestartPolicy != "" {
 		draft.Restart = selected.RestartPolicy
 	}
@@ -538,7 +563,7 @@ func replicateContainerSpec(selected domain.Container) (app.ContainerCreateSpec,
 		Command:       selected.Command,
 		Ports:         formatDraftPorts(selected.Ports),
 		Mounts:        formatDraftMounts(selected.Mounts),
-		Env:           strings.Join(selected.Env, ", "),
+		Env:           formatEnvEntries(selected.Env),
 		Restart:       selected.RestartPolicy,
 	}
 	return draft.ContainerSpec()
@@ -640,6 +665,15 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.createDoneResult = createDoneMsg{}
 			progress := make(chan string, 16)
 			m.actionProgress = progress
+			if m.createDraft.Pasting {
+				if m.createDraft.pullImageBeforeApply() {
+					m.actionProgressText = "pulling " + spec.Image + "…"
+				} else {
+					m.actionProgressText = "deploying " + spec.Name + "…"
+				}
+				m.status, m.statusErr = "pasting "+spec.Name, false
+				return m, m.pasteApplyCmd(spec, m.createDraft.pullImageBeforeApply(), progress)
+			}
 			if m.createDraft.Editing {
 				if m.createDraft.pullImageBeforeApply() {
 					m.actionProgressText = "pulling " + spec.Image + "…"
@@ -659,6 +693,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	var cmd tea.Cmd
 	switch msg.String() {
 	case "esc", "q":
 		m.overlay = overlayNone
@@ -673,37 +708,39 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.moveCreateField(-1)
 			return m, nil
 		}
-		m.editCreateFieldString("k")
+		cmd = m.forwardToFieldEditor(msg)
 	case "j":
 		if m.isCreateChoiceField() {
 			m.moveCreateField(1)
 			return m, nil
 		}
-		m.editCreateFieldString("j")
-	case "left":
+		cmd = m.forwardToFieldEditor(msg)
+	case "left", "right", "shift+left", "shift+right",
+		"ctrl+left", "ctrl+right", "ctrl+shift+left", "ctrl+shift+right":
 		if m.isCreateChoiceField() {
-			m.cycleCreateChoice(-1)
-		} else {
-			m.moveCreateCursor(-1)
+			// Only plain left/right cycle a choice — shift/ctrl variants
+			// have no meaning there (no selection, no words to jump).
+			switch msg.String() {
+			case "left":
+				m.cycleCreateChoice(-1)
+			case "right":
+				m.cycleCreateChoice(1)
+			}
+			return m, nil
 		}
-	case "right":
-		if m.isCreateChoiceField() {
-			m.cycleCreateChoice(1)
-		} else {
-			m.moveCreateCursor(1)
-		}
+		cmd = m.forwardToFieldEditor(msg)
 	case "h":
 		if m.isCreateChoiceField() {
 			m.cycleCreateChoice(-1)
 			return m, nil
 		}
-		m.editCreateFieldString("h")
+		cmd = m.forwardToFieldEditor(msg)
 	case "l":
 		if m.isCreateChoiceField() {
 			m.cycleCreateChoice(1)
 			return m, nil
 		}
-		m.editCreateFieldString("l")
+		cmd = m.forwardToFieldEditor(msg)
 	case "enter":
 		if m.isCreateChoiceField() {
 			m.cycleCreateChoice(1)
@@ -716,6 +753,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+o":
 		m.createDraft.Mode = createModeCompose
 		m.createField = createFieldComposeFile
+		m.syncCreateFieldEditor()
 		return m, m.openCreateFileBrowser()
 	case "o":
 		// Bare "o" is a browse shortcut only on a choice field (Mode/
@@ -727,12 +765,18 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Ctrl+O still open the browser from the Compose file field.
 		if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
 			m.createField = createFieldComposeFile
+			m.syncCreateFieldEditor()
 			return m, m.openCreateFileBrowser()
 		}
-		m.editCreateFieldString("o")
+		cmd = m.forwardToFieldEditor(msg)
 	case "[", "]":
 		m.cycleCreateMode()
 	case "ctrl+y":
+		// Ripple's own default keymap binds ctrl+y to Redo, but this app
+		// already uses ctrl+y globally for the Compose YAML editor — kept
+		// intercepted here unconditionally (even in standalone mode, where
+		// the body below does nothing) so it can never reach the field
+		// editor and mean something else there.
 		if m.createDraft.Mode == createModeCompose {
 			m.openCreateEditor()
 			return m, nil
@@ -756,25 +800,34 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
 			}
 		}
-	case "backspace":
-		m.editCreateFieldBackspace()
-	case "delete":
-		m.editCreateFieldDelete()
+	case "backspace", "delete", "ctrl+z", "ctrl+c", "ctrl+x", "ctrl+v":
+		// These have no msg.Runes (they're control keys, not printable
+		// input), so they'd never reach the default case's Rune-gated
+		// forward below — copy/cut/paste/undo need their own case to ever
+		// get to the editor at all.
+		cmd = m.forwardToFieldEditor(msg)
 	case "home", "ctrl+a":
-		m.createCursor = 0
+		// This app has long treated ctrl+a as a Home alias, not Ripple's
+		// own default ctrl+a-selects-all — translate to a synthetic Home
+		// key instead of forwarding the raw one, so that convention holds
+		// (Shift+Home, in the case above, already gives a real "select to
+		// start of field" if that's what's wanted).
+		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyHome})
 	case "end", "ctrl+e":
-		m.createCursor = len([]rune(m.createFieldValue()))
+		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyEnd})
 	case "ctrl+u":
 		if !m.isCreateChoiceField() {
-			m.setCreateFieldValue("")
-			m.createCursor = 0
+			m.createFieldEditor.SelectAll()
+			m.createFieldEditor.DeleteSelection()
+			m.clearCreateNotice()
+			m.setCreateFieldValue(m.createFieldEditor.Value())
 		}
 	default:
 		if len(msg.Runes) > 0 {
-			m.editCreateFieldString(string(msg.Runes))
+			cmd = m.forwardToFieldEditor(msg)
 		}
 	}
-	return m, nil
+	return m, cmd
 }
 
 func (m *Model) openCreateCatalog() {
@@ -1044,18 +1097,25 @@ func (m Model) createContainerCmd(spec app.ContainerCreateSpec, pullFirst bool, 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		if pullFirst {
-			onProgress := func(p app.PullProgress) {
-				sendActionProgress(progress, formatPullProgress(spec.Image, p))
-			}
-			if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
-				return createDoneMsg{name: spec.Name, err: err}
-			}
-		}
-		sendActionProgress(progress, "creating "+spec.Name+"…")
-		id, err := provider.CreateContainer(ctx, spec)
+		id, err := pullThenCreate(ctx, provider, spec, pullFirst, progress)
 		return createDoneMsg{name: spec.Name, id: id, err: err}
 	}
+}
+
+// pullThenCreate is createContainerCmd's actual body, factored out so
+// pasteApplyCmd (paste.go) can run the exact same pull-then-create sequence
+// after its own network-creation pre-step, instead of duplicating it.
+func pullThenCreate(ctx context.Context, provider app.Provider, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) (domain.ResourceID, error) {
+	if pullFirst {
+		onProgress := func(p app.PullProgress) {
+			sendActionProgress(progress, formatPullProgress(spec.Image, p))
+		}
+		if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
+			return domain.ResourceID{}, err
+		}
+	}
+	sendActionProgress(progress, "creating "+spec.Name+"…")
+	return provider.CreateContainer(ctx, spec)
 }
 
 // editContainerCmd replaces id in place with a fresh container built from
@@ -1216,7 +1276,7 @@ func (m Model) handleCreateFileBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.browseCreateDir(entry.Path)
 		}
 		m.createDraft.ComposeFile = entry.Path
-		m.createCursor = len([]rune(m.createDraft.ComposeFile))
+		m.syncCreateFieldEditor()
 		m.createBrowsing = false
 		m.status, m.statusErr = "compose file selected", false
 		return m, tea.Batch(m.checkComposeOverrideCmd(), m.loadSelectedComposeFileCmd(entry.Path))
@@ -1612,16 +1672,49 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 	if err != nil {
 		return app.ContainerCreateSpec{}, err
 	}
-	return app.ContainerCreateSpec{
-		Name:          strings.TrimSpace(d.ContainerName),
-		Image:         strings.TrimSpace(d.Image),
-		Command:       splitCommand(d.Command),
-		Env:           env,
-		Ports:         ports,
-		Mounts:        mounts,
-		RestartPolicy: normalizeRestartPolicy(d.Restart),
-		Start:         true,
-	}, nil
+	// A paste draft starts from the yanked container's full spec —
+	// everything the form doesn't expose (privileged, capabilities,
+	// devices, resource limits, healthcheck, DNS, ...) rides along
+	// unedited — and only overwrites the fields the form actually lets the
+	// user change below. A fresh/cloned/edited draft has no such spec to
+	// start from, so every field comes from the form as it always has.
+	spec := app.ContainerCreateSpec{}
+	if d.Pasting && d.PastePlan != nil {
+		spec = d.PastePlan.Spec
+		spec.Networks = parseCreateNetworks(d.Networks, d.PastePlan.Spec.Networks)
+	}
+	spec.Name = strings.TrimSpace(d.ContainerName)
+	spec.Image = strings.TrimSpace(d.Image)
+	spec.Command = splitCommand(d.Command)
+	spec.Env = env
+	spec.Ports = ports
+	spec.Mounts = mounts
+	spec.RestartPolicy = normalizeRestartPolicy(d.Restart)
+	spec.Start = true
+	return spec, nil
+}
+
+// parseCreateNetworks parses the Networks field's comma-joined destination
+// network names back into []app.NetworkAttachment, carrying over each
+// original entry's aliases by position — the field only lets the user
+// rename/remap which network to attach to, not edit aliases directly.
+// Fewer or more names than original loses aliases past the shorter length
+// rather than erroring, since a genuinely new network name has no aliases
+// to inherit anyway.
+func parseCreateNetworks(value string, original []app.NetworkAttachment) []app.NetworkAttachment {
+	names := splitDraftList(value)
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]app.NetworkAttachment, 0, len(names))
+	for i, name := range names {
+		attachment := app.NetworkAttachment{Name: name}
+		if i < len(original) {
+			attachment.Aliases = append([]string(nil), original[i].Aliases...)
+		}
+		out = append(out, attachment)
+	}
+	return out
 }
 
 func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error) {
@@ -1698,7 +1791,7 @@ func (d createDraft) composeOverrideContent() string {
 	}
 	lines = appendQuotedYAMLList(lines, "    ports:", splitDraftList(d.Ports), "      - ")
 	lines = appendQuotedYAMLList(lines, "    volumes:", splitDraftList(d.Mounts), "      - ")
-	lines = appendQuotedYAMLList(lines, "    environment:", splitDraftList(d.Env), "      - ")
+	lines = appendQuotedYAMLList(lines, "    environment:", splitEnvEntries(d.Env), "      - ")
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -1784,7 +1877,7 @@ func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
 	d.Command = normalizeComposeCommand(svc.Command)
 	d.Ports = strings.Join(svc.Ports, ", ")
 	d.Mounts = strings.Join(svc.Volumes, ", ")
-	d.Env = strings.Join(normalizeComposeEnvironment(svc.Environment), ", ")
+	d.Env = formatEnvEntries(normalizeComposeEnvironment(svc.Environment))
 }
 
 // selectOverrideService picks which parsed service to sync fields from: the
@@ -2588,7 +2681,7 @@ func parseCreateMounts(value string) ([]app.MountBinding, error) {
 }
 
 func parseCreateEnv(value string) ([]string, error) {
-	parts := splitDraftList(value)
+	parts := splitEnvEntries(value)
 	for _, part := range parts {
 		key, _, ok := strings.Cut(part, "=")
 		if !ok || strings.TrimSpace(key) == "" {
@@ -2599,7 +2692,7 @@ func parseCreateEnv(value string) ([]string, error) {
 }
 
 func splitCommand(value string) []string {
-	return strings.Fields(strings.TrimSpace(value))
+	return domain.SplitShellWords(value)
 }
 
 func normalizeRestartPolicy(value string) string {
@@ -2614,7 +2707,7 @@ func (m *Model) moveCreateField(delta int) {
 	fields := m.visibleCreateFields()
 	if len(fields) == 0 {
 		m.createField = createFieldMode
-		m.createCursor = 0
+		m.syncCreateFieldEditor()
 		return
 	}
 	current := 0
@@ -2625,7 +2718,7 @@ func (m *Model) moveCreateField(delta int) {
 		}
 	}
 	m.createField = fields[modIndex(current+delta, len(fields))]
-	m.createCursor = len([]rune(m.createFieldValue()))
+	m.syncCreateFieldEditor()
 }
 
 // visibleCreateFields lists the fields Tab/Shift+Tab cycle through.
@@ -2639,7 +2732,11 @@ func (m Model) visibleCreateFields() []createField {
 	if m.createDraft.Mode == createModeStandalone {
 		fields := []createField{createFieldMode, createFieldContainerName, createFieldImage}
 		fields = append(fields, createFieldImageAction)
-		return append(fields, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart)
+		fields = append(fields, createFieldCommand, createFieldPorts, createFieldMounts, createFieldEnv, createFieldRestart)
+		if m.createDraft.Pasting {
+			fields = append(fields, createFieldNetworks)
+		}
+		return fields
 	}
 	if m.createDraft.IsStack() {
 		// No single Service/Image/Ports/etc. to edit — the pasted/loaded
@@ -2685,7 +2782,6 @@ func (m *Model) cycleCreateChoice(direction int) {
 		m.createDraft.ImageAction = options[modIndex(current+direction, len(options))]
 	}
 	m.clearCreateNotice()
-	m.createCursor = len([]rune(m.createFieldValue()))
 }
 
 // cycleCreateMode toggles between Compose and standalone creation. Unlike
@@ -2721,66 +2817,67 @@ func (m *Model) revalidateCreateField() {
 	fields := m.visibleCreateFields()
 	for _, field := range fields {
 		if field == m.createField {
-			m.createCursor = len([]rune(m.createFieldValue()))
+			m.syncCreateFieldEditor()
 			return
 		}
 	}
 	if len(fields) > 0 {
 		m.createField = fields[0]
 	}
-	m.createCursor = len([]rune(m.createFieldValue()))
+	m.syncCreateFieldEditor()
 }
 
-func (m *Model) editCreateFieldBackspace() {
+// syncCreateFieldEditor (re)seeds createFieldEditor to match whichever
+// field is now focused (m.createField), with the cursor parked at the end
+// of that field's current value (SetValue does this on its own — see
+// ripple's own doc comment on it) — call this at every point the focused
+// field or its value changes out from under the editor: this used to be
+// every "m.createCursor = len([]rune(m.createFieldValue()))" site before
+// createCursor existed as a plain int. A no-op for a choice field (Mode/
+// Restart/ImageAction), which never uses this editor — those are cycled,
+// never typed into.
+func (m *Model) syncCreateFieldEditor() {
 	if m.isCreateChoiceField() {
 		return
 	}
-	value := m.createFieldValue()
-	runes := []rune(value)
-	m.createCursor = clamp(m.createCursor, 0, len(runes))
-	if m.createCursor == 0 {
-		return
+	ed := ripple.New()
+	ed.SetClipboard(editorClipboard)
+	if editorVimMode {
+		ed.SetInputMode(ripple.ModeVim)
 	}
-	runes = append(runes[:m.createCursor-1], runes[m.createCursor:]...)
-	m.createCursor--
+	ed.SetValue(m.createFieldValue())
+	if ed.InputMode() == ripple.ModeVim {
+		// Matches openCreateEditor's own reasoning for the Compose YAML
+		// editor: land in Insert so typing works immediately on focusing a
+		// field, instead of the first keystroke (and first Esc) landing in
+		// Normal mode and doing nothing visible.
+		ed.StartInsert()
+	}
+	ed.Focus()
+	m.createFieldEditor = ed
+}
+
+// forwardToFieldEditor routes msg into the embedded field editor and syncs
+// its value back into createDraft's own plain string field (still the
+// single source of truth Preview()/ContainerSpec()/etc. all read from) —
+// the shared path every text-editing key in handleCreateKey uses instead
+// of hand-rolling insert/delete/cursor movement. Ripple's own key handling
+// already covers everything that needs: character insert, backspace/
+// delete, left/right and shift+left/right selection, undo/redo, and OS
+// clipboard copy/cut/paste (the same OSC52 bridge every other editor in
+// the app already uses) — there's nothing left for a hand-rolled version
+// to do. Returns the cmd Ripple's Update produced (a clipboard write, most
+// commonly) so the caller can actually return it — swallowing it here
+// would silently break copy. A no-op (nil cmd) on a choice field.
+func (m *Model) forwardToFieldEditor(msg tea.KeyMsg) tea.Cmd {
+	if m.isCreateChoiceField() {
+		return nil
+	}
+	var cmd tea.Cmd
+	m.createFieldEditor, cmd = m.createFieldEditor.Update(msg)
 	m.clearCreateNotice()
-	m.setCreateFieldValue(string(runes))
-}
-
-func (m *Model) editCreateFieldDelete() {
-	if m.isCreateChoiceField() {
-		return
-	}
-	runes := []rune(m.createFieldValue())
-	m.createCursor = clamp(m.createCursor, 0, len(runes))
-	if m.createCursor >= len(runes) {
-		return
-	}
-	runes = append(runes[:m.createCursor], runes[m.createCursor+1:]...)
-	m.clearCreateNotice()
-	m.setCreateFieldValue(string(runes))
-}
-
-func (m *Model) editCreateFieldString(value string) {
-	if m.isCreateChoiceField() {
-		return
-	}
-	runes := []rune(m.createFieldValue())
-	insert := []rune(value)
-	m.createCursor = clamp(m.createCursor, 0, len(runes))
-	updated := append([]rune{}, runes[:m.createCursor]...)
-	updated = append(updated, insert...)
-	updated = append(updated, runes[m.createCursor:]...)
-	m.createCursor += len(insert)
-	m.clearCreateNotice()
-	m.setCreateFieldValue(string(updated))
-}
-
-func (m *Model) moveCreateCursor(delta int) {
-	if m.isCreateChoiceField() {
-		return
-	}
-	m.createCursor = clamp(m.createCursor+delta, 0, len([]rune(m.createFieldValue())))
+	m.setCreateFieldValue(m.createFieldEditor.Value())
+	return cmd
 }
 
 func (m Model) createFieldValue() string {
@@ -2809,18 +2906,11 @@ func (m Model) createFieldValue() string {
 		return m.createDraft.Restart
 	case createFieldComposeFile:
 		return m.createDraft.ComposeFile
+	case createFieldNetworks:
+		return m.createDraft.Networks
 	default:
 		return ""
 	}
-}
-
-func (m Model) createFieldValueWithCaret() string {
-	runes := []rune(m.createFieldValue())
-	cursor := clamp(m.createCursor, 0, len(runes))
-	withCaret := append([]rune{}, runes[:cursor]...)
-	withCaret = append(withCaret, '|')
-	withCaret = append(withCaret, runes[cursor:]...)
-	return string(withCaret)
 }
 
 func (m *Model) setCreateFieldValue(value string) {
@@ -2845,6 +2935,8 @@ func (m *Model) setCreateFieldValue(value string) {
 		m.createDraft.Env = value
 	case createFieldComposeFile:
 		m.createDraft.ComposeFile = value
+	case createFieldNetworks:
+		m.createDraft.Networks = value
 	}
 }
 
@@ -2901,6 +2993,8 @@ func createFieldLabel(field createField) string {
 		return "Restart"
 	case createFieldComposeFile:
 		return "Compose file"
+	case createFieldNetworks:
+		return "Networks"
 	default:
 		return ""
 	}
@@ -2923,7 +3017,7 @@ func (d createDraft) composePreview() string {
 	lines = append(lines, "services:", "  "+service+":", "    image: "+image, "    restart: "+emptyAs(d.Restart, "unless-stopped"))
 	lines = appendPreviewList(lines, "    ports:", splitDraftList(d.Ports), "      - ")
 	lines = appendPreviewList(lines, "    volumes:", splitDraftList(d.Mounts), "      - ")
-	lines = appendPreviewList(lines, "    environment:", splitDraftList(d.Env), "      - ")
+	lines = appendPreviewList(lines, "    environment:", splitEnvEntries(d.Env), "      - ")
 	return strings.Join(lines, "\n")
 }
 
@@ -2935,8 +3029,11 @@ func (d createDraft) standalonePreview() string {
 	for _, mount := range splitDraftList(d.Mounts) {
 		args = append(args, "-v "+mount)
 	}
-	for _, env := range splitDraftList(d.Env) {
+	for _, env := range splitEnvEntries(d.Env) {
 		args = append(args, "-e "+env)
+	}
+	for _, network := range splitDraftList(d.Networks) {
+		args = append(args, "--network "+network)
 	}
 	args = append(args, emptyAs(d.Image, "image:tag"))
 	if command := strings.TrimSpace(d.Command); command != "" {
@@ -2967,6 +3064,92 @@ func splitDraftList(value string) []string {
 		}
 	}
 	return out
+}
+
+// splitEnvEntries is splitDraftList for the Env field specifically: same
+// comma/newline-separated, trimmed shape, except a double-quoted entry is
+// taken literally end to end — a comma or newline inside the quotes
+// doesn't split it, and a doubled "" inside represents one literal ".
+// formatEnvEntries is this function's inverse, applying that quoting
+// whenever an entry needs it.
+//
+// Ports/Mounts/Networks stay on plain splitDraftList — their values don't
+// realistically contain a literal comma. Env values regularly do (JSON,
+// CSV lists, connection strings), and this field is the one place a
+// yanked/cloned container's real value has to survive an actual
+// human-editable, comma-joined text field: without quoting,
+// APP_OPTS=a,b,c used to come back as ["APP_OPTS=a","b","c"] — "b" and
+// "c" then fail "must be KEY=value" validation (or, worse, silently
+// become their own bogus env vars if either fragment happens to contain
+// its own "=").
+func splitEnvEntries(value string) []string {
+	runes := []rune(value)
+	n := len(runes)
+	var out []string
+	i := 0
+	for i < n {
+		for i < n && (runes[i] == ',' || runes[i] == '\n' || unicode.IsSpace(runes[i])) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		var entry []rune
+		quoted := false
+		if runes[i] == '"' {
+			quoted = true
+			i++
+			for i < n {
+				if runes[i] == '"' {
+					if i+1 < n && runes[i+1] == '"' {
+						entry = append(entry, '"')
+						i += 2
+						continue
+					}
+					i++ // consume the closing quote
+					break
+				}
+				entry = append(entry, runes[i])
+				i++
+			}
+			// Ignore anything between the closing quote and the next
+			// separator instead of erroring — malformed trailing text
+			// after a quoted entry is rare enough not to be worth a
+			// parse failure over.
+			for i < n && runes[i] != ',' && runes[i] != '\n' {
+				i++
+			}
+		} else {
+			start := i
+			for i < n && runes[i] != ',' && runes[i] != '\n' {
+				i++
+			}
+			entry = runes[start:i]
+		}
+		value := string(entry)
+		if !quoted {
+			value = strings.TrimSpace(value)
+		}
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+// formatEnvEntries joins entries (each a whole "KEY=VALUE" string) into
+// the same comma-separated text splitEnvEntries parses, quoting
+// (CSV-style, doubling any embedded ") whichever entries need it — see
+// splitEnvEntries' own doc comment for why.
+func formatEnvEntries(entries []string) string {
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if strings.ContainsAny(e, ",\n\"") {
+			e = `"` + strings.ReplaceAll(e, `"`, `""`) + `"`
+		}
+		parts = append(parts, e)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func emptyAs(value, fallback string) string {

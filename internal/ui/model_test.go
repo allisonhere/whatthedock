@@ -51,6 +51,8 @@ type fakeProvider struct {
 	networks         []domain.Network
 	networkRemoveErr error
 	removedNetworks  []string
+	networkCreateErr error
+	createdNetworks  []string
 	volumes          []domain.Volume
 	volumeRemoveErr  error
 	removedVolumes   []string
@@ -137,6 +139,14 @@ func (f *fakeProvider) Networks(context.Context) ([]domain.Network, error) { ret
 func (f *fakeProvider) RemoveNetwork(_ context.Context, id string) error {
 	f.removedNetworks = append(f.removedNetworks, id)
 	return f.networkRemoveErr
+}
+func (f *fakeProvider) CreateNetwork(_ context.Context, name string) error {
+	f.createdNetworks = append(f.createdNetworks, name)
+	if f.networkCreateErr != nil {
+		return f.networkCreateErr
+	}
+	f.networks = append(f.networks, domain.Network{ID: "created-" + name, Name: name, Driver: "bridge", Scope: "local"})
+	return nil
 }
 func (f *fakeProvider) Volumes(context.Context) ([]domain.Volume, error) { return f.volumes, nil }
 func (f *fakeProvider) RemoveVolume(_ context.Context, name string) error {
@@ -4515,19 +4525,39 @@ func TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError(t *testing.T) {
 }
 
 // TestSuccessfulSnapshotStillUpdatesRoutineStatus is
-// TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError's complement: the
-// guard must only hold back an active error, not freeze the status line
-// forever — a routine refresh with no error showing still updates it as
-// before.
+// TestSuccessfulSnapshotClearsAStaleErrorAfterTheHoldWindow's success-side
+// twin: a stale, already-held success status still gets cleared by a
+// routine refresh once the hold window has passed — the guard doesn't
+// freeze the status line forever just because nothing new ever replaces it.
 func TestSuccessfulSnapshotStillUpdatesRoutineStatus(t *testing.T) {
 	model := testModel()
 	model.status, model.statusErr = "some earlier notice", false
+	model.lastStatusText = model.status
+	model.statusSince = time.Now().Add(-statusHoldMinDuration - time.Second)
 
 	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
 	got := updated.(Model)
 
 	if got.statusErr || got.status != "Docker connected" {
-		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false when nothing was blocking it", got.status, got.statusErr)
+		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false once the hold window has passed", got.status, got.statusErr)
+	}
+}
+
+// TestSuccessfulSnapshotHoldsARecentSuccessStatus is the success-side twin
+// of TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError: a freshly set
+// success status (e.g. Start/Stop or Restart's "…complete" message) must
+// also survive an immediate routine refresh instead of being stomped back
+// to "Docker connected" before it's readable — this is the bug reported
+// live as pressing Start/Stop being "a guessing game".
+func TestSuccessfulSnapshotHoldsARecentSuccessStatus(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = "start/stop complete", false
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+
+	if got.statusErr || got.status != "start/stop complete" {
+		t.Fatalf("status/statusErr = %q/%v, want the success message preserved across an immediate routine refresh", got.status, got.statusErr)
 	}
 }
 
@@ -4539,14 +4569,48 @@ func TestSuccessfulSnapshotStillUpdatesRoutineStatus(t *testing.T) {
 func TestSuccessfulSnapshotClearsAStaleErrorAfterTheHoldWindow(t *testing.T) {
 	model := testModel()
 	model.status, model.statusErr = "delete telegraf: compose file not found on jarvis", true
-	model.lastStatusErrText = model.status
-	model.statusErrSince = time.Now().Add(-statusErrMinHold - time.Second)
+	model.lastStatusText = model.status
+	model.statusSince = time.Now().Add(-statusHoldMinDuration - time.Second)
 
 	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
 	got := updated.(Model)
 
 	if got.statusErr || got.status != "Docker connected" {
 		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false once the hold window has passed", got.status, got.statusErr)
+	}
+}
+
+// TestActionSuccessSurvivesImmediateRoutineRefresh is an end-to-end
+// regression test for the bug reported live: pressing Start/Stop (or
+// Restart) on a container showed a "…complete" message for well under a
+// second because the routine refresh every action triggers (directly via
+// refreshCmd, and again ~250ms later from the resulting Docker event — see
+// eventRefreshTickCmd) unconditionally stomped it with "Docker connected"
+// the moment the next snapshot came back, often faster than a person could
+// read it.
+func TestActionSuccessSurvivesImmediateRoutineRefresh(t *testing.T) {
+	provider := newFakeProvider()
+	model := NewModel(provider)
+	model.snapshot = provider.snapshot
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.container != nil && row.container.ID.ID == "1" {
+			model.cursor = i
+			break
+		}
+	}
+
+	msg := runCmd(t, model.actionCmd("start-stop-container", "start/stop")).(actionDoneMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+	if model.statusErr || model.status != "start/stop complete" {
+		t.Fatalf("status/statusErr = %q/%v after action, want start/stop complete/false", model.status, model.statusErr)
+	}
+
+	updated, _ = model.Update(snapshotMsg{snapshot: provider.snapshot})
+	got := updated.(Model)
+	if got.statusErr || got.status != "start/stop complete" {
+		t.Fatalf("status/statusErr = %q/%v, want the success message preserved across an immediate routine refresh (this is the reported 'guessing game' bug)", got.status, got.statusErr)
 	}
 }
 

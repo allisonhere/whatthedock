@@ -239,6 +239,7 @@ func (noopProvider) Networks(context.Context) ([]domain.Network, error) {
 	panic("not implemented")
 }
 func (noopProvider) RemoveNetwork(context.Context, string) error { panic("not implemented") }
+func (noopProvider) CreateNetwork(context.Context, string) error { panic("not implemented") }
 func (noopProvider) Volumes(context.Context) ([]domain.Volume, error) {
 	panic("not implemented")
 }

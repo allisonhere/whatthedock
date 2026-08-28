@@ -26,6 +26,7 @@ import (
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/catalog"
+	"github.com/allisonhere/whatthedock/internal/clipboard"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 	"github.com/allisonhere/whatthedock/internal/systems"
@@ -76,6 +77,10 @@ const (
 	overlayVolumeCuration
 	overlayComposeCuration
 	overlayInspectorDetail
+	overlayPaste
+	overlayHostPowerConfirm
+	overlayHostPowerPassword
+	overlayHostPowerProgress
 )
 
 type createCatalogMode int
@@ -425,13 +430,14 @@ type Model struct {
 	appLogFile   *os.File
 	appLogScroll int
 
-	// lastStatusErrText/statusErrSince back the minimum-hold guard in the
-	// snapshotMsg handler: an error status must stay legible for at least
-	// statusErrMinHold, not just until the next routine refresh happens to
-	// land, but it also must not stick around forever once that window has
-	// passed — see the snapshotMsg case for how these get used.
-	lastStatusErrText string
-	statusErrSince    time.Time
+	// lastStatusText/statusSince back the minimum-hold guard in the
+	// snapshotMsg handler: an explicit status (success or error) must stay
+	// legible for at least statusHoldMinDuration, not just until the next
+	// routine refresh happens to land, but it also must not stick around
+	// forever once that window has passed — see the snapshotMsg case for
+	// how these get used.
+	lastStatusText string
+	statusSince    time.Time
 
 	commandFilter string
 	commandCursor int
@@ -445,8 +451,10 @@ type Model struct {
 	// otherwise the label of the settingsRowText/settingsRowSecretText row
 	// currently open for inline editing (AI model/API key/base URL — the
 	// only free-text rows in Settings). settingsEditDraft/settingsEditCursor
-	// back that in-progress edit the same way createCursor does for the
-	// Create form's text fields.
+	// back that in-progress edit with the same plain string+int cursor
+	// approach the Create form's text fields used before they moved to a
+	// real embedded editor (createFieldEditor) — Settings' fields haven't
+	// been migrated to that yet (see createFieldEditor's own doc comment).
 	settingsEditingField string
 	settingsEditDraft    string
 	settingsEditCursor   int
@@ -484,9 +492,27 @@ type Model struct {
 	copyCursor int
 	openCursor int
 
-	createDraft  createDraft
-	createField  createField
-	createCursor int
+	createDraft createDraft
+	// createField: every site that changes this to a new field (not just
+	// re-reading it) must call syncCreateFieldEditor right after — nothing
+	// re-seeds createFieldEditor to match the newly-focused field
+	// automatically. Every production call site already does this
+	// (moveCreateField, openCreateOverlayWithDraft, revalidateCreateField,
+	// the Ctrl+O/"o" browse shortcuts); a test that pokes this field
+	// directly to simulate navigation needs to call it too, or whatever it
+	// then types will go into a stale editor instead of the field it looks
+	// like it's editing.
+	createField createField
+	// createFieldEditor is a real ripple.Model backing whichever free-text
+	// create-form field (createField) is currently focused — the same
+	// component the Compose YAML editor and Inspector detail use, so these
+	// fields get a real terminal cursor, selection, and OS clipboard
+	// copy/paste instead of the plain string + spliced "|" caret this used
+	// to be. Re-seeded from createDraft's own field value every time focus
+	// moves to a (non-choice) field — see syncCreateFieldEditor — never
+	// itself the source of truth for the value (createDraft's plain string
+	// fields still are, exactly as before).
+	createFieldEditor ripple.Model
 
 	createBrowsing    bool
 	createBrowseDir   string
@@ -509,6 +535,31 @@ type Model struct {
 	createEditor         editorArea
 	createNotice         string
 	createNoticeErr      bool
+
+	// clipboard is the Container Clipboard's yank history (see
+	// internal/clipboard) — a plain Model field, so switching m.provider
+	// between systems (systemSwitchMsg) leaves it untouched for free; it's
+	// never persisted to disk, only for the life of this session.
+	clipboard clipboard.DeploymentClipboard
+	// pastePlan holds the in-progress paste being reviewed on
+	// overlayPaste — nil whenever that overlay isn't open.
+	pastePlan *clipboard.PastePlan
+
+	// hostPowerKind is which action overlayHostPowerConfirm/
+	// overlayHostPowerPassword concerns — set by openHostPowerConfirm
+	// right before opening the confirm overlay, and read again when the
+	// password overlay opens later in the same flow (see
+	// internal/ui/host_power.go).
+	hostPowerKind hostPowerKind
+	// hostPowerPassword is the in-app sudo password prompt's typed buffer
+	// (overlayHostPowerPassword) — never flows into m.status or anything
+	// recordAppLog persists; see host_power.go's clearPasswordBuffer for
+	// why this is a hand-rolled []rune, not the create-form's field
+	// editor.
+	hostPowerPassword []rune
+	// hostPowerPasswordError is the previous attempt's failure text,
+	// shown in the password overlay; empty on the very first prompt.
+	hostPowerPasswordError string
 
 	aboutFrame      int
 	aboutSpotlights []aboutSpotlight
@@ -795,6 +846,14 @@ type statsHistory struct {
 type actionDoneMsg struct {
 	label string
 	err   error
+	// skipRefresh opts out of the case's usual post-success m.refreshCmd()
+	// — for an action where refreshing immediately is actively wrong (a
+	// successful host shutdown/reboot, where the very next refresh attempt
+	// is expected to fail once the host actually goes down, stomping the
+	// success status with a misleading "Docker is unavailable"). Defaults
+	// false so every existing actionCmd caller (Restart, StartStop) is
+	// unaffected.
+	skipRefresh bool
 }
 
 type logsStartedMsg struct {
@@ -860,6 +919,10 @@ type createDoneMsg struct {
 	name   string
 	id     domain.ResourceID
 	edited bool
+	// pasted marks this as a Paste's apply result (see pasteApplyCmd,
+	// paste.go) — same message shape as a plain create/edit, just its own
+	// status wording ("pasted X" instead of "created X").
+	pasted bool
 	err    error
 	// project/service are set by the Compose create/adopt paths, which
 	// have no container ID to report here (see pendingSelectProject) —
@@ -947,6 +1010,7 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		storePassword:        systems.StorePassword,
 		forgetPassword:       systems.ForgetPassword,
 		passwordFor:          systems.PasswordFor,
+		clipboard:            clipboard.NewDeploymentClipboard(),
 	}
 	if settings.StartInDashboard {
 		m.overlay = overlayDashboard
@@ -1171,21 +1235,23 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A routine refresh (the 250ms-debounced re-snapshot after any
 		// Docker event — see eventRefreshTickCmd) fires after almost every
-		// action, including the action that just set an error status the
-		// user hasn't had a chance to read yet. Hold an error on screen for
-		// at least statusErrMinHold — long enough to actually read — instead
-		// of letting the very next routine refresh stomp it; an explicit
-		// action still overwrites m.status directly regardless of the hold,
-		// so a genuinely new event (retrying, a different action) always
-		// takes over immediately. Once the hold has passed, routine refreshes
-		// resume clearing it on their own — an error that's simply gone
-		// stale (the underlying problem was fixed some other way) doesn't
-		// stay pinned forever with no explicit action to clear it.
-		if m.statusErr && m.status != m.lastStatusErrText {
-			m.lastStatusErrText = m.status
-			m.statusErrSince = time.Now()
+		// action, including the action that just set a status (success or
+		// error) the user hasn't had a chance to read yet — e.g. Start/Stop
+		// and Restart's "…complete" message, which used to be stomped back
+		// to "Docker connected" within a fraction of a second. Hold any
+		// explicit status on screen for at least statusHoldMinDuration —
+		// long enough to actually read — instead of letting the very next
+		// routine refresh stomp it; an explicit action still overwrites
+		// m.status directly regardless of the hold, so a genuinely new event
+		// (retrying, a different action) always takes over immediately. Once
+		// the hold has passed, routine refreshes resume clearing it on their
+		// own — a status that's simply gone stale doesn't stay pinned
+		// forever with no explicit action to clear it.
+		if m.status != "Docker connected" && m.status != m.lastStatusText {
+			m.lastStatusText = m.status
+			m.statusSince = time.Now()
 		}
-		if !m.statusErr || time.Since(m.statusErrSince) >= statusErrMinHold {
+		if m.status == "Docker connected" || time.Since(m.statusSince) >= statusHoldMinDuration {
 			m.status, m.statusErr = "Docker connected", false
 		}
 		if !m.focusedTreeKey.valid {
@@ -1328,6 +1394,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusPulseTickMsg:
 		m.statusPulseFrame++
 		m.drainActionProgress()
+		m.tickHostPowerActionProgress()
 		if done, ready := m.tickCreateActionProgress(); ready {
 			return m.finishCreateDone(done)
 		}
@@ -1379,12 +1446,28 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionProgress = nil
 		m.actionProgressText = ""
 		m.actionProgressPercent = 0
+		if m.overlay == overlayHostPowerProgress {
+			m.overlay = overlayNone
+		}
 		if msg.err != nil {
 			m.status, m.statusErr = msg.label+": "+friendlyDockerError(msg.err), true
 		} else {
 			m.status, m.statusErr = msg.label+" complete", false
 		}
+		if msg.skipRefresh {
+			return m, nil
+		}
 		return m, m.refreshCmd()
+	case hostPowerNeedsPasswordMsg:
+		m.busy = false
+		m.actionProgress = nil
+		m.actionProgressText = ""
+		m.actionProgressPercent = 0
+		m.hostPowerKind = msg.kind
+		m.hostPowerPasswordError = msg.err.Error()
+		m.hostPowerPassword = clearPasswordBuffer(m.hostPowerPassword)
+		m.overlay = overlayHostPowerPassword
+		return m, nil
 	case updateCheckMsg:
 		m.updateChecking = false
 		m.updateLastCheck = time.Now()
@@ -1603,6 +1686,23 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.createEditingCompose {
 			m.cancelCreateEditor()
 		}
+		return m, nil
+	case yankDoneMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "yank: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.clipboard = m.clipboard.Yank(msg.pc)
+		m.status, m.statusErr = "yanked "+msg.pc.Name, false
+		return m, nil
+	case pastePlanMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "paste: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		plan := msg.plan
+		m.pastePlan = &plan
+		m.overlay = overlayPaste
 		return m, nil
 	case createOverrideCheckMsg:
 		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service && m.createDraft.ComposeFile == msg.base {
@@ -1976,6 +2076,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()
 		}
+	case "y":
+		// A project/folder row selected does nothing yet — reserved for a
+		// future whole-Compose-project yank (see internal/clipboard's own
+		// doc comment); a specific container is always yankable, compose-
+		// managed or not, since v1 clones its runtime config either way.
+		if selected := m.selectedContainer(); selected != nil {
+			return m, m.yankSelectedCmd(selected.ID)
+		}
+	case "P":
+		// Lowercase p is already "show problems" — P (still a real vim
+		// paste variant) is Paste instead. See internal/clipboard's paste
+		// review flow (paste.go).
+		return m, m.preparePastePlanCmd()
 	case "m":
 		// Selecting the project/folder row directly and pressing "m" is
 		// an unambiguous "edit the whole project" signal — no prompt, the
@@ -2179,6 +2292,12 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleComposeCurationKey(msg)
 	case overlayInspectorDetail:
 		return m.handleInspectorDetailKey(msg)
+	case overlayPaste:
+		return m.handlePasteKey(msg)
+	case overlayHostPowerConfirm:
+		return m.handleHostPowerConfirmKey(msg)
+	case overlayHostPowerPassword:
+		return m.handleHostPowerPasswordKey(msg)
 	}
 	return m, nil
 }
@@ -3242,6 +3361,12 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()
 		}
+	case actions.Yank:
+		if selected := m.selectedContainer(); selected != nil {
+			return m, m.yankSelectedCmd(selected.ID)
+		}
+	case actions.Paste:
+		return m, m.preparePastePlanCmd()
 	case actions.CurateImages:
 		return m.openImageCuration()
 	case actions.CurateNetworks:
@@ -3304,6 +3429,10 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		m.overlay = overlayCommandPalette
 		m.commandFilter = ""
 		m.commandCursor = 0
+	case actions.ShutdownHost:
+		return m.openHostPowerConfirm(hostPowerShutdown)
+	case actions.RebootHost:
+		return m.openHostPowerConfirm(hostPowerReboot)
 	case actions.Quit:
 		m.cleanup()
 		return m, tea.Quit
@@ -4920,10 +5049,11 @@ func tickAbout() tea.Cmd {
 	return tea.Tick(55*time.Millisecond, func(time.Time) tea.Msg { return aboutTickMsg{} })
 }
 
-// statusErrMinHold is how long an error status is guaranteed to stay on
-// screen before a routine refresh (see the snapshotMsg case) is allowed to
-// clear it back to "Docker connected" on its own.
-const statusErrMinHold = 6 * time.Second
+// statusHoldMinDuration is how long an explicit status (success or error)
+// is guaranteed to stay on screen before a routine refresh (see the
+// snapshotMsg case) is allowed to clear it back to "Docker connected" on
+// its own.
+const statusHoldMinDuration = 6 * time.Second
 
 // tickStatusPulse drives the status bar's breathing connected-dot. Unlike
 // tickAbout it isn't scoped to an overlay — it reschedules itself
@@ -4982,7 +5112,27 @@ func sendActionProgress(progress chan string, line string) {
 	}
 }
 
-const actionProgressStep = 5
+// The confirm-step progress bar is cosmetic — actionProgressText (from
+// drainActionProgress) is the only genuinely live signal; the percent
+// number is just pacing. It ramps quickly (actionProgressStep per tick)
+// up to actionProgressFastCap, so the common case — an action that
+// finishes in a couple of seconds — reads as smooth, brisk progress
+// instead of it looking stalled the whole time. Past that it slows to a
+// trickle (actionProgressTrickleStep every actionProgressTrickleEvery
+// ticks) up to actionProgressSoftCap, instead of freezing there: a slow
+// pull that runs well past the fast phase must keep visibly inching
+// forward, not sit at a number that looks finished when it isn't. It
+// never reaches 100 on its own — only a real createDoneMsg (handled
+// directly in Update, not gated on this percent at all) ever actually
+// closes the overlay, so nothing here can show "100%" while the action is
+// still genuinely running.
+const (
+	actionProgressStep         = 5
+	actionProgressFastCap      = 90
+	actionProgressTrickleStep  = 1
+	actionProgressTrickleEvery = 8
+	actionProgressSoftCap      = 99
+)
 
 // drainActionProgress does a single non-blocking receive per call (not
 // drain-to-empty like drainLogs) — progress is a "latest wins" display, not
@@ -4999,10 +5149,30 @@ func (m *Model) drainActionProgress() {
 			return
 		}
 		m.actionProgressText = line
-		if !(m.overlay == overlayCreate && m.createDraft.Confirming) {
+		if !(m.overlay == overlayCreate && m.createDraft.Confirming) && m.overlay != overlayHostPowerProgress {
 			m.status = line
 		}
 	default:
+	}
+}
+
+// tickHostPowerActionProgress is overlayHostPowerProgress's counterpart to
+// tickCreateActionProgress — same fast-ramp-then-trickle constants, but
+// without that function's createDoneReady/createDoneResult buffering:
+// host-power's progress text already changes per-container (genuinely
+// live, unlike a single opaque pull/create call), so there's no "flash to
+// 100% instantly" look worth smoothing over — the modal just closes the
+// instant the real actionDoneMsg/hostPowerNeedsPasswordMsg arrives,
+// whatever percent this cosmetically reached.
+func (m *Model) tickHostPowerActionProgress() {
+	if !(m.busy && m.overlay == overlayHostPowerProgress) {
+		return
+	}
+	switch {
+	case m.actionProgressPercent < actionProgressFastCap:
+		m.actionProgressPercent = min(actionProgressFastCap, m.actionProgressPercent+actionProgressStep)
+	case m.actionProgressPercent < actionProgressSoftCap && m.statusPulseFrame%actionProgressTrickleEvery == 0:
+		m.actionProgressPercent = min(actionProgressSoftCap, m.actionProgressPercent+actionProgressTrickleStep)
 	}
 }
 
@@ -5010,7 +5180,12 @@ func (m *Model) tickCreateActionProgress() (createDoneMsg, bool) {
 	if !(m.busy && m.overlay == overlayCreate && m.createDraft.Confirming) {
 		return createDoneMsg{}, false
 	}
-	m.actionProgressPercent = min(100, m.actionProgressPercent+actionProgressStep)
+	switch {
+	case m.actionProgressPercent < actionProgressFastCap:
+		m.actionProgressPercent = min(actionProgressFastCap, m.actionProgressPercent+actionProgressStep)
+	case m.actionProgressPercent < actionProgressSoftCap && m.statusPulseFrame%actionProgressTrickleEvery == 0:
+		m.actionProgressPercent = min(actionProgressSoftCap, m.actionProgressPercent+actionProgressTrickleStep)
+	}
 	if m.actionProgressPercent == 100 && m.createDoneReady {
 		done := m.createDoneResult
 		m.createDoneReady = false
@@ -5028,7 +5203,10 @@ func (m Model) finishCreateDone(msg createDoneMsg) (tea.Model, tea.Cmd) {
 	m.createDoneReady = false
 	m.createDoneResult = createDoneMsg{}
 	verb := "create"
-	if msg.edited {
+	switch {
+	case msg.pasted:
+		verb = "paste"
+	case msg.edited:
 		verb = "update"
 	}
 	if msg.err != nil {
@@ -5059,9 +5237,12 @@ func (m Model) finishCreateDone(msg createDoneMsg) (tea.Model, tea.Cmd) {
 		// either, land on the project row instead once refreshed.
 		m.pendingSelectProject = msg.project
 	}
-	if msg.edited {
+	switch {
+	case msg.pasted:
+		m.status, m.statusErr = "pasted "+msg.name, false
+	case msg.edited:
 		m.status, m.statusErr = "updated "+msg.name, false
-	} else {
+	default:
 		m.status, m.statusErr = "created "+msg.name, false
 	}
 	return m, m.refreshCmd()

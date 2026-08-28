@@ -145,6 +145,9 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	// this used to be built from.
 	left := backgroundSpan("  WHAT THE DOCK?!  ", noticeBG, noticeFG, statusBarBG, statusBarFG, true) +
 		"  " + m.provider.Host().Name + " "
+	if current, ok := m.clipboard.Current(); ok {
+		left += "[YANK: " + short(current.Name, 24) + "] "
+	}
 	right := fmt.Sprintf("Docker connected · %d stacks · %d containers · %d problems",
 		m.snapshotStackRowCount(), m.snapshotContainerCount(), len(m.snapshotProblems()))
 	if m.statusErr {
@@ -2634,6 +2637,14 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.composeCurationOverlay(renderer)
 	case overlayInspectorDetail:
 		return m.inspectorDetailOverlay(renderer)
+	case overlayPaste:
+		return m.pasteOverlay(renderer)
+	case overlayHostPowerConfirm:
+		return m.hostPowerConfirmOverlay(renderer)
+	case overlayHostPowerPassword:
+		return m.hostPowerPasswordOverlay(renderer)
+	case overlayHostPowerProgress:
+		return m.hostPowerProgressOverlay(renderer)
 	default:
 		return nil
 	}
@@ -2728,6 +2739,98 @@ func (m Model) deleteStackConfirmOverlay(renderer tideui.Renderer) *tideui.Overl
 		),
 	}, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "delete stack", Content: content, Width: width})
+	return &overlay
+}
+
+// hostPowerConfirmOverlay is the itemized shutdown/reboot confirm reached
+// via Ctrl-K — same "itemized detail + plain y/n" shape as
+// deleteStackConfirmOverlay above, naming exactly what's about to happen
+// (which running containers get stopped first, and what the host itself
+// then does) rather than a bare "are you sure".
+func (m Model) hostPowerConfirmOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	kind := m.hostPowerKind
+	host := m.provider.Host()
+	running := runningContainers(m.snapshot)
+	names := make([]string, 0, len(running))
+	for _, c := range running {
+		names = append(names, c.DisplayName())
+	}
+	var prompt string
+	if len(names) > 0 {
+		prompt = fmt.Sprintf("%s %q? This stops %d running container(s) (%s) first, then the host %s. This cannot be undone.",
+			kind.promptVerb(), host.Name, len(names), summarizeServiceNames(names, 6), kind.outcome())
+	} else {
+		prompt = fmt.Sprintf("%s %q? The host %s. This cannot be undone.", kind.promptVerb(), host.Name, kind.outcome())
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: kind.label()},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: kind.label(), Content: content, Width: width})
+	return &overlay
+}
+
+// hostPowerPasswordOverlay is the in-app sudo password prompt shown when
+// the non-interactive shutdown/reboot attempt needed one — plain text, no
+// ripple.Model involved (see handleHostPowerPasswordKey's doc comment for
+// why a password field never reuses that editor). Every typed character
+// renders as "•"; the raw buffer never appears here or anywhere else.
+func (m Model) hostPowerPasswordOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	kind := m.hostPowerKind
+	host := m.provider.Host()
+	lines := []string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(
+			fmt.Sprintf("Authenticating to %s %q — containers are already stopped.", kind.verb(), host.Name)),
+	}
+	if m.hostPowerPasswordError != "" {
+		lines = append(lines, renderer.Styles.DetailMeta.Width(contentWidth).Render("sudo: "+m.hostPowerPasswordError))
+	}
+	lines = append(lines,
+		"",
+		renderer.Styles.DetailMeta.Width(contentWidth).Render("password: "+strings.Repeat("•", len(m.hostPowerPassword))),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "enter", Label: "submit"},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
+		),
+	)
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "sudo password", Content: content, Width: width})
+	return &overlay
+}
+
+// hostPowerProgressOverlay stays open for the whole stop-containers-then-
+// run-shutdown sequence (and again during a password-authenticated retry)
+// — reuses createActionProgressView (internal/ui/create_view.go), the same
+// percentage-bar-plus-live-text building block the create-form's confirm
+// step already uses, driven here by tickHostPowerActionProgress instead of
+// tickCreateActionProgress. No y/n hints — nothing to confirm mid-flight,
+// matching how Replicate/Delete Stack's own busy state offers no cancel.
+func (m Model) hostPowerProgressOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	kind := m.hostPowerKind
+	host := m.provider.Host()
+	header := renderer.Styles.DetailMeta.Width(contentWidth).Render(
+		fmt.Sprintf("%s %q…", kind.progressVerb(), host.Name))
+	progressText := strings.TrimSpace(m.actionProgressText)
+	if progressText == "" {
+		progressText = "working…"
+	}
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		header,
+		"",
+		createActionProgressView(renderer, contentWidth, m.actionProgressPercent, progressText),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: kind.label(), Content: content, Width: width})
 	return &overlay
 }
 
@@ -3261,6 +3364,8 @@ var helpSections = []helpSection{
 			{"n", "create container or Compose service"},
 			{"m", "edit selected service; on stack row, edit whole stack"},
 			{"C", "clone selected container or Compose service under a new name"},
+			{"y", "Container Clipboard: yank selected container's configuration"},
+			{"P", "Container Clipboard: paste the yanked container onto this host"},
 			{"D", "delete selected container/service; stack row deletes stack + file"},
 			{"u", "replicate: pull latest image and recreate in place"},
 			{"c", "copy selected detail; inspector focus copies current row"},
@@ -3330,6 +3435,20 @@ var helpSections = []helpSection{
 			{"d", "delete selected removable items"},
 			{"y / Enter", "confirm curator deletion"},
 			{"n / Esc", "cancel curator deletion"},
+		},
+	},
+	{
+		// Container Clipboard: yank a container's configuration on one
+		// Docker host, switch to another configured system, paste it there.
+		// v1 clones configuration only — never volume/bind-mount data, and
+		// never touches the source container.
+		Title: "Container Clipboard",
+		Entries: []helpEntry{
+			{"y", "yank the selected container's configuration"},
+			{"P", "paste the yanked container onto the current host"},
+			{"Enter", "on the paste review screen: open it for editing before deploying"},
+			{"d", "on the paste review screen: deploy without further edits"},
+			{"Esc", "on the paste review screen: cancel (the clipboard item is kept)"},
 		},
 	},
 	{

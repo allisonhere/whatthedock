@@ -106,7 +106,18 @@ func (p *LocalProvider) Container(ctx context.Context, id domain.ResourceID) (do
 	if err != nil {
 		return domain.Container{}, err
 	}
-	return FromInspect(p.host.ID, inspect), nil
+	ctr := FromInspect(p.host.ID, inspect)
+	if inspect.Image != "" {
+		// Best-effort: a container's own inspect has no RepoDigests of its
+		// own (only its content-addressed image ID) — Paste's "image digest
+		// if available" needs the image's, so this is a second lookup.
+		// Never fails the container inspect itself if the image lookup
+		// doesn't work out (image since removed, digest never pulled, etc).
+		if imageInspect, err := p.cli.ImageInspect(ctx, inspect.Image); err == nil && len(imageInspect.RepoDigests) > 0 {
+			ctr.ImageDigest = imageInspect.RepoDigests[0]
+		}
+	}
+	return ctr, nil
 }
 
 func (p *LocalProvider) ContainerStats(ctx context.Context, id domain.ResourceID) (domain.ContainerStats, error) {
@@ -137,23 +148,55 @@ func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options 
 }
 
 func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
-	exposedPorts, portBindings, err := createPortBindings(spec.Ports)
+	exposedPorts, portBindings, err := createPortBindings(spec.Ports, spec.ExposedPorts)
 	if err != nil {
 		return domain.ResourceID{}, err
 	}
+	var healthcheck *container.HealthConfig
+	if spec.Healthcheck != nil {
+		healthcheck = &container.HealthConfig{
+			Test:        spec.Healthcheck.Test,
+			Interval:    spec.Healthcheck.Interval,
+			Timeout:     spec.Healthcheck.Timeout,
+			Retries:     spec.Healthcheck.Retries,
+			StartPeriod: spec.Healthcheck.StartPeriod,
+		}
+	}
 	resp, err := p.cli.ContainerCreate(ctx,
 		&container.Config{
+			Hostname:     spec.Hostname,
 			Image:        spec.Image,
 			Cmd:          spec.Command,
+			Entrypoint:   spec.Entrypoint,
 			Env:          spec.Env,
 			ExposedPorts: exposedPorts,
+			Labels:       spec.Labels,
+			WorkingDir:   spec.WorkingDir,
+			User:         spec.User,
+			StopSignal:   spec.StopSignal,
+			StopTimeout:  spec.StopTimeout,
+			Healthcheck:  healthcheck,
 		},
 		&container.HostConfig{
-			PortBindings:  portBindings,
-			Mounts:        createMounts(spec.Mounts),
-			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyMode(spec.RestartPolicy)},
+			PortBindings:   portBindings,
+			Mounts:         createMounts(spec.Mounts),
+			Tmpfs:          spec.Tmpfs,
+			RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyMode(spec.RestartPolicy)},
+			Privileged:     spec.Privileged,
+			CapAdd:         spec.CapAdd,
+			CapDrop:        spec.CapDrop,
+			DNS:            spec.DNS,
+			DNSSearch:      spec.DNSSearch,
+			ReadonlyRootfs: spec.ReadonlyRootfs,
+			SecurityOpt:    spec.SecurityOpt,
+			LogConfig:      container.LogConfig{Type: spec.LogDriver, Config: spec.LogOptions},
+			Resources: container.Resources{
+				Memory:   spec.MemoryBytes,
+				NanoCPUs: spec.NanoCPUs,
+				Devices:  createDevices(spec.Devices),
+			},
 		},
-		nil,
+		createNetworkingConfig(spec.Networks),
 		nil,
 		spec.Name,
 	)
@@ -181,7 +224,7 @@ func (p *LocalProvider) RenameContainer(ctx context.Context, id domain.ResourceI
 	return p.cli.ContainerRename(ctx, id.ID, name)
 }
 
-func createPortBindings(bindings []app.PortBinding) (nat.PortSet, nat.PortMap, error) {
+func createPortBindings(bindings []app.PortBinding, exposedOnly []app.ExposedPort) (nat.PortSet, nat.PortMap, error) {
 	exposed := nat.PortSet{}
 	ports := nat.PortMap{}
 	for _, binding := range bindings {
@@ -197,15 +240,28 @@ func createPortBindings(bindings []app.PortBinding) (nat.PortSet, nat.PortMap, e
 		}
 		ports[port] = append(ports[port], host)
 	}
+	for _, expose := range exposedOnly {
+		protocol := strings.TrimSpace(expose.Protocol)
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		exposed[nat.Port(fmt.Sprintf("%d/%s", expose.ContainerPort, protocol))] = struct{}{}
+	}
 	return exposed, ports, nil
 }
 
+// createMounts converts spec.Mounts to Docker mount points. binding.Type,
+// when set, is authoritative (see app.MountBinding's doc comment); the
+// absolute-path heuristic only covers the older callers that never set it.
 func createMounts(bindings []app.MountBinding) []mount.Mount {
 	mounts := make([]mount.Mount, 0, len(bindings))
 	for _, binding := range bindings {
-		mountType := mount.TypeVolume
-		if filepath.IsAbs(binding.Source) {
-			mountType = mount.TypeBind
+		mountType := mount.Type(binding.Type)
+		if mountType == "" {
+			mountType = mount.TypeVolume
+			if filepath.IsAbs(binding.Source) {
+				mountType = mount.TypeBind
+			}
 		}
 		mounts = append(mounts, mount.Mount{
 			Type:     mountType,
@@ -215,6 +271,39 @@ func createMounts(bindings []app.MountBinding) []mount.Mount {
 		})
 	}
 	return mounts
+}
+
+func createDevices(devices []domain.Device) []container.DeviceMapping {
+	if len(devices) == 0 {
+		return nil
+	}
+	out := make([]container.DeviceMapping, 0, len(devices))
+	for _, d := range devices {
+		out = append(out, container.DeviceMapping{
+			PathOnHost:        d.PathOnHost,
+			PathInContainer:   d.PathInContainer,
+			CgroupPermissions: d.CgroupPermissions,
+		})
+	}
+	return out
+}
+
+// createNetworkingConfig builds the *network.NetworkingConfig ContainerCreate
+// needs to actually attach non-default networks (and their aliases) at
+// create time — previously always nil, so a create never attached anything
+// but the implicit default bridge network. nil for zero networks (the
+// common, pre-existing case) rather than an empty-but-non-nil map, matching
+// what every caller that never sets spec.Networks already implicitly relied
+// on.
+func createNetworkingConfig(networks []app.NetworkAttachment) *networktypes.NetworkingConfig {
+	if len(networks) == 0 {
+		return nil
+	}
+	endpoints := make(map[string]*networktypes.EndpointSettings, len(networks))
+	for _, n := range networks {
+		endpoints[n.Name] = &networktypes.EndpointSettings{Aliases: append([]string(nil), n.Aliases...)}
+	}
+	return &networktypes.NetworkingConfig{EndpointsConfig: endpoints}
 }
 
 func FromStats(host domain.HostID, containerID string, stats container.StatsResponse) domain.ContainerStats {
@@ -407,6 +496,14 @@ func (p *LocalProvider) RemoveNetwork(ctx context.Context, id string) error {
 	return p.cli.NetworkRemove(ctx, id)
 }
 
+// CreateNetwork creates a plain user-defined bridge network by name — the
+// same shape `docker network create <name>` produces. Used by Paste when a
+// yanked container's network doesn't already exist on the destination host.
+func (p *LocalProvider) CreateNetwork(ctx context.Context, name string) error {
+	_, err := p.cli.NetworkCreate(ctx, name, networktypes.CreateOptions{})
+	return err
+}
+
 // Volumes cross-references VolumeList against a fresh ContainerList (whose
 // summary Mounts already carry each mount's Type and volume Name) to derive
 // InUse, rather than trusting VolumeList's own usage data, which Docker only
@@ -495,6 +592,17 @@ func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.C
 	if inspect.Config != nil {
 		ctr.Image = inspect.Config.Image
 		ctr.Env = append([]string(nil), inspect.Config.Env...)
+		ctr.Command = domain.JoinShellWords([]string(inspect.Config.Cmd))
+		ctr.Entrypoint = domain.JoinShellWords([]string(inspect.Config.Entrypoint))
+		ctr.Hostname = inspect.Config.Hostname
+		ctr.WorkingDir = inspect.Config.WorkingDir
+		ctr.User = inspect.Config.User
+		ctr.StopSignal = inspect.Config.StopSignal
+		ctr.StopTimeout = inspect.Config.StopTimeout
+		for port := range inspect.Config.ExposedPorts {
+			ctr.ExposedPorts = append(ctr.ExposedPorts, domain.Port{Private: uint16(port.Int()), Type: port.Proto()})
+		}
+		sort.Slice(ctr.ExposedPorts, func(i, j int) bool { return ctr.ExposedPorts[i].Private < ctr.ExposedPorts[j].Private })
 		if inspect.Config.Healthcheck != nil {
 			ctr.HealthCheck = &domain.HealthCheck{
 				Test:        append([]string(nil), inspect.Config.Healthcheck.Test...),
@@ -521,12 +629,40 @@ func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.C
 		}
 	}
 	if inspect.HostConfig != nil {
-		ctr.RestartPolicy = string(inspect.HostConfig.RestartPolicy.Name)
+		hc := inspect.HostConfig
+		ctr.RestartPolicy = string(hc.RestartPolicy.Name)
+		ctr.Privileged = hc.Privileged
+		ctr.CapAdd = append([]string(nil), []string(hc.CapAdd)...)
+		ctr.CapDrop = append([]string(nil), []string(hc.CapDrop)...)
+		ctr.MemoryBytes = hc.Memory
+		ctr.NanoCPUs = hc.NanoCPUs
+		ctr.DNS = append([]string(nil), hc.DNS...)
+		ctr.DNSSearch = append([]string(nil), hc.DNSSearch...)
+		ctr.ReadonlyRootfs = hc.ReadonlyRootfs
+		ctr.SecurityOpt = append([]string(nil), hc.SecurityOpt...)
+		ctr.LogDriver = hc.LogConfig.Type
+		if len(hc.LogConfig.Config) > 0 {
+			ctr.LogOptions = copyLabels(hc.LogConfig.Config)
+		}
+		if len(hc.Tmpfs) > 0 {
+			ctr.Tmpfs = copyLabels(hc.Tmpfs)
+		}
+		for _, d := range hc.Devices {
+			ctr.Devices = append(ctr.Devices, domain.Device{
+				PathOnHost:        d.PathOnHost,
+				PathInContainer:   d.PathInContainer,
+				CgroupPermissions: d.CgroupPermissions,
+			})
+		}
 	}
 	ctr.Mounts = fromMounts(inspect.Mounts)
 	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Networks != nil {
-		for name := range inspect.NetworkSettings.Networks {
+		ctr.NetworkAliases = map[string][]string{}
+		for name, ep := range inspect.NetworkSettings.Networks {
 			ctr.Networks = append(ctr.Networks, name)
+			if ep != nil && len(ep.Aliases) > 0 {
+				ctr.NetworkAliases[name] = append([]string(nil), ep.Aliases...)
+			}
 		}
 		sort.Strings(ctr.Networks)
 	}

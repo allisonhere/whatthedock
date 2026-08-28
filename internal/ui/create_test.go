@@ -178,6 +178,60 @@ func TestCreateConfirmOverlayRendersProgressWhileBusy(t *testing.T) {
 	}
 }
 
+// TestCreateActionProgressNeverClaims100PercentWhileStillBusy guards
+// against the cosmetic progress ticker reaching (and freezing at) 100%
+// while the real action is still running — a slow image pull used to look
+// finished for however much longer it actually took, since the ticker
+// ramped to 100% in a fixed ~3s (statusPulseTickMsg every 150ms,
+// actionProgressStep=5) regardless of real duration. It must keep visibly
+// climbing (the slow trickle phase) instead of sitting at a number that
+// reads as "done."
+func TestCreateActionProgressNeverClaims100PercentWhileStillBusy(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+
+	seenPastFastCap := false
+	for i := 0; i < 400; i++ {
+		updated, _ := model.Update(statusPulseTickMsg{})
+		model = updated.(Model)
+		if model.actionProgressPercent == 100 {
+			t.Fatalf("actionProgressPercent reached 100 at tick %d while still busy — the action never actually finished", i)
+		}
+		if model.actionProgressPercent > actionProgressFastCap {
+			seenPastFastCap = true
+		}
+	}
+	if !seenPastFastCap {
+		t.Fatalf("actionProgressPercent = %d after 400 ticks, want it to have climbed past the fast-phase cap (%d) via the trickle phase", model.actionProgressPercent, actionProgressFastCap)
+	}
+	if model.actionProgressPercent != actionProgressSoftCap {
+		t.Fatalf("actionProgressPercent = %d, want it parked at the soft cap (%d) for a long-running action", model.actionProgressPercent, actionProgressSoftCap)
+	}
+}
+
+// TestCreateActionProgressRampsQuicklyForTypicalActions makes sure the fix
+// above didn't slow down the common case: most actions finish in a couple
+// of seconds, and the bar should still read as brisk, smooth progress
+// during that window, not the slow trickle meant for a much longer pull.
+func TestCreateActionProgressRampsQuicklyForTypicalActions(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.openCreateOverlay()
+	model.createDraft.Mode = createModeStandalone
+	model.createDraft.Confirming = true
+	model.busy = true
+
+	for i := 0; i < 18; i++ {
+		updated, _ := model.Update(statusPulseTickMsg{})
+		model = updated.(Model)
+	}
+	if model.actionProgressPercent != actionProgressFastCap {
+		t.Fatalf("actionProgressPercent = %d after 18 ticks (~2.7s), want it to have reached the fast cap (%d)", model.actionProgressPercent, actionProgressFastCap)
+	}
+}
+
 func TestCreateDoneSuccessClosesImmediately(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
@@ -1301,8 +1355,17 @@ func TestCreateStandaloneTextFieldsStillAcceptO(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeStandalone
+	model.createDraft.ContainerName = "portainer"
 	model.createField = createFieldContainerName
-	model.createDraft.ContainerName = ""
+	// Setting createField directly (rather than through moveCreateField, as
+	// real navigation always does) skips the sync that seeds
+	// createFieldEditor from the field's actual current value — do it
+	// explicitly, matching what every real navigation path already does
+	// (see createField's own doc comment in model.go). Without this, "o"
+	// below would land in a stale, still-empty editor instead of the real
+	// "portainer" value, and still coincidentally produce "o" as long as
+	// nothing here already checked the *starting* value was preserved.
+	model.syncCreateFieldEditor()
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	model = updated.(Model)
@@ -1310,8 +1373,8 @@ func TestCreateStandaloneTextFieldsStillAcceptO(t *testing.T) {
 	if model.createBrowsing {
 		t.Fatal("createBrowsing = true in standalone mode, want typed text")
 	}
-	if model.createDraft.ContainerName != "o" {
-		t.Fatalf("ContainerName = %q, want typed o", model.createDraft.ContainerName)
+	if model.createDraft.ContainerName != "portainero" {
+		t.Fatalf("ContainerName = %q, want the existing value with a typed o appended", model.createDraft.ContainerName)
 	}
 }
 
