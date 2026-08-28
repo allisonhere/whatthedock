@@ -26,7 +26,12 @@ var (
 func main() {
 	demoMode := flag.Bool("demo", false, "run against WhatTheDock's built-in demo Docker environment")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	fakeVersion := flag.String("fake-version", "", "pretend this build is the given version instead of the real one — for testing the update-check flow (Settings > Check for update) without a real release build; the actual version is only ever set via cmd/release's ldflags, so an ordinary `go run`/`go build` always reports \"dev\", which update.IsNewer treats as never eligible for an update by design")
 	flag.Parse()
+
+	if *fakeVersion != "" {
+		version = *fakeVersion
+	}
 
 	if *showVersion {
 		fmt.Println(versionString())

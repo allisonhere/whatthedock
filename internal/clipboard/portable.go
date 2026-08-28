@@ -233,7 +233,7 @@ func (pc PortableContainer) ToCreateSpec() app.ContainerCreateSpec {
 		Hostname:       pc.Hostname,
 		WorkingDir:     pc.WorkingDir,
 		User:           pc.User,
-		Labels:         copyStringMap(pc.Labels),
+		Labels:         filterComposeIdentityLabels(pc.Labels),
 		RestartPolicy:  pc.RestartPolicy,
 		Privileged:     pc.Privileged,
 		CapAdd:         append([]string(nil), pc.CapAdd...),
@@ -322,4 +322,38 @@ func copyStringMap(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// composeIdentityLabelPrefix is Docker Compose's own label namespace —
+// project/service/config-files/container-number/oneoff/etc. — every one
+// of which describes a specific `docker compose` deployment, not anything
+// true of a container ToCreateSpec is about to create via a bare
+// CreateContainer call. Carrying these over verbatim on a paste (the
+// original bug: a container yanked from a Compose-managed source kept its
+// source's project/service/config_files labels after being pasted as a
+// plain standalone container elsewhere) makes the *new* container look
+// Compose-managed to anything that later inspects it — this app's own
+// docker.FromInspect included — routing an ordinary edit into the Adopt
+// flow for a base file that was never real to begin with.
+const composeIdentityLabelPrefix = "com.docker.compose."
+
+// filterComposeIdentityLabels drops any composeIdentityLabelPrefix key
+// from labels — everything else (including this app's own
+// com.whatthedock.* labels) passes through unchanged. Used only by
+// ToCreateSpec: FromContainer's own Labels copy is untouched, since that's
+// the full yanked record kept for reference, not what gets deployed.
+func filterComposeIdentityLabels(labels map[string]string) map[string]string {
+	copied := copyStringMap(labels)
+	if len(copied) == 0 {
+		return copied
+	}
+	for k := range copied {
+		if strings.HasPrefix(k, composeIdentityLabelPrefix) {
+			delete(copied, k)
+		}
+	}
+	if len(copied) == 0 {
+		return nil
+	}
+	return copied
 }

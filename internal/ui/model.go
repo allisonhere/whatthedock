@@ -1733,6 +1733,8 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.createDraft.OverrideRawBase = false
 				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
+			} else if msg.baseFileMissing {
+				m.backfillAdoptDraft(m.selectedContainer())
 			}
 		}
 		return m, nil

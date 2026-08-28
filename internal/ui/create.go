@@ -118,6 +118,15 @@ type createDraft struct {
 	// merge/override path: writes a brand-new base file with the draft's
 	// current definition instead of requiring one to already exist.
 	BaseFileMissing bool
+
+	// Labels is only ever populated by backfillAdoptDraft, from the live
+	// container's own real Docker labels, when BaseFileMissing's Adopt
+	// path is about to generate a compose file from scratch (see that
+	// function's doc comment). Not user-editable, not shown on the form —
+	// composeOverrideContent reads it to detect a paste-redirect
+	// placeholder mount (clipboard.BindRedirectLabelPrefix) so it can be
+	// commented out instead of emitted as if it were real.
+	Labels map[string]string
 }
 
 type composeCreateSpec struct {
@@ -227,6 +236,9 @@ func (m *Model) openEditOverlay() tea.Cmd {
 		m.openCreateOverlayWithDraft(m.selectionCreateDraft())
 		m.createDraft.Editing = true
 		cmd := m.checkComposeOverrideCmd()
+		if m.createDraft.BaseFileMissing && !m.createDraft.OverrideRawSet {
+			m.backfillAdoptDraft(selected)
+		}
 		if m.createDraft.OverrideRawSet {
 			return cmd
 		}
@@ -236,6 +248,33 @@ func (m *Model) openEditOverlay() tea.Cmd {
 	m.createDraft.Editing = true
 	m.status, m.statusErr = "edit draft ready for "+selected.DisplayName(), false
 	return nil
+}
+
+// backfillAdoptDraft populates Command/Ports/Mounts/Env/Restart/Labels
+// from selected's live state onto m.createDraft — called only when the
+// Adopt path (BaseFileMissing, no on-disk override found either) is about
+// to generate a brand-new compose file from scratch. selectionCreateDraft
+// deliberately leaves these blank for the normal edit path, where the
+// real on-disk override/base file is the source of truth instead (see its
+// own doc comment) — but there is no on-disk file to load here, so without
+// this, composeOverrideContent generated a file with only Image/Restart
+// populated, silently dropping ports, mounts, env, and command. Labels
+// comes from the container's real Docker labels (not the draft's own
+// state, which has none) so composeOverrideContent can detect a
+// paste-redirect placeholder mount (clipboard.BindRedirectLabelPrefix)
+// and comment it out instead of emitting it as if it were real.
+func (m *Model) backfillAdoptDraft(selected *domain.Container) {
+	if selected == nil {
+		return
+	}
+	m.createDraft.Command = selected.Command
+	m.createDraft.Ports = formatDraftPorts(selected.Ports)
+	m.createDraft.Mounts = formatDraftMounts(selected.Mounts)
+	m.createDraft.Env = formatEnvEntries(selected.Env)
+	if rp := strings.TrimSpace(selected.RestartPolicy); rp != "" {
+		m.createDraft.Restart = rp
+	}
+	m.createDraft.Labels = selected.Labels
 }
 
 func batchCreateCmds(cmds ...tea.Cmd) tea.Cmd {
@@ -1790,9 +1829,46 @@ func (d createDraft) composeOverrideContent() string {
 		lines = append(lines, "    command: "+strconv.Quote(command))
 	}
 	lines = appendQuotedYAMLList(lines, "    ports:", splitDraftList(d.Ports), "      - ")
-	lines = appendQuotedYAMLList(lines, "    volumes:", splitDraftList(d.Mounts), "      - ")
+	if mounts, err := parseCreateMounts(d.Mounts); err == nil && len(mounts) > 0 {
+		lines = append(lines, "    volumes:")
+		lines = append(lines, composeVolumeLines(mounts, d.Labels)...)
+	}
 	lines = appendQuotedYAMLList(lines, "    environment:", splitEnvEntries(d.Env), "      - ")
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// formatMountEntry renders one mount as "source:destination[:ro]" — the
+// single shared convention every Mounts-field display uses (this
+// function, and paste.go's formatSpecMounts).
+func formatMountEntry(m app.MountBinding) string {
+	entry := m.Source + ":" + m.Destination
+	if m.ReadOnly {
+		entry += ":ro"
+	}
+	return entry
+}
+
+// composeVolumeLines renders composeOverrideContent's "volumes:" entries.
+// A mount whose destination carries a paste-redirect placeholder label
+// (clipboard.BindRedirectLabelPrefix — set when "t" redirected a missing
+// bind-mount source during a paste; see clipboard.RedirectMissingBindMounts)
+// is commented out with a brief explanation instead of emitted live: the
+// placeholder directory is empty, so baking it into a compose file as if
+// it were the real path would be silently wrong the moment someone
+// actually deploys from it. labels is nil for every draft that never went
+// through backfillAdoptDraft, in which case every mount renders live,
+// identical to before this existed.
+func composeVolumeLines(mounts []app.MountBinding, labels map[string]string) []string {
+	lines := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		quoted := strconv.Quote(formatMountEntry(m))
+		if original, ok := labels[clipboard.BindRedirectLabelPrefix+m.Destination]; ok {
+			lines = append(lines, "      # - "+quoted+"  # placeholder — original was "+original+", set the real path before using")
+			continue
+		}
+		lines = append(lines, "      - "+quoted)
+	}
+	return lines
 }
 
 func appendQuotedYAMLList(lines []string, title string, values []string, prefix string) []string {

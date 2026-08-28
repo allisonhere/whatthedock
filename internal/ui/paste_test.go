@@ -488,6 +488,57 @@ func TestPastePreservesCommandArgumentContainingSpace(t *testing.T) {
 	}
 }
 
+// TestPasteStripsSourceComposeIdentityLabels is a regression test for a
+// real bug found live: pasting a container whose source was Compose-
+// managed carried its com.docker.compose.* labels onto the new standalone
+// container, making it look Compose-managed on the destination too (with
+// a config_files path that was never real there) — which routed an
+// ordinary later edit into the confusing "Adopt out of Portainer" flow
+// instead of a plain standalone edit. See
+// clipboard.TestToCreateSpecStripsComposeIdentityLabels for the underlying
+// unit test; this confirms it holds through the full paste flow.
+func TestPasteStripsSourceComposeIdentityLabels(t *testing.T) {
+	source := pasteSourceProvider()
+	ctr := source.containers["src-1"]
+	ctr.Compose = domain.ComposeRef{Project: "media", Service: "radarr", ConfigFiles: "/srv/media/compose.yml"}
+	ctr.Labels = map[string]string{
+		"com.docker.compose.project":              "media",
+		"com.docker.compose.service":              "radarr",
+		"com.docker.compose.project.config_files": "/srv/media/compose.yml",
+		"maintainer": "linuxserver.io",
+	}
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if model.statusErr {
+		t.Fatalf("paste failed: %s", model.status)
+	}
+	if len(dest.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one", dest.creates)
+	}
+	for key := range dest.creates[0].Labels {
+		if strings.HasPrefix(key, "com.docker.compose.") {
+			t.Fatalf("created spec labels = %#v, want no com.docker.compose.* keys", dest.creates[0].Labels)
+		}
+	}
+	if dest.creates[0].Labels["maintainer"] != "linuxserver.io" {
+		t.Fatalf("created spec labels = %#v, want the non-compose label preserved", dest.creates[0].Labels)
+	}
+}
+
 // TestRedirectMissingBindMountsUnblocksLocalDeploy drives "t" end to end
 // against a local destination: a bind-path conflict that would otherwise
 // refuse "d" gets redirected to a real placeholder directory this test can

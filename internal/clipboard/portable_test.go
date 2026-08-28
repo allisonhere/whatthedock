@@ -181,6 +181,39 @@ func TestToCreateSpecPreservesCommandEntrypointRestartPolicy(t *testing.T) {
 	}
 }
 
+// TestToCreateSpecStripsComposeIdentityLabels is a regression test for a
+// real bug reported live: pasting a container whose *source* was
+// Compose-managed carried its com.docker.compose.* labels straight onto
+// the new standalone container, making it look Compose-managed on the
+// destination too — with a config_files path that was never real there —
+// which routed an ordinary later edit into the Adopt flow instead of a
+// plain standalone edit. Every other label (the app's own
+// com.whatthedock.* ones included) must still survive.
+func TestToCreateSpecStripsComposeIdentityLabels(t *testing.T) {
+	ctr := fullInspectContainer()
+	ctr.Labels = map[string]string{
+		"maintainer":                                         "linuxserver.io",
+		"com.docker.compose.project":                         "media",
+		"com.docker.compose.service":                         "radarr",
+		"com.docker.compose.project.config_files":            "/srv/media/compose.yml",
+		"com.whatthedock.paste.original-bind-source:/config": "/srv/media/radarr",
+	}
+	pc := FromContainer(ctr, domain.Host{ID: "h", Name: "h"})
+	spec := pc.ToCreateSpec()
+
+	for key := range spec.Labels {
+		if strings.HasPrefix(key, "com.docker.compose.") {
+			t.Fatalf("spec.Labels = %#v, want no com.docker.compose.* keys", spec.Labels)
+		}
+	}
+	if spec.Labels["maintainer"] != "linuxserver.io" {
+		t.Fatalf("spec.Labels[maintainer] = %q, want it preserved", spec.Labels["maintainer"])
+	}
+	if spec.Labels["com.whatthedock.paste.original-bind-source:/config"] != "/srv/media/radarr" {
+		t.Fatalf("spec.Labels = %#v, want the whatthedock label preserved", spec.Labels)
+	}
+}
+
 func TestToCreateSpecConvertsMountsBindVolumeTmpfs(t *testing.T) {
 	pc := FromContainer(fullInspectContainer(), domain.Host{ID: "h", Name: "h"})
 	spec := pc.ToCreateSpec()

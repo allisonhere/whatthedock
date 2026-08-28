@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/catalog"
+	"github.com/allisonhere/whatthedock/internal/clipboard"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 )
@@ -2316,6 +2318,38 @@ func TestCreateEditorOpensPrefilledWithGeneratedYAML(t *testing.T) {
 	}
 }
 
+// TestComposeOverrideContentCommentsOutPlaceholderMount is a regression
+// test for the user's explicit ask: once the Adopt flow includes mounts
+// at all (see TestAdoptFlowBackfillsPortsMountsEnvCommandLocally), a
+// mount that's a paste-redirect placeholder (clipboard.
+// RedirectMissingBindMounts's label — see last session's "t" feature)
+// must render commented out with the original path named, not as a live
+// volume line silently pointing at an empty directory. A normal mount
+// with no such label must render exactly as before.
+func TestComposeOverrideContentCommentsOutPlaceholderMount(t *testing.T) {
+	draft := createDraft{
+		Mode:    createModeCompose,
+		Service: "shelfmark",
+		Image:   "ghcr.io/calibrain/shelfmark:latest",
+		Restart: "unless-stopped",
+		Mounts:  "/home/user/.local/share/whatthedock/paste-placeholders/shelfmark/config:/config, /srv/media/books:/books",
+		Labels: map[string]string{
+			clipboard.BindRedirectLabelPrefix + "/config": "/srv/media/shelfmark/config",
+		},
+	}
+	content := draft.composeOverrideContent()
+
+	if !strings.Contains(content, `# - "/home/user/.local/share/whatthedock/paste-placeholders/shelfmark/config:/config"  # placeholder — original was /srv/media/shelfmark/config, set the real path before using`) {
+		t.Fatalf("content missing the commented placeholder line:\n%s", content)
+	}
+	if !strings.Contains(content, `      - "/srv/media/books:/books"`) {
+		t.Fatalf("content missing the normal, live mount line:\n%s", content)
+	}
+	if strings.Contains(content, `      - "/home/user/.local/share/whatthedock/paste-placeholders`) {
+		t.Fatalf("placeholder mount rendered live instead of commented out:\n%s", content)
+	}
+}
+
 func TestCreateEditorIgnoredInStandaloneMode(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.openCreateOverlay()
@@ -2922,7 +2956,7 @@ func TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere(t *testing.T) {
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	model = updated.(Model)
 
-	if model.createDraft != before {
+	if !reflect.DeepEqual(model.createDraft, before) {
 		t.Fatalf("draft changed after a stray '/' on the Mode field: before=%#v after=%#v", before, model.createDraft)
 	}
 }
@@ -3176,6 +3210,70 @@ func TestOpenCreateOverlayFlagsMissingBaseFileLocally(t *testing.T) {
 
 	if !model.createDraft.BaseFileMissing {
 		t.Fatal("BaseFileMissing = false, want true for a nonexistent base file")
+	}
+}
+
+// TestAdoptFlowBackfillsPortsMountsEnvCommandLocally is a regression test
+// for a real bug found live: adopting a container whose base compose file
+// doesn't exist (BaseFileMissing) used to generate an override with only
+// Image/Restart populated, silently dropping ports, mounts, env, and
+// command — selectionCreateDraft deliberately leaves those blank for the
+// normal edit path (where the real on-disk override is the source of
+// truth instead), but there is no on-disk file to load when the base file
+// is missing. backfillAdoptDraft must fill them in from the live
+// container instead.
+func TestAdoptFlowBackfillsPortsMountsEnvCommandLocally(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "does-not-exist.yml")
+
+	model := modelSelecting("media", "shelfmark", base)
+	model.selected.Ports = []domain.Port{{IP: "0.0.0.0", Private: 8788, Public: 8788, Type: "tcp"}}
+	model.selected.Mounts = []domain.Mount{{Source: "/srv/media/shelfmark", Destination: "/config", ReadWrite: true}}
+	model.selected.Env = []string{"PUID=1000"}
+	model.selected.RestartPolicy = "unless-stopped"
+	model.selected.Command = "run --flag"
+	model.openEditOverlay()
+
+	if !model.createDraft.BaseFileMissing {
+		t.Fatal("BaseFileMissing = false, want true — this test requires the Adopt path")
+	}
+	if model.createDraft.Command != "run --flag" {
+		t.Fatalf("Command = %q, want run --flag", model.createDraft.Command)
+	}
+	if !strings.Contains(model.createDraft.Ports, "8788") {
+		t.Fatalf("Ports = %q, want it to carry the live container's 8788 binding", model.createDraft.Ports)
+	}
+	if !strings.Contains(model.createDraft.Mounts, "/srv/media/shelfmark") {
+		t.Fatalf("Mounts = %q, want it to carry the live container's bind mount", model.createDraft.Mounts)
+	}
+	if !strings.Contains(model.createDraft.Env, "PUID=1000") {
+		t.Fatalf("Env = %q, want it to carry the live container's env", model.createDraft.Env)
+	}
+	if model.createDraft.Restart != "unless-stopped" {
+		t.Fatalf("Restart = %q, want unless-stopped", model.createDraft.Restart)
+	}
+}
+
+// TestAdoptFlowBackfillsOverSSH is the SSH/async counterpart — the same
+// backfill has to happen again from createOverrideCheckMsg, since the
+// local synchronous check in openEditOverlay never runs for an SSH system
+// (see checkComposeOverrideCmd).
+func TestAdoptFlowBackfillsOverSSH(t *testing.T) {
+	model := modelSelecting("media", "shelfmark", "/srv/media/compose.yml")
+	model.selected.Mounts = []domain.Mount{{Source: "/srv/media/shelfmark", Destination: "/config", ReadWrite: true}}
+	model.systems = []config.System{{ID: "remote", Name: "jarvis", Kind: "ssh", SSHHost: "jarvis", RemoteSocket: "/var/run/docker.sock", LocalSocket: "/tmp/whatthedock.sock"}}
+	model.activeSystem = "remote"
+	model.openCreateOverlayWithDraft(model.selectionCreateDraft())
+	model.createDraft.Editing = true
+
+	updated, _ := model.Update(createOverrideCheckMsg{
+		service: model.createDraft.Service, base: model.createDraft.ComposeFile,
+		baseFileMissing: true, found: false,
+	})
+	model = updated.(Model)
+
+	if !strings.Contains(model.createDraft.Mounts, "/srv/media/shelfmark") {
+		t.Fatalf("Mounts = %q, want it backfilled from the live container over the SSH path too", model.createDraft.Mounts)
 	}
 }
 

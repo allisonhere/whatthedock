@@ -336,11 +336,7 @@ func formatSpecPorts(ports []app.PortBinding) string {
 func formatSpecMounts(mounts []app.MountBinding) string {
 	parts := make([]string, 0, len(mounts))
 	for _, mnt := range mounts {
-		entry := mnt.Source + ":" + mnt.Destination
-		if mnt.ReadOnly {
-			entry += ":ro"
-		}
-		parts = append(parts, entry)
+		parts = append(parts, formatMountEntry(mnt))
 	}
 	return strings.Join(parts, ", ")
 }
