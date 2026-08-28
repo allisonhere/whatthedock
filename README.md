@@ -129,6 +129,7 @@ That is usually faster than remembering every key.
 | `e` / `w` / `i` / `a` in Logs | Show errors, warnings, info, or all log lines |
 | `f` / `End` in Logs | Jump to the end and follow live output |
 | `Home` / `PgUp` / `PgDn` in Logs | Move through log history |
+| `c` in Logs | Copy all currently visible (filtered) log lines to the clipboard |
 | `Esc` in Logs | Clear the active log filter |
 | `p` | Show problems |
 | `a` in Problems | Ask the configured AI provider to analyze the selected problem |
