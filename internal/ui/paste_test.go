@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/allisonhere/whatthedock/internal/clipboard"
+	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
 )
 
@@ -482,5 +485,168 @@ func TestPastePreservesCommandArgumentContainingSpace(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("Command = %#v, want %#v", got, want)
 		}
+	}
+}
+
+// TestRedirectMissingBindMountsUnblocksLocalDeploy drives "t" end to end
+// against a local destination: a bind-path conflict that would otherwise
+// refuse "d" gets redirected to a real placeholder directory this test can
+// see on disk, labeled with the original path, and the paste then deploys
+// successfully.
+func TestRedirectMissingBindMountsUnblocksLocalDeploy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	source := pasteSourceProvider()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	ctr := source.containers["src-1"]
+	ctr.Mounts = append(ctr.Mounts, domain.Mount{Type: "bind", Source: missing, Destination: "/config-extra", ReadWrite: true})
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	if !model.pastePlan.Blocked() {
+		t.Fatal("Blocked() = false, want true before redirecting")
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if model.statusErr {
+		t.Fatalf("redirect failed: %s", model.status)
+	}
+	if model.pastePlan.Blocked() {
+		t.Fatalf("Blocked() = true, want false after redirecting: %#v", model.pastePlan.Conflicts)
+	}
+	var placeholder string
+	for _, m := range model.pastePlan.Spec.Mounts {
+		if m.Destination == "/config-extra" {
+			placeholder = m.Source
+		}
+	}
+	if placeholder == "" || placeholder == missing {
+		t.Fatalf("mount source = %q, want it redirected away from %q", placeholder, missing)
+	}
+	if info, err := os.Stat(placeholder); err != nil || !info.IsDir() {
+		t.Fatalf("placeholder directory %q does not exist on disk: %v", placeholder, err)
+	}
+	if got := model.pastePlan.Spec.Labels[clipboard.BindRedirectLabelPrefix+"/config-extra"]; got != missing {
+		t.Fatalf("label = %q, want the original path %q", got, missing)
+	}
+
+	// A second "t" press finds nothing left to redirect.
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("second t press returned a cmd, want an immediate no-op (nothing to redirect)")
+	}
+	if model.statusErr || !strings.Contains(model.status, "nothing to redirect") {
+		t.Fatalf("status/statusErr = %q/%v, want an informational 'nothing to redirect'", model.status, model.statusErr)
+	}
+
+	// The previously-blocking deploy now proceeds.
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg = runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+	if model.statusErr {
+		t.Fatalf("paste failed after redirect: %s", model.status)
+	}
+	if len(dest.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one", dest.creates)
+	}
+	if dest.creates[0].Labels[clipboard.BindRedirectLabelPrefix+"/config-extra"] != missing {
+		t.Fatalf("created container's labels = %#v, want the original path preserved", dest.creates[0].Labels)
+	}
+}
+
+// TestRedirectMissingBindMountsShowsConfirmReminder is a regression test
+// for the "restate it right before deploying" addition: a one-time status
+// line after "t" is easy to lose by the time the confirm step actually
+// shows, so the confirm prompt itself must name how many mounts are
+// currently placeholders.
+func TestRedirectMissingBindMountsShowsConfirmReminder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	source := pasteSourceProvider()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	ctr := source.containers["src-1"]
+	ctr.Mounts = append(ctr.Mounts, domain.Mount{Type: "bind", Source: missing, Destination: "/config-extra", ReadWrite: true})
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // review/fix -> opens the create form
+	model = updated.(Model)
+	model.createDraft.Confirming = true
+	model.width, model.height = 100, 40
+
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "1 bind mount(s) are placeholders") {
+		t.Fatalf("confirm view missing the placeholder reminder:\n%s", view)
+	}
+}
+
+func TestRedirectMissingBindMountsOverSSHResolvesHomeAndCreatesDirectory(t *testing.T) {
+	fake := withFakeSSHRun(t)
+	fake.respond("echo $HOME", "/home/allie\n", nil)
+
+	source := pasteSourceProvider()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	fake.respond("test -e '"+missing+"'", "", errors.New("no such file or directory"))
+	ctr := source.containers["src-1"]
+	ctr.Mounts = append(ctr.Mounts, domain.Mount{Type: "bind", Source: missing, Destination: "/config-extra", ReadWrite: true})
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model.systems = []config.System{{ID: "jarvis", Name: "jarvis", Kind: "ssh", SSHHost: "jarvis"}}
+	model.activeSystem = "jarvis"
+	model = openPasteReview(t, model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if model.statusErr {
+		t.Fatalf("redirect failed: %s", model.status)
+	}
+	wantDir := "/home/allie/.local/share/whatthedock/paste-placeholders/radarr/config-extra"
+	found := false
+	for _, call := range fake.calls {
+		if call == "mkdir -p "+"'"+wantDir+"'" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ssh calls = %#v, want a quoted mkdir -p for %q", fake.calls, wantDir)
+	}
+	if got := model.pastePlan.Spec.Labels[clipboard.BindRedirectLabelPrefix+"/config-extra"]; got != missing {
+		t.Fatalf("label = %q, want the original path %q", got, missing)
 	}
 }

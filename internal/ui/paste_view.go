@@ -44,14 +44,18 @@ func (m Model) pasteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		lines = append(lines, renderer.Styles.StatusError.Width(contentWidth).Render("blocking conflict(s) above must be fixed before deploying"))
 		lines = append(lines, "")
 	}
+	hints := []tideui.SoftHint{
+		{Key: "enter", Label: "review / fix"},
+		{Key: "d", Label: "deploy"},
+	}
+	if hasBlockingBindPathConflict(plan) {
+		hints = append(hints, tideui.SoftHint{Key: "t", Label: "redirect missing paths to a placeholder"})
+	}
+	hints = append(hints, tideui.SoftHint{Key: "esc", Label: "cancel"})
 	lines = append(lines,
 		renderer.Styles.DetailMeta.Width(contentWidth).Render("configuration clone — volume/bind-mount data is not copied"),
 		"",
-		renderer.RenderSoftHints(contentWidth,
-			tideui.SoftHint{Key: "enter", Label: "review / fix"},
-			tideui.SoftHint{Key: "d", Label: "deploy"},
-			tideui.SoftHint{Key: "esc", Label: "cancel"},
-		),
+		renderer.RenderSoftHints(contentWidth, hints...),
 	)
 
 	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))

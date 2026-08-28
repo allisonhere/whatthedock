@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -136,8 +137,157 @@ func (m Model) handlePasteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.validateCreateDraft() {
 			m.createDraft.Confirming = true
 		}
+	case "t":
+		if !hasBlockingBindPathConflict(plan) {
+			m.status, m.statusErr = "nothing to redirect — no missing bind-mount paths", false
+			return m, nil
+		}
+		return m, m.redirectMissingBindMountsCmd(plan)
 	}
 	return m, nil
+}
+
+// hasBlockingBindPathConflict reports whether plan has at least one
+// bind-mount source Docker would refuse to create against — the "t" hint
+// on the review screen (and "t" itself) are both gated on this, so
+// pressing it with nothing to do is a clean no-op rather than a wasted
+// round trip.
+func hasBlockingBindPathConflict(plan clipboard.PastePlan) bool {
+	for _, c := range plan.Conflicts {
+		if c.Kind == "bind-path" && c.Severity == clipboard.SeverityBlock {
+			return true
+		}
+	}
+	return false
+}
+
+// bindRedirectDoneMsg carries the result of redirectMissingBindMountsCmd
+// back into Update.
+type bindRedirectDoneMsg struct {
+	plan       clipboard.PastePlan
+	redirected int
+	failed     []string
+	err        error
+}
+
+// redirectMissingBindMountsCmd is "t" on the paste review screen: for
+// every blocking bind-path conflict, creates a placeholder directory under
+// ~/.local/share/whatthedock/paste-placeholders/<container>/<mount> on the
+// real destination (local mkdir, or the same sshRun seam every other
+// remote operation in create.go already uses) and hands the ones that
+// actually succeeded to clipboard.RedirectMissingBindMounts — a mount
+// whose directory creation fails is left blocking, with the failure
+// reason reported, rather than silently treated as redirected.
+func (m Model) redirectMissingBindMountsCmd(plan clipboard.PastePlan) tea.Cmd {
+	system := m.activeSystemConfig()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		home, err := homeDirOn(ctx, system)
+		if err != nil {
+			return bindRedirectDoneMsg{err: fmt.Errorf("resolving home directory on %s: %w", plan.TargetHost.Name, err)}
+		}
+		placeholders := map[string]string{}
+		var failed []string
+		for _, c := range plan.Conflicts {
+			if c.Kind != "bind-path" || c.Severity != clipboard.SeverityBlock {
+				continue
+			}
+			destination := bindMountDestinationForSource(plan.Spec.Mounts, c.Detail)
+			if destination == "" {
+				continue
+			}
+			placeholder := filepath.Join(home, ".local/share/whatthedock/paste-placeholders",
+				sanitizePathSegment(plan.Spec.Name), sanitizePathSegment(destination))
+			if err := mkdirOn(ctx, system, placeholder); err != nil {
+				failed = append(failed, c.Detail+": "+err.Error())
+				continue
+			}
+			placeholders[destination] = placeholder
+		}
+		redirects := clipboard.RedirectMissingBindMounts(&plan, placeholders)
+		return bindRedirectDoneMsg{plan: plan, redirected: len(redirects), failed: failed}
+	}
+}
+
+// bindMountDestinationForSource finds the container-side path for the
+// bind mount whose (original, pre-redirect) Source is source — the join
+// between a "bind-path" conflict (which only ever records the source, via
+// BindPathConflict's Detail) and the mount it came from, so
+// redirectMissingBindMountsCmd can key its placeholders map by
+// Destination the way clipboard.RedirectMissingBindMounts expects.
+func bindMountDestinationForSource(mounts []app.MountBinding, source string) string {
+	for _, m := range mounts {
+		if m.Type == "bind" && m.Source == source {
+			return m.Destination
+		}
+	}
+	return ""
+}
+
+// sanitizePathSegment flattens value into one filesystem-safe path
+// component — a mount destination like "/data/movies" becomes
+// "data-movies" rather than nesting two more directories under the
+// placeholder root.
+func sanitizePathSegment(value string) string {
+	value = strings.Trim(value, "/")
+	value = strings.ReplaceAll(value, "/", "-")
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "mount"
+	}
+	return value
+}
+
+// homeDirOn resolves system's home directory — os.UserHomeDir() locally,
+// or "echo $HOME" over the existing sshRun seam remotely, since a
+// placeholder mount source must be an absolute path Docker can use
+// directly (unlike a shell command, Docker's API never expands "~"
+// itself).
+func homeDirOn(ctx context.Context, system config.System) (string, error) {
+	if system.Kind == "ssh" {
+		output, err := sshRun(ctx, system, "echo $HOME", "")
+		if err != nil {
+			return "", err
+		}
+		home := strings.TrimSpace(string(output))
+		if home == "" {
+			return "", errors.New("remote $HOME is empty")
+		}
+		return home, nil
+	}
+	return os.UserHomeDir()
+}
+
+// mkdirOn creates path (and any missing parents) on system — local
+// os.MkdirAll, or "mkdir -p" over sshRun for a remote system, the same
+// local-vs-SSH split every other destination-filesystem operation in this
+// package already uses.
+func mkdirOn(ctx context.Context, system config.System, path string) error {
+	if system.Kind == "ssh" {
+		_, err := sshRun(ctx, system, "mkdir -p "+systems.ShellQuote(path), "")
+		return err
+	}
+	return os.MkdirAll(path, 0o755)
+}
+
+// placeholderBindMountCount counts how many of plan's mounts are currently
+// placeholders — recovered from the label RedirectMissingBindMounts sets,
+// not separate draft state, so it can never go stale relative to
+// plan.Spec.Labels (see the paste confirm prompt in create_view.go, which
+// uses this for the "no data was migrated" reminder shown right before
+// deploying).
+func placeholderBindMountCount(plan *clipboard.PastePlan) int {
+	if plan == nil {
+		return 0
+	}
+	n := 0
+	for key := range plan.Spec.Labels {
+		if strings.HasPrefix(key, clipboard.BindRedirectLabelPrefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // draftFromPastePlan seeds a standalone createDraft from plan's proposed

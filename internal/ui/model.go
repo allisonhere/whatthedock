@@ -1704,6 +1704,25 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pastePlan = &plan
 		m.overlay = overlayPaste
 		return m, nil
+	case bindRedirectDoneMsg:
+		if msg.err != nil {
+			m.status, m.statusErr = "redirect: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		plan := msg.plan
+		m.pastePlan = &plan
+		switch {
+		case msg.redirected > 0 && len(msg.failed) > 0:
+			m.status, m.statusErr = fmt.Sprintf("redirected %d bind mount(s), %d failed: %s",
+				msg.redirected, len(msg.failed), strings.Join(msg.failed, "; ")), true
+		case msg.redirected > 0:
+			m.status, m.statusErr = fmt.Sprintf("redirected %d bind mount(s) to placeholder paths — originals saved as labels", msg.redirected), false
+		case len(msg.failed) > 0:
+			m.status, m.statusErr = "redirect failed: "+strings.Join(msg.failed, "; "), true
+		default:
+			m.status, m.statusErr = "nothing to redirect — no missing bind-mount paths", false
+		}
+		return m, nil
 	case createOverrideCheckMsg:
 		if m.overlay == overlayCreate && m.createDraft.Mode == createModeCompose && m.createDraft.Service == msg.service && m.createDraft.ComposeFile == msg.base {
 			m.createDraft.BaseFileMissing = msg.baseFileMissing

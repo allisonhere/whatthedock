@@ -203,6 +203,78 @@ func BindPathConflict(m PortableMount, exists func(string) bool) *PasteConflict 
 	return &PasteConflict{Kind: "bind-path", Severity: SeverityBlock, Detail: m.Source, Message: m.Source + " does not exist"}
 }
 
+// BindRedirectLabelPrefix keys the label RedirectMissingBindMounts sets on
+// a redirected mount — the durable "comment" recording what a placeholder
+// bind source originally pointed at. Exported so internal/ui can count how
+// many mounts on a plan are currently placeholders (the confirm-step
+// reminder) without duplicating this string.
+const BindRedirectLabelPrefix = "com.whatthedock.paste.original-bind-source:"
+
+// BindRedirect is one bind mount RedirectMissingBindMounts actually
+// redirected — returned so the caller can report exactly what happened
+// (internal/ui's status line after "t").
+type BindRedirect struct {
+	Destination     string // container-side path — unique per container, the label/placeholders join key
+	OriginalSource  string
+	PlaceholderPath string
+}
+
+// RedirectMissingBindMounts swaps a bind mount's Source for a placeholder
+// path, for every mount whose container-side Destination has an entry in
+// placeholders — placeholders is supplied by internal/ui, keyed by
+// Destination, containing only directories it actually managed to create
+// on the real destination host (see internal/ui/paste.go's
+// redirectMissingBindMountsCmd); a mount with no entry is left untouched,
+// so a failed mkdir simply leaves that conflict blocking rather than
+// silently pretending it worked. Kept provider-agnostic and free of any
+// filesystem/SSH access — the same split BindPathConflict already uses,
+// pure spec/plan mutation only:
+//   - plan.Spec.Mounts[i].Source becomes the placeholder, so anything
+//     downstream (the paste review form, the eventual create call) sees
+//     the literal truth of what will actually be mounted.
+//   - plan.Spec.Labels records the original under BindRedirectLabelPrefix
+//   - Destination — a durable comment on the created container itself,
+//     visible later via `docker inspect` or the app's own Inspector detail
+//     overlay, not just this one-time flow.
+//   - the matching "bind-path" conflict (matched by original Source, the
+//     same value BindPathConflict recorded as its Detail) is rewritten
+//     from SeverityBlock to SeverityWarn, naming both paths.
+func RedirectMissingBindMounts(plan *PastePlan, placeholders map[string]string) []BindRedirect {
+	var redirects []BindRedirect
+	placeholderByOriginal := map[string]string{}
+	for i, m := range plan.Spec.Mounts {
+		if m.Type != "bind" {
+			continue
+		}
+		placeholder, ok := placeholders[m.Destination]
+		if !ok {
+			continue
+		}
+		original := m.Source
+		plan.Spec.Mounts[i].Source = placeholder
+		if plan.Spec.Labels == nil {
+			plan.Spec.Labels = map[string]string{}
+		}
+		plan.Spec.Labels[BindRedirectLabelPrefix+m.Destination] = original
+		redirects = append(redirects, BindRedirect{Destination: m.Destination, OriginalSource: original, PlaceholderPath: placeholder})
+		placeholderByOriginal[original] = placeholder
+	}
+	for i, c := range plan.Conflicts {
+		if c.Kind != "bind-path" || c.Severity != SeverityBlock {
+			continue
+		}
+		placeholder, ok := placeholderByOriginal[c.Detail]
+		if !ok {
+			continue
+		}
+		plan.Conflicts[i] = PasteConflict{
+			Kind: "bind-path", Severity: SeverityWarn, Detail: placeholder,
+			Message: fmt.Sprintf("%s redirected to %s (original saved as a label)", c.Detail, placeholder),
+		}
+	}
+	return redirects
+}
+
 func allContainers(snapshot domain.Snapshot) []domain.Container {
 	out := append([]domain.Container(nil), snapshot.Standalone...)
 	for _, project := range snapshot.Projects {

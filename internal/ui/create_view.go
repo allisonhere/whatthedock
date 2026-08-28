@@ -21,6 +21,9 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		case m.createDraft.Pasting:
 			prompt = "Paste " + name + " onto " + m.provider.Host().Name + "?"
 			confirmLabel = "deploy"
+			if n := placeholderBindMountCount(m.createDraft.PastePlan); n > 0 {
+				prompt += fmt.Sprintf("\n\n%d bind mount(s) are placeholders — no data was migrated.", n)
+			}
 		case editing && m.createDraft.Mode != createModeCompose:
 			prompt = "Replace standalone container " + name + " with these changes?"
 		case m.createDraft.Mode == createModeCompose && m.createDraft.IsStack():

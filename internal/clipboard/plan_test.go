@@ -297,6 +297,94 @@ func TestBindPathConflictNilForNamedVolume(t *testing.T) {
 	}
 }
 
+// planWithBindMounts builds a minimal PastePlan carrying two bind mounts
+// (one missing/blocked, one already fine) plus a non-bind volume mount —
+// exactly the shape RedirectMissingBindMounts needs to discriminate
+// between them, without going through the full Plan()/BindPathConflict
+// pipeline.
+func planWithBindMounts() PastePlan {
+	return PastePlan{
+		Spec: app.ContainerCreateSpec{
+			Mounts: []app.MountBinding{
+				{Type: "bind", Source: "/srv/media/radarr", Destination: "/config"},
+				{Type: "bind", Source: "/srv/media/already-fine", Destination: "/data"},
+				{Type: "volume", Source: "radarr-cache", Destination: "/cache"},
+			},
+		},
+		Conflicts: []PasteConflict{
+			{Kind: "bind-path", Severity: SeverityBlock, Detail: "/srv/media/radarr", Message: "/srv/media/radarr does not exist"},
+		},
+	}
+}
+
+func TestRedirectMissingBindMountsSwapsSourceAndLabelsOriginal(t *testing.T) {
+	plan := planWithBindMounts()
+	redirects := RedirectMissingBindMounts(&plan, map[string]string{
+		"/config": "/home/user/.local/share/whatthedock/paste-placeholders/radarr/config",
+	})
+
+	if len(redirects) != 1 {
+		t.Fatalf("redirects = %#v, want exactly one", redirects)
+	}
+	got := redirects[0]
+	if got.Destination != "/config" || got.OriginalSource != "/srv/media/radarr" ||
+		got.PlaceholderPath != "/home/user/.local/share/whatthedock/paste-placeholders/radarr/config" {
+		t.Fatalf("redirect = %#v, unexpected fields", got)
+	}
+
+	if plan.Spec.Mounts[0].Source != "/home/user/.local/share/whatthedock/paste-placeholders/radarr/config" {
+		t.Fatalf("Mounts[0].Source = %q, want the placeholder", plan.Spec.Mounts[0].Source)
+	}
+	label := plan.Spec.Labels[BindRedirectLabelPrefix+"/config"]
+	if label != "/srv/media/radarr" {
+		t.Fatalf("label = %q, want the original source /srv/media/radarr", label)
+	}
+
+	if !hasConflict(plan.Conflicts, "bind-path", SeverityWarn) {
+		t.Fatalf("conflicts = %#v, want the bind-path conflict downgraded to warn", plan.Conflicts)
+	}
+	if hasConflict(plan.Conflicts, "bind-path", SeverityBlock) {
+		t.Fatalf("conflicts = %#v, want no blocking bind-path conflict left", plan.Conflicts)
+	}
+}
+
+func TestRedirectMissingBindMountsLeavesUnmatchedMountsAlone(t *testing.T) {
+	plan := planWithBindMounts()
+	// No entry for "/config" — e.g. its mkdir failed — so it must be left
+	// untouched: still the original source, no label, still blocking.
+	redirects := RedirectMissingBindMounts(&plan, map[string]string{})
+
+	if len(redirects) != 0 {
+		t.Fatalf("redirects = %#v, want none", redirects)
+	}
+	if plan.Spec.Mounts[0].Source != "/srv/media/radarr" {
+		t.Fatalf("Mounts[0].Source = %q, want unchanged", plan.Spec.Mounts[0].Source)
+	}
+	if len(plan.Spec.Labels) != 0 {
+		t.Fatalf("Labels = %#v, want none set", plan.Spec.Labels)
+	}
+	if !hasConflict(plan.Conflicts, "bind-path", SeverityBlock) {
+		t.Fatalf("conflicts = %#v, want the bind-path conflict still blocking", plan.Conflicts)
+	}
+}
+
+func TestRedirectMissingBindMountsIgnoresNonBindMounts(t *testing.T) {
+	plan := planWithBindMounts()
+	// An entry keyed by the volume mount's destination must never redirect
+	// a non-bind mount — RedirectMissingBindMounts only ever touches
+	// Type == "bind".
+	redirects := RedirectMissingBindMounts(&plan, map[string]string{
+		"/cache": "/home/user/.local/share/whatthedock/paste-placeholders/radarr/cache",
+	})
+
+	if len(redirects) != 0 {
+		t.Fatalf("redirects = %#v, want none — /cache is a named volume, not a bind mount", redirects)
+	}
+	if plan.Spec.Mounts[2].Source != "radarr-cache" {
+		t.Fatalf("Mounts[2].Source = %q, want unchanged", plan.Spec.Mounts[2].Source)
+	}
+}
+
 func hasConflict(conflicts []PasteConflict, kind string, severity ConflictSeverity) bool {
 	for _, c := range conflicts {
 		if c.Kind == kind && c.Severity == severity {
