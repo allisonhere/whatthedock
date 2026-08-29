@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	colorful "github.com/lucasb-eyer/go-colorful"
 
+	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -3254,14 +3255,51 @@ func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	input := renderer.Styles.InputFocused.Width(contentWidth - 4).Render(m.commandFilter)
 	var rows []string
 	rows = append(rows, input)
-	for i, item := range items {
-		rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
-			Text:     item.Name,
-			Suffix:   item.Shortcut,
-			Selected: i == m.commandCursor,
-			Muted:    !item.Enabled,
-		}, contentWidth))
+
+	// Group commands by category
+	categoryMap := make(map[string][]actions.Command)
+	categorySet := make(map[string]bool)
+	for _, item := range items {
+		if !categorySet[item.Category] {
+			categorySet[item.Category] = true
+		}
+		categoryMap[item.Category] = append(categoryMap[item.Category], item)
 	}
+
+	// Sort categories by priority
+	categoryPriority := map[string]int{
+		"Main":                    0,
+		"Container Management":    1,
+		"Docker Resources":        2,
+		"Container Info":          3,
+		"Navigation":              4,
+		"Settings":                5,
+		"System":                  6,
+		"Utility":                 7,
+	}
+	var categoryOrder []string
+	for cat := range categorySet {
+		categoryOrder = append(categoryOrder, cat)
+	}
+	sort.Slice(categoryOrder, func(i, j int) bool {
+		return categoryPriority[categoryOrder[i]] < categoryPriority[categoryOrder[j]]
+	})
+
+	// Render grouped commands with category headers
+	itemIndex := 0
+	for _, category := range categoryOrder {
+		rows = append(rows, renderer.Styles.DetailMeta.Render(strings.ToUpper(category)))
+		for _, item := range categoryMap[category] {
+			rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
+				Text:     item.Name,
+				Suffix:   item.Shortcut,
+				Selected: itemIndex == m.commandCursor,
+				Muted:    !item.Enabled,
+			}, contentWidth))
+			itemIndex++
+		}
+	}
+
 	if len(items) == 0 {
 		rows = append(rows, renderer.Styles.DetailMeta.Render("No matching commands."))
 	}
