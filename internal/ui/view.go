@@ -1659,6 +1659,12 @@ type dashboardSummary struct {
 	totalCPU             float64
 	memUsed, memLimit    uint64
 	netRxRate, netTxRate uint64
+	// peakPressure is the single hottest signal anywhere in the fleet —
+	// the max over running containers of that container's CPU% or (when it
+	// has a memory limit) its memory-of-limit %. It drives the mood
+	// strip's hue (dashboardMoodStrip): one number that answers "is
+	// anything on fire" without averaging a real spike away.
+	peakPressure float64
 }
 
 // fleetSummary computes dashboardSummary from whatever containers/history
@@ -1681,6 +1687,11 @@ func (m Model) fleetSummary() dashboardSummary {
 		summary.totalCPU += history.lastStats.CPUPercent
 		summary.memUsed += history.lastStats.MemoryUsage
 		summary.memLimit += history.lastStats.MemoryLimit
+		pressure := history.lastStats.CPUPercent
+		if history.lastStats.MemoryLimit > 0 {
+			pressure = math.Max(pressure, float64(history.lastStats.MemoryUsage)/float64(history.lastStats.MemoryLimit)*100)
+		}
+		summary.peakPressure = math.Max(summary.peakPressure, pressure)
 		if len(history.NetworkRx) > 0 {
 			summary.netRxRate += history.NetworkRx[len(history.NetworkRx)-1]
 		}
@@ -3268,14 +3279,14 @@ func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 
 	// Sort categories by priority
 	categoryPriority := map[string]int{
-		"Main":                    0,
-		"Container Management":    1,
-		"Docker Resources":        2,
-		"Container Info":          3,
-		"Navigation":              4,
-		"Settings":                5,
-		"System":                  6,
-		"Utility":                 7,
+		"Main":                 0,
+		"Container Management": 1,
+		"Docker Resources":     2,
+		"Container Info":       3,
+		"Navigation":           4,
+		"Settings":             5,
+		"System":               6,
+		"Utility":              7,
 	}
 	var categoryOrder []string
 	for cat := range categorySet {
@@ -3647,11 +3658,14 @@ func (m Model) appLogBodyBudget() int {
 	return m.softOverlayBodyBudget()
 }
 
-// dashboardHeaderRows is the fleet summary line, divider, and column
-// header row dashboardOverlay always renders above the container list —
-// subtracted from softOverlayBodyBudget's allowance to get the list's own
-// budget, same shape as helpBodyBudget subtracting the status legend.
-const dashboardHeaderRows = 3
+// dashboardHeaderRows is the fixed block dashboardOverlay always renders
+// above the container list — the fleet summary line, the aggregate CPU/NET
+// sparkline row, the mood strip, and the column header row. Subtracted
+// from softOverlayBodyBudget's allowance to get the list's own budget
+// (same shape as helpBodyBudget subtracting the status legend) and used by
+// dashboardBodyPlan/dashboardHitTest to map list rows to screen lines, so
+// it must stay equal to the number of lines that block actually renders.
+const dashboardHeaderRows = 4
 
 func (m Model) dashboardListBudget() int {
 	return max(3, m.softOverlayBodyBudget()-dashboardHeaderRows)
@@ -3799,9 +3813,14 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	contentWidth := width - 4
 	summary := m.fleetSummary()
 
+	// age counts pulse frames (150ms each) since the last poll kicked off —
+	// drives the mood strip's brief post-refresh brightening.
+	age := m.statusPulseFrame - m.dashboardRefreshFrame
+
 	lines := []string{
 		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
-		dashboardDividerLine(renderer, contentWidth),
+		dashboardPadLine(renderer, m.dashboardFleetSparkRow(renderer, contentWidth), contentWidth),
+		m.dashboardMoodStrip(renderer, summary, age, contentWidth),
 		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
 	}
 
@@ -3817,7 +3836,7 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	case len(shown) == 0:
 		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render("No running containers."), contentWidth))
 	}
-	lines = append(lines, dashboardPadLine(renderer, m.dashboardProblemsRow(renderer, stopped, contentWidth), contentWidth))
+	lines = append(lines, dashboardPadLine(renderer, m.dashboardProblemsRow(renderer, stopped, m.statusPulseFrame, contentWidth), contentWidth))
 
 	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n")+"\n\n"+
 		renderer.RenderSoftHints(contentWidth,
@@ -3906,17 +3925,84 @@ func dashboardPadLine(renderer tideui.Renderer, line string, width int) string {
 
 const dashboardDividerMaxWidth = 120
 
-func dashboardDividerLine(renderer tideui.Renderer, width int) string {
+// dashboardMoodFlashFrames is how many 150ms pulse frames the mood strip
+// stays visibly brightened after a poll kicks off — ~4 frames ≈ 0.6s, a
+// quick heartbeat rather than a strobe.
+const dashboardMoodFlashFrames = 4
+
+// dashboardMoodStrip replaces the Dashboard's old flat divider with a
+// heat-toned ribbon: same centered, width-capped rule geometry, but every
+// dash is tinted from fleet-green up through amber/red by the fleet's
+// single hottest signal (summary.peakPressure — see heatColorFrom and
+// dashboardMemColor's shared "#80c990" identity), with a faint white
+// centre sheen so the bar reads as a lit seam rather than a painted line.
+// For the first dashboardMoodFlashFrames pulse frames after a poll starts
+// (age), the whole ribbon lifts toward white — a calm "the fleet just
+// refreshed" pulse that costs nothing when nothing is happening.
+func (m Model) dashboardMoodStrip(renderer tideui.Renderer, summary dashboardSummary, age, width int) string {
 	ruleWidth := min(width, dashboardDividerMaxWidth)
 	left := max(0, (width-ruleWidth)/2)
 	right := max(0, width-ruleWidth-left)
 	bg := renderer.Styles.Theme.Bg
-	fg := styleForeground(renderer.Styles.DetailMeta, renderer.Styles.Theme.Dimmed)
-	return lipgloss.NewStyle().
-		Background(bg).
-		Foreground(fg).
-		Width(width).
-		Render(strings.Repeat(" ", left) + strings.Repeat("─", ruleWidth) + strings.Repeat(" ", right))
+	pad := lipgloss.NewStyle().Background(bg)
+
+	base := string(heatColorFrom(lipgloss.Color("#80c990"), summary.peakPressure/100)) // heatColorFrom clamps t
+	flash := 0.0
+	if age >= 0 && age < dashboardMoodFlashFrames {
+		flash = (1 - float64(age)/float64(dashboardMoodFlashFrames)) * 0.4
+	}
+
+	var b strings.Builder
+	b.WriteString(pad.Render(strings.Repeat(" ", left)))
+	for i := 0; i < ruleWidth; i++ {
+		centre := 0.0
+		if ruleWidth > 1 {
+			centre = 1 - math.Abs(float64(i)/float64(ruleWidth-1)*2-1)
+		}
+		col := lerpHexColor(base, "#ffffff", centre*0.12+flash)
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(col)).Render("─"))
+	}
+	b.WriteString(pad.Render(strings.Repeat(" ", right)))
+	return b.String()
+}
+
+// dashboardFleetSparkRow is the aggregate trend line under the summary
+// numbers: two sparklines built from the header's own poll-cadence rings
+// (m.fleetCPUHistory / m.fleetNetHistory, filled by appendFleetHistory) so
+// the screen answers "is the whole fleet climbing" at a glance, not just
+// "what is it right now". CPU is graded by dashboardGraphColor's absolute
+// cutoffs and NET by dashboardNetSpark, exactly as the per-container rows
+// are, so the aggregate line and the rows below it speak the same colour
+// language. Collapses to CPU-only, then to nothing, as width runs out.
+func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, width int) string {
+	bg := renderer.Styles.Theme.Bg
+	label := renderer.Styles.DetailMeta.Copy().Background(bg)
+
+	cpuMax := 1.0
+	for _, v := range m.fleetCPUHistory {
+		cpuMax = math.Max(cpuMax, v)
+	}
+	cpuSpark := func(w int) string {
+		return dashboardSpark(renderer, m.settings, statGraph{values: m.fleetCPUHistory, maxValue: cpuMax}, dashboardGraphColor, w, bg)
+	}
+
+	// "CPU " (4) + spark + "   NET " (7) + spark. Split the leftover evenly;
+	// drop NET, then the whole row, as the panel narrows.
+	if each := (width - 11) / 2; each >= dashboardMinSparkW {
+		var netMax, latestNet uint64
+		for _, v := range m.fleetNetHistory {
+			netMax = maxUint(netMax, v)
+		}
+		if len(m.fleetNetHistory) > 0 {
+			latestNet = m.fleetNetHistory[len(m.fleetNetHistory)-1]
+		}
+		net := dashboardNetSpark(renderer, m.settings, uintStatGraph(m.fleetNetHistory, netMax, byteLevel(latestNet), formatByteDelta), each, bg)
+		return label.Render("CPU ") + cpuSpark(each) + label.Render("   NET ") + net
+	}
+	if width-4 >= dashboardMinSparkW {
+		return label.Render("CPU ") + cpuSpark(width-4)
+	}
+	return label.Render("")
 }
 
 // dashboardSummaryLine is the Dashboard's header: status counts (running
@@ -4226,6 +4312,24 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 		}
 	}
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+
+	// Hot-row tint: when this container's CPU or memory-of-limit crosses
+	// dashboardWarnPct, wash the whole row's background a little toward the
+	// same amber/red dashboardThresholdColor its numbers already use, and
+	// colour the name to match — so a hot container pulls the eye out of a
+	// wall of green rows without needing the cursor on it. Every segment
+	// below is styled with rowBg, so tinting it here is all it takes.
+	cpuPct := statsCPU(stats)
+	hotPct := cpuPct
+	if stats != nil && stats.MemoryLimit > 0 {
+		hotPct = math.Max(hotPct, float64(stats.MemoryUsage)/float64(stats.MemoryLimit)*100)
+	}
+	nameFg := baseFg
+	if hotPct >= dashboardWarnPct {
+		hotColor := dashboardThresholdColor(hotPct, baseFg)
+		rowBg = lipgloss.Color(lerpHexColor(string(rowBg), string(hotColor), 0.14))
+		nameFg = hotColor
+	}
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(baseFg)
 
 	rail := renderer.SoftRail(selected, rowBg)
@@ -4239,9 +4343,8 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	// reported live as the status glyphs having the wrong background
 	// color.
 	glyph := lipgloss.NewStyle().Background(rowBg).Render(foregroundSpan(statusGlyph(ctr), inspectorStatusColor(ctr), baseFg, false))
-	name := plain.Render(padRunes(truncateEllipsis(ctr.DisplayName(), cols.nameWidth), cols.nameWidth))
+	name := lipgloss.NewStyle().Background(rowBg).Foreground(nameFg).Render(padRunes(truncateEllipsis(ctr.DisplayName(), cols.nameWidth), cols.nameWidth))
 
-	cpuPct := statsCPU(stats)
 	cpuNum := lipgloss.NewStyle().Background(rowBg).Foreground(dashboardGraphColor(cpuPct)).
 		Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
 	cpuPart := cpuNum
@@ -4523,8 +4626,12 @@ func dashboardNetSpark(renderer tideui.Renderer, settings appSettings, graph sta
 // View problems" hint when any exist (replacing the old easy-to-miss
 // inline "+N stopped/dead" text), or a quiet all-clear line when the
 // fleet is healthy — deliberately muted even then, so a healthy fleet
-// doesn't compete for attention with the rows above it.
-func (m Model) dashboardProblemsRow(renderer tideui.Renderer, stopped int, width int) string {
+// doesn't compete for attention with the rows above it. When there IS
+// something wrong the ⚠ line breathes between a dim and a bright amber on
+// the shared statusPulseFrame clock (frame) — the same slow pulse the
+// connected-status dot uses — so the warning stays alive in peripheral
+// vision; a healthy fleet's all-clear line never moves.
+func (m Model) dashboardProblemsRow(renderer tideui.Renderer, stopped, frame, width int) string {
 	bg := renderer.Styles.Theme.Bg
 	if stopped == 0 {
 		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("✓ All monitored containers healthy")
@@ -4533,7 +4640,9 @@ func (m Model) dashboardProblemsRow(renderer tideui.Renderer, stopped int, width
 	if stopped == 1 {
 		noun, verb = "container", "needs"
 	}
-	left := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#e5c07b")).Bold(true).
+	pulse := (math.Sin(2*math.Pi*float64(frame)/24) + 1) / 2
+	warnColor := lipgloss.Color(lerpHexColor("#7a5c1f", "#f0c674", pulse))
+	left := lipgloss.NewStyle().Background(bg).Foreground(warnColor).Bold(true).
 		Render(fmt.Sprintf("⚠ %d %s %s attention", stopped, noun, verb))
 	action := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Fg).Bold(true).Render("p") +
 		lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("  View problems")

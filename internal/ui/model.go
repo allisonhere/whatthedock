@@ -421,6 +421,21 @@ type Model struct {
 	// dashboardBodyPlan) — reset to 0 each time the overlay opens.
 	dashboardCursor int
 
+	// fleetCPUHistory/fleetNetHistory are the Dashboard header's own
+	// aggregate sparkline rings — one sample appended per poll interval
+	// from fleetSummary (see appendFleetHistory), capped at the same 24
+	// samples as every per-container series. Separate from statsHistory so
+	// a container dropping out of the fleet never perturbs the aggregate
+	// trend line's own history.
+	fleetCPUHistory []float64
+	fleetNetHistory []uint64
+
+	// dashboardRefreshFrame stamps m.statusPulseFrame at the moment the
+	// Dashboard last kicked off a stats poll — the mood strip brightens
+	// for a few pulse frames after each refresh (see dashboardMoodStrip)
+	// so a poll lands as a visible heartbeat rather than silently.
+	dashboardRefreshFrame int
+
 	// appLogLines is every distinct status-bar message this session, kept
 	// when settings.AppLog is on or save (see recordAppLog) — viewable via
 	// Settings > View app log (overlayAppLog). appLogFile is the lazily
@@ -1441,6 +1456,11 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.overlay != overlayDashboard {
 			return m, nil
 		}
+		// Snapshot the fleet aggregate once per interval (the responses
+		// from the previous fan-out have landed by now) and restart the
+		// mood strip's post-refresh brightness pulse.
+		m.appendFleetHistory()
+		m.dashboardRefreshFrame = m.statusPulseFrame
 		return m, m.dashboardRefreshCmd()
 	case actionDoneMsg:
 		m.busy = false
@@ -3485,6 +3505,7 @@ func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayDashboard
 	m.dashboardCursor = 0
+	m.dashboardRefreshFrame = m.statusPulseFrame
 	return m, m.dashboardRefreshCmd()
 }
 
@@ -4946,6 +4967,17 @@ func (m *Model) appendStats(stats domain.ContainerStats) {
 	copied := stats
 	history.lastStats = &copied
 	m.statsHistory[stats.ID] = history
+}
+
+// appendFleetHistory adds one aggregate sample to the Dashboard header's
+// CPU/network trend rings from the current fleetSummary — called once per
+// poll interval (dashboardTickMsg), not once per container response, so
+// the two series stay evenly spaced regardless of how many containers the
+// fan-out covered. Same 24-sample cap as every per-container series.
+func (m *Model) appendFleetHistory() {
+	summary := m.fleetSummary()
+	m.fleetCPUHistory = appendFloatHistory(m.fleetCPUHistory, summary.totalCPU, 24)
+	m.fleetNetHistory = appendUintHistory(m.fleetNetHistory, summary.netRxRate+summary.netTxRate, 24)
 }
 
 func counterDelta(previous, current uint64) uint64 {

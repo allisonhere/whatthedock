@@ -354,17 +354,122 @@ func TestDashboardPadLineReachesExactWidth(t *testing.T) {
 	}
 }
 
-func TestDashboardDividerCapsRuleOnWideDisplays(t *testing.T) {
+func TestDashboardMoodStripCapsRuleOnWideDisplays(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	got := ansi.Strip(dashboardDividerLine(renderer, 220))
+	model := testModel()
+	got := ansi.Strip(model.dashboardMoodStrip(renderer, dashboardSummary{}, -1, 220))
 	if visible := len([]rune(got)); visible != 220 {
-		t.Fatalf("dashboardDividerLine visible width = %d, want 220", visible)
+		t.Fatalf("dashboardMoodStrip visible width = %d, want 220", visible)
 	}
 	if dashCount := strings.Count(got, "─"); dashCount != dashboardDividerMaxWidth {
-		t.Fatalf("dashboardDividerLine dash count = %d, want capped at %d", dashCount, dashboardDividerMaxWidth)
+		t.Fatalf("dashboardMoodStrip dash count = %d, want capped at %d", dashCount, dashboardDividerMaxWidth)
 	}
 	if !strings.HasPrefix(got, strings.Repeat(" ", 50)) || !strings.HasSuffix(got, strings.Repeat(" ", 50)) {
-		t.Fatalf("dashboardDividerLine should center capped dashes in wide line, got %q", got)
+		t.Fatalf("dashboardMoodStrip should center the capped rule in a wide line, got %q", got)
+	}
+}
+
+// TestDashboardMoodStripHueTracksPressure checks goal #2/#3: the ribbon's
+// colour is fleet-green when nothing is under load and shifts to the
+// amber/red end once the hottest container crosses into the warn band,
+// and the post-refresh flash makes the whole ribbon render differently
+// for a few pulse frames.
+func TestDashboardMoodStripHueTracksPressure(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+
+	calm := model.dashboardMoodStrip(renderer, dashboardSummary{peakPressure: 3}, -1, 80)
+	mid := model.dashboardMoodStrip(renderer, dashboardSummary{peakPressure: 60}, -1, 80)
+	hot := model.dashboardMoodStrip(renderer, dashboardSummary{peakPressure: 95}, -1, 80)
+	if calm == mid || mid == hot || calm == hot {
+		t.Fatalf("dashboardMoodStrip hue did not track peak pressure across 3/60/95:\ncalm %q\nmid  %q\nhot  %q", calm, mid, hot)
+	}
+	// The calm ribbon is unmistakably green (g channel well above r and b);
+	// the hot one is not.
+	if !strings.Contains(calm, ";201;14") {
+		t.Fatalf("calm mood strip should be fleet-green, got %q", calm)
+	}
+	if strings.Contains(hot, ";201;14") {
+		t.Fatalf("maxed-out mood strip should not still be fleet-green, got %q", hot)
+	}
+
+	steady := model.dashboardMoodStrip(renderer, dashboardSummary{peakPressure: 3}, 99, 80)
+	flashing := model.dashboardMoodStrip(renderer, dashboardSummary{peakPressure: 3}, 0, 80)
+	if steady == flashing {
+		t.Fatal("dashboardMoodStrip post-refresh flash produced no visible change at age 0")
+	}
+}
+
+// TestDashboardRowTintsHotContainers checks goal #4: a container whose CPU
+// or memory-of-limit is in the warn band renders its name in the shared
+// amber/red dashboardThresholdColor and washes its row background, while a
+// container comfortably below the threshold gets neither.
+func TestDashboardRowTintsHotContainers(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	id := domain.ResourceID{Host: "local", ID: "1"}
+
+	runningRow := func(m Model) string {
+		for _, ctr := range m.snapshotContainers() {
+			if ctr.IsRunning() {
+				return m.dashboardRow(renderer, ctr, 140, false)
+			}
+		}
+		t.Fatal("no running container in fixture")
+		return ""
+	}
+
+	// The fixture's running container is named radarr-1; the tint recolors
+	// its name run (not just the status glyph, which is already red for an
+	// unhealthy container).
+	tintedName := regexp.MustCompile(`38;2;224;108;117;48;2;\d+;\d+;\d+mradarr-1`)
+
+	calm := testModel()
+	calm.appendStats(domain.ContainerStats{ID: id, CPUPercent: 12, MemoryUsage: 10, MemoryLimit: 1000})
+	calmRow := runningRow(calm)
+	if tintedName.MatchString(calmRow) {
+		t.Fatalf("a quiet container's row should not tint its name:\n%q", calmRow)
+	}
+
+	hot := testModel()
+	hot.appendStats(domain.ContainerStats{ID: id, CPUPercent: 96, MemoryUsage: 10, MemoryLimit: 1000})
+	hotRow := runningRow(hot)
+	if !tintedName.MatchString(hotRow) {
+		t.Fatalf("a container pegged at 96%% CPU should tint its name red:\n%q", hotRow)
+	}
+	if hotRow == calmRow {
+		t.Fatal("hot and calm rows rendered identically")
+	}
+}
+
+// TestDashboardFleetSparkRowRendersAggregateHistory checks goal #1: the
+// header's aggregate CPU/NET sparklines are built from the fleet history
+// rings, carry both labels at a normal width, and collapse to CPU-only
+// when the panel is narrow.
+func TestDashboardFleetSparkRowRendersAggregateHistory(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	model.fleetCPUHistory = []float64{5, 20, 60, 120, 90, 140}
+	model.fleetNetHistory = []uint64{0, 1 << 10, 1 << 20, 8 << 20, 2 << 20, 32 << 20}
+
+	wide := ansi.Strip(model.dashboardFleetSparkRow(renderer, 120))
+	if !strings.Contains(wide, "CPU ") || !strings.Contains(wide, "NET ") {
+		t.Fatalf("wide fleet spark row missing CPU/NET labels: %q", wide)
+	}
+	if strings.TrimSpace(strings.NewReplacer("CPU", "", "NET", "", "─", "").Replace(wide)) == "" {
+		t.Fatalf("wide fleet spark row drew no sparkline glyphs: %q", wide)
+	}
+
+	narrow := ansi.Strip(model.dashboardFleetSparkRow(renderer, 18))
+	if !strings.Contains(narrow, "CPU ") || strings.Contains(narrow, "NET ") {
+		t.Fatalf("narrow fleet spark row should collapse to CPU only: %q", narrow)
 	}
 }
 
@@ -875,22 +980,38 @@ func TestDashboardSummaryLineNeverExceedsWidthWhenNarrow(t *testing.T) {
 // row with the "p" action only appears when something's actually stopped,
 // and a healthy fleet gets a quiet all-clear line instead.
 func TestDashboardProblemsRowWarnsOnlyWhenStopped(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
 	model := testModel()
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 
-	warn := ansi.Strip(model.dashboardProblemsRow(renderer, 3, 80))
+	warn := ansi.Strip(model.dashboardProblemsRow(renderer, 3, 0, 80))
 	if !strings.Contains(warn, "⚠ 3 containers need attention") || !strings.Contains(warn, "View problems") {
 		t.Fatalf("dashboardProblemsRow(3) = %q, want a warning naming the count plus the View problems action", warn)
 	}
 
-	singular := ansi.Strip(model.dashboardProblemsRow(renderer, 1, 80))
+	singular := ansi.Strip(model.dashboardProblemsRow(renderer, 1, 0, 80))
 	if !strings.Contains(singular, "1 container needs attention") {
 		t.Fatalf("dashboardProblemsRow(1) = %q, want singular \"container needs\"", singular)
 	}
 
-	healthy := ansi.Strip(model.dashboardProblemsRow(renderer, 0, 80))
+	healthy := ansi.Strip(model.dashboardProblemsRow(renderer, 0, 0, 80))
 	if !strings.Contains(healthy, "All monitored containers healthy") || strings.Contains(healthy, "⚠") {
 		t.Fatalf("dashboardProblemsRow(0) = %q, want a quiet all-clear line with no warning glyph", healthy)
+	}
+
+	// The warning line breathes on the pulse clock: two different frames
+	// (a sine trough vs. peak) must pick visibly different amber shades,
+	// while the healthy all-clear line stays byte-identical frame to frame.
+	warnLo := model.dashboardProblemsRow(renderer, 3, 18, 80) // sine trough → dim amber
+	warnHi := model.dashboardProblemsRow(renderer, 3, 6, 80)  // sine peak → bright amber
+	if warnLo == warnHi {
+		t.Fatalf("dashboardProblemsRow warning did not change between pulse trough and peak:\n%q", warnLo)
+	}
+	if model.dashboardProblemsRow(renderer, 0, 6, 80) != model.dashboardProblemsRow(renderer, 0, 18, 80) {
+		t.Fatal("dashboardProblemsRow all-clear line must not animate")
 	}
 }
 
