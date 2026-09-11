@@ -1490,22 +1490,7 @@ type createFileBrowseMsg struct {
 var sshRun = defaultSSHRun
 
 func defaultSSHRun(ctx context.Context, system config.System, script string, stdin string) ([]byte, error) {
-	cmd, err := systems.RemoteCommand(ctx, system, script)
-	if err != nil {
-		return nil, err
-	}
-	if stdin != "" {
-		cmd.Stdin = strings.NewReader(stdin)
-	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		text := strings.TrimSpace(string(output))
-		if text == "" {
-			text = err.Error()
-		}
-		return nil, errors.New(text)
-	}
-	return output, nil
+	return systems.RemoteExec(ctx, system, script, stdin)
 }
 
 // remoteFileEntries lists dir on system's remote host in one round trip: cd

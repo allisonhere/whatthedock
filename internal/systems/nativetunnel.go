@@ -2,11 +2,13 @@ package systems
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -59,9 +61,33 @@ func dialKeychainTunnel(ctx context.Context, system config.System, password stri
 		return nil
 	}
 
+	client, err := dialKeychainClient(ctx, system, password)
+	if err != nil {
+		return err
+	}
+
+	listener, err := net.Listen("unix", system.LocalSocket)
+	if err != nil {
+		client.Close()
+		return fmt.Errorf("listen on %s: %w", system.LocalSocket, err)
+	}
+
+	go serveKeychainTunnel(listener, client, system.RemoteSocket)
+	return nil
+}
+
+// dialKeychainClient opens an authenticated SSH client connection to
+// system's host using password auth, honoring ctx: canceling ctx while the
+// TCP dial or the SSH handshake is still in flight aborts the attempt
+// immediately instead of waiting out the full 10s handshake timeout.
+// Shared by dialKeychainTunnel (the Docker socket tunnel) and
+// remoteKeychainCommand (one-shot remote Compose operations) — the same
+// native-Go-SSH connection either way, so the keychain password never
+// touches a subprocess's argv or environment.
+func dialKeychainClient(ctx context.Context, system config.System, password string) (*ssh.Client, error) {
 	hostKeyCallback, err := knownhosts.New(knownHostsPath())
 	if err != nil {
-		return fmt.Errorf("read known_hosts: %w — connect once with ssh first to add %s", err, system.SSHHost)
+		return nil, fmt.Errorf("read known_hosts: %w — connect once with ssh first to add %s", err, system.SSHHost)
 	}
 
 	port := system.SSHPort
@@ -74,19 +100,84 @@ func dialKeychainTunnel(ctx context.Context, system config.System, password stri
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", net.JoinHostPort(system.SSHHost, port), cfg)
+	addr := net.JoinHostPort(system.SSHHost, port)
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("ssh %s: %w", system.SSHHost, err)
+		return nil, fmt.Errorf("ssh %s: %w", system.SSHHost, err)
 	}
 
-	listener, err := net.Listen("unix", system.LocalSocket)
+	type handshakeResult struct {
+		client *ssh.Client
+		err    error
+	}
+	done := make(chan handshakeResult, 1)
+	go func() {
+		sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+		if err != nil {
+			done <- handshakeResult{err: err}
+			return
+		}
+		done <- handshakeResult{client: ssh.NewClient(sshConn, chans, reqs)}
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = conn.Close()
+		<-done // let the handshake goroutine unblock and exit before returning
+		return nil, ctx.Err()
+	case res := <-done:
+		if res.err != nil {
+			return nil, fmt.Errorf("ssh %s: %w", system.SSHHost, res.err)
+		}
+		return res.client, nil
+	}
+}
+
+// remoteKeychainCommand runs script on system's SSH host over a one-shot
+// session on a freshly authenticated connection — the RemoteExec
+// counterpart to RemoteCommand's shelled-out ssh, for keychain-mode systems
+// specifically. Canceling ctx closes the connection, which aborts whatever
+// is running remotely instead of leaving the goroutine to wait it out.
+func remoteKeychainCommand(ctx context.Context, system config.System, password, script, stdin string) ([]byte, error) {
+	client, err := dialKeychainClient(ctx, system, password)
 	if err != nil {
-		client.Close()
-		return fmt.Errorf("listen on %s: %w", system.LocalSocket, err)
+		return nil, err
+	}
+	defer client.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+		case <-stop:
+		}
+	}()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("ssh %s: open session: %w", system.SSHHost, err)
+	}
+	defer session.Close()
+	if stdin != "" {
+		session.Stdin = strings.NewReader(stdin)
 	}
 
-	go serveKeychainTunnel(listener, client, system.RemoteSocket)
-	return nil
+	output, err := session.CombinedOutput(script)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			text = err.Error()
+		}
+		return nil, errors.New(text)
+	}
+	return output, nil
 }
 
 // serveKeychainTunnel accepts local connections on listener and pipes each

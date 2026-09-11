@@ -163,6 +163,73 @@ func TestSSHCommandArgsRebuildsTunnelForStaleSocketFile(t *testing.T) {
 	}
 }
 
+// TestRemoteCommandIncludesBatchModeAndConnectTimeout is the regression
+// test for RemoteCommand having no equivalent protection to
+// SSHCommandArgs's automatic path: every caller (remote Compose file
+// operations, `docker compose` invocations) runs headless with no terminal
+// handed over, so without BatchMode a password-auth system's ssh would try
+// to prompt on /dev/tty anyway — fighting the running TUI for the real
+// terminal — and hang until the caller's own context timeout. BatchMode
+// makes it fail fast instead; ConnectTimeout bounds an unreachable host.
+func TestRemoteCommandIncludesBatchModeAndConnectTimeout(t *testing.T) {
+	cmd, err := RemoteCommand(context.Background(), config.System{
+		SSHHost:      "jarvis",
+		SSHUser:      "allie",
+		RemoteSocket: "/var/run/docker.sock",
+	}, "cat /etc/hostname")
+	if err != nil {
+		t.Fatalf("RemoteCommand() err = %v", err)
+	}
+	wantArgs := []string{"ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "allie@jarvis", "cat /etc/hostname"}
+	if !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("RemoteCommand() args = %#v, want %#v", cmd.Args, wantArgs)
+	}
+}
+
+func TestRemoteCommandIncludesPortWithBatchMode(t *testing.T) {
+	cmd, err := RemoteCommand(context.Background(), config.System{
+		SSHHost:      "jarvis.lan",
+		SSHUser:      "allie",
+		SSHPort:      "2222",
+		RemoteSocket: "/var/run/docker.sock",
+	}, "ls -1Ap")
+	if err != nil {
+		t.Fatalf("RemoteCommand() err = %v", err)
+	}
+	wantArgs := []string{"ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-p", "2222", "allie@jarvis.lan", "ls -1Ap"}
+	if !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("RemoteCommand() args = %#v, want %#v", cmd.Args, wantArgs)
+	}
+}
+
+// TestRemoteExecKeychainModeUsesStoredPasswordNotSubprocess checks
+// RemoteExec's keychain branch: it must fetch the stored password and use
+// it, rather than falling through to RemoteCommand's shelled-out ssh (which
+// has no way to supply that password and would only ever fail or hang).
+// Wiring is exercised end-to-end against a fake SSH server in
+// nativetunnel_test.go; this only checks the routing decision + error
+// message when nothing is stored, matching keychain_test.go's coverage of
+// the same branch in Factory.Provider.
+func TestRemoteExecKeychainModeErrorsClearlyWithNoStoredPassword(t *testing.T) {
+	stubSecrets(t)
+
+	_, err := RemoteExec(context.Background(), config.System{
+		ID:           "jarvis",
+		Name:         "jarvis",
+		SSHHost:      "192.168.86.74",
+		SSHUser:      "allie",
+		SSHAuth:      "keychain",
+		RemoteSocket: "/var/run/docker.sock",
+	}, "cat /etc/hostname", "")
+	if err == nil {
+		t.Fatal("RemoteExec() err = nil, want an error when no password is stored")
+	}
+	const want = `no password stored in keychain for "jarvis" — open Systems and set one`
+	if err.Error() != want {
+		t.Fatalf("RemoteExec() err = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestSSHTargetOmitsEmptyUser(t *testing.T) {
 	if got := SSHTarget(config.System{SSHHost: "jarvis"}); got != "jarvis" {
 		t.Fatalf("SSHTarget() = %q, want jarvis", got)

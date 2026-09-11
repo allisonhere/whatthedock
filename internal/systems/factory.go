@@ -150,16 +150,69 @@ func SSHTarget(system config.System) string {
 // socket tunnel above. It's for one-shot remote operations outside the
 // tunnel — listing, reading, and writing Compose files, and running
 // `docker compose` — not for the persistent -fN port forward.
+//
+// Like SSHCommandArgs's automatic path, this always sets BatchMode=yes and
+// ConnectTimeout=10: every caller (remote Compose file operations,
+// `docker compose` invocations) runs headless inside a tea.Cmd goroutine
+// with no terminal handed over, so without BatchMode a password-auth system
+// ssh can't reach programmatically would try to prompt on /dev/tty anyway —
+// fighting the running TUI for the real terminal — and hang until the
+// caller's own context timeout, rather than failing fast and cleanly.
+// ConnectTimeout bounds the separate case of an unreachable host. Keychain
+// systems don't reach this path at all — see RemoteExec.
 func RemoteCommand(ctx context.Context, system config.System, script string) (*exec.Cmd, error) {
 	if system.SSHHost == "" {
 		return nil, fmt.Errorf("ssh host is required")
 	}
-	args := []string{}
+	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
 	if system.SSHPort != "" {
 		args = append(args, "-p", system.SSHPort)
 	}
 	args = append(args, SSHTarget(system), script)
 	return exec.CommandContext(ctx, "ssh", args...), nil
+}
+
+// RemoteExec runs script on system's SSH host and returns its combined
+// output, piping stdin to the remote command when non-empty. It's the
+// single entry point every remote Compose operation goes through (see
+// internal/ui/create.go's sshRun seam), and it picks the same
+// authentication path Factory.Provider already picks for the Docker socket
+// tunnel: a keychain-mode system's stored password goes through the native
+// Go SSH client (never touching a subprocess's argv or environment — see
+// dialKeychainTunnel), everything else shells out via RemoteCommand.
+//
+// A password-prompt system (SSHAuth=="password") has no stored credential
+// to use here — by design, that mode only ever prompts on a real terminal
+// handoff (SSHCommand/tea.ExecProcess), which this headless path doesn't
+// have. It still goes through RemoteCommand and, thanks to BatchMode, fails
+// fast with a clear error instead of hanging.
+func RemoteExec(ctx context.Context, system config.System, script string, stdin string) ([]byte, error) {
+	if system.SSHAuth == "keychain" {
+		password, err := PasswordFor(system.ID)
+		if err != nil {
+			if errors.Is(err, errNoStoredPassword) {
+				return nil, fmt.Errorf("no password stored in keychain for %q — open Systems and set one", system.Name)
+			}
+			return nil, err
+		}
+		return remoteKeychainCommand(ctx, system, password, script, stdin)
+	}
+	cmd, err := RemoteCommand(ctx, system, script)
+	if err != nil {
+		return nil, err
+	}
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			text = err.Error()
+		}
+		return nil, errors.New(text)
+	}
+	return output, nil
 }
 
 // ShellQuote wraps s in single quotes for safe inclusion in a remote shell
