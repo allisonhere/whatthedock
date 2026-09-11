@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/allisonhere/whatthedock/internal/actions"
+	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/catalog"
 	"github.com/allisonhere/whatthedock/internal/clipboard"
 	"github.com/allisonhere/whatthedock/internal/config"
@@ -3537,5 +3538,93 @@ func TestConfirmStepPreviewFitsOverlayBudget(t *testing.T) {
 	view := ansi.Strip(model.View())
 	if !strings.Contains(view, "cancel") {
 		t.Fatal("cancel hint missing from the rendered confirm screen — the overlay overflowed and got clipped")
+	}
+}
+
+// TestReplaceContainerInPlaceRoundTripPreservesConfiguration is the
+// successful round trip the edit/recreate audit asked for: every field
+// replaceContainerInPlace's callers can actually populate on a
+// ContainerCreateSpec (name, image, command, ports, mounts, env, restart
+// policy, and the requested running state) must come out the other side
+// unchanged on the replacement, not just recorded in the create call.
+func TestReplaceContainerInPlaceRoundTripPreservesConfiguration(t *testing.T) {
+	model := testModel()
+	fp := model.provider.(*fakeProvider)
+	oldID := domain.ResourceID{Host: "local", ID: "1"} // seeded by newFakeProvider as radarr-1, running
+
+	spec := app.ContainerCreateSpec{
+		Name:          "radarr-1",
+		Image:         "radarr:latest",
+		Command:       []string{"run", "--flag"},
+		Ports:         []app.PortBinding{{HostIP: "0.0.0.0", HostPort: 7878, ContainerPort: 7878, Protocol: "tcp"}},
+		Mounts:        []app.MountBinding{{Type: "bind", Source: "/srv/media/radarr", Destination: "/config", ReadOnly: false}},
+		Env:           []string{"PUID=1000", "TZ=UTC"},
+		RestartPolicy: "always",
+		Start:         true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	progress := make(chan string, 16)
+	newID, err := replaceContainerInPlace(ctx, fp, oldID, spec, false, progress)
+	if err != nil {
+		t.Fatalf("replaceContainerInPlace() err = %v", err)
+	}
+
+	if _, ok := fp.containers[oldID.ID]; ok {
+		t.Fatal("original container still present after a successful replace")
+	}
+	replacement, ok := fp.containers[newID.ID]
+	if !ok {
+		t.Fatal("replacement container missing after a successful replace")
+	}
+	if replacement.Name != "radarr-1" {
+		t.Fatalf("replacement name = %q, want radarr-1", replacement.Name)
+	}
+	if replacement.Image != "radarr:latest" {
+		t.Fatalf("replacement image = %q, want radarr:latest", replacement.Image)
+	}
+	if replacement.Command != "run --flag" {
+		t.Fatalf("replacement command = %q, want %q", replacement.Command, "run --flag")
+	}
+	if len(replacement.Ports) != 1 || replacement.Ports[0].Public != 7878 || replacement.Ports[0].Private != 7878 {
+		t.Fatalf("replacement ports = %#v, want the 7878:7878/tcp binding preserved", replacement.Ports)
+	}
+	if len(replacement.Mounts) != 1 || replacement.Mounts[0].Destination != "/config" || !replacement.Mounts[0].ReadWrite {
+		t.Fatalf("replacement mounts = %#v, want the read-write /config mount preserved", replacement.Mounts)
+	}
+	if len(replacement.Env) != 2 || replacement.Env[0] != "PUID=1000" || replacement.Env[1] != "TZ=UTC" {
+		t.Fatalf("replacement env = %#v, want PUID=1000, TZ=UTC preserved", replacement.Env)
+	}
+	if replacement.RestartPolicy != "always" {
+		t.Fatalf("replacement restart policy = %q, want always", replacement.RestartPolicy)
+	}
+	if replacement.State != domain.StateRunning {
+		t.Fatalf("replacement state = %v, want running (Start was requested)", replacement.State)
+	}
+}
+
+// TestReplaceContainerInPlacePropagatesContextCancellationWithoutRemovingOriginal
+// covers failure mode "context canceled at each stage": whatever error a
+// provider call returns — including a real context.Canceled once the
+// caller's context is done — must stop the sequence before anything
+// destructive happens, exactly like any other error from that same stage.
+func TestReplaceContainerInPlacePropagatesContextCancellationWithoutRemovingOriginal(t *testing.T) {
+	model := testModel()
+	fp := model.provider.(*fakeProvider)
+	fp.pullErr = context.Canceled
+	oldID := domain.ResourceID{Host: "local", ID: "1"}
+	spec := app.ContainerCreateSpec{Name: "radarr-1", Image: "radarr:latest", Start: true}
+
+	progress := make(chan string, 16)
+	_, err := replaceContainerInPlace(context.Background(), fp, oldID, spec, true, progress)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("replaceContainerInPlace() err = %v, want context.Canceled", err)
+	}
+	if len(fp.removed) != 0 || len(fp.creates) != 0 {
+		t.Fatalf("removed/creates = %#v/%#v, want no destructive action once the context is canceled mid-pull", fp.removed, fp.creates)
+	}
+	if _, ok := fp.containers[oldID.ID]; !ok {
+		t.Fatal("original container missing after a context-canceled pull")
 	}
 }

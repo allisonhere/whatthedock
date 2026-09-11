@@ -39,12 +39,14 @@ type fakeProvider struct {
 	renamed          []string
 	removed          []domain.ResourceID
 	forced           []bool
+	started          []domain.ResourceID
 	pulled           []string
 	progressCalls    []app.PullProgress
 	removeErr        error
 	pullErr          error
 	createErr        error
 	renameErr        error
+	startErr         error
 	images           []domain.Image
 	imageRemoveErr   error
 	removedImages    []string
@@ -75,8 +77,17 @@ func (f *fakeProvider) Logs(context.Context, domain.ResourceID, app.LogOptions) 
 func (f *fakeProvider) Events(context.Context) (<-chan domain.ContainerEvent, error) {
 	return make(chan domain.ContainerEvent), nil
 }
-func (f *fakeProvider) StartContainer(context.Context, domain.ResourceID) error {
+func (f *fakeProvider) StartContainer(_ context.Context, id domain.ResourceID) error {
 	f.starts++
+	f.started = append(f.started, id)
+	if f.startErr != nil {
+		return f.startErr
+	}
+	if ctr, ok := f.containers[id.ID]; ok {
+		ctr.State = domain.StateRunning
+		ctr.Status = "Up 1 second"
+		f.containers[id.ID] = ctr
+	}
 	return nil
 }
 func (f *fakeProvider) StopContainer(context.Context, domain.ResourceID) error {
@@ -97,10 +108,49 @@ func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCrea
 	if spec.Start {
 		state, status = domain.StateRunning, "Up 1 second"
 	}
-	ctr := domain.Container{ID: id, Name: spec.Name, Image: spec.Image, State: state, Status: status, Labels: map[string]string{}}
+	ctr := domain.Container{
+		ID:            id,
+		Name:          spec.Name,
+		Image:         spec.Image,
+		State:         state,
+		Status:        status,
+		Labels:        map[string]string{},
+		Command:       strings.Join(spec.Command, " "),
+		Env:           append([]string(nil), spec.Env...),
+		RestartPolicy: spec.RestartPolicy,
+		Ports:         specPortsToDomain(spec.Ports),
+		Mounts:        specMountsToDomain(spec.Mounts),
+	}
 	f.containers[id.ID] = ctr
 	f.snapshot.Standalone = append(f.snapshot.Standalone, ctr)
 	return id, nil
+}
+
+// specPortsToDomain/specMountsToDomain mirror the shape ContainerSpec's
+// ports/mounts translate to on a real Docker inspect, so tests exercising
+// replaceContainerInPlace's round trip can assert against the fake
+// provider's stored container the same way they'd assert against a real
+// one, not just the raw spec that was sent.
+func specPortsToDomain(ports []app.PortBinding) []domain.Port {
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([]domain.Port, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, domain.Port{IP: p.HostIP, Private: p.ContainerPort, Public: p.HostPort, Type: p.Protocol})
+	}
+	return out
+}
+
+func specMountsToDomain(mounts []app.MountBinding) []domain.Mount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]domain.Mount, 0, len(mounts))
+	for _, m := range mounts {
+		out = append(out, domain.Mount{Type: m.Type, Source: m.Source, Destination: m.Destination, ReadWrite: !m.ReadOnly})
+	}
+	return out
 }
 func (f *fakeProvider) RenameContainer(_ context.Context, id domain.ResourceID, name string) error {
 	f.renamed = append(f.renamed, id.ID+"="+name)
@@ -3254,6 +3304,9 @@ func modelSelectingStandalone(name, image string) Model {
 	model.selected.Name = name
 	model.selected.Image = image
 	model.selectedID = model.selected.ID
+	if fp, ok := model.provider.(*fakeProvider); ok {
+		fp.containers[model.selected.ID.ID] = *model.selected
+	}
 	return model
 }
 
@@ -3799,6 +3852,84 @@ func TestConfirmEditStandaloneKeepsReplacementWhenRenameFailsAfterRemoval(t *tes
 	}
 }
 
+// TestConfirmEditStandaloneCleansUpReplacementWhenOriginalRemovalFails
+// checks the other side of editContainerCmd's cleanup boundary: if removing
+// the original fails (it's still in use, still running with something
+// holding it open, ...), the just-created temp-named replacement must be
+// torn down again — and that cleanup must target the replacement's ID,
+// never the original's, which is still safely in place.
+func TestConfirmEditStandaloneCleansUpReplacementWhenOriginalRemovalFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selectedContainer().ID
+	fp := model.provider.(*fakeProvider)
+	fp.removeErr = errors.New("container is in use")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "container is in use") {
+		t.Fatalf("createDoneMsg.err = %v, want the remove error", msg.err)
+	}
+
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one replacement create attempt", fp.creates)
+	}
+	tempID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
+	if len(fp.removed) != 2 || fp.removed[0] != oldID || fp.removed[1] != tempID {
+		t.Fatalf("removed = %#v, want [original %v, replacement %v] in that order", fp.removed, oldID, tempID)
+	}
+	if len(fp.renamed) != 0 || fp.starts != 0 {
+		t.Fatalf("renamed/starts = %#v/%d, want neither once removal of the original fails", fp.renamed, fp.starts)
+	}
+}
+
+// TestConfirmEditStandaloneKeepsReplacementWhenStartFails checks the final
+// failure point in editContainerCmd: rename succeeds but starting the
+// replacement fails. The renamed replacement must survive — it's the only
+// container left, correctly configured even if not running.
+func TestConfirmEditStandaloneKeepsReplacementWhenStartFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selectedContainer().ID
+	fp := model.provider.(*fakeProvider)
+	fp.startErr = errors.New("driver failed programming external connectivity")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	model.createDraft.Confirming = true
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd).(createDoneMsg)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "external connectivity") {
+		t.Fatalf("createDoneMsg.err = %v, want the start error", msg.err)
+	}
+
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	}
+	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
+		t.Fatalf("renamed = %#v, want the replacement renamed to grafana before the start attempt", fp.renamed)
+	}
+	newID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
+	if len(fp.started) != 1 || fp.started[0] != newID {
+		t.Fatalf("started = %#v, want exactly one start attempt on the replacement", fp.started)
+	}
+	replacement, ok := fp.containers[newID.ID]
+	if !ok {
+		t.Fatal("replacement container removed after start failure, want it kept")
+	}
+	if replacement.Name != "grafana" {
+		t.Fatalf("replacement name = %q, want grafana", replacement.Name)
+	}
+	if replacement.State == domain.StateRunning {
+		t.Fatal("replacement reports running despite StartContainer returning an error")
+	}
+}
+
 func TestHandleDeleteKeyStandaloneCallsRemoveContainer(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana")
 	model.overlay = overlayDelete
@@ -3827,9 +3958,24 @@ func TestHandleDeleteKeyStandaloneCallsRemoveContainer(t *testing.T) {
 	}
 }
 
-func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) {
+// TestHandleReplicateKeyStandaloneUsesCreateBeforeRemoveSequence is the
+// regression test for a confirmed bug: "u" (pull latest and recreate) on a
+// standalone container used to pull, then remove the original, then create
+// a replacement under the original's own name — with nothing proving the
+// replacement could actually be created before the original was gone. Any
+// failure in that final CreateContainer call (port conflict, invalid mount,
+// daemon disconnect, ...) left the user with neither container. This now
+// goes through the same safe sequence "edit" uses: pull, create a stopped
+// replacement under a temporary name, only then remove the original,
+// rename the replacement to the real name, and start it — see
+// replaceContainerInPlace.
+func TestHandleReplicateKeyStandaloneUsesCreateBeforeRemoveSequence(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
 	model.selected.Ports = []domain.Port{{IP: "0.0.0.0", Private: 3000, Public: 3000, Type: "tcp"}}
+	model.selected.Mounts = []domain.Mount{{Type: "bind", Source: "/srv/grafana", Destination: "/var/lib/grafana", ReadWrite: true}}
+	model.selected.Env = []string{"GF_AUTH=none"}
+	model.selected.RestartPolicy = "unless-stopped"
 	model.overlay = overlayReplicate
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
@@ -3851,22 +3997,207 @@ func TestHandleReplicateKeyStandaloneCallsPullRemoveCreateInOrder(t *testing.T) 
 	if !strings.Contains(model.status, "grafana/grafana:latest") {
 		t.Fatalf("status after draining progress = %q, want it to reflect the pull progress", model.status)
 	}
+
 	fp := model.provider.(*fakeProvider)
 	if len(fp.pulled) != 1 || fp.pulled[0] != "grafana/grafana:latest" {
 		t.Fatalf("pulled = %#v, want a single pull of the original image", fp.pulled)
 	}
-	if len(fp.removed) != 1 || fp.removed[0] != model.selected.ID {
-		t.Fatalf("removed = %#v, want a single call for %v", fp.removed, model.selected.ID)
-	}
 	if len(fp.creates) != 1 {
-		t.Fatalf("creates = %#v, want a single recreate call", fp.creates)
+		t.Fatalf("creates = %#v, want a single replacement create", fp.creates)
 	}
 	created := fp.creates[0]
-	if created.Name != "grafana" || created.Image != "grafana/grafana:latest" {
-		t.Fatalf("recreated spec = %#v, want the same identity as the original, not a -clone name", created)
+	if created.Name == "grafana" || !strings.HasPrefix(created.Name, "whatthedock-edit-grafana-") {
+		t.Fatalf("recreated spec name = %q, want a temporary replacement name (created before the original is removed)", created.Name)
+	}
+	if created.Start {
+		t.Fatal("recreated spec Start = true, want the temp replacement created stopped")
 	}
 	if len(created.Ports) != 1 || created.Ports[0].ContainerPort != 3000 {
 		t.Fatalf("recreated ports = %#v, want the original 3000 binding carried over", created.Ports)
+	}
+	if len(created.Mounts) != 1 || created.Mounts[0].Destination != "/var/lib/grafana" {
+		t.Fatalf("recreated mounts = %#v, want the original mount carried over", created.Mounts)
+	}
+	if len(created.Env) != 1 || created.Env[0] != "GF_AUTH=none" {
+		t.Fatalf("recreated env = %#v, want the original env carried over", created.Env)
+	}
+	if created.RestartPolicy != "unless-stopped" {
+		t.Fatalf("recreated restart policy = %q, want unless-stopped", created.RestartPolicy)
+	}
+	// The create call happens (and must succeed) strictly before the
+	// original is ever removed.
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want a single call for the original %v, after create succeeded", fp.removed, oldID)
+	}
+	if len(fp.renamed) != 1 || fp.renamed[0] != "created-"+created.Name+"=grafana" {
+		t.Fatalf("renamed = %#v, want the replacement renamed to grafana", fp.renamed)
+	}
+	newID := domain.ResourceID{Host: "local", ID: "created-" + created.Name}
+	if len(fp.started) != 1 || fp.started[0] != newID {
+		t.Fatalf("started = %#v, want the replacement (%v) started", fp.started, newID)
+	}
+	// Original is gone, replacement lives on under the real name.
+	if _, ok := fp.containers[oldID.ID]; ok {
+		t.Fatal("original container still present after a successful replicate")
+	}
+	replacement, ok := fp.containers[newID.ID]
+	if !ok {
+		t.Fatal("replacement container missing after a successful replicate")
+	}
+	if replacement.Name != "grafana" || replacement.State != domain.StateRunning {
+		t.Fatalf("replacement = %#v, want it named grafana and running", replacement)
+	}
+}
+
+func TestHandleReplicateKeyStandaloneDoesNotRemoveWhenPullFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.provider.(*fakeProvider).pullErr = errors.New("registry unreachable")
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	done := runCmd(t, cmd).(actionDoneMsg)
+	if done.err == nil || !strings.Contains(done.err.Error(), "registry unreachable") {
+		t.Fatalf("actionDoneMsg.err = %v, want registry unreachable", done.err)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 0 || len(fp.creates) != 0 {
+		t.Fatalf("removed/creates = %#v/%#v, want no destructive action after pull failure", fp.removed, fp.creates)
+	}
+	if _, ok := fp.containers[model.selected.ID.ID]; !ok {
+		t.Fatal("original container missing after pull failure")
+	}
+}
+
+func TestHandleReplicateKeyStandaloneDoesNotRemoveWhenReplacementCreateFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
+	model.provider.(*fakeProvider).createErr = errors.New("port is already allocated")
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	done := runCmd(t, cmd).(actionDoneMsg)
+	if done.err == nil || !strings.Contains(done.err.Error(), "port is already allocated") {
+		t.Fatalf("actionDoneMsg.err = %v, want the create error", done.err)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.removed) != 0 {
+		t.Fatalf("removed = %#v, want the original never removed when the replacement can't be created", fp.removed)
+	}
+	if len(fp.creates) != 1 || fp.creates[0].Start {
+		t.Fatalf("creates = %#v, want exactly one stopped replacement attempt", fp.creates)
+	}
+	if _, ok := fp.containers[oldID.ID]; !ok {
+		t.Fatal("original container missing after replacement create failure")
+	}
+}
+
+// TestHandleReplicateKeyStandaloneCleansUpReplacementWhenOriginalRemovalFails
+// checks that a failed original-removal (original still occupied, e.g. a
+// stop error under force-remove) triggers cleanup of the just-created
+// temp-named replacement — and that cleanup targets the replacement's own
+// ID, never the original's.
+func TestHandleReplicateKeyStandaloneCleansUpReplacementWhenOriginalRemovalFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
+	fp := model.provider.(*fakeProvider)
+	fp.removeErr = errors.New("container is in use")
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	done := runCmd(t, cmd).(actionDoneMsg)
+	if done.err == nil || !strings.Contains(done.err.Error(), "container is in use") {
+		t.Fatalf("actionDoneMsg.err = %v, want the remove error", done.err)
+	}
+
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one replacement create attempt", fp.creates)
+	}
+	tempID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
+	// removeErr makes every RemoveContainer call fail — both the attempt on
+	// the original (which the sequence itself makes) and the deferred
+	// cleanup attempt on the replacement land in fp.removed. Both must
+	// target the correct, distinct IDs: never the same one twice, never
+	// the wrong one.
+	if len(fp.removed) != 2 || fp.removed[0] != oldID || fp.removed[1] != tempID {
+		t.Fatalf("removed = %#v, want [original %v, replacement %v] in that order", fp.removed, oldID, tempID)
+	}
+	if len(fp.renamed) != 0 || fp.starts != 0 {
+		t.Fatalf("renamed/starts = %#v/%d, want neither once removal of the original fails", fp.renamed, fp.starts)
+	}
+}
+
+func TestHandleReplicateKeyStandaloneKeepsReplacementWhenRenameFailsAfterRemoval(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
+	fp := model.provider.(*fakeProvider)
+	fp.renameErr = errors.New("container name already in use")
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	done := runCmd(t, cmd).(actionDoneMsg)
+	if done.err == nil || !strings.Contains(done.err.Error(), "already in use") {
+		t.Fatalf("actionDoneMsg.err = %v, want the rename error", done.err)
+	}
+
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	}
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want one replacement create", fp.creates)
+	}
+	replacementID := "created-" + fp.creates[0].Name
+	if _, ok := fp.containers[replacementID]; !ok {
+		t.Fatalf("replacement container %s was removed after rename failure, want it kept — the original is already gone", replacementID)
+	}
+	if fp.starts != 0 {
+		t.Fatalf("starts = %d, want no start attempt after rename failure", fp.starts)
+	}
+}
+
+// TestHandleReplicateKeyStandaloneKeepsReplacementWhenStartFails checks the
+// last failure point: rename succeeds (replacement now bears the real
+// name) but starting it fails. The replacement must survive under its real
+// name rather than being torn down — it's the only container left, and
+// it's fully configured even if not running.
+func TestHandleReplicateKeyStandaloneKeepsReplacementWhenStartFails(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	oldID := model.selected.ID
+	fp := model.provider.(*fakeProvider)
+	fp.startErr = errors.New("driver failed programming external connectivity")
+	model.overlay = overlayReplicate
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	done := runCmd(t, cmd).(actionDoneMsg)
+	if done.err == nil || !strings.Contains(done.err.Error(), "external connectivity") {
+		t.Fatalf("actionDoneMsg.err = %v, want the start error", done.err)
+	}
+
+	if len(fp.removed) != 1 || fp.removed[0] != oldID {
+		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	}
+	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
+		t.Fatalf("renamed = %#v, want the replacement renamed to grafana before the start attempt", fp.renamed)
+	}
+	newID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
+	if len(fp.started) != 1 || fp.started[0] != newID {
+		t.Fatalf("started = %#v, want exactly one start attempt on the replacement", fp.started)
+	}
+	replacement, ok := fp.containers[newID.ID]
+	if !ok {
+		t.Fatal("replacement container removed after start failure, want it kept")
+	}
+	if replacement.Name != "grafana" {
+		t.Fatalf("replacement name = %q, want grafana (renamed before start was attempted)", replacement.Name)
+	}
+	if replacement.State == domain.StateRunning {
+		t.Fatal("replacement reports running despite StartContainer returning an error")
 	}
 }
 

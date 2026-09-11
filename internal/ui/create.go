@@ -1157,56 +1157,75 @@ func pullThenCreate(ctx context.Context, provider app.Provider, spec app.Contain
 	return provider.CreateContainer(ctx, spec)
 }
 
+// replaceContainerInPlace is the one safe sequence for swapping id's live
+// container for a fresh one built from spec — used by both "edit"
+// (editContainerCmd) and standalone "pull latest and recreate"
+// (startReplicate's non-Compose branch), so this safety-critical ordering
+// only has to be gotten right in one place.
+//
+// Pulling and creating a stopped replacement (under a temporary name, so it
+// can never collide with id's own name/ports while both exist) happen
+// before removing the current container, so a registry failure or
+// create-time validation failure does not delete the user's still-working
+// original. Starting still happens after removal, and after renaming to
+// spec's real name, because Docker cannot run two containers with the same
+// published ports/name at once — that final window (original already gone,
+// replacement not yet renamed/started) is the one failure region this
+// can't fully protect against; see the inline comments below for exactly
+// what's preserved at each point.
+func replaceContainerInPlace(ctx context.Context, provider app.Provider, id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) (domain.ResourceID, error) {
+	if pullFirst {
+		onProgress := func(p app.PullProgress) {
+			sendActionProgress(progress, formatPullProgress(spec.Image, p))
+		}
+		if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
+			return domain.ResourceID{}, err
+		}
+	}
+	tempSpec := spec
+	tempSpec.Name = editReplacementName(spec.Name)
+	tempSpec.Start = false
+	sendActionProgress(progress, "creating replacement for "+spec.Name+"…")
+	newID, err := provider.CreateContainer(ctx, tempSpec)
+	if err != nil {
+		return domain.ResourceID{}, err
+	}
+	cleanupReplacement := true
+	defer func() {
+		if cleanupReplacement {
+			_ = provider.RemoveContainer(context.Background(), newID, true)
+		}
+	}()
+	sendActionProgress(progress, "removing "+spec.Name+"…")
+	if err := provider.RemoveContainer(ctx, id, true); err != nil {
+		return domain.ResourceID{}, err
+	}
+	// The original is gone as of here, so the replacement must never be
+	// cleaned up past this point no matter what fails next — deleting it
+	// once the original is already gone would leave the user with neither
+	// container. cleanupReplacement exists only to undo the replacement
+	// create itself, while the original is still safely in place.
+	cleanupReplacement = false
+	sendActionProgress(progress, "renaming replacement to "+spec.Name+"…")
+	if err := provider.RenameContainer(ctx, newID, spec.Name); err != nil {
+		return newID, err
+	}
+	sendActionProgress(progress, "starting "+spec.Name+"…")
+	if err := provider.StartContainer(ctx, newID); err != nil {
+		return newID, err
+	}
+	return newID, nil
+}
+
 // editContainerCmd replaces id in place with a fresh container built from
-// spec. Pulling and creating a stopped replacement happen before removing
-// the current container, so a registry failure or create-time validation
-// failure does not delete the user's still-working original. Starting still
-// happens after removal because Docker cannot run two containers with the
-// same published ports/name at once.
+// spec — see replaceContainerInPlace for the actual safe sequence.
 func (m Model) editContainerCmd(id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) tea.Cmd {
 	provider := m.provider
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		if pullFirst {
-			onProgress := func(p app.PullProgress) {
-				sendActionProgress(progress, formatPullProgress(spec.Image, p))
-			}
-			if err := provider.PullImage(ctx, spec.Image, onProgress); err != nil {
-				return createDoneMsg{name: spec.Name, edited: true, err: err}
-			}
-		}
-		tempSpec := spec
-		tempSpec.Name = editReplacementName(spec.Name)
-		tempSpec.Start = false
-		sendActionProgress(progress, "creating replacement for "+spec.Name+"…")
-		newID, err := provider.CreateContainer(ctx, tempSpec)
+		newID, err := replaceContainerInPlace(ctx, provider, id, spec, pullFirst, progress)
 		if err != nil {
-			return createDoneMsg{name: spec.Name, edited: true, err: err}
-		}
-		cleanupReplacement := true
-		defer func() {
-			if cleanupReplacement {
-				_ = provider.RemoveContainer(context.Background(), newID, true)
-			}
-		}()
-		sendActionProgress(progress, "removing "+spec.Name+"…")
-		if err := provider.RemoveContainer(ctx, id, true); err != nil {
-			return createDoneMsg{name: spec.Name, edited: true, err: err}
-		}
-		// The original is gone as of here, so the replacement must never be
-		// cleaned up past this point no matter what fails next — deleting
-		// it once the original is already gone would leave the user with
-		// neither container. cleanupReplacement exists only to undo the
-		// replacement create itself, while the original is still safely in
-		// place.
-		cleanupReplacement = false
-		sendActionProgress(progress, "renaming replacement to "+spec.Name+"…")
-		if err := provider.RenameContainer(ctx, newID, spec.Name); err != nil {
-			return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
-		}
-		sendActionProgress(progress, "starting "+spec.Name+"…")
-		if err := provider.StartContainer(ctx, newID); err != nil {
 			return createDoneMsg{name: spec.Name, id: newID, edited: true, err: err}
 		}
 		return createDoneMsg{name: spec.Name, id: newID, edited: true}

@@ -2506,9 +2506,14 @@ func (m Model) startDeleteStack(project string) (tea.Model, tea.Cmd) {
 }
 
 // startReplicate dispatches to the Compose (pull + up -d) or standalone
-// (pull + remove + recreate with an identical spec) path. Standalone wires
-// PullImage's onProgress callback into actionProgress (drained each
-// statusPulseTickMsg tick, see drainActionProgress) for real pull detail.
+// path. Standalone goes through the same replaceContainerInPlace sequence
+// "edit" uses (pull, create a stopped replacement under a temp name, only
+// then remove the original, rename, start) instead of removing the
+// original before anything has proven it can be recreated — a pull
+// succeeding is no guarantee the create that follows will (port conflicts,
+// invalid mount/network config, a daemon disconnect mid-sequence, ...), and
+// removing first would leave the user with neither container when it
+// doesn't.
 func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -2541,20 +2546,7 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
 		defer cancel()
-		onProgress := func(p app.PullProgress) {
-			select {
-			case progress <- formatPullProgress(image, p):
-			default: // UI hasn't drained yet; drop, next tick catches up
-			}
-		}
-		if err := provider.PullImage(ctx, image, onProgress); err != nil {
-			return actionDoneMsg{label: label, err: err}
-		}
-		sendActionProgress(progress, "recreating "+selected.DisplayName()+"…")
-		if err := provider.RemoveContainer(ctx, id, true); err != nil {
-			return actionDoneMsg{label: label, err: err}
-		}
-		_, err := provider.CreateContainer(ctx, spec)
+		_, err := replaceContainerInPlace(ctx, provider, id, spec, true, progress)
 		return actionDoneMsg{label: label, err: err}
 	}
 }
