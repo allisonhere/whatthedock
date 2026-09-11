@@ -1752,7 +1752,12 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.createDraft.OverrideRawSet = true
 				m.createDraft.OverrideLoaded = true
 				m.createDraft.OverrideRawBase = false
-				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+				// createDraft.FieldsDirty: see its doc comment — this is the same
+				// async-load-races-user-edits case as createSelectedComposeFileMsg
+				// below, just for the "an override already exists" branch.
+				if !m.createDraft.FieldsDirty {
+					m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+				}
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
 			} else if msg.baseFileMissing {
 				m.backfillAdoptDraft(m.selectedContainer())
@@ -1789,8 +1794,16 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createDraft.OverrideRawSet = true
 			m.createDraft.OverrideLoaded = true
 			m.createDraft.OverrideRawBase = true
-			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
-			m.revalidateCreateField()
+			// createDraft.FieldsDirty: don't clobber fields the user has already
+			// started editing with this (possibly slower, over SSH) load's
+			// version of them — see its doc comment on Model. The
+			// structural OverrideRaw/OverrideRawSet/... fields above still
+			// need to be set regardless, so the eventual save-back knows
+			// this is a real base-file-defined service either way.
+			if !m.createDraft.FieldsDirty {
+				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+				m.revalidateCreateField()
+			}
 			m.status, m.statusErr = "loaded compose service from "+filepath.Base(msg.path), false
 			return m, nil
 		}
@@ -1801,8 +1814,10 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.createDraft.OverrideRawSet = true
 		m.createDraft.OverrideLoaded = true
 		m.createDraft.OverrideRawBase = true
-		m.createDraft.applyOverrideFieldsFromYAML(msg.content)
-		m.revalidateCreateField()
+		if !m.createDraft.FieldsDirty {
+			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+			m.revalidateCreateField()
+		}
 		m.status, m.statusErr = "loaded compose stack from "+filepath.Base(msg.path), false
 		return m, nil
 	case createFileBrowseMsg:

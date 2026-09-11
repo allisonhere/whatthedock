@@ -3690,6 +3690,49 @@ func TestPressMDoesNothingWithNoSelection(t *testing.T) {
 	}
 }
 
+// TestEditStandaloneCyclingRestartFieldActuallySticks drives the real key
+// sequence a user performs on the edit form — land on the Restart field,
+// press "right" to cycle its value, then confirm — instead of poking
+// createDraft.Restart directly (as the sibling test above does). This is
+// what actually exercises cycleCreateChoice's dispatch, to rule out a
+// UI-input bug distinct from the already-proven-correct apply pipeline.
+func TestEditStandaloneCyclingRestartFieldActuallySticks(t *testing.T) {
+	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
+	model.selected.RestartPolicy = "no"
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	model = updated.(Model)
+	if model.createDraft.Restart != "no" {
+		t.Fatalf("createDraft.Restart after opening edit = %q, want no (prefilled from the container)", model.createDraft.Restart)
+	}
+
+	model.createField = createFieldRestart
+	model.syncCreateFieldEditor()
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.createDraft.Restart == "no" {
+		t.Fatalf("createDraft.Restart after cycling = %q, want it changed from no", model.createDraft.Restart)
+	}
+	wantRestart := model.createDraft.Restart
+
+	model.createDraft.Confirming = true
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg, ok := runCmd(t, cmd).(createDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("createDoneMsg = %#v", msg)
+	}
+
+	fp := model.provider.(*fakeProvider)
+	if len(fp.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one", fp.creates)
+	}
+	if fp.creates[0].RestartPolicy != wantRestart {
+		t.Fatalf("created RestartPolicy = %q, want %q (the cycled value) — it didn't stick", fp.creates[0].RestartPolicy, wantRestart)
+	}
+}
+
 func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
 	model.selected.RestartPolicy = "always"

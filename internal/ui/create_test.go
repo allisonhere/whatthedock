@@ -688,6 +688,162 @@ func TestImageActionAppearsForNonStackCreateDrafts(t *testing.T) {
 	}
 }
 
+// TestComposeSpecUsesRegeneratedContentAfterFieldEdit is the regression
+// test for the actual root cause behind a live report: editing an existing
+// Compose service's Restart field (or any other) and confirming silently
+// applied nothing, no error, every time. ComposeSpec's content-selection
+// logic preferred draft.OverrideRaw — a raw YAML snapshot loaded once,
+// either before or after the user's edit — over the freshly-generated
+// content that actually reflects the live form, whenever OverrideRawSet
+// was true. Since editing an *existing* service always sets
+// OverrideRawSet (see openEditOverlay/checkComposeOverrideCmd), this meant
+// no field edit on an existing service ever reached the applied compose
+// content unless FieldsDirty is also checked.
+func TestComposeSpecUsesRegeneratedContentAfterFieldEdit(t *testing.T) {
+	draft := createDraft{
+		Mode:        createModeCompose,
+		Editing:     true,
+		Project:     "media",
+		Service:     "dash",
+		Image:       "ghcr.io/allisonhere/dash:latest",
+		Restart:     "always", // the user's edit
+		ComposeFile: "/home/allie/dash/compose.yaml",
+		// OverrideRaw simulates the loaded base file's content — set
+		// regardless of the user's edit above, the same way
+		// createSelectedComposeFileMsg's handler always records it.
+		OverrideRaw:     "services:\n  dash:\n    image: ghcr.io/allisonhere/dash:latest\n    restart: unless-stopped\n",
+		OverrideRawSet:  true,
+		OverrideRawBase: true,
+		FieldsDirty:     true, // the user edited Restart after that load
+	}
+
+	spec, err := draft.ComposeSpec(config.DefaultSystem())
+	if err != nil {
+		t.Fatalf("ComposeSpec() error = %v", err)
+	}
+	if !strings.Contains(spec.Content, `restart: "always"`) {
+		t.Fatalf("spec.Content = %q, want it to contain the edited restart: always, not the stale loaded unless-stopped", spec.Content)
+	}
+	if strings.Contains(spec.Content, "unless-stopped") {
+		t.Fatalf("spec.Content = %q, still contains the stale loaded value", spec.Content)
+	}
+}
+
+// TestComposeSpecPrefersOverrideRawWhenFieldsUntouched is
+// TestComposeSpecUsesRegeneratedContentAfterFieldEdit's complement: without
+// any field edit (FieldsDirty false — matching a hand-typed ctrl+y save,
+// or a load nothing has diverged from yet), OverrideRaw still wins, since
+// it can carry content the per-field form has no way to express.
+func TestComposeSpecPrefersOverrideRawWhenFieldsUntouched(t *testing.T) {
+	draft := createDraft{
+		Mode:            createModeCompose,
+		Editing:         true,
+		Project:         "media",
+		Service:         "dash",
+		Image:           "ghcr.io/allisonhere/dash:latest",
+		Restart:         "unless-stopped",
+		ComposeFile:     "/home/allie/dash/compose.yaml",
+		OverrideRaw:     "services:\n  dash:\n    image: ghcr.io/allisonhere/dash:latest\n    restart: unless-stopped\n    labels:\n      hand-typed: yes\n",
+		OverrideRawSet:  true,
+		OverrideRawBase: true,
+		FieldsDirty:     false,
+	}
+
+	spec, err := draft.ComposeSpec(config.DefaultSystem())
+	if err != nil {
+		t.Fatalf("ComposeSpec() error = %v", err)
+	}
+	if !strings.Contains(spec.Content, "hand-typed: yes") {
+		t.Fatalf("spec.Content = %q, want the hand-typed OverrideRaw content preserved when no field was edited", spec.Content)
+	}
+}
+
+// TestEditingFieldOnBaseDefinedServicePreservesUnmanagedKeys is the
+// regression test for a real, live incident: editing a field (Restart)
+// on a Compose service whose base compose.yaml defines fields the form
+// doesn't expose (container_name, network_mode, build) used to wholesale-
+// overwrite the entire base file with the regenerated, sparse 6-field
+// document — deleting container_name/network_mode/build and every
+// comment. Docker Compose then fell back to its own default container
+// naming and bridge networking, breaking the service.
+//
+// Root cause: ComposeSpec's FullBase (composeCreateSpec.FullBase) told
+// mergeComposeCreateIntoBase it was safe to replace the whole file,
+// because it was only ever gated on OverrideRawBase (true whenever the
+// base file was loaded as a single-service document) — never on whether
+// Content was still that same complete document. Once a field edit made
+// Content the regenerated sparse one (see FieldsDirty), FullBase should
+// have gone false so the safe per-field merge path
+// (mergeComposeServiceFields) ran instead.
+func TestEditingFieldOnBaseDefinedServicePreservesUnmanagedKeys(t *testing.T) {
+	original := composeCommand
+	defer func() { composeCommand = original }()
+	composeCommand = func(context.Context, composeCreateSpec, ...string) error { return nil }
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yaml")
+	content := `services:
+  dash:
+    # a comment the form knows nothing about
+    build: .
+    image: ghcr.io/allisonhere/dash:latest
+    container_name: dash
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=3939
+    volumes:
+      - ./data:/config
+`
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	draft := createDraft{
+		Mode:            createModeCompose,
+		Editing:         true,
+		Project:         "dash",
+		Service:         "dash",
+		Image:           "ghcr.io/allisonhere/dash:latest",
+		Restart:         "always", // the user's edit
+		Env:             "PORT=3939",
+		Mounts:          "./data:/config",
+		ComposeFile:     base,
+		OverrideRaw:     content,
+		OverrideRawSet:  true,
+		OverrideRawBase: true,
+		FieldsDirty:     true,
+	}
+	spec, err := draft.ComposeSpec(config.DefaultSystem())
+	if err != nil {
+		t.Fatalf("ComposeSpec() error = %v", err)
+	}
+	if spec.FullBase {
+		t.Fatal("spec.FullBase = true, want false once a field has been edited — wholesale-replace would delete container_name/network_mode/build")
+	}
+
+	if err := defaultApplyComposeCreate(context.Background(), spec); err != nil {
+		t.Fatalf("defaultApplyComposeCreate() error = %v", err)
+	}
+
+	updated, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(updated)
+	for _, want := range []string{"container_name: dash", "network_mode: host", "build: .", "a comment the form knows nothing about"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("base file after edit = %q, missing %q (a key/comment the form doesn't manage, wrongly deleted)", got, want)
+		}
+	}
+	if !strings.Contains(got, "restart: always") {
+		t.Fatalf("base file after edit = %q, want the edited restart: always applied", got)
+	}
+	if strings.Contains(got, "unless-stopped") {
+		t.Fatalf("base file after edit = %q, still has the old restart value", got)
+	}
+}
+
 func TestCreateComposeSpecWritesOverrideBesideBaseFile(t *testing.T) {
 	draft := createDraft{
 		Mode:        createModeCompose,
@@ -2957,7 +3113,14 @@ func TestCreateStrayKeyOnModeFieldIsIgnoredNotTypedElsewhere(t *testing.T) {
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	model = updated.(Model)
 
-	if !reflect.DeepEqual(model.createDraft, before) {
+	// FieldsDirty is internal bookkeeping (any non-navigation key marks it,
+	// conservatively, to protect against a slower async prefill landing
+	// after the fact — see its doc comment) — not user-visible content, so
+	// it's expected to flip here even though nothing the user can see
+	// changed. Everything else must be untouched.
+	got, want := model.createDraft, before
+	got.FieldsDirty, want.FieldsDirty = false, false
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("draft changed after a stray '/' on the Mode field: before=%#v after=%#v", before, model.createDraft)
 	}
 }
@@ -3159,6 +3322,62 @@ func TestOpenEditOverlayLoadsBaseComposeWhenNoOverrideExists(t *testing.T) {
 	}
 	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase || model.createDraft.OverrideRaw != content {
 		t.Fatalf("OverrideRawSet/Base/Raw = %v/%v/%q, want exact base compose content loaded", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase, model.createDraft.OverrideRaw)
+	}
+}
+
+// TestEditingRestartBeforeBaseComposeLoadArrivesIsNotClobbered is the
+// regression test for a real reported bug: opening Edit on a Compose
+// service kicks off an async load of the base compose file to prefill the
+// form (openEditOverlay -> loadSelectedComposeFileCmd) — on a remote (SSH)
+// system that's a real network round trip, slow enough that someone can
+// open Edit, change a field, and even confirm before it lands. When it
+// finally did land, its handler (createSelectedComposeFileMsg in model.go)
+// used to unconditionally overwrite the form's fields — including
+// Restart — with the base file's original values, silently discarding
+// whatever the user had already typed, with no error. This reproduces
+// that exact ordering: user edits Restart *before* the load's result
+// message is delivered to Update.
+func TestEditingRestartBeforeBaseComposeLoadArrivesIsNotClobbered(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := `services:
+  dash:
+    image: ghcr.io/allisonhere/dash:latest
+    restart: unless-stopped
+`
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("dash", "dash", base)
+	cmd := model.openEditOverlay()
+	if cmd == nil {
+		t.Fatal("openEditOverlay() returned nil, want a base compose load command")
+	}
+	// The user edits the Restart field before the async load's result ever
+	// reaches Update — exactly the ordering a slow SSH round trip allows.
+	model.createField = createFieldRestart
+	model.syncCreateFieldEditor()
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if model.createDraft.Restart == "unless-stopped" {
+		t.Fatalf("createDraft.Restart after cycling = %q, want it changed", model.createDraft.Restart)
+	}
+	edited := model.createDraft.Restart
+
+	// Now the slow load finally "arrives".
+	msg := runCmd(t, cmd).(createSelectedComposeFileMsg)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if model.createDraft.Restart != edited {
+		t.Fatalf("createDraft.Restart after the base-file load landed = %q, want %q (the user's edit) preserved, not clobbered", model.createDraft.Restart, edited)
+	}
+	// The structural override bookkeeping must still be set correctly —
+	// only the visible field re-population is skipped, not the save-back
+	// mechanism that depends on this.
+	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase {
+		t.Fatalf("OverrideRawSet/OverrideRawBase = %v/%v, want both true even when the field prefill was skipped", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase)
 	}
 }
 

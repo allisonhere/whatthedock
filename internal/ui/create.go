@@ -102,10 +102,42 @@ type createDraft struct {
 	// openCreateOverlay/checkRemoteOverrideCmd) or hand-edited via the
 	// Ripple editor opened with ctrl+y. OverrideLoaded distinguishes the
 	// two for the form's label; saving an edit in the editor clears it.
+	// That precedence is only correct while OverrideRaw actually reflects
+	// what's on screen, though — see FieldsDirty.
 	OverrideRaw     string
 	OverrideRawSet  bool
 	OverrideLoaded  bool
 	OverrideRawBase bool
+
+	// FieldsDirty is set the moment the user changes a form field (Restart,
+	// Ports, Mounts, Env, Image, ...) via handleCreateKey, and cleared
+	// whenever OverrideRaw becomes freshly authoritative again — a new
+	// draft opening, or a raw-editor save (saveCreateEditor). It guards two
+	// things against a loaded-but-now-stale OverrideRaw:
+	//
+	//  1. ComposeSpec's own content-precedence rule above: once the user
+	//     has edited a field, ComposeSpec must regenerate content from the
+	//     live fields (composeOverrideContent) instead of reusing
+	//     OverrideRaw — otherwise editing e.g. Restart on an existing
+	//     Compose service and confirming would silently apply nothing at
+	//     all, no error, because OverrideRaw (loaded once, before or after
+	//     the edit) would keep winning over whatever the form now shows.
+	//  2. The async load races in model.go's createSelectedComposeFileMsg/
+	//     createOverrideCheckMsg handlers: opening Edit on a Compose
+	//     service kicks off a load of the base/override file to prefill
+	//     the form — on a remote (SSH) system that's a real round trip,
+	//     slow enough to open Edit, change a field, and confirm before it
+	//     lands. Once FieldsDirty, those handlers skip re-populating the
+	//     visible fields from what they loaded (they still record the
+	//     structural OverrideRaw/OverrideRawSet/... bookkeeping either
+	//     way), so a field edit is never silently overwritten by a slow
+	//     background load landing after the fact.
+	//
+	// Both failure modes were reported live as "I set Restart to always,
+	// confirmed, and it's still the old value" on a Compose service on a
+	// remote system — no error either time, since nothing failed; the
+	// edit just never reached the file that got written.
+	FieldsDirty bool
 
 	// BaseFileMissing is set (see openCreateOverlay/checkRemoteOverrideCmd)
 	// when ComposeFile was already non-empty at form-open time — i.e. an
@@ -437,6 +469,7 @@ func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
 	m.createField = m.visibleCreateFields()[0]
 	m.syncCreateFieldEditor()
 	m.createEditingCompose = false
+	m.createDraft.FieldsDirty = false
 	m.clearCreateNotice()
 	m.status, m.statusErr = "create draft ready", false
 }
@@ -748,6 +781,14 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.createContainerCmd(spec, m.createDraft.pullImageBeforeApply(), progress)
 		}
 		return m, nil
+	}
+	switch msg.String() {
+	case "esc", "q", "up", "down", "tab", "shift+tab":
+		// Pure navigation — no field value changes, so a still-in-flight
+		// async prefill (see createDraft.FieldsDirty's doc comment) is
+		// still safe to apply once it lands.
+	default:
+		m.createDraft.FieldsDirty = true
 	}
 	var cmd tea.Cmd
 	switch msg.String() {
@@ -1409,6 +1450,10 @@ func (m *Model) saveCreateEditor() {
 	m.createDraft.OverrideLoaded = false // now hand-edited this session, not just loaded
 	m.createDraft.OverrideRawBase = m.createDraft.OverrideRawBase && value != ""
 	m.createEditingCompose = false
+	// The just-saved raw YAML is authoritative again from here — any
+	// field divergence FieldsDirty was tracking is moot now that
+	// applyOverrideFieldsFromYAML below resyncs the fields from it.
+	m.createDraft.FieldsDirty = false
 	if m.createDraft.OverrideRawSet {
 		m.createDraft.applyOverrideFieldsFromYAML(value)
 		m.setCreateNotice("override YAML edited", false)
@@ -1818,7 +1863,11 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		override = filepath.Join(filepath.Dir(base), overrideName)
 	}
 	content := d.composeOverrideContent()
-	if d.OverrideRawSet {
+	// OverrideRaw only wins while it's still what's on screen — once the
+	// user has edited a field (FieldsDirty), the regenerated content above
+	// is the only thing that reflects that edit; see FieldsDirty's doc
+	// comment for the bug this guards against.
+	if d.OverrideRawSet && !d.FieldsDirty {
 		content = d.OverrideRaw
 	}
 	return composeCreateSpec{
@@ -1827,7 +1876,18 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		BaseFile:     base,
 		OverrideFile: override,
 		Content:      content,
-		FullBase:     d.OverrideRawBase,
+		// FullBase tells mergeComposeCreateIntoBase it's safe to write
+		// Content over the base file wholesale instead of merging just the
+		// known fields into it — only true when Content is genuinely the
+		// complete document (OverrideRawBase) *and* still exactly that
+		// document (!FieldsDirty). Once a field's been edited, Content is
+		// composeOverrideContent()'s regenerated 6-field-only YAML, not a
+		// full replacement for the base file — wholesale-writing that
+		// would silently delete container_name, network_mode, build, and
+		// every comment the base file had. See FieldsDirty's doc comment;
+		// this was reported live as exactly that happening to a real
+		// service.
+		FullBase:     d.OverrideRawBase && !d.FieldsDirty,
 		PullBeforeUp: d.pullImageBeforeApply(),
 		System:       system,
 	}, nil
