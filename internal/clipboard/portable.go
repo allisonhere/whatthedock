@@ -22,6 +22,7 @@
 package clipboard
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,15 +190,26 @@ func FromContainer(ctr domain.Container, sourceHost domain.Host) PortableContain
 		pc.Env = append(pc.Env, PortableEnv{Key: key, Value: value, Secret: IsLikelySecret(key)})
 	}
 
+	published := map[string]bool{}
 	for _, p := range ctr.Ports {
 		if p.Public == 0 {
 			continue // not actually published — see domain.Container.Ports' own convention
 		}
+		published[portableTypeKey(p.Private, p.Type)] = true
 		pc.Ports = append(pc.Ports, PortablePort{
 			HostIP: p.IP, HostPort: p.Public, ContainerPort: p.Private, Protocol: p.Type, Published: true,
 		})
 	}
 	for _, p := range ctr.ExposedPorts {
+		// Docker's own inspect lists a published container port in both
+		// Config.ExposedPorts (ctr.ExposedPorts) and NetworkSettings.Ports
+		// (ctr.Ports) — publishing a port always exposes it too. Without
+		// this check, every published port would also get a second,
+		// contradictory PortablePort{Published: false} entry for the same
+		// container port/protocol here.
+		if published[portableTypeKey(p.Private, p.Type)] {
+			continue
+		}
 		pc.Ports = append(pc.Ports, PortablePort{ContainerPort: p.Private, Protocol: p.Type, Published: false})
 	}
 
@@ -290,6 +302,13 @@ func splitEnv(entry string) (string, string) {
 		return entry, ""
 	}
 	return key, value
+}
+
+// portableTypeKey identifies a container port/protocol pair — used to spot
+// the same port appearing in both ctr.Ports (Public==0 skipped) and
+// ctr.ExposedPorts (see FromContainer's port loop).
+func portableTypeKey(containerPort uint16, protocol string) string {
+	return strings.ToLower(strings.TrimSpace(protocol)) + "/" + strconv.Itoa(int(containerPort))
 }
 
 // splitFields is the shared quote-aware splitting convention

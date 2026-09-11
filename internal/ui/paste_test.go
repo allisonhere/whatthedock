@@ -362,6 +362,75 @@ func TestPasteCreatesNetworkAddedViaReviewFormEdit(t *testing.T) {
 	}
 }
 
+// TestPasteRemovesJustCreatedNetworkWhenContainerCreateFails is a failure
+// injection test for the "errors occurring after network creation leave
+// unwanted resources behind" concern: pasteApplyCmd creates the missing
+// destination network first, then the container create itself fails (a
+// port conflict, invalid config, ...). The just-created network must be
+// rolled back — pasteApplyCmd's cleanup-on-failure — since it exists only
+// because this paste attempt needed it, and no container should exist.
+func TestPasteRemovesJustCreatedNetworkWhenContainerCreateFails(t *testing.T) {
+	dest := pasteDestProvider()
+	dest.createErr = errors.New("port is already allocated")
+	model := modelWithSourceSelected(t, pasteSourceProvider())
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("'d' itself should only open the confirm step, not deploy yet")
+	}
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if !model.statusErr || !strings.Contains(model.status, "port is already allocated") {
+		t.Fatalf("status/statusErr = %q/%v, want the create error surfaced", model.status, model.statusErr)
+	}
+	if len(dest.createdNetworks) != 1 || dest.createdNetworks[0] != "media_default" {
+		t.Fatalf("createdNetworks = %#v, want [media_default] created before the failed container create", dest.createdNetworks)
+	}
+	if len(dest.removedNetworks) != 1 || dest.removedNetworks[0] != "media_default" {
+		t.Fatalf("removedNetworks = %#v, want the just-created network rolled back after the container create failed", dest.removedNetworks)
+	}
+	if len(dest.containers) != 0 {
+		t.Fatalf("containers = %#v, want none — the failed create must leave nothing behind", dest.containers)
+	}
+}
+
+// TestPasteNeverCreatesContainerWhenNetworkCreateFails is the other half of
+// the same failure-injection requirement: if the network create itself
+// fails, pasteApplyCmd must never attempt the container create at all, and
+// must never try to remove a network that was never successfully created.
+func TestPasteNeverCreatesContainerWhenNetworkCreateFails(t *testing.T) {
+	dest := pasteDestProvider()
+	dest.networkCreateErr = errors.New("network name pool exhausted")
+	model := modelWithSourceSelected(t, pasteSourceProvider())
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	model = updated.(Model)
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	msg := runCmd(t, cmd)
+	updated, _ = model.Update(msg)
+	model = updated.(Model)
+
+	if !model.statusErr || !strings.Contains(model.status, "network name pool exhausted") {
+		t.Fatalf("status/statusErr = %q/%v, want the network create error surfaced", model.status, model.statusErr)
+	}
+	if len(dest.creates) != 0 {
+		t.Fatalf("creates = %#v, want the container create never attempted", dest.creates)
+	}
+	if len(dest.removedNetworks) != 0 {
+		t.Fatalf("removedNetworks = %#v, want no removal attempt — the network was never actually created", dest.removedNetworks)
+	}
+}
+
 func TestPreparePastePlanAppendsBindPathConflict(t *testing.T) {
 	source := pasteSourceProvider()
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
