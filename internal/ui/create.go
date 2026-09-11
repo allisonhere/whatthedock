@@ -619,12 +619,29 @@ func formatDraftPorts(ports []domain.Port) string {
 			continue
 		}
 		entry := fmt.Sprintf("%d:%d/%s", p.Public, p.Private, emptyAs(p.Type, "tcp"))
-		if p.IP != "" && p.IP != "0.0.0.0" {
-			entry = p.IP + ":" + entry
+		if prefix := formatPortHostIP(p.IP); prefix != "" {
+			entry = prefix + ":" + entry
 		}
 		parts = append(parts, entry)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// formatPortHostIP renders a port binding's host IP for the "host:container"
+// text field, or "" when there's nothing worth showing (unset, or Docker's
+// default any-interface 0.0.0.0). An IPv6 address is bracketed
+// ("[::1]") — the same [ipv6]:host:container shape Docker's own -p flag
+// uses and parseCreatePorts expects back — since a bare "::1:8080:80"
+// would be ambiguous (indistinguishable from a run of colon-separated
+// fields) and unparseable.
+func formatPortHostIP(ip string) string {
+	if ip == "" || ip == "0.0.0.0" {
+		return ""
+	}
+	if strings.Contains(ip, ":") {
+		return "[" + ip + "]"
+	}
+	return ip
 }
 
 // formatDraftMounts renders a container's mounts into the comma-joined
@@ -2697,7 +2714,23 @@ func parseCreatePorts(value string) ([]app.PortBinding, error) {
 	out := make([]app.PortBinding, 0, len(parts))
 	for _, part := range parts {
 		hostIP := ""
-		if strings.Count(part, ":") >= 2 {
+		if strings.HasPrefix(part, "[") {
+			// Bracketed IPv6 host address ("[::1]:8080:80") — the address
+			// itself contains colons, so naive colon-counting below would
+			// slice through the middle of it. Consume the bracketed
+			// address as one unit first; everything else proceeds exactly
+			// as the IPv4 host:container[/proto] shape already does.
+			end := strings.IndexByte(part, ']')
+			if end < 0 {
+				return nil, fmt.Errorf("port %q has an unterminated IPv6 address (missing ])", part)
+			}
+			hostIP = strings.TrimSpace(part[1:end])
+			rest := part[end+1:]
+			if !strings.HasPrefix(rest, ":") {
+				return nil, fmt.Errorf("port %q must be [ipv6]:host:container", part)
+			}
+			part = rest[1:]
+		} else if strings.Count(part, ":") >= 2 {
 			before, after, _ := strings.Cut(part, ":")
 			hostIP = strings.TrimSpace(before)
 			part = after
@@ -3224,7 +3257,15 @@ func splitEnvEntries(value string) []string {
 func formatEnvEntries(entries []string) string {
 	parts := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if strings.ContainsAny(e, ",\n\"") {
+		// splitEnvEntries trims leading/trailing whitespace off an
+		// unquoted entry (needed so "KEY1=a, KEY2=b" — the space after
+		// the comma is only ever separator formatting — round-trips
+		// clean). An entry whose real value has leading/trailing
+		// whitespace of its own ("KEY= leading", "KEY=trailing ") would
+		// have that whitespace silently stripped by the same trim on the
+		// next parse unless it's quoted here too, the same way a comma or
+		// embedded quote already forces quoting.
+		if strings.ContainsAny(e, ",\n\"") || e != strings.TrimSpace(e) {
 			e = `"` + strings.ReplaceAll(e, `"`, `""`) + `"`
 		}
 		parts = append(parts, e)

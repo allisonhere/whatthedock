@@ -325,8 +325,8 @@ func formatSpecPorts(ports []app.PortBinding) string {
 	parts := make([]string, 0, len(ports))
 	for _, p := range ports {
 		entry := fmt.Sprintf("%d:%d/%s", p.HostPort, p.ContainerPort, emptyAs(p.Protocol, "tcp"))
-		if p.HostIP != "" && p.HostIP != "0.0.0.0" {
-			entry = p.HostIP + ":" + entry
+		if prefix := formatPortHostIP(p.HostIP); prefix != "" {
+			entry = prefix + ":" + entry
 		}
 		parts = append(parts, entry)
 	}
