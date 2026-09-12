@@ -177,6 +177,64 @@ func TestRunAutoRefusesDirtyWorkingTree(t *testing.T) {
 	}
 }
 
+// TestTagExistsDistinguishesKnownFromUnknownTags backs the regression test
+// below — tagExists is what screenVersion's "enter" handler and runAuto
+// use to catch a tag collision before Build/Sign run for nothing.
+func TestTagExistsDistinguishesKnownFromUnknownTags(t *testing.T) {
+	initTestRepo(t)
+	if err := os.WriteFile("f.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "commit", "-q", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "tag", "v0.1.4"); err != nil {
+		t.Fatal(err)
+	}
+
+	if !tagExists("v0.1.4") {
+		t.Fatal("tagExists(\"v0.1.4\") = false, want true — it was just created")
+	}
+	if tagExists("v0.1.24") {
+		t.Fatal("tagExists(\"v0.1.24\") = true, want false — it was never created")
+	}
+}
+
+// TestRunAutoRefusesExistingTag is the regression test for a real failure:
+// runAuto (and, via the same tagExists check, the interactive version
+// screen) used to only discover a tag collision at the Tag step itself —
+// after Build and Sign had already run — surfacing as a bare "fatal: tag
+// 'vX.Y.Z' already exists" with no earlier, clearer signal. A hand-typed
+// or -version-overridden value landing on an already-released version
+// (the version input field only supports backspace-from-end/append-at-end
+// editing, easy to overshoot) is now caught immediately.
+func TestRunAutoRefusesExistingTag(t *testing.T) {
+	initTestRepo(t)
+	if err := os.WriteFile("f.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "commit", "-q", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("git", "tag", "v0.1.4"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runAuto("v0.1.4", true)
+	if err == nil {
+		t.Fatal("runAuto() error = nil, want a refusal for an already-existing tag")
+	}
+	if !strings.Contains(err.Error(), "v0.1.4") || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("runAuto() error = %q, want it to name the conflicting tag", err.Error())
+	}
+}
+
 // initTestRepo creates and cd's into (t.Chdir) a fresh git repo for
 // gitStatusShort/commitAll to run against — both shell out to git in the
 // process's current directory (runCmd, like every other git call in this

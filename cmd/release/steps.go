@@ -219,6 +219,20 @@ func latestTag() string {
 	return tags[0]
 }
 
+// tagExists reports whether version is already a tag in this repo. Checked
+// before a release ever starts (screenVersion's "enter" handler, and
+// runAuto) — the Tag step itself only discovers a collision after Build
+// and Sign have already run, which is a slow, confusing way to find out a
+// hand-typed or overridden version was wrong (the version-input field only
+// supports backspace-from-end/append-at-end editing with no real cursor,
+// so overshooting past the intended edit point and landing on an
+// already-used version, e.g. typing over "v0.1.24" down to "v0.1.4", is an
+// easy mistake to make without noticing).
+func tagExists(version string) bool {
+	_, err := runCmd("git", "rev-parse", "--verify", "-q", "refs/tags/"+version)
+	return err == nil
+}
+
 // commitLog returns the last n "<short-sha> <subject>" lines, most recent
 // first — shown on screenVersion so there's real repo content to look at
 // the moment the tool opens, not just a bare version prompt.

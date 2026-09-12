@@ -38,6 +38,7 @@ type model struct {
 	diffStat  string
 
 	versionInput string
+	versionErr   string
 	dryRun       bool
 
 	// screenCommit state — see handleKey's screenVersion "c" case and
@@ -163,6 +164,18 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.versionInput == "" {
 				return m, nil
 			}
+			// Catch a tag collision here — before Build and Sign run for
+			// nothing — rather than only discovering it at the Tag step.
+			// The version field only supports backspace-from-end/append-
+			// at-end editing with no real cursor, so overshooting past the
+			// intended edit and landing on an already-released version
+			// (e.g. "v0.1.24" backspaced down to "v0.1.4") is an easy
+			// mistake to make without noticing.
+			if tagExists(m.versionInput) {
+				m.versionErr = "tag " + m.versionInput + " already exists — pick a version that hasn't been released"
+				return m, nil
+			}
+			m.versionErr = ""
 			m.steps = releasePlanSteps(m.versionInput)
 			m.screen = screenConfirm
 			return m, nil
@@ -170,6 +183,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.versionInput) > 0 {
 				m.versionInput = m.versionInput[:len(m.versionInput)-1]
 			}
+			m.versionErr = ""
 			return m, nil
 		case "c":
 			// Only a dedicated command when there's something to commit —
@@ -185,11 +199,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if len(msg.Runes) > 0 {
 				m.versionInput += string(msg.Runes)
+				m.versionErr = ""
 			}
 			return m, nil
 		default:
 			if len(msg.Runes) > 0 {
 				m.versionInput += string(msg.Runes)
+				m.versionErr = ""
 			}
 			return m, nil
 		}

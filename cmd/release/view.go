@@ -62,6 +62,9 @@ func (m model) versionView(width int) string {
 	}
 
 	lines = append(lines, "", "Version to release:", renderer.Styles.InputFocused.Width(max(20, width-12)).Render(m.versionInput+"█"))
+	if m.versionErr != "" {
+		lines = append(lines, renderer.Styles.StatusError.Render(" "+m.versionErr+" "))
+	}
 	hints := []tideui.SoftHint{{Key: "enter", Label: "continue"}}
 	if m.dirty {
 		hints = append(hints, tideui.SoftHint{Key: "c", Label: "commit changes"})

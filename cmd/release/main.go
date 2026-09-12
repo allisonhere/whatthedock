@@ -90,6 +90,9 @@ func runAuto(version string, dryRun bool) error {
 	if isDirty() {
 		return fmt.Errorf("working tree is dirty — commit or stash before an unattended release (see git status)")
 	}
+	if tagExists(version) {
+		return fmt.Errorf("tag %s already exists — pass -version=vX.Y.Z with a version that hasn't been released yet", version)
+	}
 	fmt.Println("whatthedock release", version)
 	if dryRun {
 		fmt.Println("(dry run — nothing will be tagged, pushed, or published)")
