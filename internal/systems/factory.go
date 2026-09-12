@@ -246,6 +246,15 @@ func isLiveSocket(path string) bool {
 	return true
 }
 
+// IsLiveSocket is isLiveSocket, exported for read-only external callers
+// (cmd/whatthedock's doctor command) that need to report a tunnel socket's
+// live/stale/missing state without going through prepareLocalSocket's own
+// mutating stale-file cleanup — a diagnostic check must never delete
+// anything on the strength of a single failed dial.
+func IsLiveSocket(path string) bool {
+	return isLiveSocket(path)
+}
+
 // prepareLocalSocket reports whether path is already a live tunnel socket
 // (nothing to do — caller should reuse it) or, if not, removes any stale
 // socket file and ensures its parent directory exists so a fresh listener

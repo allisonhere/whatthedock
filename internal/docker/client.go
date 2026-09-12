@@ -59,6 +59,19 @@ func (p *LocalProvider) Ping(ctx context.Context) error {
 	return err
 }
 
+// ServerVersion reports the connected daemon's version and negotiated API
+// version — not part of the app.Provider interface (no UI caller needs it
+// today), but useful diagnostic detail for cmd/whatthedock's doctor
+// command, which talks to LocalProvider directly rather than through the
+// generic interface for exactly this kind of extra detail.
+func (p *LocalProvider) ServerVersion(ctx context.Context) (version, apiVersion string, err error) {
+	v, err := p.cli.ServerVersion(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	return v.Version, v.APIVersion, nil
+}
+
 func (p *LocalProvider) Snapshot(ctx context.Context) (domain.Snapshot, error) {
 	items, err := p.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
