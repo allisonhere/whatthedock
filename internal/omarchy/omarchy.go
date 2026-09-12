@@ -172,6 +172,15 @@ func CurrentPalette() (p Palette, ok bool) {
 
 // runResolver runs `omarchy-theme-color --all` and returns its key→value map.
 func runResolver() (map[string]string, bool) {
+	// OMARCHY_DIR pins the palette source to a specific directory for
+	// containers and deterministic tests. The resolver shells out to the real
+	// `omarchy-theme-color` binary, which reads the global Omarchy state and
+	// ignores OMARCHY_DIR — letting it run here would override the pinned dir
+	// (and make any OMARCHY_DIR-based test read the developer's own desktop
+	// theme). Skip it whenever the override is set.
+	if os.Getenv("OMARCHY_DIR") != "" {
+		return nil, false
+	}
 	bin, err := exec.LookPath("omarchy-theme-color")
 	if err != nil {
 		return nil, false

@@ -268,3 +268,35 @@ func TestCurrentPaletteFallsBackToConfigRoot(t *testing.T) {
 		t.Fatal("signature empty for a resolvable config-root theme")
 	}
 }
+
+// OMARCHY_DIR must win over the resolver: a resolver left on PATH would read
+// the real desktop theme and override the pinned dir, so runResolver must not
+// run when OMARCHY_DIR is set.
+func TestCurrentPaletteOMARCHYDirSkipsResolver(t *testing.T) {
+	bin := t.TempDir()
+	fake := `#!/bin/sh
+printf 'background\t#ffffff\nforeground\t#000000\naccent\t#ff0000\nmode\tdark\n'
+`
+	if err := os.WriteFile(filepath.Join(bin, "omarchy-theme-color"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	root := t.TempDir()
+	t.Setenv("OMARCHY_DIR", root)
+	themeDir := filepath.Join(root, "current", "theme")
+	if err := os.MkdirAll(themeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(themeDir, "colors.toml"), []byte("background = \"#123456\"\nforeground = \"#abcdef\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p, ok := CurrentPalette()
+	if !ok {
+		t.Fatal("CurrentPalette should read the OMARCHY_DIR theme")
+	}
+	if p.Background != "#123456" {
+		t.Fatalf("Background = %q, want OMARCHY_DIR's #123456 (resolver must be skipped)", p.Background)
+	}
+}
