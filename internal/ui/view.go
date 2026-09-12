@@ -3977,7 +3977,7 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	shown, more, stopped, _, _ := m.dashboardBodyPlan()
 	cursor := clamp(m.dashboardCursor, 0, max(0, len(shown)-1))
 	for i, ctr := range shown {
-		selected := len(shown) > 0 && i == cursor
+		selected := m.dashboardCursorActive && len(shown) > 0 && i == cursor
 		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, ctr, contentWidth, selected), contentWidth))
 	}
 	switch {
@@ -4465,11 +4465,6 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	stats := history.lastStats
 
 	rowBg := renderer.Styles.Theme.Bg
-	if selected {
-		if c, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
-			rowBg = c
-		}
-	}
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
 
 	// Hot-row tint: when this container's CPU or memory-of-limit crosses
@@ -4491,6 +4486,9 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	}
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(baseFg)
 
+	// Selection rail: a left-edge "▌" marker is the only selection
+	// indicator — no full-row background wash. SoftRail keeps its own
+	// 2-cell width, so dashboardRailWidth's column math stays valid.
 	rail := renderer.SoftRail(selected, rowBg)
 	// foregroundSpan only ever sets foreground (see its own doc comment) —
 	// it's meant to sit inside one continuous outer-styled Render call,

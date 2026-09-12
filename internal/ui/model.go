@@ -426,6 +426,11 @@ type Model struct {
 	// dashboardBodyPlan) — reset to 0 each time the overlay opens.
 	dashboardCursor int
 
+	// dashboardCursorActive is true once the user has moved the Dashboard
+	// cursor (j/k/up/down or the mouse wheel); until then the Dashboard
+	// shows no selection highlight at all. Reset to false on open.
+	dashboardCursorActive bool
+
 	// fleetCPUHistory/fleetNetHistory are the Dashboard header's own
 	// aggregate sparkline rings — one sample appended per poll interval
 	// from fleetSummary (see appendFleetHistory), capped at the same 24
@@ -3554,6 +3559,7 @@ func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayDashboard
 	m.dashboardCursor = 0
+	m.dashboardCursorActive = false
 	m.dashboardRefreshFrame = m.statusPulseFrame
 	return m, m.dashboardRefreshCmd()
 }
@@ -4650,6 +4656,7 @@ func (m *Model) dashboardMoveCursor(delta int) {
 		return
 	}
 	m.dashboardCursor = clamp(m.dashboardCursor+delta, 0, len(shown)-1)
+	m.dashboardCursorActive = true
 }
 
 // dashboardOpenSelected closes the Dashboard and focuses the inspector on

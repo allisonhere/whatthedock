@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -1253,5 +1254,74 @@ func TestDashboardMouseClickStatusRowOpensProblems(t *testing.T) {
 	}
 	if next.focus != paneActivity || next.mode != activityProblems {
 		t.Fatalf("focus/mode after clicking status row = %v/%v, want paneActivity/activityProblems", next.focus, next.mode)
+	}
+}
+
+// TestDashboardRowSelectionIsRailOnlyNotBackground verifies the selected row
+// shows the left-edge "▌" rail but does NOT paint the row with ItemSelected's
+// background color — selection is a rail marker, never a full-row wash.
+func TestDashboardRowSelectionIsRailOnlyNotBackground(t *testing.T) {
+	original := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(original)
+
+	model := testModel()
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+
+	var ctr domain.Container
+	for _, c := range model.snapshotContainers() {
+		if c.IsRunning() {
+			ctr = c
+			break
+		}
+	}
+	if ctr.ID.ID == "" {
+		t.Fatal("no running container found to render a row for")
+	}
+
+	selected := model.dashboardRow(renderer, ctr, 120, true)
+	unselected := model.dashboardRow(renderer, ctr, 120, false)
+
+	// Rail: the selected row starts with the "▌" marker; the unselected
+	// row does not.
+	if got := ansi.Strip(selected); !strings.HasPrefix(got, "▌ ") {
+		t.Fatalf("selected row missing left-edge rail: %q", got)
+	}
+	if got := ansi.Strip(unselected); strings.HasPrefix(got, "▌") {
+		t.Fatalf("unselected row unexpectedly has a rail: %q", got)
+	}
+
+	// No full-row wash: ItemSelected's background SGR must not appear in
+	// the selected row.
+	if bg, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
+		r, g, b := parseHexColor(string(bg))
+		sgr := fmt.Sprintf("\x1b[48;2;%d;%d;%dm", r, g, b)
+		if strings.Contains(selected, sgr) {
+			t.Fatalf("selected row still paints ItemSelected background %q:\n%q", bg, selected)
+		}
+	}
+}
+
+// TestDashboardNoHighlightUntilNavigation verifies the Dashboard shows no
+// selection highlight when it opens, and only after a cursor move does the
+// highlight appear.
+func TestDashboardNoHighlightUntilNavigation(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 120, 34
+	model.rows = model.buildRows()
+
+	opened, _ := model.openDashboardOverlay()
+	model = opened.(Model)
+
+	// Fresh open: cursor inactive, no highlight.
+	if model.dashboardCursorActive {
+		t.Fatal("dashboardCursorActive = true on open, want false")
+	}
+
+	// j moves the cursor and activates the highlight.
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = updated.(Model)
+	if !model.dashboardCursorActive {
+		t.Fatal("dashboardCursorActive = false after j, want true")
 	}
 }
