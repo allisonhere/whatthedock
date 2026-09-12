@@ -475,3 +475,5 @@ terminal UI pieces: panes, borders, rows, overlays, themes, and status bars.
 
 Docker behavior, Compose behavior, settings, actions, and app state live here in
 WhatTheDock.
+
+![TIDE logo](images/TIDE-small.png)
