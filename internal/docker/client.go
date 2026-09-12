@@ -330,6 +330,7 @@ func FromStats(host domain.HostID, containerID string, stats container.StatsResp
 		ID:          domain.ResourceID{Host: host, ID: containerID},
 		Read:        stats.Read,
 		CPUPercent:  cpuPercent(stats),
+		CPUCores:    onlineCPUs(stats),
 		MemoryUsage: memoryUsage(stats.MemoryStats),
 		MemoryLimit: stats.MemoryStats.Limit,
 		NetworkRx:   networkRx,
@@ -347,14 +348,22 @@ func cpuPercent(stats container.StatsResponse) float64 {
 	}
 	cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - stats.PreCPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
-	onlineCPUs := float64(stats.CPUStats.OnlineCPUs)
-	if onlineCPUs == 0 {
-		onlineCPUs = float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
-	}
-	if cpuDelta <= 0 || systemDelta <= 0 || onlineCPUs <= 0 {
+	cores := onlineCPUs(stats)
+	if cpuDelta <= 0 || systemDelta <= 0 || cores <= 0 {
 		return 0
 	}
-	return cpuDelta / systemDelta * onlineCPUs * 100
+	return cpuDelta / systemDelta * cores * 100
+}
+
+// onlineCPUs is how many CPUs the daemon reports online for this
+// container. Older daemons leave OnlineCPUs unset and only fill the
+// per-CPU usage slice, so fall back to its length. Returns 0 when neither
+// is available — "unknown", which cpuPercent treats as "can't compute".
+func onlineCPUs(stats container.StatsResponse) float64 {
+	if stats.CPUStats.OnlineCPUs > 0 {
+		return float64(stats.CPUStats.OnlineCPUs)
+	}
+	return float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
 }
 
 func memoryUsage(stats container.MemoryStats) uint64 {

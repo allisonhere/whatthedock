@@ -131,6 +131,7 @@ func demoStats(ctr domain.Container, tick int) domain.ContainerStats {
 		ID:          ctr.ID,
 		Read:        time.Now(),
 		CPUPercent:  clampFloat(float64((len(ctr.DisplayName())%6)+1)*4.5+float64(wave)*1.7, 0, 100),
+		CPUCores:    8,
 		MemoryUsage: 192*1024*1024 + base + byteWave,
 		MemoryLimit: 2 * 1024 * 1024 * 1024,
 		NetworkRx:   40*1024*1024 + base*2 + uint64(tick%9)*5*1024*1024,

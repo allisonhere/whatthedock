@@ -450,26 +450,57 @@ func TestDashboardRowTintsHotContainers(t *testing.T) {
 }
 
 // TestDashboardFleetSparkRowRendersAggregateHistory checks goal #1: the
-// header's aggregate CPU/NET sparklines are built from the fleet history
-// rings, carry both labels at a normal width, and collapse to CPU-only
-// when the panel is narrow.
+// header's aggregate CPU gauge / NET sparkline are built from the fleet
+// history rings, carry both labels at a normal width, and collapse to
+// CPU-only when the panel is narrow.
 func TestDashboardFleetSparkRowRendersAggregateHistory(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	model := testModel()
 	model.fleetCPUHistory = []float64{5, 20, 60, 120, 90, 140}
 	model.fleetNetHistory = []uint64{0, 1 << 10, 1 << 20, 8 << 20, 2 << 20, 32 << 20}
+	summary := dashboardSummary{counts: map[string]int{}, totalCPU: 140, cpuCores: 8}
 
-	wide := ansi.Strip(model.dashboardFleetSparkRow(renderer, 120))
+	wide := ansi.Strip(model.dashboardFleetSparkRow(renderer, summary, 120))
 	if !strings.Contains(wide, "CPU ") || !strings.Contains(wide, "NET ") {
 		t.Fatalf("wide fleet spark row missing CPU/NET labels: %q", wide)
 	}
 	if strings.TrimSpace(strings.NewReplacer("CPU", "", "NET", "", "─", "").Replace(wide)) == "" {
-		t.Fatalf("wide fleet spark row drew no sparkline glyphs: %q", wide)
+		t.Fatalf("wide fleet spark row drew no glyphs: %q", wide)
 	}
 
-	narrow := ansi.Strip(model.dashboardFleetSparkRow(renderer, 18))
+	narrow := ansi.Strip(model.dashboardFleetSparkRow(renderer, summary, 18))
 	if !strings.Contains(narrow, "CPU ") || strings.Contains(narrow, "NET ") {
 		t.Fatalf("narrow fleet spark row should collapse to CPU only: %q", narrow)
+	}
+}
+
+// TestDashboardFleetCPUGaugeScalesToHostCapacity is the regression guard
+// for "why is cpu always red": the fleet's CPU is a *sum* of per-core
+// percentages, so grading or filling it against a 0-100 scale (or against
+// its own running max) pinned it permanently full and permanently red.
+// Against real host capacity (cores*100) a fleet using 140% of an 8-core
+// box is ~18% full, and nowhere near the red end of the gradient.
+func TestDashboardFleetCPUGaugeScalesToHostCapacity(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	const width = 40
+
+	out := ansi.Strip(renderCPUGauge(renderer, statGraph{values: []float64{140}}, 8*100, width, "#000000"))
+	filled := 0
+	for _, r := range out {
+		if r != '─' {
+			filled++
+		}
+	}
+	// 140 of 800 == 17.5% -> 7 of 40 cells.
+	if filled != 7 {
+		t.Fatalf("140%% of an 8-core host filled %d of %d cells, want 7: %q", filled, width, out)
+	}
+
+	// An unknown core count (no provider reported one) must read as the
+	// empty "unknown" track, never as a guessed full bar.
+	unknown := ansi.Strip(renderCPUGauge(renderer, statGraph{values: []float64{140}}, 0, width, "#000000"))
+	if strings.Trim(unknown, "─") != "" {
+		t.Fatalf("unknown capacity should render the dim empty track, got %q", unknown)
 	}
 }
 
@@ -603,17 +634,17 @@ func TestDashboardThresholdColorBoundaries(t *testing.T) {
 }
 
 // TestDashboardGraphColorBoundaries checks dashboardGraphColor's anchor
-// points land exactly on CPU's own cyan identity color at 0%, and on the
+// points land exactly on CPU's own green identity color at 0%, and on the
 // shared yellow/orange/red anchors at dashboardCautionPct/dashboardWarnPct/
-// dashboardCritPct — the Dashboard's CPU sparkline always has a resting
-// cyan baseline (not dashboardThresholdColor's per-caller neutral) that
+// dashboardCritPct — the Dashboard's CPU gauge always has a resting
+// green baseline (not dashboardThresholdColor's per-caller neutral) that
 // climbs continuously rather than jumping between flat bands.
 func TestDashboardGraphColorBoundaries(t *testing.T) {
 	cases := []struct {
 		pct  float64
 		want lipgloss.Color
 	}{
-		{0, "#7dcfff"},
+		{0, "#98c379"},
 		{50, "#e8c170"},
 		{70, "#edad75"},
 		{90, "#e06c75"},

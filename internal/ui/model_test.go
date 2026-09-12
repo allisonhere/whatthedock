@@ -2023,7 +2023,10 @@ func TestStatsViewShowsHeatSparklineAndDeltas(t *testing.T) {
 
 	rawView := model.View()
 	view := ansi.Strip(rawView)
-	for _, want := range []string{"▓▓▓▓░", "▂▃", "↗ 72.0%", "↗ +4"} {
+	// CPU is pinned to the always-gauge look (renderCPUGauge)
+	// regardless of Graph style, so its row shows "━"/"╸" fill glyphs, not
+	// a wave sparkline — see cpuStatGraph's forceGauge field.
+	for _, want := range []string{"▓▓▓▓░", "━", "↗ 72.0%", "↗ +4"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing hybrid stats treatment %q:\n%s", want, view)
 		}

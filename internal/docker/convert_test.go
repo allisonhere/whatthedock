@@ -77,6 +77,13 @@ func TestFromStatsAggregatesDockerStats(t *testing.T) {
 	if stats.CPUPercent != 40 {
 		t.Fatalf("CPUPercent = %v, want 40", stats.CPUPercent)
 	}
+	// CPUPercent is per-core-normalized (0..CPUCores*100), so the core
+	// count has to survive the conversion — it's the only thing that lets
+	// the UI turn a sum of container percentages back into a fraction of
+	// real host capacity.
+	if stats.CPUCores != 2 {
+		t.Fatalf("CPUCores = %v, want 2", stats.CPUCores)
+	}
 	if stats.MemoryUsage != 384 || stats.MemoryLimit != 1024 {
 		t.Fatalf("memory = %d/%d, want 384/1024", stats.MemoryUsage, stats.MemoryLimit)
 	}

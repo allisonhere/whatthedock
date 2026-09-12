@@ -717,6 +717,12 @@ type statGraph struct {
 	delta         string
 	peak          string
 	static        string
+	// forceGauge pins this row to the always-gauge, left-to-right growing
+	// bar (renderCPUGauge) regardless of settings.GraphStyle — see
+	// cpuStatGraph and renderCPUGauge's doc comments for why CPU is the
+	// one row that opts into this instead of following the user's chosen
+	// Graph style like every other row.
+	forceGauge bool
 }
 
 func statsCPU(stats *domain.ContainerStats) float64 {
@@ -835,7 +841,8 @@ func cpuStatGraph(stats *domain.ContainerStats, history statsHistory) statGraph 
 		delta:         formatPercentDelta(floatDelta(history.CPU)),
 		// history.maxCPU, not maxValue above — maxValue is floored at 100
 		// as the graph's scale ceiling, not the real historical peak.
-		peak: fmt.Sprintf("peak %.1f%%", history.maxCPU),
+		peak:       fmt.Sprintf("peak %.1f%%", history.maxCPU),
+		forceGauge: true,
 	}
 }
 
@@ -911,13 +918,14 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	if width < 12 {
 		return renderSparkline(renderer, settings, graph, color, width)
 	}
-	// The gauge style's own bar is already a proportional fill — pairing
-	// it with the old 5-segment meter would show the same information
-	// twice, so gauge skips the meter and lets the bar fill the space
-	// the meter would otherwise have taken.
+	// The gauge style's own bar (and CPU's own forceGauge bar, pinned to
+	// that same look regardless of settings.GraphStyle) is already a
+	// proportional fill — pairing it with the old 5-segment meter would
+	// show the same information twice, so both skip the meter and let the
+	// bar fill the space the meter would otherwise have taken.
 	meter := ""
 	sparkWidth := width
-	if settings.GraphStyle != graphStyleGauge {
+	if settings.GraphStyle != graphStyleGauge && !graph.forceGauge {
 		meter = renderMeter(renderer, settings, graphLevel(settings, graph), color)
 		sparkWidth = width - lipgloss.Width(meter) - 2
 	}
@@ -1014,6 +1022,9 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 	if graph.static != "" {
 		return styleGraphGlyphs(renderer, settings, graph.static, graph.fallbackLevel, color)
 	}
+	if graph.forceGauge {
+		return renderCPUGauge(renderer, graph, cpuGaugeOneCore, width, renderer.Styles.Theme.Bg)
+	}
 	if settings.GraphStyle == graphStyleGauge {
 		if len(graph.values) == 0 || graph.maxValue <= 0 {
 			return renderGaugeBar(renderer, settings, 0, 1, color, width)
@@ -1021,15 +1032,7 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 		return renderGaugeBar(renderer, settings, graph.values[len(graph.values)-1], graph.maxValue, color, width)
 	}
 	if settings.GraphStyle == graphStyleBraille {
-		// A fixed 8-level heat scale, independent of graphGlyphs' own
-		// (much shorter) glyph count for this style — see brailleLevel's
-		// doc comment on why dot-height and color-heat are quantized
-		// separately.
-		colorFor := func(value float64) lipgloss.Color {
-			level := clamp(int(value/graph.maxValue*7)+1, 1, 8)
-			return statHeatColor(settings, level, color, renderer)
-		}
-		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, colorFor, renderer.Styles.Theme.Bg)
+		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, renderer.Styles.Theme.Bg)
 	}
 	if len(graph.values) == 0 || graph.maxValue <= 0 {
 		level := clamp(graph.fallbackLevel, 1, len(glyphs))
@@ -1111,17 +1114,32 @@ func brailleColumnBits(col, level int) int {
 	return bits
 }
 
+// brailleLevelColors maps a half-column's dot level (1-4) straight to a
+// color — a discrete step per level (green/yellow/orange/red), not a
+// continuous blend: 1 dot lit reads as "quiet" and should look
+// unambiguously green regardless of exactly how far into that quarter of
+// the scale it sits, the same way a single dot vs. two dots is a step
+// change, not a gradient. Reuses the app's existing semantic colors
+// (Memory's own green identity, and heatColorFrom's yellow/orange/red
+// stops) rather than inventing a new palette just for this.
+var brailleLevelColors = [4]lipgloss.Color{"#80c990", "#e8c170", "#edad75", "#e06c75"}
+
+func brailleLevelColor(level int) lipgloss.Color {
+	return brailleLevelColors[clamp(level, 1, 4)-1]
+}
+
 // renderBrailleGraph draws values as a true 2x4-dot braille sparkline:
 // each of the cols output columns packs two samples (left/right
 // half-column) at up to 4 vertical dot levels each — real sub-character
 // resolution, unlike every other graph style's one-glyph-per-sample
 // lookup. Up to cols*2 of the most recent values are used; any columns
 // left over once values runs out are rendered as empty/dimmed cells,
-// matching dashboardSpark's existing "no data yet" convention. colorFor
-// receives whichever of a cell's two packed values produced the taller
-// dot level, the same "one raw value in, one color out" shape
-// dashboardSpark's own colorFor callers already use.
-func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue float64, cols int, colorFor func(value float64) lipgloss.Color, bg lipgloss.Color) string {
+// matching dashboardSpark's existing "no data yet" convention. A cell's
+// color comes from brailleLevelColor of whichever of its two packed
+// values produced the taller dot level — the dot count itself is already
+// the "how much" signal, so color rides on that same level rather than a
+// separately-computed continuous heat value that could disagree with it.
+func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue float64, cols int, bg lipgloss.Color) string {
 	cols = max(1, cols)
 	flat := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(string(rune(0x2800)))
 	if maxValue <= 0 || len(values) == 0 {
@@ -1137,21 +1155,20 @@ func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue flo
 	for c := 0; c < drawnCols; c++ {
 		bits := 0
 		level := 0
-		var colorValue float64
 		if li := c * 2; li < len(values) {
 			l := brailleLevel(values[li], maxValue)
 			bits |= brailleColumnBits(0, l)
-			level, colorValue = l, values[li]
+			level = l
 		}
 		if ri := c*2 + 1; ri < len(values) {
 			l := brailleLevel(values[ri], maxValue)
 			bits |= brailleColumnBits(1, l)
 			if l > level {
-				level, colorValue = l, values[ri]
+				level = l
 			}
 		}
 		cell := string(rune(0x2800 + bits))
-		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(colorFor(colorValue)).Render(cell))
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(brailleLevelColor(level)).Render(cell))
 	}
 	for c := drawnCols; c < cols; c++ {
 		b.WriteString(flat)
@@ -1788,6 +1805,13 @@ type dashboardSummary struct {
 	// strip's hue (dashboardMoodStrip): one number that answers "is
 	// anything on fire" without averaging a real spike away.
 	peakPressure float64
+	// cpuCores is the host's online CPU count (max reported across
+	// containers — they all run on the same host, so they agree; taking
+	// the max just ignores any that reported 0/unknown). totalCPU is a sum
+	// of per-core-normalized percentages, so cpuCores*100 is the fleet's
+	// real capacity ceiling and the only thing that makes totalCPU
+	// gaugeable. 0 means no container reported it.
+	cpuCores float64
 }
 
 // fleetSummary computes dashboardSummary from whatever containers/history
@@ -1808,6 +1832,7 @@ func (m Model) fleetSummary() dashboardSummary {
 			continue
 		}
 		summary.totalCPU += history.lastStats.CPUPercent
+		summary.cpuCores = math.Max(summary.cpuCores, history.lastStats.CPUCores)
 		summary.memUsed += history.lastStats.MemoryUsage
 		summary.memLimit += history.lastStats.MemoryLimit
 		pressure := history.lastStats.CPUPercent
@@ -3820,7 +3845,7 @@ const (
 // unstyled until it actually needs a warning reads calmer than text that's
 // always tinted something. dashboardGraphColor below is the four-band
 // green→yellow→orange→red version for the Dashboard's actual graphs (the
-// CPU sparkline, the memory meter), where a resting baseline color is the
+// CPU gauge, the memory meter), where a resting baseline color is the
 // point.
 func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color {
 	switch {
@@ -3834,21 +3859,22 @@ func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color
 }
 
 // dashboardGraphColor grades a percentage into the Dashboard's CPU
-// gradient — heatColorFrom blended from CPU's own cyan identity color,
+// gradient — heatColorFrom blended from a green "cold" baseline,
 // continuously through yellow/orange/red at exactly the
 // dashboardCautionPct/dashboardWarnPct/dashboardCritPct fractions of
 // 100, rather than the flat 4-band steps this used to snap between. The
-// CPU sparkline uses this instead of dashboardThresholdColor's
-// plain-text neutral/amber/red so a healthy container has a resting
-// baseline color to climb away from — the same green→red gradient
-// family the single-container Stats pane's statHeatColor uses, but
-// graded on the fleet-wide absolute cutoffs above rather than that
-// pane's per-container relative scale (see dashboardWarnPct's own doc
-// comment for why the Dashboard deliberately stays absolute).
-// dashboardMemColor below is Memory's own version of this, with a
-// distinct green identity color instead of sharing CPU's cyan.
+// CPU gauge uses this instead of dashboardThresholdColor's plain-text
+// neutral/amber/red so a healthy container has a resting baseline color
+// to climb away from — the same green→red gradient family the
+// single-container Stats pane's statHeatColor uses, but graded on the
+// fleet-wide absolute cutoffs above rather than that pane's
+// per-container relative scale (see dashboardWarnPct's own doc comment
+// for why the Dashboard deliberately stays absolute).
+// dashboardMemColor below is Memory's own version of this, with its own
+// distinct (slightly different) green identity color so the two rows
+// don't share one identical baseline hue.
 func dashboardGraphColor(pct float64) lipgloss.Color {
-	return heatColorFrom("#7dcfff", pct/100)
+	return heatColorFrom("#98c379", pct/100)
 }
 
 // dashboardMemColor is dashboardGraphColor's Memory counterpart — same
@@ -3942,7 +3968,7 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 
 	lines := []string{
 		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
-		dashboardPadLine(renderer, m.dashboardFleetSparkRow(renderer, contentWidth), contentWidth),
+		dashboardPadLine(renderer, m.dashboardFleetSparkRow(renderer, summary, contentWidth), contentWidth),
 		m.dashboardMoodStrip(renderer, summary, age, contentWidth),
 		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
 	}
@@ -4089,24 +4115,33 @@ func (m Model) dashboardMoodStrip(renderer tideui.Renderer, summary dashboardSum
 	return b.String()
 }
 
-// dashboardFleetSparkRow is the aggregate trend line under the summary
-// numbers: two sparklines built from the header's own poll-cadence rings
-// (m.fleetCPUHistory / m.fleetNetHistory, filled by appendFleetHistory) so
-// the screen answers "is the whole fleet climbing" at a glance, not just
-// "what is it right now". CPU is graded by dashboardGraphColor's absolute
-// cutoffs and NET by dashboardNetSpark, exactly as the per-container rows
-// are, so the aggregate line and the rows below it speak the same colour
-// language. Collapses to CPU-only, then to nothing, as width runs out.
-func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, width int) string {
+// dashboardFleetSparkRow is the aggregate line under the summary numbers:
+// a live CPU gauge and a NET sparkline, built from the header's own
+// poll-cadence rings (m.fleetCPUHistory / m.fleetNetHistory, filled by
+// appendFleetHistory). Collapses to CPU-only, then to nothing, as width
+// runs out.
+//
+// CPU is gauged against real host capacity — summary.cpuCores*100 — not
+// against its own running history max. totalCPU is a *sum* of per-core-
+// normalized container percentages (see dashboardSummaryLine's cpuText
+// doc comment), so it has no 0-100 ceiling of its own: a dozen ordinary
+// containers trivially sum past 100. Scaling it against its own max
+// instead pinned the bar at 100% on every frame, since the newest sample
+// is almost always at or near that max, and grading its *color* on the
+// absolute 0-100 scale painted it permanently red for any fleet summing
+// past 90 — the exact "alarming a normal metric" failure this redesign
+// exists to avoid. Against cpuCores*100 the reading finally means
+// something real: "the fleet is using this much of the machine".
+//
+// NET stays a sparkline: byte rates are already absolute (100 MB/s is
+// 100 MB/s no matter how many containers produced it), so summing them
+// is meaningful and dashboardNetSpark's own grading still holds.
+func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, summary dashboardSummary, width int) string {
 	bg := renderer.Styles.Theme.Bg
 	label := renderer.Styles.DetailMeta.Copy().Background(bg)
 
-	cpuMax := 1.0
-	for _, v := range m.fleetCPUHistory {
-		cpuMax = math.Max(cpuMax, v)
-	}
-	cpuSpark := func(w int) string {
-		return dashboardSpark(renderer, m.settings, statGraph{values: m.fleetCPUHistory, maxValue: cpuMax}, dashboardGraphColor, w, bg)
+	cpuGauge := func(w int) string {
+		return renderCPUGauge(renderer, statGraph{values: m.fleetCPUHistory}, summary.cpuCores*100, w, bg)
 	}
 
 	// "CPU " (4) + spark + "   NET " (7) + spark. Split the leftover evenly;
@@ -4120,10 +4155,10 @@ func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, width int) strin
 			latestNet = m.fleetNetHistory[len(m.fleetNetHistory)-1]
 		}
 		net := dashboardNetSpark(renderer, m.settings, uintStatGraph(m.fleetNetHistory, netMax, byteLevel(latestNet), formatByteDelta, formatBytes), each, bg)
-		return label.Render("CPU ") + cpuSpark(each) + label.Render("   NET ") + net
+		return label.Render("CPU ") + cpuGauge(each) + label.Render("   NET ") + net
 	}
 	if width-4 >= dashboardMinSparkW {
-		return label.Render("CPU ") + cpuSpark(width-4)
+		return label.Render("CPU ") + cpuGauge(width-4)
 	}
 	return label.Render("")
 }
@@ -4402,7 +4437,7 @@ func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
 // the selected one.
 //
 // CPU and memory deliberately share the same "number, then a small
-// visualization" shape (a sparkline for CPU, a meter for memory) instead
+// visualization" shape (a linear gauge for CPU, a meter for memory) instead
 // of the old mismatched "near-empty line vs. huge heatmap" look, and
 // every color here comes from dashboardGraphColor's absolute percentage
 // cutoffs rather than any per-container relative scale — see
@@ -4472,7 +4507,7 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 		Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
 	cpuPart := cpuNum
 	if cols.cpuSparkW > 0 {
-		cpuPart += plain.Render("  ") + dashboardSpark(renderer, m.settings, cpuStatGraph(stats, history), dashboardGraphColor, cols.cpuSparkW, rowBg)
+		cpuPart += plain.Render("  ") + renderCPUGauge(renderer, cpuStatGraph(stats, history), cpuGaugeOneCore, cols.cpuSparkW, rowBg)
 	}
 
 	memPct, hasLimit, memText := 0.0, false, "n/a"
@@ -4549,6 +4584,84 @@ func dashboardGaugeBar(renderer tideui.Renderer, frac float64, color lipgloss.Co
 		rest := lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width-filled))
 		return fill + rest
 	}
+}
+
+// cpuGaugeOneCore is a single container's gauge capacity. Container CPU%
+// is normalized so 100 means one full core, so this is "one core's
+// worth" — a container pegging a whole core reads as a full bar,
+// regardless of how many cores the host has.
+const cpuGaugeOneCore = 100.0
+
+// renderCPUGauge draws CPU's always-gauge look, shared by the Dashboard's
+// per-container CPU column and the single-container Stats pane
+// (renderSparkline's graph.forceGauge branch): a single bar that grows
+// left to right with the latest CPU%, against a fixed 100% ceiling, with
+// a dim gray "hint" track (the "─" remainder) showing the rest of the
+// range ahead of the fill — so the eye sees both "how full" and "how much
+// room is left" at once, the way a fuel gauge's empty track does.
+//
+// capacity is the gauge's ceiling and must always be an *external*
+// reference — cpuGaugeOneCore for a single container (100 = one full
+// core), summary.cpuCores*100 for the fleet aggregate (the whole
+// machine). Never pass graph.maxValue or any running max of the data
+// itself: a value-over-its-own-max scale pins the bar at 100% on every
+// frame, because the newest sample is almost always at or near that max.
+// A gauge needs a fixed reference to mean anything. Anything above
+// capacity simply saturates the bar, and a capacity of 0 ("unknown",
+// e.g. a provider that never reported a core count) renders as the dim
+// empty track rather than guessing — the same "unknown, not necessarily
+// bad" treatment dashboardMemMeter gives a container with no memory
+// limit.
+//
+// Unlike dashboardGaugeBar (Memory's gauge, and CPU's own old
+// single-flat-color version of this), the filled portion isn't painted
+// one color derived from the current value — it's painted as the actual
+// green→yellow→orange→red gradient sweeping left to right across the
+// bar's full 0-100% span, via dashboardGraphColor keyed on each column's
+// own position (not the live value), so the gradient always represents
+// the fixed 0-100% scale rather than being squeezed into whatever length
+// happens to be filled right now. A gauge whose whole fill is one solid
+// color looks like a static, "stuck" progress bar no matter how hot it
+// gets; sweeping the real gradient across the fill is what makes it read
+// as a heat gauge rather than a plain loading bar, and a glance at where
+// the fill's leading edge sits in that gradient still tells you how hot
+// the current value is, exactly as the flat-color version did.
+func renderCPUGauge(renderer tideui.Renderer, graph statGraph, capacity float64, width int, bg lipgloss.Color) string {
+	width = max(1, width)
+	value := 0.0
+	if len(graph.values) > 0 {
+		value = graph.values[len(graph.values)-1]
+	}
+	frac := 0.0
+	if capacity > 0 {
+		frac = value / capacity
+	}
+	if frac < 0 {
+		frac = 0
+	} else if frac > 1 {
+		frac = 1
+	}
+	filled := clamp(int(frac*float64(width)+0.5), 0, width)
+	dim := renderer.Styles.Theme.Dimmed
+	if filled <= 0 {
+		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
+	}
+	var b strings.Builder
+	for i := 0; i < filled; i++ {
+		pos := 0.0
+		if width > 1 {
+			pos = float64(i) / float64(width-1)
+		}
+		glyph := "━"
+		if i == filled-1 && filled < width {
+			glyph = "╸"
+		}
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(dashboardGraphColor(pos * 100)).Bold(true).Render(glyph))
+	}
+	if filled < width {
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width-filled)))
+	}
+	return b.String()
 }
 
 // dashboardMemMeter draws the memory column's visualization. With
@@ -4631,7 +4744,7 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 	}
 
 	if settings.GraphStyle == graphStyleBraille {
-		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, colorFor, bg)
+		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, bg)
 	}
 
 	glyphs := graphGlyphs(settings)

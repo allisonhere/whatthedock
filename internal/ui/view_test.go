@@ -377,6 +377,105 @@ func TestBrailleLevelQuantizesToFourLevels(t *testing.T) {
 	}
 }
 
+// TestRenderCPUGaugeFillsProportionallyToPercent pins the invariant that
+// makes this a gauge rather than a decorative bar: the fill length is the
+// CPU percentage of the track, against a fixed 100% ceiling. Regressions
+// here are silent and were reported live twice as the bar looking "stuck"
+// or "100% of the line all the time" — both times because the fill was
+// being scaled against a *relative* ceiling (graph.maxValue, or the
+// history's own running max) instead of a fixed one, which pins a
+// steady-state metric at or near full on every frame.
+func TestRenderCPUGaugeFillsProportionallyToPercent(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	const width = 20
+
+	tests := []struct {
+		name       string
+		values     []float64
+		wantFilled int
+	}{
+		{"no samples yet", nil, 0},
+		{"idle", []float64{0}, 0},
+		{"a low value barely registers", []float64{6.3}, 1},
+		{"half", []float64{50}, 10},
+		{"maxed", []float64{100}, 20},
+		// More than one core's worth saturates the bar rather than
+		// overflowing it.
+		{"multi-core saturates", []float64{250}, 20},
+		// The whole point: an earlier 250% spike must not rescale the
+		// gauge, so a container now idling at 6.3% still shows 6.3%.
+		{"a historical peak never rescales the gauge", []float64{250, 6.3}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// maxValue is deliberately set to something far from the
+			// capacity — the gauge must ignore it entirely.
+			graph := statGraph{values: tt.values, maxValue: 250, forceGauge: true}
+			out := ansi.Strip(renderCPUGauge(renderer, graph, cpuGaugeOneCore, width, "#000000"))
+
+			if got := len([]rune(out)); got != width {
+				t.Fatalf("rendered %d cells, want exactly %d: %q", got, width, out)
+			}
+			filled := 0
+			for _, r := range out {
+				if r != '─' {
+					filled++
+				}
+			}
+			if filled != tt.wantFilled {
+				t.Fatalf("%q filled %d of %d cells, want %d", out, filled, width, tt.wantFilled)
+			}
+		})
+	}
+}
+
+// TestBrailleLevelColorIsADiscreteFourStepPalette checks the exact
+// mapping requested live: 1 dot green, 2 yellow, 3 orange, 4 red — a step
+// function keyed on dot level, not a continuous blend, so "one dot lit"
+// always reads the same unambiguous green regardless of where exactly in
+// that quarter of the scale the value sits.
+func TestBrailleLevelColorIsADiscreteFourStepPalette(t *testing.T) {
+	tests := []struct {
+		level int
+		want  lipgloss.Color
+	}{
+		{1, "#80c990"}, // green
+		{2, "#e8c170"}, // yellow
+		{3, "#edad75"}, // orange
+		{4, "#e06c75"}, // red
+	}
+	for _, tt := range tests {
+		if got := brailleLevelColor(tt.level); got != tt.want {
+			t.Fatalf("brailleLevelColor(%d) = %q, want %q", tt.level, got, tt.want)
+		}
+	}
+}
+
+// TestRenderBrailleGraphColorsCellByItsOwnLevel checks the color actually
+// reaching rendered output tracks each cell's own dot level — a quiet
+// value must render green, a maxed-out one red, in the same call.
+func TestRenderBrailleGraphColorsCellByItsOwnLevel(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	// Two columns: first cell packs two near-zero samples (level 1,
+	// green); second packs two near-max samples (level 4, red).
+	values := []float64{1, 1, 99, 100}
+
+	out := renderBrailleGraph(renderer, values, 100, 2, "#000000")
+
+	sgrFor := func(color lipgloss.Color) string {
+		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
+		return rendered[:strings.Index(rendered, "x")]
+	}
+	greenSGR := sgrFor(brailleLevelColor(1))
+	redSGR := sgrFor(brailleLevelColor(4))
+	if !strings.Contains(out, greenSGR) {
+		t.Fatalf("output = %q, want the quiet cell's own green SGR (%q)", out, greenSGR)
+	}
+	if !strings.Contains(out, redSGR) {
+		t.Fatalf("output = %q, want the maxed-out cell's own red SGR (%q)", out, redSGR)
+	}
+}
+
 // TestRenderBrailleGraphPacksTwoSamplesPerColumn is the core regression
 // test for the braille revamp: unlike every other graph style (one glyph
 // per sample), braille must pack two samples into each output column's
@@ -386,9 +485,8 @@ func TestBrailleLevelQuantizesToFourLevels(t *testing.T) {
 func TestRenderBrailleGraphPacksTwoSamplesPerColumn(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	values := []float64{10, 20, 30, 40, 50, 90}
-	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
 
-	out := ansi.Strip(renderBrailleGraph(renderer, values, 100, 3, flatColor, "#000000"))
+	out := ansi.Strip(renderBrailleGraph(renderer, values, 100, 3, "#000000"))
 	cells := []rune(out)
 	if len(cells) != 3 {
 		t.Fatalf("renderBrailleGraph() = %q (%d cells), want exactly 3 columns for a width-3 budget", out, len(cells))
@@ -405,9 +503,8 @@ func TestRenderBrailleGraphPacksTwoSamplesPerColumn(t *testing.T) {
 // on a zero maxValue or leaving cells uninitialized.
 func TestRenderBrailleGraphNoDataIsAllFlatCells(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
 
-	out := ansi.Strip(renderBrailleGraph(renderer, nil, 0, 5, flatColor, "#000000"))
+	out := ansi.Strip(renderBrailleGraph(renderer, nil, 0, 5, "#000000"))
 	for _, r := range out {
 		if r != 0x2800 {
 			t.Fatalf("renderBrailleGraph() with no data = %q, want every cell empty (0x2800)", out)

@@ -209,9 +209,15 @@ type Volume struct {
 func (v Volume) Removable() bool { return !v.InUse }
 
 type ContainerStats struct {
-	ID          ResourceID
-	Read        time.Time
-	CPUPercent  float64
+	ID         ResourceID
+	Read       time.Time
+	CPUPercent float64
+	// CPUCores is how many CPUs the host reports online for this
+	// container. CPUPercent is normalized so 100 means one full core, so
+	// it ranges 0..CPUCores*100 — CPUCores is what turns that into a
+	// fraction of real host capacity. 0 means the provider didn't report
+	// it; callers must treat that as "unknown" rather than "no CPUs".
+	CPUCores    float64
 	MemoryUsage uint64
 	MemoryLimit uint64
 	NetworkRx   uint64
