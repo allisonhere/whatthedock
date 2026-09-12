@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(timeout 3 go run ./cmd/whatthedock --demo)",
+      "Bash(echo \"exit:$?\")",
+      "Read(//tmp/**)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(gh api *)",
+      "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index",
+      "mcp__plugin_context-mode_context-mode__ctx_search",
+      "Bash(/tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/venv/bin/python /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/render.py /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/snaps.pkl /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/wtd_frame)",
+      "Bash(/tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/venv/bin/python /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/drive3.py /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/wtd /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/snaps2.pkl)",
+      "Bash(/tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/venv/bin/python /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/render.py /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/snaps2.pkl /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/w2)",
+      "Bash(/tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/venv/bin/python /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/drive5.py /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/wtd /tmp/claude-1000/-home-allieb-Projects-tidedock/59654add-dd9c-4c8c-9528-bd00dd759be4/scratchpad/snaps4.pkl)",
+      "Bash(gofmt -l internal/ui/*.go)"
+    ]
+  }
+}
