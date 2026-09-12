@@ -4949,19 +4949,27 @@ func dashboardTickCmd(interval time.Duration) tea.Cmd {
 	return tea.Tick(interval, func(time.Time) tea.Msg { return dashboardTickMsg{} })
 }
 
+// statsHistorySamples is how many samples of each metric statsHistory
+// retains — a sample count, not a duration, so it scales with whatever
+// statsRefresh interval is configured (~6 minutes at the 2s default).
+// renderSparkline/dashboardSpark already trim to however many samples fit
+// the available render width, so a wider row simply gets to show more of
+// this before it starts scrolling.
+const statsHistorySamples = 180
+
 func (m *Model) appendStats(stats domain.ContainerStats) {
 	if m.statsHistory == nil {
 		m.statsHistory = map[domain.ResourceID]statsHistory{}
 	}
 	history := m.statsHistory[stats.ID]
-	history.CPU = appendFloatHistory(history.CPU, stats.CPUPercent, 24)
-	history.Memory = appendUintHistory(history.Memory, stats.MemoryUsage, 24)
+	history.CPU = appendFloatHistory(history.CPU, stats.CPUPercent, statsHistorySamples)
+	history.Memory = appendUintHistory(history.Memory, stats.MemoryUsage, statsHistorySamples)
 	if history.lastStats != nil {
-		history.NetworkRx = appendUintHistory(history.NetworkRx, counterDelta(history.lastStats.NetworkRx, stats.NetworkRx), 24)
-		history.NetworkTx = appendUintHistory(history.NetworkTx, counterDelta(history.lastStats.NetworkTx, stats.NetworkTx), 24)
-		history.BlockTotal = appendUintHistory(history.BlockTotal, counterDelta(history.lastStats.BlockRead+history.lastStats.BlockWrite, stats.BlockRead+stats.BlockWrite), 24)
+		history.NetworkRx = appendUintHistory(history.NetworkRx, counterDelta(history.lastStats.NetworkRx, stats.NetworkRx), statsHistorySamples)
+		history.NetworkTx = appendUintHistory(history.NetworkTx, counterDelta(history.lastStats.NetworkTx, stats.NetworkTx), statsHistorySamples)
+		history.BlockTotal = appendUintHistory(history.BlockTotal, counterDelta(history.lastStats.BlockRead+history.lastStats.BlockWrite, stats.BlockRead+stats.BlockWrite), statsHistorySamples)
 	}
-	history.PIDs = appendUintHistory(history.PIDs, stats.PIDs, 24)
+	history.PIDs = appendUintHistory(history.PIDs, stats.PIDs, statsHistorySamples)
 	history.maxCPU = maxFloat(history.maxCPU, stats.CPUPercent)
 	history.maxMemory = maxUint(history.maxMemory, stats.MemoryUsage)
 	if len(history.NetworkRx) > 0 {
@@ -4983,8 +4991,8 @@ func (m *Model) appendStats(stats domain.ContainerStats) {
 // fan-out covered. Same 24-sample cap as every per-container series.
 func (m *Model) appendFleetHistory() {
 	summary := m.fleetSummary()
-	m.fleetCPUHistory = appendFloatHistory(m.fleetCPUHistory, summary.totalCPU, 24)
-	m.fleetNetHistory = appendUintHistory(m.fleetNetHistory, summary.netRxRate+summary.netTxRate, 24)
+	m.fleetCPUHistory = appendFloatHistory(m.fleetCPUHistory, summary.totalCPU, statsHistorySamples)
+	m.fleetNetHistory = appendUintHistory(m.fleetNetHistory, summary.netRxRate+summary.netTxRate, statsHistorySamples)
 }
 
 func counterDelta(previous, current uint64) uint64 {

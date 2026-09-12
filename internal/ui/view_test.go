@@ -335,3 +335,137 @@ func TestFormatMountsIsStableRegardlessOfInputOrder(t *testing.T) {
 		t.Fatalf("formatMounts gave different output for the same mounts in a different order:\n%q\n%q", gotA, gotB)
 	}
 }
+
+// TestBrailleColumnBitsFillsFromBottomUp checks the dot-matrix building
+// block renderBrailleGraph is built on: level N should light exactly the
+// bottom N dots of a half-column (a filled mini-bar), not a single
+// floating dot at height N.
+func TestBrailleColumnBitsFillsFromBottomUp(t *testing.T) {
+	tests := []struct {
+		col, level int
+		want       int
+	}{
+		{0, 0, 0x00},
+		{0, 1, 0x40}, // bottom-left dot only
+		{0, 4, 0x01 | 0x02 | 0x04 | 0x40},
+		{1, 1, 0x80}, // bottom-right dot only
+		{1, 4, 0x08 | 0x10 | 0x20 | 0x80},
+	}
+	for _, tt := range tests {
+		if got := brailleColumnBits(tt.col, tt.level); got != tt.want {
+			t.Fatalf("brailleColumnBits(%d, %d) = %#x, want %#x", tt.col, tt.level, got, tt.want)
+		}
+	}
+}
+
+func TestBrailleLevelQuantizesToFourLevels(t *testing.T) {
+	tests := []struct {
+		value, maxValue float64
+		want            int
+	}{
+		{0, 100, 1},
+		{25, 100, 2},
+		{50, 100, 3},
+		{99, 100, 4},
+		{100, 100, 4},
+		{5, 0, 0}, // no scale yet — brailleColumnBits(col, 0) leaves it empty
+	}
+	for _, tt := range tests {
+		if got := brailleLevel(tt.value, tt.maxValue); got != tt.want {
+			t.Fatalf("brailleLevel(%v, %v) = %d, want %d", tt.value, tt.maxValue, got, tt.want)
+		}
+	}
+}
+
+// TestRenderBrailleGraphPacksTwoSamplesPerColumn is the core regression
+// test for the braille revamp: unlike every other graph style (one glyph
+// per sample), braille must pack two samples into each output column's
+// left/right half — 6 samples in a 3-column budget should use all 3
+// columns with real dot patterns, not need 6 columns or fall back to one
+// sample per column.
+func TestRenderBrailleGraphPacksTwoSamplesPerColumn(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	values := []float64{10, 20, 30, 40, 50, 90}
+	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
+
+	out := ansi.Strip(renderBrailleGraph(renderer, values, 100, 3, flatColor, "#000000"))
+	cells := []rune(out)
+	if len(cells) != 3 {
+		t.Fatalf("renderBrailleGraph() = %q (%d cells), want exactly 3 columns for a width-3 budget", out, len(cells))
+	}
+	for i, r := range cells {
+		if r == 0x2800 {
+			t.Fatalf("cell %d is empty (0x2800), want all 3 columns filled — 6 samples exactly fill a 3-column (6-sample) budget", i)
+		}
+	}
+}
+
+// TestRenderBrailleGraphNoDataIsAllFlatCells checks the "nothing collected
+// yet" case renders as empty braille cells (0x2800) rather than panicking
+// on a zero maxValue or leaving cells uninitialized.
+func TestRenderBrailleGraphNoDataIsAllFlatCells(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
+
+	out := ansi.Strip(renderBrailleGraph(renderer, nil, 0, 5, flatColor, "#000000"))
+	for _, r := range out {
+		if r != 0x2800 {
+			t.Fatalf("renderBrailleGraph() with no data = %q, want every cell empty (0x2800)", out)
+		}
+	}
+	if len([]rune(out)) != 5 {
+		t.Fatalf("renderBrailleGraph() with no data = %q, want exactly 5 columns", out)
+	}
+}
+
+// TestAppendStatsRetainsMoreThanTheOldTwentyFourSampleCap is the
+// regression test for the history window being far too short (24 samples
+// = 48s of trend at the default 2s refresh) — see statsHistorySamples.
+func TestAppendStatsRetainsMoreThanTheOldTwentyFourSampleCap(t *testing.T) {
+	m := &Model{}
+	id := domain.ResourceID{Host: "local", ID: "1"}
+	for i := 0; i < 40; i++ {
+		m.appendStats(domain.ContainerStats{ID: id, CPUPercent: float64(i)})
+	}
+	got := len(m.statsHistory[id].CPU)
+	if got != 40 {
+		t.Fatalf("history length after 40 samples = %d, want 40 (old 24-sample cap would have truncated this)", got)
+	}
+}
+
+// TestCPUStatGraphPeakUsesRealHistoricalMaxNotTheFlooredScale checks
+// cpuStatGraph's peak label reports history.maxCPU itself, not the
+// graph's scale ceiling (which is floored at 100 even when the real peak
+// is lower) — the doc comment on cpuStatGraph's peak field explains why
+// those two numbers can differ.
+func TestCPUStatGraphPeakUsesRealHistoricalMaxNotTheFlooredScale(t *testing.T) {
+	history := statsHistory{CPU: []float64{5, 12, 8}, maxCPU: 12}
+	graph := cpuStatGraph(&domain.ContainerStats{CPUPercent: 8}, history)
+	if graph.maxValue != 100 {
+		t.Fatalf("graph.maxValue = %v, want the floored scale ceiling 100, not the real peak 12", graph.maxValue)
+	}
+	if graph.peak != "peak 12.0%" {
+		t.Fatalf("graph.peak = %q, want \"peak 12.0%%\" (the real historical peak, not the floored scale)", graph.peak)
+	}
+}
+
+func TestUintStatGraphSetsPeakFromMaxValue(t *testing.T) {
+	graph := uintStatGraph([]uint64{100, 500, 200}, 500, 1, formatByteDelta, formatBytes)
+	if graph.peak != "peak "+formatBytes(500) {
+		t.Fatalf("graph.peak = %q, want %q", graph.peak, "peak "+formatBytes(500))
+	}
+}
+
+// TestRenderHybridGraphShowsPeakOnAWideRow checks the peak annotation
+// actually reaches rendered output when there's room for it.
+func TestRenderHybridGraphShowsPeakOnAWideRow(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	settings := defaultSettings()
+	settings.ShowDeltas = false // isolate peak from the delta slot
+	graph := statGraph{values: []float64{10, 90}, maxValue: 100, peak: "peak 90.0%"}
+
+	out := ansi.Strip(renderHybridGraph(renderer, settings, graph, "#7dcfff", 60))
+	if !strings.Contains(out, "peak 90.0%") {
+		t.Fatalf("renderHybridGraph() = %q, want it to include the peak annotation on a wide row", out)
+	}
+}

@@ -693,14 +693,14 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 	lines := []string{
 		header,
 		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), "#7dcfff"),
-		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta), formatMemoryStats(stats), "#80c990"),
-		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
-		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta), formatBytes(statsNetworkTx(stats)), "#8aadf4"),
-		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), "#e8c170"),
+		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta, formatBytes), formatMemoryStats(stats), "#80c990"),
+		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
+		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkTx(stats)), "#8aadf4"),
+		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta, formatBytes), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), "#e8c170"),
 		"",
 		renderStatRow(renderer, restartsRowSettings(m.settings), width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
 		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#c9a0f5", uptimeColor(ctr.Created)),
-		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta), formatPIDs(stats), "#6fd6c9"),
+		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta, formatPIDCount), formatPIDs(stats), "#6fd6c9"),
 		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: containerTitle(*ctr)}, width),
 	}
 	if m.focus == paneActivity {
@@ -715,6 +715,7 @@ type statGraph struct {
 	maxValue      float64
 	fallbackLevel int
 	delta         string
+	peak          string
 	static        string
 }
 
@@ -832,10 +833,13 @@ func cpuStatGraph(stats *domain.ContainerStats, history statsHistory) statGraph 
 		maxValue:      maxValue,
 		fallbackLevel: percentLevel(statsCPU(stats)),
 		delta:         formatPercentDelta(floatDelta(history.CPU)),
+		// history.maxCPU, not maxValue above — maxValue is floored at 100
+		// as the graph's scale ceiling, not the real historical peak.
+		peak: fmt.Sprintf("peak %.1f%%", history.maxCPU),
 	}
 }
 
-func uintStatGraph(values []uint64, maxValue uint64, fallbackLevel int, formatDelta func(int64) string) statGraph {
+func uintStatGraph(values []uint64, maxValue uint64, fallbackLevel int, formatDelta func(int64) string, formatPeak func(uint64) string) statGraph {
 	if len(values) == 0 || maxValue == 0 {
 		return statGraph{fallbackLevel: fallbackLevel}
 	}
@@ -848,6 +852,7 @@ func uintStatGraph(values []uint64, maxValue uint64, fallbackLevel int, formatDe
 		maxValue:      float64(maxValue),
 		fallbackLevel: fallbackLevel,
 		delta:         formatDelta(uintDelta(values)),
+		peak:          "peak " + formatPeak(maxValue),
 	}
 }
 
@@ -930,6 +935,20 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	} else {
 		delta = ""
 	}
+	// Peak gets whatever room delta didn't already claim — same width
+	// gate, checked second so an already-tight row still prefers the more
+	// established delta signal over the newer peak one.
+	peak := graph.peak
+	if peak != "" && width >= 24 {
+		peakWidth := lipgloss.Width(peak) + 2
+		if sparkWidth-peakWidth >= 6 {
+			sparkWidth -= peakWidth
+		} else {
+			peak = ""
+		}
+	} else {
+		peak = ""
+	}
 	spark := renderSparkline(renderer, settings, graph, color, max(1, sparkWidth))
 	parts := []string{spark}
 	if meter != "" {
@@ -937,6 +956,9 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	}
 	if delta != "" {
 		parts = append(parts, renderer.Styles.DetailMeta.Render(delta))
+	}
+	if peak != "" {
+		parts = append(parts, renderer.Styles.DetailMeta.Render(peak))
 	}
 	// The gap between parts is otherwise a bare, unstyled string — same
 	// falls-through-to-default issue as the suffix above.
@@ -992,15 +1014,26 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 	if graph.static != "" {
 		return styleGraphGlyphs(renderer, settings, graph.static, graph.fallbackLevel, color)
 	}
-	if len(graph.values) == 0 || graph.maxValue <= 0 {
-		if settings.GraphStyle == graphStyleGauge {
+	if settings.GraphStyle == graphStyleGauge {
+		if len(graph.values) == 0 || graph.maxValue <= 0 {
 			return renderGaugeBar(renderer, settings, 0, 1, color, width)
 		}
+		return renderGaugeBar(renderer, settings, graph.values[len(graph.values)-1], graph.maxValue, color, width)
+	}
+	if settings.GraphStyle == graphStyleBraille {
+		// A fixed 8-level heat scale, independent of graphGlyphs' own
+		// (much shorter) glyph count for this style — see brailleLevel's
+		// doc comment on why dot-height and color-heat are quantized
+		// separately.
+		colorFor := func(value float64) lipgloss.Color {
+			level := clamp(int(value/graph.maxValue*7)+1, 1, 8)
+			return statHeatColor(settings, level, color, renderer)
+		}
+		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, colorFor, renderer.Styles.Theme.Bg)
+	}
+	if len(graph.values) == 0 || graph.maxValue <= 0 {
 		level := clamp(graph.fallbackLevel, 1, len(glyphs))
 		return styleGraphGlyphs(renderer, settings, strings.Join(glyphs[:level], ""), level, color)
-	}
-	if settings.GraphStyle == graphStyleGauge {
-		return renderGaugeBar(renderer, settings, graph.values[len(graph.values)-1], graph.maxValue, color, width)
 	}
 	// Each bar takes 1+spacing columns (bars' spaced style takes 2: the
 	// glyph plus its trailing blank), so fewer values fit in the same
@@ -1041,6 +1074,89 @@ func graphGlyphs(settings appSettings) []string {
 	default:
 		return []string{"▁", "▂", "▂", "▃", "▄", "▅", "▇", "█", "▆", "▄", "▃", "▅", "▆", "▇"}
 	}
+}
+
+// brailleDotBits maps each dot's position in a Unicode braille cell's 2x4
+// dot matrix to its bit in the U+2800 block's encoding — column 0 (left
+// half) uses dots 1/2/3/7, column 1 (right half) uses dots 4/5/6/8, row 0
+// is the top of the cell and row 3 the bottom.
+var brailleDotBits = [2][4]int{
+	{0x01, 0x02, 0x04, 0x40},
+	{0x08, 0x10, 0x20, 0x80},
+}
+
+// brailleLevel quantizes value/maxValue into one of the 4 dot-height
+// levels a single braille half-column can represent (independent of
+// graphGlyphs' own level count, which graphStyleBraille only still uses
+// for the single static/fallback glyph case — see graphGlyphs).
+func brailleLevel(value, maxValue float64) int {
+	if maxValue <= 0 {
+		return 0
+	}
+	return clamp(int(value/maxValue*4)+1, 1, 4)
+}
+
+// brailleColumnBits returns the bitmask for filling col's half-column from
+// the bottom up to level dots tall (level 0 leaves it empty) — this is
+// what makes each half-column read as a small filled bar rather than a
+// single floating dot.
+func brailleColumnBits(col, level int) int {
+	if level <= 0 {
+		return 0
+	}
+	bits := 0
+	for row := 4 - level; row < 4; row++ {
+		bits |= brailleDotBits[col][row]
+	}
+	return bits
+}
+
+// renderBrailleGraph draws values as a true 2x4-dot braille sparkline:
+// each of the cols output columns packs two samples (left/right
+// half-column) at up to 4 vertical dot levels each — real sub-character
+// resolution, unlike every other graph style's one-glyph-per-sample
+// lookup. Up to cols*2 of the most recent values are used; any columns
+// left over once values runs out are rendered as empty/dimmed cells,
+// matching dashboardSpark's existing "no data yet" convention. colorFor
+// receives whichever of a cell's two packed values produced the taller
+// dot level, the same "one raw value in, one color out" shape
+// dashboardSpark's own colorFor callers already use.
+func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue float64, cols int, colorFor func(value float64) lipgloss.Color, bg lipgloss.Color) string {
+	cols = max(1, cols)
+	flat := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(string(rune(0x2800)))
+	if maxValue <= 0 || len(values) == 0 {
+		return strings.Repeat(flat, cols)
+	}
+	slots := cols * 2
+	if len(values) > slots {
+		values = values[len(values)-slots:]
+	}
+	drawnCols := (len(values) + 1) / 2
+
+	var b strings.Builder
+	for c := 0; c < drawnCols; c++ {
+		bits := 0
+		level := 0
+		var colorValue float64
+		if li := c * 2; li < len(values) {
+			l := brailleLevel(values[li], maxValue)
+			bits |= brailleColumnBits(0, l)
+			level, colorValue = l, values[li]
+		}
+		if ri := c*2 + 1; ri < len(values) {
+			l := brailleLevel(values[ri], maxValue)
+			bits |= brailleColumnBits(1, l)
+			if l > level {
+				level, colorValue = l, values[ri]
+			}
+		}
+		cell := string(rune(0x2800 + bits))
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(colorFor(colorValue)).Render(cell))
+	}
+	for c := drawnCols; c < cols; c++ {
+		b.WriteString(flat)
+	}
+	return b.String()
 }
 
 // graphGlyphSpacing is how many blank, background-colored columns follow
@@ -1271,6 +1387,13 @@ func formatPIDs(stats *domain.ContainerStats) string {
 		return "pending stats"
 	}
 	return fmt.Sprintf("%d", stats.PIDs)
+}
+
+// formatPIDCount is formatPIDs' uintStatGraph-compatible counterpart — a
+// bare count (no "pending stats" case, since it's only ever called with a
+// real historical peak, never a possibly-nil live sample).
+func formatPIDCount(value uint64) string {
+	return fmt.Sprintf("%d", value)
 }
 
 func formatStatsAge(read time.Time) string {
@@ -3996,7 +4119,7 @@ func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, width int) strin
 		if len(m.fleetNetHistory) > 0 {
 			latestNet = m.fleetNetHistory[len(m.fleetNetHistory)-1]
 		}
-		net := dashboardNetSpark(renderer, m.settings, uintStatGraph(m.fleetNetHistory, netMax, byteLevel(latestNet), formatByteDelta), each, bg)
+		net := dashboardNetSpark(renderer, m.settings, uintStatGraph(m.fleetNetHistory, netMax, byteLevel(latestNet), formatByteDelta, formatBytes), each, bg)
 		return label.Render("CPU ") + cpuSpark(each) + label.Render("   NET ") + net
 	}
 	if width-4 >= dashboardMinSparkW {
@@ -4380,8 +4503,8 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 
 	var netPart string
 	if cols.splitNet {
-		rxGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(rx), formatByteDelta)
-		txGraph := uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(tx), formatByteDelta)
+		rxGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(rx), formatByteDelta, formatBytes)
+		txGraph := uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(tx), formatByteDelta, formatBytes)
 		down := plain.Render("↓ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(rx)).
 			Render(rightAlignRunes(formatCompactBytes(rx), dashboardNetNumWidth))
 		up := plain.Render("↑ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(tx)).
@@ -4505,6 +4628,10 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 			maxValue = 1
 		}
 		return dashboardGaugeBar(renderer, value/maxValue, colorFor(value), width, bg)
+	}
+
+	if settings.GraphStyle == graphStyleBraille {
+		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, colorFor, bg)
 	}
 
 	glyphs := graphGlyphs(settings)

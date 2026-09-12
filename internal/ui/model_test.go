@@ -4737,7 +4737,11 @@ func TestSettingsAffectStatsRendering(t *testing.T) {
 	model.appendStats(stats)
 
 	view := ansi.Strip(model.View())
-	if !strings.Contains(view, "⣀⣶") {
+	// Braille style now composes its own dot patterns (renderBrailleGraph)
+	// rather than picking from a fixed 4-glyph set, so any rune in the
+	// Unicode Braille Patterns block (U+2800-U+28FF) counts, not a
+	// specific hardcoded glyph pair.
+	if !strings.ContainsFunc(view, func(r rune) bool { return r >= 0x2800 && r <= 0x28FF }) {
 		t.Fatalf("stats view missing braille graph style:\n%s", view)
 	}
 	if strings.Contains(view, "↗") || strings.Contains(view, "↘") {

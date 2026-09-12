@@ -770,11 +770,16 @@ func TestDashboardSparkHonorsGraphStyleGlyphSet(t *testing.T) {
 	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
 	blocksOut := ansi.Strip(dashboardSpark(renderer, blocks, graph, flatColor, 10, "#000000"))
 	brailleOut := ansi.Strip(dashboardSpark(renderer, braille, graph, flatColor, 10, "#000000"))
-	if strings.ContainsAny(blocksOut, "⣀⣤⣶⣿") {
+	// Braille style now composes its own dot patterns (renderBrailleGraph)
+	// rather than picking from a fixed 4-glyph set, so any rune in the
+	// Unicode Braille Patterns block (U+2800-U+28FF) counts, not just the
+	// old 4 pre-made glyphs.
+	isBraille := func(r rune) bool { return r >= 0x2800 && r <= 0x28FF }
+	if strings.ContainsFunc(blocksOut, isBraille) {
 		t.Fatalf("dashboardSpark(blocks style) = %q, want block glyphs (▁-█), not Braille", blocksOut)
 	}
-	if !strings.ContainsAny(brailleOut, "⣀⣤⣶⣿") {
-		t.Fatalf("dashboardSpark(braille style) = %q, want at least one Braille glyph (⣀⣤⣶⣿)", brailleOut)
+	if !strings.ContainsFunc(brailleOut, isBraille) {
+		t.Fatalf("dashboardSpark(braille style) = %q, want at least one Braille dot pattern", brailleOut)
 	}
 }
 
