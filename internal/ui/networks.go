@@ -184,13 +184,16 @@ func (m Model) networkCommandStrip(renderer tideui.Renderer, width int) string {
 	switch {
 	case m.networkRemoving:
 		text = "REMOVING SELECTED NETWORKS..."
-		fg, bg, bold = lipgloss.Color("#7dcfff"), lipgloss.Color("#24313a"), true
+		fg, bg = emphasisColors(renderer, activePalette.Info)
+		bold = true
 	case m.networkConfirming:
 		text = fmt.Sprintf("DELETE %d NETWORK(S)?   y/enter continue   n/esc cancel", m.selectedNetworkCount())
-		fg, bg, bold = lipgloss.Color("#ffd7d9"), lipgloss.Color("#4a2429"), true
+		fg, bg = emphasisColors(renderer, activePalette.Bad)
+		bold = true
 	case m.selectedNetworkCount() > 0:
 		text = fmt.Sprintf("%d NETWORK(S) SELECTED   d DELETE", m.selectedNetworkCount())
-		fg, bg, bold = lipgloss.Color("#ffe3a3"), lipgloss.Color("#413724"), true
+		fg, bg = emphasisColors(renderer, activePalette.Warn)
+		bold = true
 	}
 	text = ansi.Truncate(" "+text, max(1, width), "…")
 	return lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(bold).Width(width).Render(text)
@@ -217,13 +220,13 @@ func networkTableHeader(width int) string {
 func networkTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, network domain.Network) string {
 	nameWidth, subnetWidth, stateWidth, idWidth := networkColumnWidths(width)
 	state := "USED"
-	stateColor := lipgloss.Color("#80c990")
+	stateColor := lipgloss.Color(activePalette.OK)
 	if network.Removable() {
 		state = "UNUSED"
-		stateColor = lipgloss.Color("#e06c75")
+		stateColor = lipgloss.Color(activePalette.Bad)
 	} else if network.Containers == 0 {
 		state = "BUILT-IN"
-		stateColor = lipgloss.Color("#7f92a8")
+		stateColor = lipgloss.Color(activePalette.Muted)
 	}
 	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))

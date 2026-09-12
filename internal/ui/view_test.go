@@ -29,8 +29,8 @@ func withTrueColorProfile(t *testing.T) {
 
 func TestInspectorStatusColorDeadIsRed(t *testing.T) {
 	got := inspectorStatusColor(domain.Container{State: domain.StateDead})
-	if got != "#e06c75" {
-		t.Fatalf("inspectorStatusColor(dead) = %q, want red #e06c75", got)
+	if got != activePalette.Bad {
+		t.Fatalf("inspectorStatusColor(dead) = %q, want the theme's error colour %q", got, activePalette.Bad)
 	}
 }
 
@@ -410,7 +410,7 @@ func TestRenderCPUGaugeFillsProportionallyToPercent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// maxValue is deliberately set to something far from the
 			// capacity — the gauge must ignore it entirely.
-			graph := statGraph{values: tt.values, maxValue: 250, forceGauge: true}
+			graph := statGraph{values: tt.values, maxValue: 250}
 			out := ansi.Strip(renderCPUGauge(renderer, graph, cpuGaugeOneCore, width, "#000000"))
 
 			if got := len([]rune(out)); got != width {
@@ -439,10 +439,10 @@ func TestBrailleLevelColorIsADiscreteFourStepPalette(t *testing.T) {
 		level int
 		want  lipgloss.Color
 	}{
-		{1, "#80c990"}, // green
-		{2, "#e8c170"}, // yellow
-		{3, "#edad75"}, // orange
-		{4, "#e06c75"}, // red
+		{1, activePalette.OK},   // success
+		{2, activePalette.Warn}, // warning
+		{3, activePalette.Warn}, // warning, deeper
+		{4, activePalette.Bad},  // danger
 	}
 	for _, tt := range tests {
 		if got := brailleLevelColor(tt.level); got != tt.want {
@@ -460,7 +460,7 @@ func TestRenderBrailleGraphColorsCellByItsOwnLevel(t *testing.T) {
 	// green); second packs two near-max samples (level 4, red).
 	values := []float64{1, 1, 99, 100}
 
-	out := renderBrailleGraph(renderer, values, 100, 2, "#000000")
+	out := renderBrailleGraph(renderer, defaultSettings(), values, 100, "#7dcfff", 2, "#000000")
 
 	sgrFor := func(color lipgloss.Color) string {
 		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
@@ -486,7 +486,7 @@ func TestRenderBrailleGraphPacksTwoSamplesPerColumn(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	values := []float64{10, 20, 30, 40, 50, 90}
 
-	out := ansi.Strip(renderBrailleGraph(renderer, values, 100, 3, "#000000"))
+	out := ansi.Strip(renderBrailleGraph(renderer, defaultSettings(), values, 100, "#7dcfff", 3, "#000000"))
 	cells := []rune(out)
 	if len(cells) != 3 {
 		t.Fatalf("renderBrailleGraph() = %q (%d cells), want exactly 3 columns for a width-3 budget", out, len(cells))
@@ -504,7 +504,7 @@ func TestRenderBrailleGraphPacksTwoSamplesPerColumn(t *testing.T) {
 func TestRenderBrailleGraphNoDataIsAllFlatCells(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 
-	out := ansi.Strip(renderBrailleGraph(renderer, nil, 0, 5, "#000000"))
+	out := ansi.Strip(renderBrailleGraph(renderer, defaultSettings(), nil, 0, "#7dcfff", 5, "#000000"))
 	for _, r := range out {
 		if r != 0x2800 {
 			t.Fatalf("renderBrailleGraph() with no data = %q, want every cell empty (0x2800)", out)

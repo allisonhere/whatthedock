@@ -194,13 +194,16 @@ func (m Model) imageCommandStrip(renderer tideui.Renderer, width int) string {
 	switch {
 	case m.imageRemoving:
 		text = "REMOVING SELECTED IMAGES..."
-		fg, bg, bold = lipgloss.Color("#7dcfff"), lipgloss.Color("#24313a"), true
+		fg, bg = emphasisColors(renderer, activePalette.Info)
+		bold = true
 	case m.imageConfirming:
 		text = fmt.Sprintf("DELETE %d IMAGE(S)?   y/enter continue   n/esc cancel", m.selectedImageCount())
-		fg, bg, bold = lipgloss.Color("#ffd7d9"), lipgloss.Color("#4a2429"), true
+		fg, bg = emphasisColors(renderer, activePalette.Bad)
+		bold = true
 	case m.selectedImageCount() > 0:
 		text = fmt.Sprintf("%d IMAGE(S) SELECTED · %s RECLAIMABLE   d DELETE", m.selectedImageCount(), formatBytes(uint64(m.selectedImageBytes())))
-		fg, bg, bold = lipgloss.Color("#ffe3a3"), lipgloss.Color("#413724"), true
+		fg, bg = emphasisColors(renderer, activePalette.Warn)
+		bold = true
 	}
 	text = ansi.Truncate(" "+text, max(1, width), "…")
 	return lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(bold).Width(width).Render(text)
@@ -235,10 +238,10 @@ func imageTableHeader(width int) string {
 func imageTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, image domain.Image) string {
 	nameWidth, sizeWidth, stateWidth, idWidth := imageColumnWidths(width)
 	state := "USED"
-	stateColor := lipgloss.Color("#80c990")
+	stateColor := lipgloss.Color(activePalette.OK)
 	if image.Removable() {
 		state = "UNUSED"
-		stateColor = lipgloss.Color("#e06c75")
+		stateColor = lipgloss.Color(activePalette.Bad)
 	}
 	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))

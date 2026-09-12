@@ -335,6 +335,11 @@ type Model struct {
 	provider app.Provider
 	theme    tideui.Theme
 	themes   tideui.ThemePicker
+	// omarchySig/omarchyWatching back the same signature-based live-follow
+	// loop used by the other Tide apps. The resolver only runs after the
+	// active palette changes, not on every timer tick.
+	omarchySig      string
+	omarchyWatching bool
 
 	width  int
 	height int
@@ -901,6 +906,8 @@ type aboutTickMsg struct{}
 
 type statusPulseTickMsg struct{}
 
+type omarchyThemeTickMsg struct{}
+
 type openDoneMsg struct {
 	label string
 	err   error
@@ -987,10 +994,13 @@ func NewModelWithSettings(provider app.Provider, persisted config.Settings, sett
 
 func NewModelWithProviderFactory(provider app.Provider, persisted config.Settings, settingsPath string, factory providerFactory) Model {
 	theme := whatthedockTheme()
-	themes := append([]tideui.Theme{theme}, tideui.BuiltinThemes...)
+	themes := pickableThemes()
 	initialThemeName := theme.Name
 	if persisted.Theme != "" {
 		initialThemeName = persisted.Theme
+	}
+	if isMatchOmarchy(initialThemeName) {
+		initialThemeName = omarchyThemeName
 	}
 	themePicker := tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: themes, InitialTheme: initialThemeName, Title: "THEMES"})
 	theme = themePicker.ConfirmedTheme()
@@ -1027,6 +1037,9 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		forgetPassword:       systems.ForgetPassword,
 		passwordFor:          systems.PasswordFor,
 		clipboard:            clipboard.NewDeploymentClipboard(),
+	}
+	if isMatchOmarchy(theme.Name) {
+		m.omarchyWatching = true
 	}
 	if settings.StartInDashboard {
 		m.overlay = overlayDashboard
@@ -1205,6 +1218,9 @@ func whatthedockTheme() tideui.Theme {
 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.refreshCmd(), m.startEventsCmd(), tickStatusPulse()}
+	if m.omarchyWatching {
+		cmds = append(cmds, tickOmarchyTheme())
+	}
 	if cmd := m.autoCheckForUpdateCmd(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
@@ -1415,6 +1431,25 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.finishCreateDone(done)
 		}
 		return m, tickStatusPulse()
+	case omarchyThemeTickMsg:
+		if m.themes.Opened() {
+			return m, tickOmarchyTheme()
+		}
+		if !isMatchOmarchy(m.theme.Name) {
+			m.omarchyWatching = false
+			return m, nil
+		}
+		m.omarchyWatching = true
+		sig := omarchySignature()
+		if sig == "" || sig != m.omarchySig {
+			if theme, ok := loadOmarchyTheme(); ok {
+				m.omarchySig = sig
+				m.theme = theme
+				m.themes = tideui.NewThemePicker(tideui.ThemePickerOptions{Themes: pickableThemes(), InitialTheme: omarchyThemeName, Title: "THEMES"})
+				return m, tea.Batch(tickOmarchyTheme(), setTermColorsCmd(theme))
+			}
+		}
+		return m, tickOmarchyTheme()
 	case statsMsg:
 		if msg.stats.ID != m.selectedID {
 			return m, nil
@@ -2311,6 +2346,7 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case overlayCommandPalette:
 		return m.handleCommandPaletteKey(msg)
 	case overlayThemePicker:
+		wasWatching := m.omarchyWatching
 		switch m.themes.Update(msg) {
 		case tideui.ThemePickerConfirm:
 			m.theme = m.themes.ConfirmedTheme()
@@ -2325,6 +2361,12 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			m.theme = m.themes.PreviewTheme()
 		}
+		if isMatchOmarchy(m.theme.Name) && !wasWatching {
+			m.omarchyWatching = true
+			m.omarchySig = ""
+			return m, tea.Batch(setTermColorsCmd(m.theme), tickOmarchyTheme())
+		}
+		return m, setTermColorsCmd(m.theme)
 	case overlaySettings:
 		return m.handleSettingsKey(msg)
 	case overlaySystems:
@@ -3517,6 +3559,11 @@ func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) openThemePicker() {
+	// Resolve when opening, so previewing Omarchy after a desktop switch
+	// cannot select the palette captured when this app started.
+	m.themes = tideui.NewThemePicker(tideui.ThemePickerOptions{
+		Themes: pickableThemes(), InitialTheme: m.theme.Name, Title: "THEMES",
+	})
 	m.themes.Open(m.theme.Name)
 	m.overlay = overlayThemePicker
 }
@@ -5139,6 +5186,12 @@ const statusHoldMinDuration = 6 * time.Second
 // the persistent status bar, not a transient screen.
 func tickStatusPulse() tea.Cmd {
 	return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return statusPulseTickMsg{} })
+}
+
+// tickOmarchyTheme keeps the opt-in desktop palette live. Signature polling is
+// cheap; palette resolution only happens after that signature changes.
+func tickOmarchyTheme() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return omarchyThemeTickMsg{} })
 }
 
 func forwardLogs(in <-chan string, out chan<- string) {

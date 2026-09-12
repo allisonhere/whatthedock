@@ -184,13 +184,16 @@ func (m Model) volumeCommandStrip(renderer tideui.Renderer, width int) string {
 	switch {
 	case m.volumeRemoving:
 		text = "REMOVING SELECTED VOLUMES..."
-		fg, bg, bold = lipgloss.Color("#7dcfff"), lipgloss.Color("#24313a"), true
+		fg, bg = emphasisColors(renderer, activePalette.Info)
+		bold = true
 	case m.volumeConfirming:
 		text = fmt.Sprintf("DELETE %d VOLUME(S)?   y/enter continue   n/esc cancel", m.selectedVolumeCount())
-		fg, bg, bold = lipgloss.Color("#ffd7d9"), lipgloss.Color("#4a2429"), true
+		fg, bg = emphasisColors(renderer, activePalette.Bad)
+		bold = true
 	case m.selectedVolumeCount() > 0:
 		text = fmt.Sprintf("%d VOLUME(S) SELECTED   d DELETE", m.selectedVolumeCount())
-		fg, bg, bold = lipgloss.Color("#ffe3a3"), lipgloss.Color("#413724"), true
+		fg, bg = emphasisColors(renderer, activePalette.Warn)
+		bold = true
 	}
 	text = ansi.Truncate(" "+text, max(1, width), "…")
 	return lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(bold).Width(width).Render(text)
@@ -210,10 +213,10 @@ func volumeTableHeader(width int) string {
 func volumeTableRow(renderer tideui.Renderer, width, index int, marker string, highlighted bool, selected string, volume domain.Volume) string {
 	nameWidth, mountWidth, stateWidth := volumeColumnWidths(width)
 	state := "USED"
-	stateColor := lipgloss.Color("#80c990")
+	stateColor := lipgloss.Color(activePalette.OK)
 	if volume.Removable() {
 		state = "UNUSED"
-		stateColor = lipgloss.Color("#e06c75")
+		stateColor = lipgloss.Color(activePalette.Bad)
 	}
 	rowBG := stripedRowBackground(renderer, index%2 == 1, highlighted)
 	base := lipgloss.NewStyle().Background(rowBG).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))

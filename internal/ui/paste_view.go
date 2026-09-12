@@ -13,10 +13,10 @@ import (
 // ambers inspectorStatusColor already uses elsewhere in the app, reused
 // here rather than inventing a second color vocabulary for "this is fine"
 // vs. "this needs a look."
-var (
-	pasteConflictOK   = lipgloss.Color("#80c990")
-	pasteConflictWarn = lipgloss.Color("#e5c07b")
-)
+// They are functions, not vars: a package-level value would be frozen at init,
+// before any theme exists, and would not follow a theme switch.
+func pasteConflictOK() lipgloss.Color   { return activePalette.OK }
+func pasteConflictWarn() lipgloss.Color { return activePalette.Warn }
 
 // pasteOverlay is the review/conflict screen shown after "P" — see
 // handlePasteKey. Its shape follows the request's own mockup: a checklist
@@ -66,10 +66,10 @@ func (m Model) pasteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 func pasteConflictLine(renderer tideui.Renderer, c clipboard.PasteConflict) string {
 	switch c.Severity {
 	case clipboard.SeverityOK:
-		return lipgloss.NewStyle().Foreground(pasteConflictOK).Render("✓ " + c.Message)
+		return lipgloss.NewStyle().Foreground(pasteConflictOK()).Render("✓ " + c.Message)
 	case clipboard.SeverityBlock:
 		return renderer.Styles.StatusError.Render("! " + c.Message)
 	default:
-		return lipgloss.NewStyle().Foreground(pasteConflictWarn).Render("! " + c.Message)
+		return lipgloss.NewStyle().Foreground(pasteConflictWarn()).Render("! " + c.Message)
 	}
 }

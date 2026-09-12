@@ -1892,19 +1892,19 @@ func TestStaleLogsStartedMessageIsIgnored(t *testing.T) {
 }
 
 func TestLogTokenColors(t *testing.T) {
-	if got := httpStatusColor("200"); got != lipgloss.Color("#80c990") {
-		t.Fatalf("httpStatusColor(200) = %q, want green", got)
+	if got := httpStatusColor("200"); got != activePalette.OK {
+		t.Fatalf("httpStatusColor(200) = %q, want the theme's success colour %q", got, activePalette.OK)
 	}
-	if got := httpStatusColor("404"); got != lipgloss.Color("#f5a97f") {
-		t.Fatalf("httpStatusColor(404) = %q, want orange", got)
+	if got := httpStatusColor("404"); got != activePalette.Warn {
+		t.Fatalf("httpStatusColor(404) = %q, want the theme's warning colour %q", got, activePalette.Warn)
 	}
-	if got := httpStatusColor("500"); got != lipgloss.Color("#e06c75") {
-		t.Fatalf("httpStatusColor(500) = %q, want red", got)
+	if got := httpStatusColor("500"); got != activePalette.Bad {
+		t.Fatalf("httpStatusColor(500) = %q, want the theme's error colour %q", got, activePalette.Bad)
 	}
-	if got := logSeverityColor("[WARN]"); got != lipgloss.Color("#e8c170") {
+	if got := logSeverityColor("[WARN]"); got != lipgloss.Color(activePalette.Warn) {
 		t.Fatalf("logSeverityColor([WARN]) = %q, want yellow", got)
 	}
-	if got := logSeverityColor("ERROR"); got != lipgloss.Color("#e06c75") {
+	if got := logSeverityColor("ERROR"); got != lipgloss.Color(activePalette.Bad) {
 		t.Fatalf("logSeverityColor(ERROR) = %q, want red", got)
 	}
 }
@@ -2023,10 +2023,10 @@ func TestStatsViewShowsHeatSparklineAndDeltas(t *testing.T) {
 
 	rawView := model.View()
 	view := ansi.Strip(rawView)
-	// CPU is pinned to the always-gauge look (renderCPUGauge)
-	// regardless of Graph style, so its row shows "━"/"╸" fill glyphs, not
-	// a wave sparkline — see cpuStatGraph's forceGauge field.
-	for _, want := range []string{"▓▓▓▓░", "━", "↗ 72.0%", "↗ +4"} {
+	// Every Stats row, CPU included, renders as an ordinary sparkline
+	// following the chosen Graph style — the always-gauge treatment is
+	// Dashboard-only (see renderCPUGauge's doc comment).
+	for _, want := range []string{"▓▓▓▓░", "▂▃", "↗ 72.0%", "↗ +4"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing hybrid stats treatment %q:\n%s", want, view)
 		}
@@ -2142,7 +2142,7 @@ func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
 	if got := statHeatColor(defaultSettings(), 1, cpuColor, renderer); got != cpuColor {
 		t.Fatalf("statHeatColor(1) = %q, want %q (the passed-in color, unblended at t=0)", got, cpuColor)
 	}
-	if got := statHeatColor(defaultSettings(), 8, cpuColor, renderer); got != lipgloss.Color("#e06c75") {
+	if got := statHeatColor(defaultSettings(), 8, cpuColor, renderer); got != lipgloss.Color(activePalette.Bad) {
 		t.Fatalf("statHeatColor(8) = %q, want #e06c75 (the shared red danger color at t=1)", got)
 	}
 
@@ -2159,31 +2159,47 @@ func TestStatHeatColorFollowsSmoothRamp(t *testing.T) {
 	}
 }
 
-// TestStatGlyphColorFollowsSmoothHeightRamp is
-// TestStatHeatColorFollowsSmoothRamp's counterpart for the per-glyph
-// path — same contract, keyed by glyph character instead of level.
-func TestStatGlyphColorFollowsSmoothHeightRamp(t *testing.T) {
+// TestStatGlyphColorIsTheSharedFourStepPalette checks every sparkline
+// style grades through the same discrete green/yellow/orange/red steps,
+// keyed on how tall the glyph actually draws rather than on the metric's
+// identity hue. The eight-tall block glyphs pair up two per step and
+// braille's four dot glyphs take one each, so a glyph a quarter of the
+// way up reads the same green in any style. This deliberately replaced a
+// per-metric continuous blend: that ramp started from each metric's own
+// color, which left Disk (whose identity color IS the palette's yellow)
+// with a flat, gradient-less bottom half.
+func TestStatGlyphColorIsTheSharedFourStepPalette(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	cpuColor := lipgloss.Color("#7dcfff")
+	green, yellow, orange, red := lipgloss.Color(activePalette.OK), lipgloss.Color(activePalette.Warn), lipgloss.Color(activePalette.Warn), lipgloss.Color(activePalette.Bad)
 
-	if got := statGlyphColor(defaultSettings(), "▁", cpuColor, renderer); got != cpuColor {
-		t.Fatalf("statGlyphColor(▁) = %q, want %q (the passed-in color, unblended at t=0)", got, cpuColor)
+	blocks := map[string]lipgloss.Color{
+		"▁": green, "▂": green, "▃": yellow, "▄": yellow,
+		"▅": orange, "▆": orange, "▇": red, "█": red,
 	}
-	if got := statGlyphColor(defaultSettings(), "█", cpuColor, renderer); got != lipgloss.Color("#e06c75") {
-		t.Fatalf("statGlyphColor(█) = %q, want #e06c75 (the shared red danger color at t=1)", got)
+	braille := map[string]lipgloss.Color{"⣀": green, "⣤": yellow, "⣶": orange, "⣿": red}
+
+	// The metric's own color must no longer influence the gradient at all:
+	// two very different identity colors have to grade identically.
+	for _, metric := range []lipgloss.Color{activePalette.Info, activePalette.Warn} {
+		for _, set := range []map[string]lipgloss.Color{blocks, braille} {
+			for glyph, want := range set {
+				if got := statGlyphColor(defaultSettings(), glyph, metric, renderer); got != want {
+					t.Fatalf("statGlyphColor(%q) with metric %q = %q, want %q", glyph, metric, got, want)
+				}
+			}
+		}
 	}
 
-	glyphs := []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
-	var prev lipgloss.Color
-	for i, glyph := range glyphs {
-		got := statGlyphColor(defaultSettings(), glyph, cpuColor, renderer)
-		if _, err := colorful.Hex(string(got)); err != nil {
-			t.Fatalf("statGlyphColor(%q) = %q is not a valid hex color: %v", glyph, got, err)
-		}
-		if i > 0 && got == prev {
-			t.Fatalf("statGlyphColor(%q) = %q, same as %q — want a continuously distinct ramp", glyph, got, glyphs[i-1])
-		}
-		prev = got
+	// Metric and Mono modes still override the palette entirely.
+	metricMode := defaultSettings()
+	metricMode.GraphColor = graphColorMetric
+	if got := statGlyphColor(metricMode, "█", "#7dcfff", renderer); got != lipgloss.Color("#7dcfff") {
+		t.Fatalf("Metric mode statGlyphColor(█) = %q, want the metric's own color", got)
+	}
+	monoMode := defaultSettings()
+	monoMode.GraphColor = graphColorMono
+	if got := statGlyphColor(monoMode, "█", "#7dcfff", renderer); got != renderer.Styles.Theme.Dimmed {
+		t.Fatalf("Mono mode statGlyphColor(█) = %q, want the theme's dimmed color", got)
 	}
 }
 
@@ -2199,10 +2215,10 @@ func TestHeatColorFromAnchors(t *testing.T) {
 		want lipgloss.Color
 	}{
 		{0.0, base},
-		{0.5, "#e8c170"},
-		{0.7, "#edad75"},
-		{0.9, "#e06c75"},
-		{1.0, "#e06c75"},
+		{0.5, activePalette.Warn},
+		{0.7, activePalette.Warn},
+		{0.9, activePalette.Bad},
+		{1.0, activePalette.Bad},
 	}
 	for _, c := range cases {
 		if got := heatColorFrom(base, c.t); got != c.want {
@@ -2210,7 +2226,7 @@ func TestHeatColorFromAnchors(t *testing.T) {
 		}
 	}
 	mid := heatColorFrom(base, 0.25)
-	if mid == base || mid == lipgloss.Color("#e8c170") {
+	if mid == base || mid == lipgloss.Color(activePalette.Warn) {
 		t.Fatalf("heatColorFrom(base, 0.25) = %q, want a distinct blend strictly between base and yellow", mid)
 	}
 }
@@ -2227,9 +2243,9 @@ func TestUptimeColorBands(t *testing.T) {
 		want    lipgloss.Color
 	}{
 		{"zero value", time.Time{}, "#9aa6b2"},
-		{"just started", now.Add(-30 * time.Second), "#e06c75"},
-		{"fresh", now.Add(-30 * time.Minute), "#e8c170"},
-		{"stable", now.Add(-48 * time.Hour), "#c9a0f5"},
+		{"just started", now.Add(-30 * time.Second), activePalette.Bad},
+		{"fresh", now.Add(-30 * time.Minute), activePalette.Warn},
+		{"stable", now.Add(-48 * time.Hour), activePalette.Alt2},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -4500,7 +4516,7 @@ func TestSelectedInspectorFieldRowUsesSelectedForegroundForValueColors(t *testin
 		t.Fatal("renderInspectorFieldRow returned no rows")
 	}
 
-	for _, color := range []lipgloss.Color{"#e5c07b", "#98c379", "#9aa6b2"} {
+	for _, color := range []lipgloss.Color{"#e5c07b", activePalette.OK, "#9aa6b2"} {
 		if strings.Contains(rows[0], "38;2;"+trueColorTriplet(t, color)) {
 			t.Fatalf("selected inspector row still uses low-contrast value/token color %s instead of selected foreground:\n%q", color, rows[0])
 		}
@@ -5525,8 +5541,8 @@ func TestInitStartsSnapshotAndEventSubscription(t *testing.T) {
 	if !ok {
 		t.Fatalf("Init() msg = %#v, want tea.BatchMsg", msg)
 	}
-	// snapshot refresh, event subscription, the status-bar pulse tick, and
-	// an update check.
+	// Snapshot refresh, event subscription, the status-bar pulse tick, and
+	// an update check. The Omarchy poll is opt-in, not a global timer.
 	if len(batch) != 4 {
 		t.Fatalf("Init() batch length = %d, want 4", len(batch))
 	}
@@ -6135,7 +6151,7 @@ func TestStatusLeftShowsTextForNonConnectedStatuses(t *testing.T) {
 }
 
 func TestPulseDotColorBreathesOverFrames(t *testing.T) {
-	bright := lipgloss.Color("#80c990")
+	bright := lipgloss.Color(activePalette.OK)
 	start := pulseDotColor(0, bright)
 	quarterCycle := pulseDotColor(6, bright)
 	if start == quarterCycle {

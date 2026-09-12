@@ -28,6 +28,9 @@ func (m Model) View() string {
 	if m.width <= 0 || m.height <= 0 {
 		return ""
 	}
+	// Refresh the derived accent set before painting so container state, log
+	// severity, graphs and the inspector track the active theme.
+	setActivePalette(m.theme)
 	renderer := tideui.NewRenderer(m.theme, tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners, ModalShadow: m.settings.ModalShadow})
 	topbar := m.renderTopbar(renderer)
 	if m.height == 1 {
@@ -555,9 +558,9 @@ func renderLogToken(renderer tideui.Renderer, mode logColorMode, token string, f
 	trimmed := strings.Trim(token, `[](),;:"'`)
 	switch {
 	case first && logTimestampPattern.MatchString(token) && (mode == logColorFull || mode == logColorHTTP || mode == logColorSeverity):
-		return foregroundSpan(token, "#8aadf4", baseFg, false)
+		return foregroundSpan(token, activePalette.Alt, baseFg, false)
 	case logHTTPMethodPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
-		return foregroundSpan(token, "#7dcfff", baseFg, true)
+		return foregroundSpan(token, activePalette.Info, baseFg, true)
 	case logHTTPStatusPattern.MatchString(trimmed) && (mode == logColorFull || mode == logColorHTTP):
 		return foregroundSpan(token, httpStatusColor(trimmed), baseFg, true)
 	case logSeverityPattern.MatchString(token) && (mode == logColorFull || mode == logColorSeverity):
@@ -599,7 +602,7 @@ func renderLogMatch(renderer tideui.Renderer, query, token, rendered string) str
 		return rendered
 	}
 	end := start + len(queryRunes)
-	const matchBg = lipgloss.Color("#a855f7")
+	matchBg := activePalette.Alt2
 	const matchFg = lipgloss.Color("#ffffff")
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
 	match := backgroundSpan(string(tokenRunes[start:end]), matchBg, matchFg, renderer.Styles.Theme.Bg, baseFg, true)
@@ -639,15 +642,15 @@ func isLogSpace(char byte) bool {
 func httpStatusColor(status string) lipgloss.Color {
 	switch {
 	case strings.HasPrefix(status, "5"):
-		return "#e06c75"
+		return activePalette.Bad
 	case strings.HasPrefix(status, "4"):
-		return "#f5a97f"
+		return activePalette.Warn
 	case strings.HasPrefix(status, "3"):
-		return "#e8c170"
+		return activePalette.Warn
 	case strings.HasPrefix(status, "2"):
-		return "#80c990"
+		return activePalette.OK
 	default:
-		return "#9aa6b2"
+		return activePalette.Muted
 	}
 }
 
@@ -655,13 +658,13 @@ func logSeverityColor(severity string) lipgloss.Color {
 	normalized := strings.Trim(strings.ToUpper(severity), "[]")
 	switch normalized {
 	case "ERROR", "ERR":
-		return "#e06c75"
+		return activePalette.Bad
 	case "WARN", "WRN":
-		return "#e8c170"
+		return activePalette.Warn
 	case "DEBUG", "DBG":
-		return "#9aa6b2"
+		return activePalette.Muted
 	default:
-		return "#80c990"
+		return activePalette.OK
 	}
 }
 
@@ -692,14 +695,14 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 	}
 	lines := []string{
 		header,
-		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), "#7dcfff"),
-		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta, formatBytes), formatMemoryStats(stats), "#80c990"),
-		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkRx(stats)), "#8aadf4"),
-		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkTx(stats)), "#8aadf4"),
-		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta, formatBytes), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), "#e8c170"),
+		renderStatRow(renderer, m.settings, width, "CPU", cpuStatGraph(stats, history), formatCPU(stats), activePalette.Info),
+		renderStatRow(renderer, m.settings, width, "Memory", uintStatGraph(history.Memory, history.maxMemory, memoryLevel(stats), formatByteDelta, formatBytes), formatMemoryStats(stats), activePalette.OK),
+		renderStatRow(renderer, m.settings, width, "Net In", uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(statsNetworkRx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkRx(stats)), activePalette.Alt),
+		renderStatRow(renderer, m.settings, width, "Net Out", uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(statsNetworkTx(stats)), formatByteDelta, formatBytes), formatBytes(statsNetworkTx(stats)), activePalette.Alt),
+		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta, formatBytes), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), activePalette.Warn),
 		"",
 		renderStatRow(renderer, restartsRowSettings(m.settings), width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
-		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), "#c9a0f5", uptimeColor(ctr.Created)),
+		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), activePalette.Alt2, uptimeColor(ctr.Created)),
 		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta, formatPIDCount), formatPIDs(stats), "#6fd6c9"),
 		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: containerTitle(*ctr)}, width),
 	}
@@ -717,12 +720,6 @@ type statGraph struct {
 	delta         string
 	peak          string
 	static        string
-	// forceGauge pins this row to the always-gauge, left-to-right growing
-	// bar (renderCPUGauge) regardless of settings.GraphStyle — see
-	// cpuStatGraph and renderCPUGauge's doc comments for why CPU is the
-	// one row that opts into this instead of following the user's chosen
-	// Graph style like every other row.
-	forceGauge bool
 }
 
 func statsCPU(stats *domain.ContainerStats) float64 {
@@ -841,8 +838,7 @@ func cpuStatGraph(stats *domain.ContainerStats, history statsHistory) statGraph 
 		delta:         formatPercentDelta(floatDelta(history.CPU)),
 		// history.maxCPU, not maxValue above — maxValue is floored at 100
 		// as the graph's scale ceiling, not the real historical peak.
-		peak:       fmt.Sprintf("peak %.1f%%", history.maxCPU),
-		forceGauge: true,
+		peak: fmt.Sprintf("peak %.1f%%", history.maxCPU),
 	}
 }
 
@@ -918,14 +914,13 @@ func renderHybridGraph(renderer tideui.Renderer, settings appSettings, graph sta
 	if width < 12 {
 		return renderSparkline(renderer, settings, graph, color, width)
 	}
-	// The gauge style's own bar (and CPU's own forceGauge bar, pinned to
-	// that same look regardless of settings.GraphStyle) is already a
-	// proportional fill — pairing it with the old 5-segment meter would
-	// show the same information twice, so both skip the meter and let the
-	// bar fill the space the meter would otherwise have taken.
+	// The gauge style's own bar is already a proportional fill — pairing
+	// it with the old 5-segment meter would show the same information
+	// twice, so gauge skips the meter and lets the bar fill the space
+	// the meter would otherwise have taken.
 	meter := ""
 	sparkWidth := width
-	if settings.GraphStyle != graphStyleGauge && !graph.forceGauge {
+	if settings.GraphStyle != graphStyleGauge {
 		meter = renderMeter(renderer, settings, graphLevel(settings, graph), color)
 		sparkWidth = width - lipgloss.Width(meter) - 2
 	}
@@ -1022,9 +1017,6 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 	if graph.static != "" {
 		return styleGraphGlyphs(renderer, settings, graph.static, graph.fallbackLevel, color)
 	}
-	if graph.forceGauge {
-		return renderCPUGauge(renderer, graph, cpuGaugeOneCore, width, renderer.Styles.Theme.Bg)
-	}
 	if settings.GraphStyle == graphStyleGauge {
 		if len(graph.values) == 0 || graph.maxValue <= 0 {
 			return renderGaugeBar(renderer, settings, 0, 1, color, width)
@@ -1032,7 +1024,7 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 		return renderGaugeBar(renderer, settings, graph.values[len(graph.values)-1], graph.maxValue, color, width)
 	}
 	if settings.GraphStyle == graphStyleBraille {
-		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, renderer.Styles.Theme.Bg)
+		return renderBrailleGraph(renderer, settings, graph.values, graph.maxValue, color, width, renderer.Styles.Theme.Bg)
 	}
 	if len(graph.values) == 0 || graph.maxValue <= 0 {
 		level := clamp(graph.fallbackLevel, 1, len(glyphs))
@@ -1114,18 +1106,16 @@ func brailleColumnBits(col, level int) int {
 	return bits
 }
 
-// brailleLevelColors maps a half-column's dot level (1-4) straight to a
-// color — a discrete step per level (green/yellow/orange/red), not a
-// continuous blend: 1 dot lit reads as "quiet" and should look
-// unambiguously green regardless of exactly how far into that quarter of
-// the scale it sits, the same way a single dot vs. two dots is a step
-// change, not a gradient. Reuses the app's existing semantic colors
-// (Memory's own green identity, and heatColorFrom's yellow/orange/red
-// stops) rather than inventing a new palette just for this.
-var brailleLevelColors = [4]lipgloss.Color{"#80c990", "#e8c170", "#edad75", "#e06c75"}
-
+// brailleLevelColor maps a half-column's dot level (1-4) straight to a
+// palette step — green/yellow/orange/red, one per level, not a continuous
+// blend: 1 dot lit reads as "quiet" and should look unambiguously green
+// regardless of exactly how far into that quarter of the scale it sits,
+// the same way one dot vs. two is a step change, not a gradient. The four
+// levels are the four quarters of full scale, so this is just
+// graphHeatColor's own palette at braille's resolution — every other
+// style grades the same way.
 func brailleLevelColor(level int) lipgloss.Color {
-	return brailleLevelColors[clamp(level, 1, 4)-1]
+	return graphHeatColor(float64(clamp(level, 1, 4)-1) / 3)
 }
 
 // renderBrailleGraph draws values as a true 2x4-dot braille sparkline:
@@ -1135,11 +1125,13 @@ func brailleLevelColor(level int) lipgloss.Color {
 // lookup. Up to cols*2 of the most recent values are used; any columns
 // left over once values runs out are rendered as empty/dimmed cells,
 // matching dashboardSpark's existing "no data yet" convention. A cell's
-// color comes from brailleLevelColor of whichever of its two packed
-// values produced the taller dot level — the dot count itself is already
-// the "how much" signal, so color rides on that same level rather than a
-// separately-computed continuous heat value that could disagree with it.
-func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue float64, cols int, bg lipgloss.Color) string {
+// color comes from whichever of its two packed values produced the taller
+// dot level — the dot count itself is already the "how much" signal, so
+// color rides on that same level rather than a separately-computed heat
+// value that could disagree with it — routed through graphHeatColorFor so
+// braille honours settings.GraphColor's Metric/Mono modes exactly like
+// every other style does.
+func renderBrailleGraph(renderer tideui.Renderer, settings appSettings, values []float64, maxValue float64, color lipgloss.Color, cols int, bg lipgloss.Color) string {
 	cols = max(1, cols)
 	flat := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(string(rune(0x2800)))
 	if maxValue <= 0 || len(values) == 0 {
@@ -1168,7 +1160,8 @@ func renderBrailleGraph(renderer tideui.Renderer, values []float64, maxValue flo
 			}
 		}
 		cell := string(rune(0x2800 + bits))
-		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(brailleLevelColor(level)).Render(cell))
+		cellColor := graphHeatColorFor(settings, float64(clamp(level, 1, 4)-1)/3, color, renderer)
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(cellColor).Render(cell))
 	}
 	for c := drawnCols; c < cols; c++ {
 		b.WriteString(flat)
@@ -1247,9 +1240,9 @@ func heatColorFrom(base lipgloss.Color, t float64) lipgloss.Color {
 		hex string
 	}{
 		{0.0, string(base)},
-		{0.5, "#e8c170"},
-		{0.7, "#edad75"},
-		{0.9, "#e06c75"},
+		{0.5, string(activePalette.Warn)},
+		{0.7, string(activePalette.Warn)},
+		{0.9, string(activePalette.Bad)},
 	}
 	if t <= stops[0].at {
 		return base
@@ -1272,7 +1265,7 @@ func heatColorFrom(base lipgloss.Color, t float64) lipgloss.Color {
 			return lipgloss.Color(from.BlendRgb(to, frac).Hex())
 		}
 	}
-	return "#e06c75"
+	return activePalette.Bad
 }
 
 func statHeatColor(settings appSettings, level int, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
@@ -1286,47 +1279,55 @@ func statHeatColor(settings appSettings, level int, color lipgloss.Color, render
 	return heatColorFrom(color, float64(clamp(level, 1, levels)-1)/float64(levels-1))
 }
 
-// statGlyphColor keeps the glyph-character switch (rather than a raw
-// level index) because it correctly encodes each glyph's intensity
-// ordinal independent of graphStyleWave's non-monotonic up-down shape —
-// the same character reappears at different sequence positions in a
-// wave, so indexing by position (instead of by which character it is)
-// would mis-color it.
-func statGlyphColor(settings appSettings, glyph string, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
+// graphHeatColors is the shared sparkline palette: green, yellow, orange,
+// red — one discrete step per quarter of full scale, not a continuous
+// blend. Every graph style uses it, so a glyph drawn a quarter of the way
+// up reads the same unambiguous green whether it's a braille dot, a block
+// or a wave, instead of each metric starting from its own identity hue
+// and heating along a different ramp.
+var graphHeatColors = [4]lipgloss.Color{activePalette.OK, activePalette.Warn, activePalette.Warn, activePalette.Bad}
+
+// graphHeatColor picks the palette step for t, a glyph's height as a
+// fraction of full scale. The boundaries are the quarters, so the braille
+// renderer's four dot levels (t = 0, 1/3, 2/3, 1) land on exactly one
+// color each, and the eight-tall block glyphs pair up two per step.
+func graphHeatColor(t float64) lipgloss.Color {
+	return graphHeatColors[clamp(int(t*4), 0, 3)]
+}
+
+// graphGlyphHeight is how tall each sparkline glyph actually draws, as a
+// fraction of a full cell. Color keys off this rather than a sample's
+// index in the series because graphStyleWave's glyph list is deliberately
+// non-monotonic — the same character reappears at different sequence
+// positions — so indexing by position would mis-color it. Keying on the
+// character means the color always agrees with what the glyph looks like.
+var graphGlyphHeight = map[string]float64{
+	"▁": 0.0 / 7, "▂": 1.0 / 7, "▃": 2.0 / 7, "▄": 3.0 / 7,
+	"▅": 4.0 / 7, "▆": 5.0 / 7, "▇": 6.0 / 7, "█": 7.0 / 7,
+	"⣀": 0.0 / 3, "⣤": 1.0 / 3, "⣶": 2.0 / 3, "⣿": 3.0 / 3,
+}
+
+// graphHeatColorFor applies settings.GraphColor to a height fraction:
+// Metric pins everything to the row's own identity color, Mono dims it
+// away entirely, and the default Gradient grades it through
+// graphHeatColors. Every sparkline style routes its per-cell color
+// through here, so all four styles honour the setting identically.
+func graphHeatColorFor(settings appSettings, t float64, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
 	switch settings.GraphColor {
 	case graphColorMetric:
 		return color
 	case graphColorMono:
 		return renderer.Styles.Theme.Dimmed
 	}
-	switch glyph {
-	case "▁":
-		return heatColorFrom(color, 0.0/7)
-	case "▂":
-		return heatColorFrom(color, 1.0/7)
-	case "▃":
-		return heatColorFrom(color, 2.0/7)
-	case "▄":
-		return heatColorFrom(color, 3.0/7)
-	case "▅":
-		return heatColorFrom(color, 4.0/7)
-	case "▆":
-		return heatColorFrom(color, 5.0/7)
-	case "▇":
-		return heatColorFrom(color, 6.0/7)
-	case "█":
-		return heatColorFrom(color, 7.0/7)
-	case "⣀":
-		return heatColorFrom(color, 0.0/3)
-	case "⣤":
-		return heatColorFrom(color, 1.0/3)
-	case "⣶":
-		return heatColorFrom(color, 2.0/3)
-	case "⣿":
-		return heatColorFrom(color, 3.0/3)
-	default:
-		return "#9aa6b2"
+	return graphHeatColor(t)
+}
+
+func statGlyphColor(settings appSettings, glyph string, color lipgloss.Color, renderer tideui.Renderer) lipgloss.Color {
+	height, ok := graphGlyphHeight[glyph]
+	if !ok {
+		return activePalette.Muted
 	}
+	return graphHeatColorFor(settings, height, color, renderer)
 }
 
 func statGlyphBold(glyph string) bool {
@@ -1439,12 +1440,12 @@ func restartLevel(count int) int {
 
 func restartColor(count int) lipgloss.Color {
 	if count >= 5 {
-		return "#e06c75"
+		return activePalette.Bad
 	}
 	if count > 0 {
-		return "#e8c170"
+		return activePalette.Warn
 	}
-	return "#80c990"
+	return activePalette.OK
 }
 
 // restartsRowSettings forces the Restarts row's own color resolution
@@ -1493,15 +1494,15 @@ func uptimeLevel(created time.Time) int {
 // suspicious state, not one that's been running for days.
 func uptimeColor(created time.Time) lipgloss.Color {
 	if created.IsZero() {
-		return "#9aa6b2"
+		return activePalette.Muted
 	}
 	switch age := time.Since(created); {
 	case age < 5*time.Minute:
-		return "#e06c75"
+		return activePalette.Bad
 	case age < time.Hour:
-		return "#e8c170"
+		return activePalette.Warn
 	default:
-		return "#c9a0f5"
+		return activePalette.Alt2
 	}
 }
 
@@ -1917,32 +1918,32 @@ func (m Model) inspectorRows() []inspectorRow {
 	addTitle(containerTitle(ctr))
 	addSection("Runtime")
 	addField("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr), "")
-	addField("Uptime", formatDuration(ctr.Created), "", "#9aa6b2", "")
+	addField("Uptime", formatDuration(ctr.Created), "", activePalette.Muted, "")
 	addField("Restart", ctr.RestartPolicy, "", "", "")
 	addField("Restarts", fmt.Sprintf("%d", ctr.RestartCount), "", restartCountColor(ctr.RestartCount), "")
 
 	addSection("Image")
-	addField("Image", ctr.Image, "c", "#7dcfff", "image")
-	addFieldFull("Image ID", short(ctr.ImageID, 20), ctr.ImageID, "c", "#9aa6b2", "digest")
+	addField("Image", ctr.Image, "c", activePalette.Info, "image")
+	addFieldFull("Image ID", short(ctr.ImageID, 20), ctr.ImageID, "c", activePalette.Muted, "digest")
 
 	if ctr.Compose.Project != "" {
 		addSection("Compose")
-		addField("Stack", ctr.Compose.Project, "c", "#80c990", "")
-		addField("Service", ctr.Compose.Service, "c", "#80c990", "")
-		addField("Number", ctr.Compose.ContainerNumber, "c", "#9aa6b2", "")
-		addField("Config", ctr.Compose.ConfigFiles, "c/o", "#9aa6b2", "path")
+		addField("Stack", ctr.Compose.Project, "c", activePalette.OK, "")
+		addField("Service", ctr.Compose.Service, "c", activePalette.OK, "")
+		addField("Number", ctr.Compose.ContainerNumber, "c", activePalette.Muted, "")
+		addField("Config", ctr.Compose.ConfigFiles, "c/o", activePalette.Muted, "path")
 	}
 
 	addSection("Network")
-	addField("Ports", formatPorts(ctr.Ports), detailHint(len(ctr.Ports) > 0, true), "#e5c07b", "ports")
-	addField("Networks", strings.Join(ctr.Networks, ", "), "", "#7dcfff", "")
+	addField("Ports", formatPorts(ctr.Ports), detailHint(len(ctr.Ports) > 0, true), activePalette.Warn, "ports")
+	addField("Networks", strings.Join(ctr.Networks, ", "), "", activePalette.Info, "")
 
 	addSection("Files")
-	addField("Mounts", formatMounts(ctr.Mounts), detailHint(len(ctr.Mounts) > 0, true), "#c678dd", "mounts")
+	addField("Mounts", formatMounts(ctr.Mounts), detailHint(len(ctr.Mounts) > 0, true), activePalette.Alt2, "mounts")
 
 	addSection("Metadata")
-	addFieldFull("Env", formatList(ctr.Env, 8), formatList(ctr.Env, len(ctr.Env)), "", "#9aa6b2", "kv")
-	addFieldFull("Labels", formatMap(ctr.Labels, 8), formatMap(ctr.Labels, len(ctr.Labels)), detailHint(len(ctr.Labels) > 0, false), "#9aa6b2", "kv")
+	addFieldFull("Env", formatList(ctr.Env, 8), formatList(ctr.Env, len(ctr.Env)), "", activePalette.Muted, "kv")
+	addFieldFull("Labels", formatMap(ctr.Labels, 8), formatMap(ctr.Labels, len(ctr.Labels)), detailHint(len(ctr.Labels) > 0, false), activePalette.Muted, "kv")
 	if ctr.HealthCheck != nil {
 		addField("Health", strings.Join(ctr.HealthCheck.Test, " "), "", inspectorStatusColor(ctr), "")
 	}
@@ -1958,21 +1959,21 @@ func (m Model) inspectorRows() []inspectorRow {
 func inspectorTokenColor(kind string) lipgloss.Color {
 	switch kind {
 	case "key":
-		return "#7dcfff"
+		return activePalette.Info
 	case "string":
-		return "#e0af68"
+		return activePalette.Warn
 	case "path":
-		return "#c678dd"
+		return activePalette.Alt2
 	case "num":
-		return "#98c379"
+		return activePalette.OK
 	case "proto":
-		return "#9aa6b2"
+		return activePalette.Muted
 	case "digest":
-		return "#e5c07b"
+		return activePalette.Warn
 	case "tag":
-		return "#98c379"
+		return activePalette.OK
 	case "comment":
-		return "#565f89"
+		return activePalette.Muted
 	default:
 		return ""
 	}
@@ -2469,47 +2470,47 @@ func inspectorStatusText(ctr domain.Container) string {
 
 func inspectorStatusColor(ctr domain.Container) lipgloss.Color {
 	if ctr.Restarting || ctr.State == domain.StateRestarting {
-		return "#e5c07b"
+		return activePalette.Warn
 	}
 	switch ctr.Health {
 	case domain.HealthHealthy:
-		return "#80c990"
+		return activePalette.OK
 	case domain.HealthUnhealthy:
-		return "#e06c75"
+		return activePalette.Bad
 	case domain.HealthStarting, domain.HealthUnknown:
-		return "#e5c07b"
+		return activePalette.Warn
 	}
 	switch ctr.State {
 	case domain.StateRunning:
-		return "#80c990"
+		return activePalette.OK
 	case domain.StateStopped, domain.StateExited:
-		return "#9aa6b2"
+		return activePalette.Muted
 	case domain.StateDead:
-		return "#e06c75"
+		return activePalette.Bad
 	default:
-		return "#7dcfff"
+		return activePalette.Info
 	}
 }
 
 func severityColor(severity string) lipgloss.Color {
 	switch severity {
 	case "crit":
-		return "#e06c75"
+		return activePalette.Bad
 	case "warn":
-		return "#e5c07b"
+		return activePalette.Warn
 	default:
-		return "#9aa6b2"
+		return activePalette.Muted
 	}
 }
 
 func restartCountColor(count int) lipgloss.Color {
 	if count <= 0 {
-		return "#9aa6b2"
+		return activePalette.Muted
 	}
 	if count < 3 {
-		return "#e5c07b"
+		return activePalette.Warn
 	}
-	return "#e06c75"
+	return activePalette.Bad
 }
 
 func detailHint(hasValue, openable bool) string {
@@ -3745,11 +3746,11 @@ var statusLegendEntries = []struct {
 	color lipgloss.Color
 	label string
 }{
-	{"●", "#80c990", "healthy / running"},
-	{"▲", "#e5c07b", "restarting"},
-	{"○", "#9aa6b2", "stopped, exited cleanly"},
-	{"✖", "#e06c75", "dead"},
-	{"!", "#e06c75", "unhealthy"},
+	{"●", activePalette.OK, "healthy / running"},
+	{"▲", activePalette.Warn, "restarting"},
+	{"○", activePalette.Muted, "stopped, exited cleanly"},
+	{"✖", activePalette.Bad, "dead"},
+	{"!", activePalette.Bad, "unhealthy"},
 }
 
 // statusLegendLineCount is statusLegendLines' fixed output size (1 header
@@ -3850,9 +3851,9 @@ const (
 func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color {
 	switch {
 	case pct >= dashboardCritPct:
-		return "#e06c75"
+		return activePalette.Bad
 	case pct >= dashboardWarnPct:
-		return "#e5c07b"
+		return activePalette.Warn
 	default:
 		return neutral
 	}
@@ -3874,7 +3875,7 @@ func dashboardThresholdColor(pct float64, neutral lipgloss.Color) lipgloss.Color
 // distinct (slightly different) green identity color so the two rows
 // don't share one identical baseline hue.
 func dashboardGraphColor(pct float64) lipgloss.Color {
-	return heatColorFrom("#98c379", pct/100)
+	return heatColorFrom(activePalette.OK, pct/100)
 }
 
 // dashboardMemColor is dashboardGraphColor's Memory counterpart — same
@@ -3882,7 +3883,7 @@ func dashboardGraphColor(pct float64) lipgloss.Color {
 // instead of CPU's cyan, so the two rows read as distinct metrics
 // rather than sharing one baseline hue.
 func dashboardMemColor(pct float64) lipgloss.Color {
-	return heatColorFrom("#80c990", pct/100)
+	return heatColorFrom(activePalette.OKAlt, pct/100)
 }
 
 // dashboardStatusWords labels dashboardSummaryLine's per-status counts —
@@ -4083,7 +4084,7 @@ const dashboardMoodFlashFrames = 4
 // heat-toned ribbon: same centered, width-capped rule geometry, but every
 // dash is tinted from fleet-green up through amber/red by the fleet's
 // single hottest signal (summary.peakPressure — see heatColorFrom and
-// dashboardMemColor's shared "#80c990" identity), with a faint white
+// dashboardMemColor's shared activePalette.OK identity), with a faint white
 // centre sheen so the bar reads as a lit seam rather than a painted line.
 // For the first dashboardMoodFlashFrames pulse frames after a poll starts
 // (age), the whole ribbon lifts toward white — a calm "the fleet just
@@ -4095,7 +4096,7 @@ func (m Model) dashboardMoodStrip(renderer tideui.Renderer, summary dashboardSum
 	bg := renderer.Styles.Theme.Bg
 	pad := lipgloss.NewStyle().Background(bg)
 
-	base := string(heatColorFrom(lipgloss.Color("#80c990"), summary.peakPressure/100)) // heatColorFrom clamps t
+	base := string(heatColorFrom(lipgloss.Color(activePalette.OK), summary.peakPressure/100)) // heatColorFrom clamps t
 	flash := 0.0
 	if age >= 0 && age < dashboardMoodFlashFrames {
 		flash = (1 - float64(age)/float64(dashboardMoodFlashFrames)) * 0.4
@@ -4592,13 +4593,19 @@ func dashboardGaugeBar(renderer tideui.Renderer, frac float64, color lipgloss.Co
 // regardless of how many cores the host has.
 const cpuGaugeOneCore = 100.0
 
-// renderCPUGauge draws CPU's always-gauge look, shared by the Dashboard's
-// per-container CPU column and the single-container Stats pane
-// (renderSparkline's graph.forceGauge branch): a single bar that grows
-// left to right with the latest CPU%, against a fixed 100% ceiling, with
-// a dim gray "hint" track (the "─" remainder) showing the rest of the
-// range ahead of the fill — so the eye sees both "how full" and "how much
-// room is left" at once, the way a fuel gauge's empty track does.
+// renderCPUGauge draws the Dashboard's CPU look — its per-container
+// column and its fleet aggregate line: a single bar that grows left to
+// right with the latest CPU%, against a fixed capacity, with a dim gray
+// "hint" track (the "─" remainder) showing the rest of the range ahead of
+// the fill, so the eye sees both "how full" and "how much room is left" at
+// once, the way a fuel gauge's empty track does.
+//
+// This is Dashboard-only. The single-container Stats pane renders CPU as
+// an ordinary sparkline through renderSparkline like every other row
+// there, following whatever Graph style is set — the Dashboard is the
+// at-a-glance "how loaded is this box" screen where a fill reading is the
+// point, while the Stats pane is the per-container history view where the
+// shape over time is.
 //
 // capacity is the gauge's ceiling and must always be an *external*
 // reference — cpuGaugeOneCore for a single container (100 = one full
@@ -4744,7 +4751,14 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 	}
 
 	if settings.GraphStyle == graphStyleBraille {
-		return renderBrailleGraph(renderer, graph.values, graph.maxValue, width, bg)
+		// settings.GraphColor is a Stats-pane setting the Dashboard never
+		// honours (see this function's doc comment), so force the gradient
+		// mode rather than letting Mono/Metric leak in here through the
+		// shared renderer. colorFor(0) is this metric's own cold-end
+		// identity color, which only the Metric mode would ever read.
+		brailleSettings := settings
+		brailleSettings.GraphColor = graphColorGradient
+		return renderBrailleGraph(renderer, brailleSettings, graph.values, graph.maxValue, colorFor(0), width, bg)
 	}
 
 	glyphs := graphGlyphs(settings)
@@ -4767,7 +4781,21 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 	var b strings.Builder
 	for _, v := range values {
 		level := clamp(int(v/graph.maxValue*float64(len(glyphs)-1)+0.5), 0, len(glyphs)-1)
-		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(colorFor(v)).Render(glyphs[level]) + gap)
+		glyph := glyphs[level]
+		// Color by the glyph's own height through the shared
+		// green/yellow/orange/red palette, the same way the Stats pane's
+		// sparklines grade (see statGlyphColor), rather than by colorFor's
+		// absolute value scale. colorFor's landmarks are tens of megabytes
+		// per second; a fleet whose containers idle in the hundreds of
+		// bytes lands every sample on the gradient's cold end, so every
+		// glyph rendered the same flat identity blue and the color carried
+		// no information at all. Height-keyed color always varies with the
+		// shape that's actually drawn — the tradeoff being that it reads
+		// relative to this container's own recent peak, so a hot glyph
+		// means "busy for this container", not "busy in absolute terms".
+		// colorFor still grades the gauge branch above, where a single bar
+		// has no shape of its own to key off.
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(graphHeatColor(graphGlyphHeight[glyph])).Render(glyph) + gap)
 	}
 	if pad := slots - len(values); pad > 0 {
 		b.WriteString(strings.Repeat(flatCell, pad))
@@ -4784,7 +4812,7 @@ func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGr
 // Dashboard, but interpolated continuously between them (see netHeatT)
 // instead of jumping in flat steps.
 func dashboardNetGraphColor(value uint64) lipgloss.Color {
-	return heatColorFrom("#8aadf4", netHeatT(value))
+	return heatColorFrom(activePalette.Alt, netHeatT(value))
 }
 
 // netHeatT maps a byte rate to heatColorFrom's [0,1] domain, landing on

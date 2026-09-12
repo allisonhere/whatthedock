@@ -621,10 +621,10 @@ func TestDashboardThresholdColorBoundaries(t *testing.T) {
 		{0, neutral},
 		{0.4, neutral},
 		{69.9, neutral},
-		{70, "#e5c07b"},
-		{89.9, "#e5c07b"},
-		{90, "#e06c75"},
-		{100, "#e06c75"},
+		{70, activePalette.Warn},
+		{89.9, activePalette.Warn},
+		{90, activePalette.Bad},
+		{100, activePalette.Bad},
 	}
 	for _, c := range cases {
 		if got := dashboardThresholdColor(c.pct, neutral); got != c.want {
@@ -644,11 +644,11 @@ func TestDashboardGraphColorBoundaries(t *testing.T) {
 		pct  float64
 		want lipgloss.Color
 	}{
-		{0, "#98c379"},
-		{50, "#e8c170"},
-		{70, "#edad75"},
-		{90, "#e06c75"},
-		{100, "#e06c75"},
+		{0, activePalette.OK},
+		{50, activePalette.Warn},
+		{70, activePalette.Warn},
+		{90, activePalette.Bad},
+		{100, activePalette.Bad},
 	}
 	for _, c := range cases {
 		if got := dashboardGraphColor(c.pct); got != c.want {
@@ -668,15 +668,15 @@ func TestDashboardGraphColorBoundaries(t *testing.T) {
 // dashboardGraphColor, at the same percentage — the point of splitting
 // them was to give each metric its own baseline hue.
 func TestDashboardMemColorHasItsOwnIdentity(t *testing.T) {
-	if got := dashboardMemColor(0); got != "#80c990" {
-		t.Fatalf("dashboardMemColor(0) = %v, want #80c990 (Memory's green identity)", got)
+	if got := dashboardMemColor(0); got != activePalette.OKAlt {
+		t.Fatalf("dashboardMemColor(0) = %v, want %v (Memory's own success-family hue)", got, activePalette.OKAlt)
 	}
 	if dashboardMemColor(10) == dashboardGraphColor(10) {
 		t.Fatalf("dashboardMemColor(10) and dashboardGraphColor(10) are identical, want distinct per-metric baseline colors")
 	}
 	// Both still converge on the same red danger color once critical.
-	if got := dashboardMemColor(90); got != "#e06c75" {
-		t.Fatalf("dashboardMemColor(90) = %v, want #e06c75 (shared red danger color)", got)
+	if got := dashboardMemColor(90); got != activePalette.Bad {
+		t.Fatalf("dashboardMemColor(90) = %v, want %v (shared danger colour)", got, activePalette.Bad)
 	}
 }
 
@@ -691,11 +691,11 @@ func TestDashboardNetGraphColorBoundaries(t *testing.T) {
 		value uint64
 		want  lipgloss.Color
 	}{
-		{1 << 20, "#8aadf4"},
-		{32 << 20, "#e8c170"},
-		{128 << 20, "#edad75"},
-		{512 << 20, "#e06c75"},
-		{1 << 30, "#e06c75"},
+		{1 << 20, activePalette.Alt},
+		{32 << 20, activePalette.Warn},
+		{128 << 20, activePalette.Warn},
+		{512 << 20, activePalette.Bad},
+		{1 << 30, activePalette.Bad},
 	}
 	for _, c := range cases {
 		if got := dashboardNetGraphColor(c.value); got != c.want {
@@ -838,6 +838,35 @@ func TestDashboardSparkColorsEachGlyphByItsOwnValue(t *testing.T) {
 	}
 	if !strings.Contains(out, greenSGR) {
 		t.Fatalf("dashboardSpark output = %q, want a quiet neighbor sample's own green foreground SGR (%q)", out, greenSGR)
+	}
+}
+
+// TestDashboardSparkColorsQuietTrafficByShapeNotAbsoluteRate is the
+// regression guard for a Dashboard reported live as having entirely
+// colorless NET sparklines. Glyph color used to come from colorFor's
+// absolute byte-rate scale, whose landmarks are tens of megabytes per
+// second — so a normal home fleet idling in the hundreds of bytes graded
+// every single sample to the gradient's cold end and every glyph rendered
+// the identical flat identity blue, carrying no information whatever.
+// Color now keys off the glyph's drawn height, so a sparkline with any
+// shape to it always has color that varies with that shape.
+func TestDashboardSparkColorsQuietTrafficByShapeNotAbsoluteRate(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	// Byte rates from a real quiet container: peaks at ~1.5K/s, which is
+	// thousands of times below the absolute scale's first landmark.
+	graph := statGraph{values: []float64{0, 200, 1500, 400, 1500, 0}, maxValue: 1500}
+
+	netColor := func(v float64) lipgloss.Color { return dashboardNetGraphColor(uint64(v)) }
+	out := dashboardSpark(renderer, defaultSettings(), graph, netColor, 12, "#000000")
+
+	sgrFor := func(color lipgloss.Color) string {
+		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
+		return rendered[:strings.Index(rendered, "x")]
+	}
+	for _, want := range []lipgloss.Color{"#80c990", "#e06c75"} {
+		if !strings.Contains(out, sgrFor(want)) {
+			t.Fatalf("quiet-traffic sparkline = %q, want it to span the palette including %q — a flat one-color line means color is keyed on an absolute scale this fleet never reaches", out, want)
+		}
 	}
 }
 

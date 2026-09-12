@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/demo"
+	"github.com/allisonhere/whatthedock/internal/omarchy"
 	"github.com/allisonhere/whatthedock/internal/systems"
 	"github.com/allisonhere/whatthedock/internal/ui"
 )
@@ -33,8 +35,23 @@ func main() {
 
 	demoMode := flag.Bool("demo", false, "run against WhatTheDock's built-in demo Docker environment")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	showTheme := flag.Bool("theme-info", false, "print the resolved Omarchy palette and source, then exit")
 	fakeVersion := flag.String("fake-version", "", "pretend this build is the given version instead of the real one — for testing the update-check flow (Settings > Check for update) without a real release build; the actual version is only ever set via cmd/release's ldflags, so an ordinary `go run`/`go build` always reports \"dev\", which update.IsNewer treats as never eligible for an update by design")
 	flag.Parse()
+	if *showTheme {
+		palette, ok := omarchy.CurrentPalette()
+		if !ok {
+			fmt.Fprintln(os.Stderr, "whatthedock: no usable Omarchy palette found")
+			os.Exit(1)
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(palette); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *fakeVersion != "" {
 		version = *fakeVersion
@@ -72,8 +89,13 @@ func main() {
 	if startupErr != nil {
 		model = model.WithStatus("couldn't connect to "+systemName+": "+startupErr.Error()+" — using local Docker instead", true)
 	}
+	setTerminalColors, resetTerminalColors := model.TerminalColorSequences()
+	_, _ = fmt.Fprint(os.Stdout, setTerminalColors)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := program.Run()
+	// Restore both defaults before returning or re-execing into an installed
+	// update; syscall.Exec does not run deferred cleanup.
+	_, _ = fmt.Fprint(os.Stdout, resetTerminalColors)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)
 		os.Exit(1)

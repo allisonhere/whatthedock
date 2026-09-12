@@ -119,7 +119,7 @@ func (m Model) inspectorDetailOverlay(renderer tideui.Renderer) *tideui.Overlay 
 	ed.SetSize(innerWidth, innerHeight)
 
 	cursorStyle := lipgloss.NewStyle().Background(renderer.Styles.Theme.BorderFocus).Foreground(composeEditorBG)
-	selBg, selFg := renderer.Styles.Theme.Selected, lipgloss.Color("#c0caf5")
+	selBg, selFg := renderer.Styles.Theme.Selected, renderer.Styles.Theme.Fg
 	if bg, ok := renderer.Styles.ItemSelected.GetBackground().(lipgloss.Color); ok {
 		selBg = bg
 	}
@@ -182,7 +182,7 @@ func inspectorTokenStyle(kind string) lipgloss.Style {
 	case "comment":
 		return style.Foreground(inspectorTokenColor("comment")).Italic(true)
 	case "":
-		return style.Foreground(lipgloss.Color("#c0caf5"))
+		return style.Foreground(inspectorPlainFg())
 	default:
 		return style.Foreground(inspectorTokenColor(kind))
 	}
