@@ -81,6 +81,7 @@ const (
 	overlayHostPowerConfirm
 	overlayHostPowerPassword
 	overlayHostPowerProgress
+	overlayRestoreComposeConfirm
 )
 
 type createCatalogMode int
@@ -592,6 +593,10 @@ type Model struct {
 	// hostPowerPasswordError is the previous attempt's failure text,
 	// shown in the password overlay; empty on the very first prompt.
 	hostPowerPasswordError string
+
+	// restoreComposeBase is the base compose file the restore-backup confirm
+	// (overlayRestoreComposeConfirm) will restore from its newest snapshot.
+	restoreComposeBase string
 
 	aboutFrame      int
 	aboutSpotlights []aboutSpotlight
@@ -1530,6 +1535,17 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.refreshCmd()
+	case composeRestoreDoneMsg:
+		m.busy = false
+		m.actionProgress = nil
+		m.actionProgressText = ""
+		m.actionProgressPercent = 0
+		if msg.err != nil {
+			m.status, m.statusErr = "restore backup: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.status, m.statusErr = "restored "+filepath.Base(msg.base)+" from "+filepath.Base(msg.backup)+" — run Replicate (u) to apply", false
+		return m, nil
 	case hostPowerNeedsPasswordMsg:
 		m.busy = false
 		m.actionProgress = nil
@@ -2421,6 +2437,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHostPowerConfirmKey(msg)
 	case overlayHostPowerPassword:
 		return m.handleHostPowerPasswordKey(msg)
+	case overlayRestoreComposeConfirm:
+		return m.handleRestoreComposeConfirmKey(msg)
 	}
 	return m, nil
 }
@@ -3473,6 +3491,8 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		if selected := m.selectedContainer(); selected != nil {
 			m.overlay = overlayReplicate
 		}
+	case actions.RestoreBackup:
+		return m.openRestoreComposeConfirm()
 	case actions.Clone:
 		if selected := m.selectedContainer(); selected != nil {
 			m.openCloneOverlay()

@@ -2,6 +2,7 @@ package actions
 
 import (
 	"context"
+	"strings"
 
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -16,6 +17,7 @@ const (
 	Restart        ID = "restart-container"
 	Delete         ID = "delete-container"
 	Replicate      ID = "replicate-container"
+	RestoreBackup  ID = "restore-compose-backup"
 	Clone          ID = "clone-container"
 	Yank           ID = "yank-container"
 	Paste          ID = "paste-container"
@@ -67,6 +69,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Category: "Container Management", Run: restart},
 		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer, Category: "Container Management"},
+		{ID: RestoreBackup, Name: "Restore last compose backup", Shortcut: "", Aliases: []string{"undo apply", "revert compose", "recover compose", "backup"}, Enabled: hasComposeBackupTarget(selected), Category: "Container Management"},
 		{ID: Clone, Name: "Clone container or Compose service under a new name", Shortcut: "C", Aliases: []string{"duplicate", "copy container"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: Yank, Name: "Yank container configuration (Container Clipboard)", Shortcut: "y", Aliases: []string{"clipboard", "copy container config", "migrate"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: Paste, Name: "Paste yanked container onto this host (Container Clipboard)", Shortcut: "P", Aliases: []string{"clipboard", "deploy yanked", "migrate"}, Enabled: true, Category: "Container Management"},
@@ -117,6 +120,15 @@ func hasOpenMount(selected *domain.Container) bool {
 		}
 	}
 	return selected.Compose.ConfigFiles != ""
+}
+
+// hasComposeBackupTarget reports whether selected is a Compose service with a
+// known base file — the only thing the restore action can operate on. Whether
+// a backup actually exists is checked at execution time (it may be remote).
+func hasComposeBackupTarget(selected *domain.Container) bool {
+	return selected != nil &&
+		strings.TrimSpace(selected.Compose.Project) != "" &&
+		strings.TrimSpace(selected.Compose.ConfigFiles) != ""
 }
 
 func startStop(ctx context.Context, provider app.Provider, selected *domain.Container) error {

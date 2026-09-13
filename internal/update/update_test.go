@@ -238,3 +238,13 @@ func stubVerificationKey(t *testing.T, pub ed25519.PublicKey) func() {
 	verificationPublicKey = pub
 	return func() { verificationPublicKey = original }
 }
+
+// TestHTTPClientHasNoFixedTimeout guards the download fix: a fixed client
+// Timeout bounds the whole body read, so a multi-megabyte asset on a slow
+// link aborts even though the caller's context allowed more time. The
+// deadline must come from the request context, not the shared client.
+func TestHTTPClientHasNoFixedTimeout(t *testing.T) {
+	if httpClient.Timeout != 0 {
+		t.Fatalf("httpClient.Timeout = %v, want 0 (the caller's context owns the deadline)", httpClient.Timeout)
+	}
+}

@@ -2831,6 +2831,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		return m.hostPowerPasswordOverlay(renderer)
 	case overlayHostPowerProgress:
 		return m.hostPowerProgressOverlay(renderer)
+	case overlayRestoreComposeConfirm:
+		return m.restoreComposeConfirmOverlay(renderer)
 	default:
 		return nil
 	}
@@ -3027,6 +3029,28 @@ func (m Model) hostPowerProgressOverlay(renderer tideui.Renderer) *tideui.Overla
 		createActionProgressView(renderer, contentWidth, m.actionProgressPercent, progressText),
 	}, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: kind.label(), Content: content, Width: width})
+	return &overlay
+}
+
+// restoreComposeConfirmOverlay confirms restoring a Compose service's base
+// file from its most recent WhatTheDock pre-apply backup. It names the file
+// and makes clear the current contents are snapshotted first (so the restore
+// is reversible) and that Replicate still has to run to apply it.
+func (m Model) restoreComposeConfirmOverlay(renderer tideui.Renderer) *tideui.Overlay {
+	width := min(72, max(40, m.width-8))
+	contentWidth := width - 4
+	target := short(m.restoreComposeBase, max(12, contentWidth-4))
+	prompt := "Restore " + target + " from its most recent WhatTheDock backup? " +
+		"The current file is snapshotted first, so this is reversible — but any changes since that backup are replaced."
+	content := renderer.RenderSoftBody(width, strings.Join([]string{
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
+		"",
+		renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "y", Label: "restore"},
+			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+		),
+	}, "\n"))
+	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "restore backup", Content: content, Width: width})
 	return &overlay
 }
 

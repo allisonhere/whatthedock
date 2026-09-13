@@ -25,7 +25,17 @@ import (
 // Repo is the GitHub "owner/name" WhatTheDock releases are published under.
 const Repo = "allisonhere/whatthedock"
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+// httpClient deliberately sets no whole-request Timeout: release binaries are
+// multi-megabyte, and a short fixed client timeout aborts the download on a
+// slow link regardless of the context. Every call passes a context with its
+// own deadline (10s for the version check in the UI, 2 minutes for the
+// install), so a stalled transfer is still bounded — by the caller, not by a
+// value that also has to suit a tiny JSON request.
+var httpClient = &http.Client{}
+
+// latestReleaseTimeout bounds LatestRelease's own metadata request even if a
+// caller passes a context without a deadline.
+const latestReleaseTimeout = 15 * time.Second
 
 // executableOverride is os.Executable behind a seam so tests can point
 // ReplaceRunningExecutable at a throwaway file instead of the real test
@@ -41,6 +51,8 @@ type release struct {
 // LatestRelease fetches repo's latest published release tag (e.g.
 // "v0.1.4") from the GitHub API.
 func LatestRelease(ctx context.Context, repo string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, latestReleaseTimeout)
+	defer cancel()
 	url := "https://api.github.com/repos/" + repo + "/releases/latest"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
