@@ -101,7 +101,7 @@ func (d createDraft) composeChangePreview(system config.System) (target, before,
 		if !fieldsOK {
 			return spec.BaseFile, d.OverrideRaw, spec.Content, true
 		}
-		merged, mergeErr := mergeComposeServiceFields([]byte(d.OverrideRaw), spec.Service, fields)
+		merged, mergeErr := mergeComposeServiceFields([]byte(d.OverrideRaw), spec.Service, fields, spec.ChangedFields)
 		if mergeErr != nil {
 			return spec.BaseFile, d.OverrideRaw, spec.Content, true
 		}

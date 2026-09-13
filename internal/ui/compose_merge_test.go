@@ -33,7 +33,7 @@ services:
 		Image:   "nginx:1.27",
 		Restart: "unless-stopped",
 		Ports:   []string{"8080:80"},
-	})
+	}, composeFieldAll)
 	if err != nil {
 		t.Fatalf("mergeComposeServiceFields() error = %v", err)
 	}
@@ -67,7 +67,7 @@ func TestMergeComposeServiceFieldsHandlesExecFormCommand(t *testing.T) {
 	}
 
 	base := []byte("services:\n  web:\n    image: nginx:1.25\n")
-	merged, err := mergeComposeServiceFields(base, "web", fields)
+	merged, err := mergeComposeServiceFields(base, "web", fields, composeFieldAll)
 	if err != nil {
 		t.Fatalf("mergeComposeServiceFields() error = %v", err)
 	}
@@ -76,9 +76,40 @@ func TestMergeComposeServiceFieldsHandlesExecFormCommand(t *testing.T) {
 	}
 }
 
+// TestMergeComposeServiceFieldsOnlyTouchesChangedFields guards the real
+// dirty model's core safety property: fields not selected in the changed set
+// are left exactly as the file had them, even when the incoming value is
+// empty. That's what stops a superseded prefill (empty form fields) from
+// deleting a base service's ports/volumes/environment.
+func TestMergeComposeServiceFieldsOnlyTouchesChangedFields(t *testing.T) {
+	base := []byte(`services:
+  web:
+    image: nginx:1.25
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - KEEP=me
+`)
+	// Only restart changed; the incoming empty Image/Ports/Environment must
+	// not delete the existing entries.
+	merged, err := mergeComposeServiceFields(base, "web", composeOverrideService{
+		Restart: "always",
+	}, composeFieldRestart)
+	if err != nil {
+		t.Fatalf("mergeComposeServiceFields() error = %v", err)
+	}
+	out := string(merged)
+	for _, want := range []string{"image: nginx:1.25", "restart: always", "8080:80", "KEEP=me"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("merged output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestMergeComposeServiceFieldsErrorsWhenServiceMissing(t *testing.T) {
 	base := []byte("services:\n  web:\n    image: nginx:latest\n")
-	if _, err := mergeComposeServiceFields(base, "cache", composeOverrideService{Image: "redis:7"}); err == nil {
+	if _, err := mergeComposeServiceFields(base, "cache", composeOverrideService{Image: "redis:7"}, composeFieldAll); err == nil {
 		t.Fatal("mergeComposeServiceFields() error = nil, want error for missing service")
 	}
 }

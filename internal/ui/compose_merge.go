@@ -111,17 +111,35 @@ func scalarSequence(values []string) *yaml.Node {
 	return seq
 }
 
-// mergeComposeServiceFields rewrites base so service's block matches
-// fields — image, restart, command, ports, volumes, and environment — while
-// leaving every other key already on the service (networks, depends_on,
-// labels, build, ...), every other service, and the rest of the document
-// (comments, key order) exactly as it was. Only the specific value lines
-// being replaced can lose an inline comment of their own; nothing else is
-// touched. Environment is always written back as a list of "KEY=value"
-// strings regardless of whether it was previously a list or a map — both
-// are valid Compose syntax, so this is a formatting choice, not a semantic
-// one.
-func mergeComposeServiceFields(base []byte, service string, fields composeOverrideService) ([]byte, error) {
+// composeFieldSet is a bitmask of the mergeable Compose service fields. It
+// lets an apply touch only the fields the user actually changed, leaving the
+// rest of the existing service block (including any field the form never
+// loaded) untouched.
+type composeFieldSet uint8
+
+const (
+	composeFieldImage composeFieldSet = 1 << iota
+	composeFieldRestart
+	composeFieldCommand
+	composeFieldPorts
+	composeFieldVolumes
+	composeFieldEnvironment
+
+	composeFieldAll = composeFieldImage | composeFieldRestart | composeFieldCommand |
+		composeFieldPorts | composeFieldVolumes | composeFieldEnvironment
+)
+
+// mergeComposeServiceFields rewrites base so service's block matches the
+// fields selected in changed — image, restart, command, ports, volumes, and
+// environment — while leaving every other key already on the service
+// (networks, depends_on, labels, build, ...), every other service, and the
+// rest of the document (comments, key order) exactly as it was. Only the
+// specific value lines being replaced can lose an inline comment of their
+// own; nothing else is touched. Environment is always written back as a list
+// of "KEY=value" strings regardless of whether it was previously a list or a
+// map — both are valid Compose syntax, so this is a formatting choice, not a
+// semantic one.
+func mergeComposeServiceFields(base []byte, service string, fields composeOverrideService, changed composeFieldSet) ([]byte, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(base, &root); err != nil {
 		return nil, err
@@ -134,12 +152,24 @@ func mergeComposeServiceFields(base []byte, service string, fields composeOverri
 	if !ok {
 		return nil, fmt.Errorf("service %q not found in base compose file", service)
 	}
-	setMappingScalar(value, "image", fields.Image)
-	setMappingScalar(value, "restart", fields.Restart)
-	setMappingScalar(value, "command", normalizeComposeCommand(fields.Command))
-	setMappingList(value, "ports", fields.Ports)
-	setMappingList(value, "volumes", fields.Volumes)
-	setMappingList(value, "environment", normalizeComposeEnvironment(fields.Environment))
+	if changed&composeFieldImage != 0 {
+		setMappingScalar(value, "image", fields.Image)
+	}
+	if changed&composeFieldRestart != 0 {
+		setMappingScalar(value, "restart", fields.Restart)
+	}
+	if changed&composeFieldCommand != 0 {
+		setMappingScalar(value, "command", normalizeComposeCommand(fields.Command))
+	}
+	if changed&composeFieldPorts != 0 {
+		setMappingList(value, "ports", fields.Ports)
+	}
+	if changed&composeFieldVolumes != 0 {
+		setMappingList(value, "volumes", fields.Volumes)
+	}
+	if changed&composeFieldEnvironment != 0 {
+		setMappingList(value, "environment", normalizeComposeEnvironment(fields.Environment))
+	}
 	return encodeComposeYAML(&root)
 }
 

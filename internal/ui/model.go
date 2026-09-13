@@ -1797,11 +1797,12 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.createDraft.OverrideRawSet = true
 				m.createDraft.OverrideLoaded = true
 				m.createDraft.OverrideRawBase = false
-				// createDraft.FieldsDirty: see its doc comment — this is the same
-				// async-load-races-user-edits case as createSelectedComposeFileMsg
-				// below, just for the "an override already exists" branch.
-				if !m.createDraft.FieldsDirty {
-					m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+				// Same async-load-races-user-edits case as
+				// createSelectedComposeFileMsg below, for the "an override
+				// already exists" branch: skip repopulating when a field has
+				// already diverged from the baseline.
+				if !m.createDraft.composeContentChanged() {
+					m.createDraft.loadFields(msg.content)
 				}
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
 			} else if msg.baseFileMissing {
@@ -1839,14 +1840,13 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createDraft.OverrideRawSet = true
 			m.createDraft.OverrideLoaded = true
 			m.createDraft.OverrideRawBase = true
-			// createDraft.FieldsDirty: don't clobber fields the user has already
-			// started editing with this (possibly slower, over SSH) load's
-			// version of them — see its doc comment on Model. The
-			// structural OverrideRaw/OverrideRawSet/... fields above still
-			// need to be set regardless, so the eventual save-back knows
-			// this is a real base-file-defined service either way.
-			if !m.createDraft.FieldsDirty {
-				m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+			// Don't clobber fields the user already started editing with this
+			// (possibly slower, over SSH) load's version — see createDraft's
+			// baseline. The structural OverrideRaw/OverrideRawSet/... fields
+			// above are still recorded regardless, so the eventual save-back
+			// knows this is a real base-file-defined service either way.
+			if !m.createDraft.composeContentChanged() {
+				m.createDraft.loadFields(msg.content)
 				m.revalidateCreateField()
 			}
 			m.status, m.statusErr = "loaded compose service from "+filepath.Base(msg.path), false
@@ -1859,8 +1859,8 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.createDraft.OverrideRawSet = true
 		m.createDraft.OverrideLoaded = true
 		m.createDraft.OverrideRawBase = true
-		if !m.createDraft.FieldsDirty {
-			m.createDraft.applyOverrideFieldsFromYAML(msg.content)
+		if !m.createDraft.composeContentChanged() {
+			m.createDraft.loadFields(msg.content)
 			m.revalidateCreateField()
 		}
 		m.status, m.statusErr = "loaded compose stack from "+filepath.Base(msg.path), false

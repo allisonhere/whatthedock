@@ -103,41 +103,38 @@ type createDraft struct {
 	// Ripple editor opened with ctrl+y. OverrideLoaded distinguishes the
 	// two for the form's label; saving an edit in the editor clears it.
 	// That precedence is only correct while OverrideRaw actually reflects
-	// what's on screen, though — see FieldsDirty.
+	// what's on screen, though — see baseline below and
+	// composeContentChanged.
 	OverrideRaw     string
 	OverrideRawSet  bool
 	OverrideLoaded  bool
 	OverrideRawBase bool
 
-	// FieldsDirty is set the moment the user changes a form field (Restart,
-	// Ports, Mounts, Env, Image, ...) via handleCreateKey, and cleared
-	// whenever OverrideRaw becomes freshly authoritative again — a new
-	// draft opening, or a raw-editor save (saveCreateEditor). It guards two
-	// things against a loaded-but-now-stale OverrideRaw:
+	// baseline is the set of editable field values the draft last loaded —
+	// the form's values at open, refreshed every time content is loaded into
+	// the form (a base/override file, the catalog, or the raw editor). It
+	// replaces the old sticky FieldsDirty bool: "dirty" is now computed by
+	// comparing the live fields to this baseline (see changedComposeFields /
+	// composeContentChanged), so no key has to guess whether it constituted an
+	// edit. That keeps two things honest:
 	//
-	//  1. ComposeSpec's own content-precedence rule above: once the user
-	//     has edited a field, ComposeSpec must regenerate content from the
-	//     live fields (composeOverrideContent) instead of reusing
-	//     OverrideRaw — otherwise editing e.g. Restart on an existing
-	//     Compose service and confirming would silently apply nothing at
-	//     all, no error, because OverrideRaw (loaded once, before or after
-	//     the edit) would keep winning over whatever the form now shows.
+	//  1. ComposeSpec's content-precedence rule: once a field differs from
+	//     the loaded baseline, content is regenerated from the live fields
+	//     instead of reusing OverrideRaw — otherwise editing e.g. Restart on
+	//     an existing Compose service and confirming would silently apply
+	//     nothing, because OverrideRaw kept winning over the form.
 	//  2. The async load races in model.go's createSelectedComposeFileMsg/
-	//     createOverrideCheckMsg handlers: opening Edit on a Compose
-	//     service kicks off a load of the base/override file to prefill
-	//     the form — on a remote (SSH) system that's a real round trip,
-	//     slow enough to open Edit, change a field, and confirm before it
-	//     lands. Once FieldsDirty, those handlers skip re-populating the
-	//     visible fields from what they loaded (they still record the
-	//     structural OverrideRaw/OverrideRawSet/... bookkeeping either
-	//     way), so a field edit is never silently overwritten by a slow
-	//     background load landing after the fact.
+	//     createOverrideCheckMsg handlers: opening Edit kicks off a load of
+	//     the base/override file (a real round trip over SSH), slow enough to
+	//     open Edit, change a field, and confirm before it lands. Those
+	//     handlers skip repopulating the form when any field has diverged, so
+	//     a background load can never clobber a field edit.
 	//
-	// Both failure modes were reported live as "I set Restart to always,
-	// confirmed, and it's still the old value" on a Compose service on a
-	// remote system — no error either time, since nothing failed; the
-	// edit just never reached the file that got written.
-	FieldsDirty bool
+	// Crucially, the apply only ever merges the fields that actually changed
+	// relative to this baseline (see changedComposeFields), so a skipped
+	// prefill can no longer turn into a silent deletion of the base file's
+	// ports/volumes/environment/command.
+	baseline createEditableValues
 
 	// confirmDiffPath/confirmDiffLabel/confirmDiffLines cache the
 	// before→after view of the file an apply will rewrite, computed once
@@ -171,11 +168,12 @@ type createDraft struct {
 	Labels map[string]string
 }
 
-// createEditableValues is the set of user-editable createDraft fields whose
-// change is what createDraft.FieldsDirty actually tracks. Identity fields
-// that trigger a reload (ComposeFile) and the Mode toggle are deliberately
-// excluded: selecting a different file, or switching Compose/standalone, is
-// not editing a value and must not suppress the async prefill that follows.
+// createEditableValues is the snapshot of user-editable createDraft fields
+// the dirty model compares against (see createDraft.baseline and
+// changedComposeFields). Identity fields that trigger a reload (ComposeFile)
+// and the Mode toggle are deliberately excluded: selecting a different file,
+// or switching Compose/standalone, is not editing a value and must not
+// suppress the async prefill that follows.
 type createEditableValues struct {
 	Project       string
 	Service       string
@@ -206,6 +204,51 @@ func (d createDraft) editableValues() createEditableValues {
 	}
 }
 
+// changedComposeFields is the subset of the six mergeable Compose service
+// fields whose live value differs from the loaded baseline. Only these are
+// applied when merging into the base/override file, so fields the form never
+// got a chance to load (for example because a slow prefill was superseded by
+// an edit) are left exactly as the file had them instead of being deleted.
+func (d createDraft) changedComposeFields() composeFieldSet {
+	var changed composeFieldSet
+	if d.Image != d.baseline.Image {
+		changed |= composeFieldImage
+	}
+	if d.Restart != d.baseline.Restart {
+		changed |= composeFieldRestart
+	}
+	if d.Command != d.baseline.Command {
+		changed |= composeFieldCommand
+	}
+	if d.Ports != d.baseline.Ports {
+		changed |= composeFieldPorts
+	}
+	if d.Mounts != d.baseline.Mounts {
+		changed |= composeFieldVolumes
+	}
+	if d.Env != d.baseline.Env {
+		changed |= composeFieldEnvironment
+	}
+	return changed
+}
+
+// composeContentChanged reports whether any mergeable field was edited, i.e.
+// whether OverrideRaw is still an accurate stand-in for the live form.
+func (d createDraft) composeContentChanged() bool {
+	return d.changedComposeFields() != 0
+}
+
+// loadFields applies content's service fields to the form (via
+// applyOverrideFieldsFromYAML) and rebases the dirty baseline onto the loaded
+// values. Callers use it for loads that are allowed to overwrite the form
+// (a fresh draft, a catalog entry, the raw editor, a local override check);
+// the async SSH handlers guard it with composeContentChanged so a slow load
+// never clobbers a field the user already changed.
+func (d *createDraft) loadFields(content string) {
+	d.applyOverrideFieldsFromYAML(content)
+	d.baseline = d.editableValues()
+}
+
 type composeCreateSpec struct {
 	Project      string
 	Service      string
@@ -213,9 +256,13 @@ type composeCreateSpec struct {
 	OverrideFile string
 	Content      string
 	FullBase     bool
-	PullBeforeUp bool
-	Progress     func(string)
-	System       config.System
+	// ChangedFields is the set of service fields the user edited relative to
+	// the loaded baseline. The base-file merge applies only these, so
+	// untouched (or never-prefilled) fields in the base file are preserved.
+	ChangedFields composeFieldSet
+	PullBeforeUp  bool
+	Progress      func(string)
+	System        config.System
 }
 
 const (
@@ -271,7 +318,7 @@ func (m *Model) checkComposeOverrideCmd() tea.Cmd {
 		m.createDraft.OverrideRawSet = true
 		m.createDraft.OverrideLoaded = true
 		m.createDraft.OverrideRawBase = false
-		m.createDraft.applyOverrideFieldsFromYAML(content)
+		m.createDraft.loadFields(content)
 		m.status, m.statusErr = "loaded existing override for "+m.createDraft.Service, false
 	}
 	return nil
@@ -482,11 +529,17 @@ type createSelectedComposeFileMsg struct {
 	err     error
 }
 
-func (m Model) loadSelectedComposeFileCmd(composeFile string) tea.Cmd {
+func (m *Model) loadSelectedComposeFileCmd(composeFile string) tea.Cmd {
 	composeFile = strings.TrimSpace(composeFile)
 	if composeFile == "" {
 		return nil
 	}
+	// Rebase the dirty baseline at the moment the load is requested: the
+	// form's current values become "what was loaded". A deliberate retarget
+	// (the file browser picking a new file) then still repopulates the form,
+	// while any edit made after this point is detected against this baseline
+	// and preserved when the load lands.
+	m.createDraft.baseline = m.createDraft.editableValues()
 	system := m.activeSystemConfig()
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -514,7 +567,7 @@ func (m *Model) openCreateOverlayWithDraft(draft createDraft) {
 	m.createField = m.visibleCreateFields()[0]
 	m.syncCreateFieldEditor()
 	m.createEditingCompose = false
-	m.createDraft.FieldsDirty = false
+	m.createDraft.baseline = m.createDraft.editableValues()
 	m.clearCreateNotice()
 	m.status, m.statusErr = "create draft ready", false
 }
@@ -827,156 +880,146 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	// Run the key through the form dispatch, then mark the draft dirty only
-	// if an editable value actually changed. Marking on any key outside a
-	// small navigation whitelist (the old behavior) meant a stray arrow, or
-	// Enter opening the file browser, counted as an edit: a still-in-flight
-	// async prefill (see createDraft.FieldsDirty's doc comment) was then
-	// skipped, and confirming merged the still-empty fields over the real
-	// base file — silently deleting ports/volumes/env/command.
-	before := m.createDraft.editableValues()
-	next, cmd := func() (Model, tea.Cmd) {
-		var cmd tea.Cmd
-		switch msg.String() {
-		case "esc", "q":
-			m.overlay = overlayNone
-		case "up":
+	// No key has to decide whether it was an "edit": dirtiness is computed by
+	// comparing the live fields to the loaded baseline (see createDraft's
+	// baseline field), so navigation, mode switches, and opening the file
+	// browser can't be mistaken for a field change.
+	var cmd tea.Cmd
+	switch msg.String() {
+	case "esc", "q":
+		m.overlay = overlayNone
+	case "up":
+		m.moveCreateField(-1)
+	case "down", "tab":
+		m.moveCreateField(1)
+	case "shift+tab":
+		m.moveCreateField(-1)
+	case "k":
+		if m.isCreateChoiceField() {
 			m.moveCreateField(-1)
-		case "down", "tab":
+			return m, nil
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "j":
+		if m.isCreateChoiceField() {
 			m.moveCreateField(1)
-		case "shift+tab":
-			m.moveCreateField(-1)
-		case "k":
-			if m.isCreateChoiceField() {
-				m.moveCreateField(-1)
-				return m, nil
-			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "j":
-			if m.isCreateChoiceField() {
-				m.moveCreateField(1)
-				return m, nil
-			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "left", "right", "shift+left", "shift+right",
-			"ctrl+left", "ctrl+right", "ctrl+shift+left", "ctrl+shift+right":
-			if m.isCreateChoiceField() {
-				// Only plain left/right cycle a choice — shift/ctrl variants
-				// have no meaning there (no selection, no words to jump).
-				switch msg.String() {
-				case "left":
-					m.cycleCreateChoice(-1)
-				case "right":
-					m.cycleCreateChoice(1)
-				}
-				return m, nil
-			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "h":
-			if m.isCreateChoiceField() {
+			return m, nil
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "left", "right", "shift+left", "shift+right",
+		"ctrl+left", "ctrl+right", "ctrl+shift+left", "ctrl+shift+right":
+		if m.isCreateChoiceField() {
+			// Only plain left/right cycle a choice — shift/ctrl variants
+			// have no meaning there (no selection, no words to jump).
+			switch msg.String() {
+			case "left":
 				m.cycleCreateChoice(-1)
-				return m, nil
-			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "l":
-			if m.isCreateChoiceField() {
+			case "right":
 				m.cycleCreateChoice(1)
-				return m, nil
 			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "enter":
-			if m.isCreateChoiceField() {
-				m.cycleCreateChoice(1)
-				return m, nil
-			}
-			if m.createField == createFieldComposeFile {
-				return m, m.openCreateFileBrowser()
-			}
-			m.moveCreateField(1)
-		case "ctrl+o":
-			m.createDraft.Mode = createModeCompose
+			return m, nil
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "h":
+		if m.isCreateChoiceField() {
+			m.cycleCreateChoice(-1)
+			return m, nil
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "l":
+		if m.isCreateChoiceField() {
+			m.cycleCreateChoice(1)
+			return m, nil
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "enter":
+		if m.isCreateChoiceField() {
+			m.cycleCreateChoice(1)
+			return m, nil
+		}
+		if m.createField == createFieldComposeFile {
+			return m, m.openCreateFileBrowser()
+		}
+		m.moveCreateField(1)
+	case "ctrl+o":
+		m.createDraft.Mode = createModeCompose
+		m.createField = createFieldComposeFile
+		m.syncCreateFieldEditor()
+		return m, m.openCreateFileBrowser()
+	case "o":
+		// Bare "o" is a browse shortcut only on a choice field (Mode/
+		// Restart), which ignores letters anyway. Every text field — the
+		// Compose file row included — must accept "o" as ordinary input:
+		// plenty of real values contain it ("postgres", "sonarr", and
+		// "compose.yml" itself), and the Compose file field is exactly
+		// where someone would want to type a path by hand. Enter or
+		// Ctrl+O still open the browser from the Compose file field.
+		if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
 			m.createField = createFieldComposeFile
 			m.syncCreateFieldEditor()
 			return m, m.openCreateFileBrowser()
-		case "o":
-			// Bare "o" is a browse shortcut only on a choice field (Mode/
-			// Restart), which ignores letters anyway. Every text field — the
-			// Compose file row included — must accept "o" as ordinary input:
-			// plenty of real values contain it ("postgres", "sonarr", and
-			// "compose.yml" itself), and the Compose file field is exactly
-			// where someone would want to type a path by hand. Enter or
-			// Ctrl+O still open the browser from the Compose file field.
-			if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
-				m.createField = createFieldComposeFile
-				m.syncCreateFieldEditor()
-				return m, m.openCreateFileBrowser()
-			}
-			cmd = m.forwardToFieldEditor(msg)
-		case "[", "]":
-			m.cycleCreateMode()
-		case "ctrl+y":
-			// Ripple's own default keymap binds ctrl+y to Redo, but this app
-			// already uses ctrl+y globally for the Compose YAML editor — kept
-			// intercepted here unconditionally (even in standalone mode, where
-			// the body below does nothing) so it can never reach the field
-			// editor and mean something else there.
-			if m.createDraft.Mode == createModeCompose {
-				m.openCreateEditor()
-				return m, nil
-			}
-		case "ctrl+p":
-			if m.createDraft.Mode == createModeCompose {
-				m.openCreateCatalog()
-				return m, nil
-			}
-		case "ctrl+s":
-			m.validateCreateDraft()
-		case "ctrl+enter", "alt+enter":
-			if m.validateCreateDraft() {
-				m.createDraft.Confirming = true
-				m.prepareComposeConfirmDiff()
-				switch {
-				case m.createDraft.IsStack():
-					m.status, m.statusErr = "confirm deploy stack "+m.createDraft.TargetName(), false
-				case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
-					m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
-				default:
-					m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
-				}
-			}
-		case "backspace", "delete", "ctrl+z", "ctrl+c", "ctrl+x", "ctrl+v":
-			// These have no msg.Runes (they're control keys, not printable
-			// input), so they'd never reach the default case's Rune-gated
-			// forward below — copy/cut/paste/undo need their own case to ever
-			// get to the editor at all.
-			cmd = m.forwardToFieldEditor(msg)
-		case "home", "ctrl+a":
-			// This app has long treated ctrl+a as a Home alias, not Ripple's
-			// own default ctrl+a-selects-all — translate to a synthetic Home
-			// key instead of forwarding the raw one, so that convention holds
-			// (Shift+Home, in the case above, already gives a real "select to
-			// start of field" if that's what's wanted).
-			cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyHome})
-		case "end", "ctrl+e":
-			cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyEnd})
-		case "ctrl+u":
-			if !m.isCreateChoiceField() {
-				m.createFieldEditor.SelectAll()
-				m.createFieldEditor.DeleteSelection()
-				m.clearCreateNotice()
-				m.setCreateFieldValue(m.createFieldEditor.Value())
-			}
-		default:
-			if len(msg.Runes) > 0 {
-				cmd = m.forwardToFieldEditor(msg)
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "[", "]":
+		m.cycleCreateMode()
+	case "ctrl+y":
+		// Ripple's own default keymap binds ctrl+y to Redo, but this app
+		// already uses ctrl+y globally for the Compose YAML editor — kept
+		// intercepted here unconditionally (even in standalone mode, where
+		// the body below does nothing) so it can never reach the field
+		// editor and mean something else there.
+		if m.createDraft.Mode == createModeCompose {
+			m.openCreateEditor()
+			return m, nil
+		}
+	case "ctrl+p":
+		if m.createDraft.Mode == createModeCompose {
+			m.openCreateCatalog()
+			return m, nil
+		}
+	case "ctrl+s":
+		m.validateCreateDraft()
+	case "ctrl+enter", "alt+enter":
+		if m.validateCreateDraft() {
+			m.createDraft.Confirming = true
+			m.prepareComposeConfirmDiff()
+			switch {
+			case m.createDraft.IsStack():
+				m.status, m.statusErr = "confirm deploy stack "+m.createDraft.TargetName(), false
+			case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
+				m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
+			default:
+				m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
 			}
 		}
-		return m, cmd
-	}()
-	if next.createDraft.editableValues() != before {
-		next.createDraft.FieldsDirty = true
+	case "backspace", "delete", "ctrl+z", "ctrl+c", "ctrl+x", "ctrl+v":
+		// These have no msg.Runes (they're control keys, not printable
+		// input), so they'd never reach the default case's Rune-gated
+		// forward below — copy/cut/paste/undo need their own case to ever
+		// get to the editor at all.
+		cmd = m.forwardToFieldEditor(msg)
+	case "home", "ctrl+a":
+		// This app has long treated ctrl+a as a Home alias, not Ripple's
+		// own default ctrl+a-selects-all — translate to a synthetic Home
+		// key instead of forwarding the raw one, so that convention holds
+		// (Shift+Home, in the case above, already gives a real "select to
+		// start of field" if that's what's wanted).
+		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyHome})
+	case "end", "ctrl+e":
+		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyEnd})
+	case "ctrl+u":
+		if !m.isCreateChoiceField() {
+			m.createFieldEditor.SelectAll()
+			m.createFieldEditor.DeleteSelection()
+			m.clearCreateNotice()
+			m.setCreateFieldValue(m.createFieldEditor.Value())
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			cmd = m.forwardToFieldEditor(msg)
+		}
 	}
-	return next, cmd
+	return m, cmd
 }
 
 func (m *Model) openCreateCatalog() {
@@ -1201,7 +1244,7 @@ func (m *Model) loadCurrentCatalogEntry() error {
 	m.createDraft.OverrideRawSet = strings.TrimSpace(m.createDraft.OverrideRaw) != ""
 	m.createDraft.OverrideLoaded = true
 	m.createDraft.OverrideRawBase = true
-	m.createDraft.applyOverrideFieldsFromYAML(m.createDraft.OverrideRaw)
+	m.createDraft.loadFields(m.createDraft.OverrideRaw)
 	m.revalidateCreateField()
 	m.status, m.statusErr = "loaded catalog entry "+entry.Name, false
 	return nil
@@ -1499,12 +1542,12 @@ func (m *Model) saveCreateEditor() {
 	m.createDraft.OverrideLoaded = false // now hand-edited this session, not just loaded
 	m.createDraft.OverrideRawBase = m.createDraft.OverrideRawBase && value != ""
 	m.createEditingCompose = false
-	// The just-saved raw YAML is authoritative again from here — any
-	// field divergence FieldsDirty was tracking is moot now that
-	// applyOverrideFieldsFromYAML below resyncs the fields from it.
-	m.createDraft.FieldsDirty = false
+	// The just-saved raw YAML is authoritative again from here — any field
+	// divergence is moot now that applyOverrideFieldsFromYAML below resyncs
+	// the fields from it, and the baseline is rebased onto those values.
 	if m.createDraft.OverrideRawSet {
 		m.createDraft.applyOverrideFieldsFromYAML(value)
+		m.createDraft.baseline = m.createDraft.editableValues()
 		m.setCreateNotice("override YAML edited", false)
 		// applyOverrideFieldsFromYAML leaves the Service field alone when
 		// the content doesn't unambiguously name one to sync from (e.g. a
@@ -1515,6 +1558,7 @@ func (m *Model) saveCreateEditor() {
 			m.setCreateNotice("override saved, but "+err.Error(), true)
 		}
 	} else {
+		m.createDraft.baseline = m.createDraft.editableValues()
 		m.setCreateNotice("override YAML reset to generated", false)
 	}
 	// Saving can change whether this draft is a stack (createDraft.
@@ -1912,12 +1956,22 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		override = filepath.Join(filepath.Dir(base), overrideName)
 	}
 	content := d.composeOverrideContent()
-	// OverrideRaw only wins while it's still what's on screen — once the
-	// user has edited a field (FieldsDirty), the regenerated content above
-	// is the only thing that reflects that edit; see FieldsDirty's doc
-	// comment for the bug this guards against.
-	if d.OverrideRawSet && !d.FieldsDirty {
+	changed := d.changedComposeFields()
+	switch {
+	case d.OverrideRawSet && changed == 0:
+		// Nothing on the form diverges from what was loaded, so OverrideRaw
+		// is still an accurate stand-in and may carry content the per-field
+		// form can't express (comments, unmanaged keys).
 		content = d.OverrideRaw
+	case d.OverrideRawSet && !d.OverrideRawBase:
+		// Editing an existing generated override: merge only the changed
+		// fields into it so keys the form doesn't cover survive, instead of
+		// replacing it with the regenerated sparse document.
+		if fields, ok := composeServiceFieldsFromContent(content, service); ok {
+			if merged, err := mergeComposeServiceFields([]byte(d.OverrideRaw), service, fields, changed); err == nil {
+				content = string(merged)
+			}
+		}
 	}
 	return composeCreateSpec{
 		Project:      strings.TrimSpace(d.Project),
@@ -1925,18 +1979,19 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		BaseFile:     base,
 		OverrideFile: override,
 		Content:      content,
+		// ChangedFields is the set of fields the user actually edited; the
+		// base-file merge applies only these, so a field the form never
+		// loaded (a superseded prefill) is left as the file had it rather
+		// than deleted.
+		ChangedFields: changed,
 		// FullBase tells mergeComposeCreateIntoBase it's safe to write
-		// Content over the base file wholesale instead of merging just the
-		// known fields into it — only true when Content is genuinely the
-		// complete document (OverrideRawBase) *and* still exactly that
-		// document (!FieldsDirty). Once a field's been edited, Content is
-		// composeOverrideContent()'s regenerated 6-field-only YAML, not a
-		// full replacement for the base file — wholesale-writing that
-		// would silently delete container_name, network_mode, build, and
-		// every comment the base file had. See FieldsDirty's doc comment;
-		// this was reported live as exactly that happening to a real
-		// service.
-		FullBase:     d.OverrideRawBase && !d.FieldsDirty,
+		// Content over the base file wholesale instead of merging fields
+		// into it — only true when Content is still the complete,
+		// unmodified base document (OverrideRawBase with nothing changed).
+		// Once a field differs from the baseline, Content is a sparse
+		// field-only document and wholesale-writing it would delete
+		// container_name, network_mode, build, and every comment.
+		FullBase:     d.OverrideRawBase && changed == 0,
 		PullBeforeUp: d.pullImageBeforeApply(),
 		System:       system,
 	}, nil
@@ -2555,7 +2610,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	if !ok {
 		return fmt.Errorf("could not read fields for service %q", spec.Service)
 	}
-	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields)
+	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields, spec.ChangedFields)
 	if err != nil {
 		return err
 	}
@@ -2660,7 +2715,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	if !ok {
 		return fmt.Errorf("could not read fields for service %q", spec.Service)
 	}
-	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields)
+	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields, spec.ChangedFields)
 	if err != nil {
 		return err
 	}
@@ -3361,9 +3416,10 @@ func (d createDraft) Preview() string {
 		return d.standalonePreview()
 	}
 	// Mirrors ComposeSpec's precedence: OverrideRaw only reflects what's on
-	// screen while no field has been edited (see FieldsDirty). Otherwise the
-	// confirm preview would show stale values the apply path won't write.
-	if d.OverrideRawSet && !d.FieldsDirty {
+	// screen while no mergeable field has diverged from the loaded baseline.
+	// Otherwise the preview would show stale values the apply path won't
+	// write.
+	if d.OverrideRawSet && !d.composeContentChanged() {
 		return d.OverrideRaw
 	}
 	return d.composePreview()

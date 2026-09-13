@@ -796,7 +796,7 @@ func (m Model) loadCurrentComposeCatalogEntry() (tea.Model, tea.Cmd) {
 	draft.OverrideRawSet = true
 	draft.OverrideRawBase = true
 	draft.OverrideLoaded = true
-	draft.applyOverrideFieldsFromYAML(content)
+	draft.loadFields(content)
 	m.openCreateOverlayWithDraft(draft)
 	m.status, m.statusErr = "loaded compose catalog entry "+entry.Name, false
 	return m, nil

@@ -35,13 +35,13 @@ func TestApplyComposeEditBacksUpBaseBeforeOverwrite(t *testing.T) {
 		Project:         "web",
 		Service:         "web",
 		Image:           "nginx",
-		Restart:         "always",
 		ComposeFile:     base,
 		OverrideRaw:     originalContent,
 		OverrideRawSet:  true,
 		OverrideRawBase: true,
-		FieldsDirty:     true,
 	}
+	draft.loadFields(draft.OverrideRaw)
+	draft.Restart = "always"
 	spec, err := draft.ComposeSpec(config.DefaultSystem())
 	if err != nil {
 		t.Fatalf("ComposeSpec() error = %v", err)
@@ -116,13 +116,13 @@ func TestComposeChangePreviewMirrorsMerge(t *testing.T) {
 		Project:         "dash",
 		Service:         "dash",
 		Image:           "ghcr.io/allisonhere/dash:latest",
-		Restart:         "always",
 		ComposeFile:     "/srv/dash/compose.yaml",
 		OverrideRaw:     content,
 		OverrideRawSet:  true,
 		OverrideRawBase: true,
-		FieldsDirty:     true,
 	}
+	draft.loadFields(draft.OverrideRaw)
+	draft.Restart = "always"
 
 	label, before, after, ok := draft.composeChangePreview(config.DefaultSystem())
 	if !ok {
