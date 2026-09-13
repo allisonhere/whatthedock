@@ -38,6 +38,13 @@ func (f *fakeDockerChecker) Snapshot(context.Context) (domain.Snapshot, error) {
 func baseDoctorDeps(t *testing.T) doctorDeps {
 	t.Helper()
 	settingsDir := t.TempDir()
+	// Pin os.TempDir() to an empty per-test directory: the Tunnel sockets
+	// check scans it for whatthedock-*.sock, and on a developer machine the
+	// real /tmp holds the running app's SSH tunnel socket, which made these
+	// tests non-deterministic (a healthy-config report could pick up a
+	// stray "1 stale" warning). Each test that wants a socket uses its own
+	// t.TempDir() path through the Remote systems check instead.
+	t.Setenv("TMPDIR", t.TempDir())
 	return doctorDeps{
 		version:      "v1.2.3",
 		commit:       "abc1234",
