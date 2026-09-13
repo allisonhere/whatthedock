@@ -2929,10 +2929,10 @@ func (m Model) deleteStackConfirmOverlay(renderer tideui.Renderer) *tideui.Overl
 }
 
 // hostPowerConfirmOverlay is the itemized shutdown/reboot confirm reached
-// via Ctrl-K — same "itemized detail + plain y/n" shape as
-// deleteStackConfirmOverlay above, naming exactly what's about to happen
-// (which running containers get stopped first, and what the host itself
-// then does) rather than a bare "are you sure".
+// via Ctrl-K — names exactly what's about to happen (which running
+// containers get stopped first, and what the host itself then does) and
+// requires typing the host's own name to arm it, so the action can't fire
+// from a single mis-key or a mis-highlighted command-palette row.
 func (m Model) hostPowerConfirmOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
@@ -2950,14 +2950,24 @@ func (m Model) hostPowerConfirmOverlay(renderer tideui.Renderer) *tideui.Overlay
 	} else {
 		prompt = fmt.Sprintf("%s %q? The host %s. This cannot be undone.", kind.promptVerb(), host.Name, kind.outcome())
 	}
-	content := renderer.RenderSoftBody(width, strings.Join([]string{
+	lines := []string{
 		renderer.Styles.DetailMeta.Width(contentWidth).Render(prompt),
 		"",
+		renderer.Styles.DetailMeta.Width(contentWidth).Render(
+			fmt.Sprintf("Type the host name %q to confirm:", host.Name)),
+		renderer.Styles.InputFocused.Width(contentWidth).Render(string(m.hostPowerConfirmInput)),
+	}
+	if typed := strings.TrimSpace(string(m.hostPowerConfirmInput)); typed != "" && !m.hostPowerConfirmMatches() {
+		lines = append(lines, renderer.Styles.DetailMeta.Width(contentWidth).Render(
+			"name does not match — esc to cancel"))
+	}
+	lines = append(lines, "",
 		renderer.RenderSoftHints(contentWidth,
-			tideui.SoftHint{Key: "y", Label: kind.label()},
-			tideui.SoftHint{Key: "n/esc", Label: "cancel"},
+			tideui.SoftHint{Key: "enter", Label: kind.label()},
+			tideui.SoftHint{Key: "esc", Label: "cancel"},
 		),
-	}, "\n"))
+	)
+	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: kind.label(), Content: content, Width: width})
 	return &overlay
 }

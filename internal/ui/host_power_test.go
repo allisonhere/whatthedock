@@ -126,10 +126,11 @@ func TestHostPowerConfirmYPressStopsRunningContainersThenRunsCommand(t *testing.
 	model.overlay = overlayHostPowerConfirm
 	model.hostPowerKind = hostPowerShutdown
 
-	updated, cmd := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = typeHostPowerConfirm(t, model, model.hostPowerConfirmTarget())
+	updated, cmd := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if model.overlay != overlayHostPowerProgress {
-		t.Fatalf("overlay = %v, want overlayHostPowerProgress immediately after y", model.overlay)
+		t.Fatalf("overlay = %v, want overlayHostPowerProgress immediately after confirming", model.overlay)
 	}
 	if !model.busy {
 		t.Fatal("busy = false, want true while the progress modal is open")
@@ -194,7 +195,8 @@ func TestHostPowerNonInteractiveFailureOpensPasswordPrompt(t *testing.T) {
 	model.overlay = overlayHostPowerConfirm
 	model.hostPowerKind = hostPowerReboot
 
-	updated, cmd := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = typeHostPowerConfirm(t, model, model.hostPowerConfirmTarget())
+	updated, cmd := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	msg := runCmd(t, cmd)
 	if _, ok := msg.(hostPowerNeedsPasswordMsg); !ok {
@@ -242,6 +244,84 @@ func TestHostPowerConfirmEscCancelsWithoutStoppingAnything(t *testing.T) {
 	}
 	if len(fake.calls) != 0 {
 		t.Fatalf("hostPowerRun calls = %#v, want none", fake.calls)
+	}
+}
+
+// typeHostPowerConfirm drives handleHostPowerConfirmKey for each rune of s,
+// as individual keystrokes.
+func typeHostPowerConfirm(t *testing.T, model Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		updated, _ := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		model = updated.(Model)
+	}
+	return model
+}
+
+// TestHostPowerConfirmRequiresTypingHostName is the core of the safety fix:
+// neither a stray 'y' nor a partial/wrong name may arm the shutdown; only
+// entering the target host's exact name does.
+func TestHostPowerConfirmRequiresTypingHostName(t *testing.T) {
+	fake := withFakeHostPowerRun(t)
+	model := testModel()
+	target := model.hostPowerConfirmTarget()
+	if target == "" {
+		t.Fatal("hostPowerConfirmTarget() is empty, want the host name")
+	}
+	model.overlay = overlayHostPowerConfirm
+	model.hostPowerKind = hostPowerShutdown
+
+	// A single 'y' is just typed input now — it must not start anything.
+	updated, cmd := model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	if cmd != nil || model.overlay != overlayHostPowerConfirm {
+		t.Fatalf("cmd/overlay = %v/%v after 'y', want no action and the confirm still open", cmd, model.overlay)
+	}
+
+	// A wrong name plus enter is still a no-op.
+	model = typeHostPowerConfirm(t, model, "not-the-host")
+	updated, cmd = model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd != nil || model.overlay != overlayHostPowerConfirm {
+		t.Fatalf("cmd/overlay = %v/%v after a wrong name, want no action", cmd, model.overlay)
+	}
+	if provider := model.provider.(*fakeProvider); provider.stops != 0 || len(fake.calls) != 0 {
+		t.Fatalf("stops/calls = %d/%#v after a wrong name, want none", provider.stops, fake.calls)
+	}
+
+	// Clear, then the exact name arms it.
+	updated, _ = model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = updated.(Model)
+	model = typeHostPowerConfirm(t, model, target)
+	updated, cmd = model.handleHostPowerConfirmKey(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd == nil || model.overlay != overlayHostPowerProgress {
+		t.Fatalf("cmd/overlay = %v/%v after the exact name + enter, want the action armed", cmd, model.overlay)
+	}
+}
+
+// TestHostPowerConfirmOverlayShowsRequiredNameAndTypedInput checks the
+// overlay tells the user what to type and echoes the buffer (it isn't a
+// secret, unlike the password prompt).
+func TestHostPowerConfirmOverlayShowsRequiredNameAndTypedInput(t *testing.T) {
+	model := testModel()
+	model.width, model.height = 100, 40
+	model.overlay = overlayHostPowerConfirm
+	model.hostPowerKind = hostPowerShutdown
+	target := model.hostPowerConfirmTarget()
+	model = typeHostPowerConfirm(t, model, target)
+
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	overlay := model.hostPowerConfirmOverlay(renderer)
+	if overlay == nil {
+		t.Fatal("hostPowerConfirmOverlay() = nil")
+	}
+	content := ansi.Strip(overlay.Content)
+	if !strings.Contains(content, "Type the host name") {
+		t.Fatalf("overlay missing the typed-confirmation instruction:\n%s", content)
+	}
+	if !strings.Contains(content, target) {
+		t.Fatalf("overlay missing the required host name %q:\n%s", target, content)
 	}
 }
 

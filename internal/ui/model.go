@@ -577,6 +577,12 @@ type Model struct {
 	// password overlay opens later in the same flow (see
 	// internal/ui/host_power.go).
 	hostPowerKind hostPowerKind
+	// hostPowerConfirmInput is the typed confirmation buffer for the
+	// shutdown/reboot overlay: the host's own name must be typed to enable
+	// the action, so a mis-highlighted palette row can't trigger it with a
+	// single keystroke. Hand-rolled []rune for the same reason as the
+	// password buffer below.
+	hostPowerConfirmInput []rune
 	// hostPowerPassword is the in-app sudo password prompt's typed buffer
 	// (overlayHostPowerPassword) — never flows into m.status or anything
 	// recordAppLog persists; see host_power.go's clearPasswordBuffer for

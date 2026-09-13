@@ -128,20 +128,56 @@ func (m Model) openHostPowerConfirm(kind hostPowerKind) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.hostPowerKind = kind
+	m.hostPowerConfirmInput = nil
 	m.overlay = overlayHostPowerConfirm
 	return m, nil
 }
 
-// handleHostPowerConfirmKey answers the itemized shutdown/reboot confirm —
-// same plain esc/n/q-cancels, y-proceeds shape as handleDeleteStackConfirmKey.
+// hostPowerConfirmTarget is the name the user must type to enable the
+// shutdown/reboot: the affected host's own name, so the confirmation is tied
+// to the specific machine rather than a generic "yes".
+func (m Model) hostPowerConfirmTarget() string {
+	return strings.TrimSpace(m.provider.Host().Name)
+}
+
+// hostPowerConfirmMatches reports whether the typed confirmation buffer
+// matches the target host name (case-insensitively, so a lowercase-typed
+// name still works).
+func (m Model) hostPowerConfirmMatches() bool {
+	return strings.EqualFold(strings.TrimSpace(string(m.hostPowerConfirmInput)), m.hostPowerConfirmTarget())
+}
+
+// handleHostPowerConfirmKey answers the itemized shutdown/reboot confirm.
+// This is deliberately not a one-keystroke y/n: the palette can run the same
+// action, and a mis-highlighted row must not be able to power off a machine.
+// The user has to type the target host's name and press enter; esc cancels.
+// Because the target contains letters, n/q are NOT treated as cancel here —
+// only esc (and ctrl+c) get out.
 func (m Model) handleHostPowerConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc", "n", "q":
+	case "esc":
+		m.hostPowerConfirmInput = nil
 		m.overlay = overlayNone
-	case "y":
+	case "backspace", "ctrl+h":
+		if n := len(m.hostPowerConfirmInput); n > 0 {
+			m.hostPowerConfirmInput = m.hostPowerConfirmInput[:n-1]
+		}
+	case "ctrl+u":
+		m.hostPowerConfirmInput = nil
+	case "enter":
+		if !m.hostPowerConfirmMatches() {
+			// Nothing to say beyond the overlay's own mismatch hint; a wrong
+			// or partial name simply does not arm the action.
+			return m, nil
+		}
 		kind := m.hostPowerKind
+		m.hostPowerConfirmInput = nil
 		m.overlay = overlayNone
 		return m.startHostPower(kind)
+	default:
+		if len(msg.Runes) > 0 {
+			m.hostPowerConfirmInput = append(m.hostPowerConfirmInput, msg.Runes...)
+		}
 	}
 	return m, nil
 }
