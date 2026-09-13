@@ -1891,6 +1891,51 @@ func TestStaleLogsStartedMessageIsIgnored(t *testing.T) {
 	}
 }
 
+// TestForwardLogsUnblocksWhenDoneCloses guards the log-stream goroutine leak:
+// when a container switch abandons the destination channel, forwardLogs used
+// to block forever sending a line into a channel nothing drained, which in
+// turn blocked readLogLines and leaked the open Docker log stream. Closing
+// the stream's done channel must always let it exit.
+func TestForwardLogsUnblocksWhenDoneCloses(t *testing.T) {
+	in := make(chan string)
+	out := make(chan string) // unbuffered: nothing drains it
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		forwardLogs(in, out, done)
+		close(exited)
+	}()
+
+	in <- "line" // forwardLogs takes it, then blocks trying to send to out
+	close(done)
+
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwardLogs did not exit after done closed while its output was full")
+	}
+}
+
+// TestReadLogLinesUnblocksWhenDoneCloses is the reader half of the same fix:
+// with an unbuffered, undrained destination, the send-side select on done
+// must abort the loop instead of blocking forever.
+func TestReadLogLinesUnblocksWhenDoneCloses(t *testing.T) {
+	pr, pw := io.Pipe()
+	lines := make(chan string) // unbuffered: nothing drains it
+	done := make(chan struct{})
+	cancelled := make(chan struct{})
+	go readLogLines(pr, lines, func() { close(cancelled) }, done)
+
+	go func() { _, _ = pw.Write([]byte("hello\n")) }()
+	close(done)
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLogLines did not exit after done closed while its output was full")
+	}
+}
+
 func TestLogTokenColors(t *testing.T) {
 	if got := httpStatusColor("200"); got != activePalette.OK {
 		t.Fatalf("httpStatusColor(200) = %q, want the theme's success colour %q", got, activePalette.OK)
@@ -2355,6 +2400,30 @@ func TestCommandPaletteCanShowStats(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("show-stats cmd is nil, want stats load")
+	}
+}
+
+// TestCommandPaletteOrderIsCategoryPriority guards the invariant that the
+// command palette's cursor (which indexes filteredCommands and decides what
+// Enter runs) and the rendered rows (built from the same slice) agree. The
+// rows used to be re-sorted by category in the view only, so the highlighted
+// row and the executed command diverged at the System/Utility boundary: the
+// list highlighted "Shut down host machine" while Enter ran "Show keyboard
+// help". filteredCommands must therefore already be in category-priority
+// order.
+func TestCommandPaletteOrderIsCategoryPriority(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	items := model.filteredCommands()
+	if len(items) == 0 {
+		t.Fatal("filteredCommands() = empty, want the full catalog")
+	}
+	last := -1
+	for i, item := range items {
+		priority := commandCategoryPriority(item.Category)
+		if priority < last {
+			t.Fatalf("filteredCommands()[%d] = %q (priority %d) comes after a higher-priority category; palette highlight and Enter would diverge", i, item.Name, priority)
+		}
+		last = priority
 	}
 }
 

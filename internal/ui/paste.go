@@ -136,6 +136,7 @@ func (m Model) handlePasteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openCreateOverlayWithDraft(draftFromPastePlan(plan))
 		if m.validateCreateDraft() {
 			m.createDraft.Confirming = true
+			m.prepareComposeConfirmDiff()
 		}
 	case "t":
 		if !hasBlockingBindPathConflict(plan) {

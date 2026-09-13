@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -272,10 +271,13 @@ func analyzeGemini(ctx context.Context, cfg Config, prompt string) (string, erro
 	if model == "" {
 		model = geminiDefaultModel
 	}
-	endpoint := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiEndpoint, model, url.QueryEscape(cfg.APIKey))
+	// Send the key as a header, not in the query string: a failed request's
+	// http.Client error embeds the request URL, which would otherwise leak
+	// the key into user-visible error text (and logs/transcripts).
+	endpoint := fmt.Sprintf("%s/%s:generateContent", geminiEndpoint, model)
 	reqBody := geminiRequest{Contents: []geminiContent{{Parts: []geminiPart{{Text: prompt}}}}}
 	var resp geminiResponse
-	if err := doJSON(ctx, endpoint, nil, reqBody, &resp); err != nil {
+	if err := doJSON(ctx, endpoint, map[string]string{"x-goog-api-key": cfg.APIKey}, reqBody, &resp); err != nil {
 		return "", err
 	}
 	if resp.Error != nil {

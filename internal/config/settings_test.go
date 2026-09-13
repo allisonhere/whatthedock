@@ -127,6 +127,37 @@ func TestSaveSettingsTightensExistingLoosePermissions(t *testing.T) {
 	}
 }
 
+// TestSaveSettingsBacksUpCorruptFile guards a data-loss report: a corrupt
+// settings.json (parse failure) was loaded as empty, and the next autonomous
+// save (the update check) overwrote it with defaults, destroying the only
+// copy. SaveSettings must preserve the unparseable original beside it first.
+func TestSaveSettingsBacksUpCorruptFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	corrupt := []byte(`{"theme": "omarchy",`) // truncated JSON
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SaveSettings(path, Settings{Theme: "default"}); err != nil {
+		t.Fatalf("SaveSettings() err = %v", err)
+	}
+
+	backup, err := os.ReadFile(path + ".corrupt")
+	if err != nil {
+		t.Fatalf("ReadFile(%q) err = %v, want the corrupt original preserved", path+".corrupt", err)
+	}
+	if string(backup) != string(corrupt) {
+		t.Fatalf("backup = %q, want the original corrupt bytes %q", backup, corrupt)
+	}
+	loaded, err := LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings() after save err = %v, want valid settings", err)
+	}
+	if loaded.Theme != "default" {
+		t.Fatalf("loaded.Theme = %q, want default", loaded.Theme)
+	}
+}
+
 func TestNormalizeSystemsCreatesLocalDefault(t *testing.T) {
 	settings := NormalizeSystems(Settings{})
 	if len(settings.Systems) != 1 {

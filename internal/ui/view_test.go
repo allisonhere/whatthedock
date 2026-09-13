@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -564,5 +565,71 @@ func TestRenderHybridGraphShowsPeakOnAWideRow(t *testing.T) {
 	out := ansi.Strip(renderHybridGraph(renderer, settings, graph, "#7dcfff", 60))
 	if !strings.Contains(out, "peak 90.0%") {
 		t.Fatalf("renderHybridGraph() = %q, want it to include the peak annotation on a wide row", out)
+	}
+}
+
+// TestWindowProblemRowsKeepsCursorVisible guards a reported bug: the
+// Problems list was truncated from the top, so once the cursor moved past
+// the visible rows the highlight disappeared and Enter acted on an
+// off-screen problem. windowProblemRows must pin the summary header and
+// scroll the rows so the cursor's row is always in the returned window.
+func TestWindowProblemRowsKeepsCursorVisible(t *testing.T) {
+	header := "13 problem(s) found"
+	rows := make([]string, 13)
+	for i := range rows {
+		rows[i] = fmt.Sprintf("problem-%02d", i)
+	}
+	list := append([]string{header}, rows...)
+
+	// Cursor on the last row must bring it (and the header) into a 4-line
+	// window rather than keeping the first rows fixed.
+	got := windowProblemRows(list, len(rows)-1, 4)
+	if len(got) != 4 {
+		t.Fatalf("len(window) = %d, want 4", len(got))
+	}
+	if got[0] != header {
+		t.Fatalf("first window line = %q, want the summary header pinned", got[0])
+	}
+	foundCursor := false
+	for _, line := range got[1:] {
+		if line == rows[len(rows)-1] {
+			foundCursor = true
+		}
+	}
+	if !foundCursor {
+		t.Fatalf("window = %#v, want the cursor row %q included", got, rows[len(rows)-1])
+	}
+
+	// Cursor at the top keeps the top rows.
+	top := windowProblemRows(list, 0, 4)
+	if top[1] != rows[0] {
+		t.Fatalf("window at cursor 0 = %#v, want it to start at the first problem row", top)
+	}
+
+	// Fewer rows than the limit returns the list unchanged.
+	if short := windowProblemRows(list[:3], 2, 10); len(short) != 3 {
+		t.Fatalf("len(window) = %d for a short list, want it unchanged", len(short))
+	}
+}
+
+// TestAboutOverlayAlwaysUsesFixedDarkGrayBackground guards the deliberate
+// exception: About must render its panel on the same very dark gray surface
+// in every theme (light ones included), so the logo/ship animation stays
+// legible instead of following the active theme's modal background.
+func TestAboutOverlayAlwaysUsesFixedDarkGrayBackground(t *testing.T) {
+	withTrueColorProfile(t)
+	want := "48;2;20;20;20" // #141414
+
+	for _, theme := range []tideui.Theme{tideui.CatppuccinMocha, tideui.CatppuccinLatte} {
+		model := testModel()
+		model.width, model.height = 100, 40
+		model.theme = theme
+		model.overlay = overlayAbout
+		model.aboutSpotlights = newAboutSpotlights(aboutSpotlightCount, len(aboutLogo()), aboutContentWidth(model.width))
+
+		view := model.View()
+		if !strings.Contains(view, want) {
+			t.Fatalf("about view with theme %q missing the fixed dark-gray background %s", theme.Name, want)
+		}
 	}
 }

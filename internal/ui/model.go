@@ -886,7 +886,12 @@ type logsStartedMsg struct {
 	id     domain.ResourceID
 	lines  <-chan string
 	cancel context.CancelFunc
-	err    error
+	// done is closed by cancel; the forward/read goroutines select on it so
+	// abandoning a stream (container switch) unblocks them even when the
+	// destination channel is full, instead of leaking the goroutine and the
+	// open Docker log reader.
+	done <-chan struct{}
+	err  error
 }
 
 type eventsStartedMsg struct {
@@ -1378,7 +1383,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.logChan = make(chan string, 256)
 		m.logCancel = msg.cancel
-		go forwardLogs(msg.lines, m.logChan)
+		go forwardLogs(msg.lines, m.logChan, msg.done)
 		return m, tickLogs()
 	case eventsStartedMsg:
 		if msg.err != nil {
@@ -5168,8 +5173,8 @@ func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 			return logsStartedMsg{id: id, err: err}
 		}
 		lines := make(chan string, 256)
-		go readLogLines(stream, lines, cancel)
-		return logsStartedMsg{id: id, lines: lines, cancel: cancel}
+		go readLogLines(stream, lines, cancel, ctx.Done())
+		return logsStartedMsg{id: id, lines: lines, cancel: cancel, done: ctx.Done()}
 	}
 }
 
@@ -5201,14 +5206,29 @@ func tickOmarchyTheme() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return omarchyThemeTickMsg{} })
 }
 
-func forwardLogs(in <-chan string, out chan<- string) {
+// forwardLogs relays lines from a log reader to the view's buffered channel.
+// It returns as soon as done closes, so tearing down a stream never leaves it
+// blocked forever sending into a channel nothing drains.
+func forwardLogs(in <-chan string, out chan<- string, done <-chan struct{}) {
 	defer close(out)
-	for line := range in {
-		out <- line
+	for {
+		select {
+		case line, ok := <-in:
+			if !ok {
+				return
+			}
+			select {
+			case out <- line:
+			case <-done:
+				return
+			}
+		case <-done:
+			return
+		}
 	}
 }
 
-func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.CancelFunc) {
+func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.CancelFunc, done <-chan struct{}) {
 	defer cancel()
 	defer close(lines)
 	defer reader.Close()
@@ -5216,7 +5236,11 @@ func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.Canc
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
-		lines <- cleanDockerLogLine(scanner.Text())
+		select {
+		case lines <- cleanDockerLogLine(scanner.Text()):
+		case <-done:
+			return
+		}
 	}
 }
 
@@ -5431,17 +5455,53 @@ func (m Model) filteredCommands() []actions.Command {
 	selected := m.selectedContainer()
 	query := strings.ToLower(strings.TrimSpace(m.commandFilter))
 	items := actions.Catalog(selected)
-	if query == "" {
-		return items
-	}
-	var filtered []actions.Command
-	for _, item := range items {
-		haystack := strings.ToLower(item.Name + " " + string(item.ID) + " " + strings.Join(item.Aliases, " "))
-		if strings.Contains(haystack, query) {
-			filtered = append(filtered, item)
+	if query != "" {
+		var filtered []actions.Command
+		for _, item := range items {
+			haystack := strings.ToLower(item.Name + " " + string(item.ID) + " " + strings.Join(item.Aliases, " "))
+			if strings.Contains(haystack, query) {
+				filtered = append(filtered, item)
+			}
 		}
+		items = filtered
 	}
-	return filtered
+	// The palette cursor indexes this slice while commandPaletteOverlay
+	// renders it grouped by category, so it must already be in
+	// category-priority order. Ordering only in the view left the highlight
+	// and the executed command divergent: the row for "Shut down host
+	// machine" was highlighted while Enter ran "Show keyboard help". See
+	// commandCategoryPriority.
+	sort.SliceStable(items, func(i, j int) bool {
+		return commandCategoryPriority(items[i].Category) < commandCategoryPriority(items[j].Category)
+	})
+	return items
+}
+
+// commandCategoryPriority is the single source of truth for the command
+// palette's category order, shared by filteredCommands (which the cursor
+// indexes) and its render so the two can never disagree. Unknown categories
+// sort last.
+func commandCategoryPriority(category string) int {
+	switch category {
+	case "Main":
+		return 0
+	case "Container Management":
+		return 1
+	case "Docker Resources":
+		return 2
+	case "Container Info":
+		return 3
+	case "Navigation":
+		return 4
+	case "Settings":
+		return 5
+	case "System":
+		return 6
+	case "Utility":
+		return 7
+	default:
+		return 8
+	}
 }
 
 func friendlyDockerError(err error) string {

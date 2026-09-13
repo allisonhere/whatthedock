@@ -2446,15 +2446,34 @@ func TestApplyComposeDeleteRemoteRemovesServiceFromBaseWhenDefined(t *testing.T)
 		t.Fatalf("applyComposeDeleteRemote() error = %v", err)
 	}
 
+	// The rewritten base is staged to a temp file, then promoted atomically.
+	var wrote string
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "cat > '/srv/media-stack/compose.yml.tmp'\x00stdin=") {
+			wrote = call
+		}
+	}
+	if wrote == "" {
+		t.Fatalf("no write of the rewritten base temp file: %#v", fake.calls)
+	}
+	if strings.Contains(wrote, "redis:7") {
+		t.Fatalf("rewritten base still defines the deleted service: %q", wrote)
+	}
+	if !strings.Contains(wrote, "nginx:latest") {
+		t.Fatalf("rewritten base lost an unrelated service: %q", wrote)
+	}
 	last := fake.calls[len(fake.calls)-1]
-	if !strings.HasPrefix(last, "cat > '/srv/media-stack/compose.yml'\x00stdin=") {
-		t.Fatalf("last call = %q, want the rewritten base file written back", last)
+	if last != "mv '/srv/media-stack/compose.yml.tmp' '/srv/media-stack/compose.yml'" {
+		t.Fatalf("last call = %q, want the staged base promoted atomically", last)
 	}
-	if strings.Contains(last, "redis:7") {
-		t.Fatalf("rewritten base still defines the deleted service: %q", last)
+	sawBackup := false
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "cp -p '/srv/media-stack/compose.yml' ") {
+			sawBackup = true
+		}
 	}
-	if !strings.Contains(last, "nginx:latest") {
-		t.Fatalf("rewritten base lost an unrelated service: %q", last)
+	if !sawBackup {
+		t.Fatalf("no backup of the existing base file was taken: %#v", fake.calls)
 	}
 }
 
@@ -3378,6 +3397,59 @@ func TestEditingRestartBeforeBaseComposeLoadArrivesIsNotClobbered(t *testing.T) 
 	// mechanism that depends on this.
 	if !model.createDraft.OverrideRawSet || !model.createDraft.OverrideRawBase {
 		t.Fatalf("OverrideRawSet/OverrideRawBase = %v/%v, want both true even when the field prefill was skipped", model.createDraft.OverrideRawSet, model.createDraft.OverrideRawBase)
+	}
+}
+
+// TestNavigationBeforeBaseComposeLoadStillAppliesPrefill guards the other
+// half of the async-prefill data-loss fix: only a real field edit may set
+// FieldsDirty. Navigation (arrow keys moving the caret) used to count as an
+// edit, so a base-file load still in flight over SSH would be skipped —
+// leaving Ports/Mounts/Env/Command empty — and confirming then merged those
+// empty values over the real file, deleting the service's ports, volumes,
+// and environment. Navigation must leave FieldsDirty false so the prefill
+// still lands.
+func TestNavigationBeforeBaseComposeLoadStillAppliesPrefill(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yml")
+	content := `services:
+  dash:
+    image: ghcr.io/allisonhere/dash:latest
+    restart: unless-stopped
+    ports:
+      - "3939:3939"
+    environment:
+      - PORT=3939
+`
+	if err := os.WriteFile(base, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := modelSelecting("dash", "dash", base)
+	cmd := model.openEditOverlay()
+	if cmd == nil {
+		t.Fatal("openEditOverlay() returned nil, want a base compose load command")
+	}
+	// Caret movement in a text field before the load lands must not count
+	// as an edit.
+	model.createField = createFieldPorts
+	model.syncCreateFieldEditor()
+	for _, key := range []tea.KeyMsg{{Type: tea.KeyRight}, {Type: tea.KeyLeft}} {
+		updated, _ := model.Update(key)
+		model = updated.(Model)
+	}
+	if model.createDraft.FieldsDirty {
+		t.Fatal("FieldsDirty = true after caret navigation only, want false so the async prefill still applies")
+	}
+
+	msg := runCmd(t, cmd).(createSelectedComposeFileMsg)
+	updated, _ := model.Update(msg)
+	model = updated.(Model)
+
+	if model.createDraft.Ports != "3939:3939" {
+		t.Fatalf("Ports = %q after the base-file load landed, want the file's port populated", model.createDraft.Ports)
+	}
+	if !strings.Contains(model.createDraft.Env, "PORT=3939") {
+		t.Fatalf("Env = %q after the base-file load landed, want the file's environment populated", model.createDraft.Env)
 	}
 }
 

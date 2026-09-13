@@ -256,16 +256,55 @@ func ReplaceStack(dir, id, note, sourceSystem string, sourcePaths []string, file
 		entry.SourcePaths = compactStrings(sourcePaths)
 		entry.Files = nil
 		entry.PrimaryFile = ""
-		if err := os.RemoveAll(entryDirPath(dir, entry.ID)); err != nil {
+
+		// Write the replacement into a staging directory beside the real
+		// entry and swap it in only after every file succeeded. The old
+		// code removed the existing entry first, so a failed write (an empty
+		// source compose file, a disk error) destroyed the only copy and
+		// permanently broke the entry.
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Entry{}, err
 		}
-		if err := writeStackFiles(dir, &entry, files); err != nil {
-			_ = os.RemoveAll(entryDirPath(dir, entry.ID))
+		staging, err := os.MkdirTemp(dir, ".stage-"+filepath.Base(id)+"-")
+		if err != nil {
+			return Entry{}, err
+		}
+		if err := writeStackFilesAt(staging, &entry, files); err != nil {
+			_ = os.RemoveAll(staging)
+			return Entry{}, err
+		}
+
+		entryDir := entryDirPath(dir, id)
+		backup := ""
+		if _, statErr := os.Stat(entryDir); statErr == nil {
+			backup = entryDir + ".bak"
+			if err := os.RemoveAll(backup); err != nil {
+				_ = os.RemoveAll(staging)
+				return Entry{}, err
+			}
+			if err := os.Rename(entryDir, backup); err != nil {
+				_ = os.RemoveAll(staging)
+				return Entry{}, err
+			}
+		}
+		if err := os.Rename(staging, entryDir); err != nil {
+			if backup != "" {
+				_ = os.Rename(backup, entryDir)
+			}
+			_ = os.RemoveAll(staging)
 			return Entry{}, err
 		}
 		entries[i] = entry
 		if err := writeIndex(dir, entries); err != nil {
+			// Roll the on-disk entry back so it still matches index.json.
+			_ = os.RemoveAll(entryDir)
+			if backup != "" {
+				_ = os.Rename(backup, entryDir)
+			}
 			return Entry{}, err
+		}
+		if backup != "" {
+			_ = os.RemoveAll(backup)
 		}
 		return entry, nil
 	}
@@ -509,6 +548,17 @@ func writeEntryFile(dir, id, name, content string) error {
 }
 
 func writeStackFiles(dir string, entry *Entry, files []FileContent) error {
+	return writeStackFilesAt(entryDirPath(dir, entry.ID), entry, files)
+}
+
+// writeStackFilesAt writes files into targetDir (created if needed) while
+// populating entry's file metadata. Callers that must not disturb an
+// existing entry write into a staging directory first and swap it in only
+// once every file succeeded — see ReplaceStack.
+func writeStackFilesAt(targetDir string, entry *Entry, files []FileContent) error {
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return err
+	}
 	seenNames := map[string]bool{}
 	primarySet := false
 	for i, file := range files {
@@ -531,7 +581,7 @@ func writeStackFiles(dir string, entry *Entry, files []FileContent) error {
 			file.Content = ApplyNoteHeader(file.Content, entry.Note)
 		}
 		entry.Files = append(entry.Files, EntryFile{Name: file.Name, SourcePath: file.SourcePath, Primary: file.Primary})
-		if err := writeEntryFile(dir, entry.ID, file.Name, file.Content); err != nil {
+		if err := os.WriteFile(filepath.Join(targetDir, filepath.Base(file.Name)), []byte(file.Content), 0o600); err != nil {
 			return err
 		}
 	}

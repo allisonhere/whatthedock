@@ -229,6 +229,41 @@ func TestReplaceStackRefreshesExistingEntryWithoutChangingID(t *testing.T) {
 	}
 }
 
+// TestReplaceStackKeepsOriginalWhenReplacementInvalid guards a data-loss
+// bug: ReplaceStack used to delete the existing entry's directory before
+// writing the replacement, so an invalid replacement (here, empty file
+// content) destroyed the only copy and permanently broke the entry.
+func TestReplaceStackKeepsOriginalWhenReplacementInvalid(t *testing.T) {
+	dir := t.TempDir()
+	entry, err := SaveStack(dir, "Media", "", "local", []string{"/srv/media/compose.yml"}, []FileContent{{
+		Name: "compose.yml", Content: "services:\n  app:\n    image: nginx\n", Primary: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ReplaceStack(dir, entry.ID, "", "local", []string{"/srv/media/compose.yml"}, []FileContent{{
+		Name: "compose.yml", Content: "   \n", Primary: true,
+	}}); err == nil {
+		t.Fatal("ReplaceStack() error = nil, want a rejection for empty content")
+	}
+
+	content, err := Read(dir, entry.ID)
+	if err != nil {
+		t.Fatalf("Read() after a failed ReplaceStack = %v, want the original entry intact", err)
+	}
+	if !contains(content, "image: nginx") {
+		t.Fatalf("content = %q after a failed ReplaceStack, want the original preserved", content)
+	}
+	entries, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != entry.ID {
+		t.Fatalf("entries = %#v, want the original entry still indexed", entries)
+	}
+}
+
 func contains(value, substr string) bool {
 	return strings.Contains(value, substr)
 }

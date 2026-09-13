@@ -17,7 +17,6 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	colorful "github.com/lucasb-eyer/go-colorful"
 
-	"github.com/allisonhere/whatthedock/internal/actions"
 	"github.com/allisonhere/whatthedock/internal/app"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -1562,8 +1561,7 @@ func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
 		}, width))
 	}
 	if m.focus == paneActivity {
-		limit := max(1, m.problemsListRows())
-		listLines = listLines[:min(len(listLines), limit)]
+		listLines = windowProblemRows(listLines, m.problemCursor, max(1, m.problemsListRows()))
 	}
 	list := strings.Join(listLines, "\n")
 
@@ -1576,6 +1574,20 @@ func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
 	insight := m.renderProblemInsight(renderer, *current, width)
 
 	return lipgloss.JoinVertical(lipgloss.Left, list, divider, insight), width
+}
+
+// windowProblemRows keeps listLines' summary header pinned and windows the
+// problem rows below it so the row at cursor stays visible. The list used to
+// be truncated from the top, so a cursor past the visible rows highlighted
+// nothing and Enter acted on an off-screen problem.
+func windowProblemRows(listLines []string, cursor, limit int) []string {
+	if limit < 1 || len(listLines) <= limit {
+		return listLines
+	}
+	rows := listLines[1:]
+	visible := max(1, limit-1)
+	start, end := visibleRange(len(rows), cursor, visible)
+	return append([]string{listLines[0]}, rows[start:end]...)
 }
 
 // renderProblemInsight renders the insight block's body for row: the
@@ -2746,10 +2758,16 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	case overlayAbout:
 		width := min(82, max(46, m.width-8))
 		contentWidth := aboutContentWidth(m.width)
-		content := renderer.RenderSoftBody(width, m.aboutText(renderer, contentWidth)+"\n"+
-			m.aboutExtras(renderer, contentWidth)+"\n\n"+
-			renderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/A/q", Label: "close"}))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "about", Content: content, Width: width})
+		// Pin the soft-panel surface to the fixed About background (see
+		// aboutBackground): the soft chrome derives its base background from
+		// Theme.Overlay, so overriding it here makes the border, padding and
+		// hints dark gray too, not just the logo canvas.
+		aboutRenderer := renderer
+		aboutRenderer.Styles.Theme.Overlay = aboutBackground
+		content := aboutRenderer.RenderSoftBody(width, m.aboutText(aboutRenderer, contentWidth)+"\n"+
+			m.aboutExtras(aboutRenderer, contentWidth)+"\n\n"+
+			aboutRenderer.RenderSoftHints(width-4, tideui.SoftHint{Key: "esc/A/q", Label: "close"}))
+		overlay := aboutRenderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "about", Content: content, Width: width})
 		return &overlay
 	case overlayDashboard:
 		return m.dashboardOverlay(renderer)
@@ -3416,48 +3434,24 @@ func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	var rows []string
 	rows = append(rows, input)
 
-	// Group commands by category
-	categoryMap := make(map[string][]actions.Command)
-	categorySet := make(map[string]bool)
-	for _, item := range items {
-		if !categorySet[item.Category] {
-			categorySet[item.Category] = true
-		}
-		categoryMap[item.Category] = append(categoryMap[item.Category], item)
-	}
-
-	// Sort categories by priority
-	categoryPriority := map[string]int{
-		"Main":                 0,
-		"Container Management": 1,
-		"Docker Resources":     2,
-		"Container Info":       3,
-		"Navigation":           4,
-		"Settings":             5,
-		"System":               6,
-		"Utility":              7,
-	}
-	var categoryOrder []string
-	for cat := range categorySet {
-		categoryOrder = append(categoryOrder, cat)
-	}
-	sort.Slice(categoryOrder, func(i, j int) bool {
-		return categoryPriority[categoryOrder[i]] < categoryPriority[categoryOrder[j]]
-	})
-
-	// Render grouped commands with category headers
+	// filteredCommands() returns rows already grouped in category-priority
+	// order, so emit a header whenever the category changes. The same slice
+	// backs m.commandCursor in handleCommandPaletteKey, keeping the
+	// highlighted row and the command Enter runs in lockstep.
 	itemIndex := 0
-	for _, category := range categoryOrder {
-		rows = append(rows, renderer.Styles.DetailMeta.Render(strings.ToUpper(category)))
-		for _, item := range categoryMap[category] {
-			rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
-				Text:     item.Name,
-				Suffix:   item.Shortcut,
-				Selected: itemIndex == m.commandCursor,
-				Muted:    !item.Enabled,
-			}, contentWidth))
-			itemIndex++
+	lastCategory := ""
+	for _, item := range items {
+		if item.Category != lastCategory {
+			rows = append(rows, renderer.Styles.DetailMeta.Render(strings.ToUpper(item.Category)))
+			lastCategory = item.Category
 		}
+		rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
+			Text:     item.Name,
+			Suffix:   item.Shortcut,
+			Selected: itemIndex == m.commandCursor,
+			Muted:    !item.Enabled,
+		}, contentWidth))
+		itemIndex++
 	}
 
 	if len(items) == 0 {
@@ -4924,13 +4918,18 @@ func aboutContentWidth(termWidth int) int {
 	return min(82, max(46, termWidth-8)) - 4
 }
 
+// aboutBackground is the About screen's fixed, very dark gray surface. Unlike
+// every other overlay, About deliberately ignores the active theme's modal
+// background so its logo/starfield/ship animation always reads the same way.
+var aboutBackground = lipgloss.Color("#141414")
+
 func (m Model) aboutText(renderer tideui.Renderer, width int) string {
 	// Every cell — including blanks and the row's own right-padding — gets
-	// an explicit background matching the panel body. A Foreground-only
-	// style (or a bare unstyled space) falls through to whatever's behind
-	// it instead of the theme's own color, which looks fine by coincidence
-	// in a dark theme and glaringly wrong in a light one.
-	bg := renderer.Styles.OverlayBody.GetBackground()
+	// an explicit background. About pins that to aboutBackground rather than
+	// the theme's panel body so the screen stays a consistent very dark gray
+	// in every theme (light ones included, where a themed background would
+	// wash the animation out).
+	bg := aboutBackground
 	logo := aboutLogo()
 	rows := len(logo)
 	lines := make([]string, 0, rows)
@@ -4955,7 +4954,7 @@ const aboutTagline = "Get Your Ship Together"
 // (the same bug this session already hit and fixed in the ember/burn
 // reveal, the stats graphs, and the Ripple editor).
 func (m Model) aboutExtras(renderer tideui.Renderer, width int) string {
-	bg := renderer.Styles.OverlayBody.GetBackground()
+	bg := aboutBackground
 	blank := lipgloss.NewStyle().Width(width).Background(bg).Render("")
 
 	tagline := lipgloss.NewStyle().Width(width).Background(bg).Bold(true).Foreground(lipgloss.Color("#e7b2b2")).

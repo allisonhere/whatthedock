@@ -139,6 +139,16 @@ type createDraft struct {
 	// edit just never reached the file that got written.
 	FieldsDirty bool
 
+	// confirmDiffPath/confirmDiffLabel/confirmDiffLines cache the
+	// before→after view of the file an apply will rewrite, computed once
+	// when the confirm prompt opens (see prepareComposeConfirmDiff) so the
+	// render path never runs an O(n·m) diff per frame. An empty label means
+	// there's nothing to show (a standalone draft), and the confirm screen
+	// falls back to Preview.
+	confirmDiffPath  string
+	confirmDiffLabel string
+	confirmDiffLines []string
+
 	// BaseFileMissing is set (see openCreateOverlay/checkRemoteOverrideCmd)
 	// when ComposeFile was already non-empty at form-open time — i.e. an
 	// already-labeled container — but doesn't actually exist on disk, the
@@ -159,6 +169,41 @@ type createDraft struct {
 	// placeholder mount (clipboard.BindRedirectLabelPrefix) so it can be
 	// commented out instead of emitted as if it were real.
 	Labels map[string]string
+}
+
+// createEditableValues is the set of user-editable createDraft fields whose
+// change is what createDraft.FieldsDirty actually tracks. Identity fields
+// that trigger a reload (ComposeFile) and the Mode toggle are deliberately
+// excluded: selecting a different file, or switching Compose/standalone, is
+// not editing a value and must not suppress the async prefill that follows.
+type createEditableValues struct {
+	Project       string
+	Service       string
+	ContainerName string
+	Image         string
+	ImageAction   string
+	Command       string
+	Ports         string
+	Mounts        string
+	Env           string
+	Restart       string
+	Networks      string
+}
+
+func (d createDraft) editableValues() createEditableValues {
+	return createEditableValues{
+		Project:       d.Project,
+		Service:       d.Service,
+		ContainerName: d.ContainerName,
+		Image:         d.Image,
+		ImageAction:   d.ImageAction,
+		Command:       d.Command,
+		Ports:         d.Ports,
+		Mounts:        d.Mounts,
+		Env:           d.Env,
+		Restart:       d.Restart,
+		Networks:      d.Networks,
+	}
 }
 
 type composeCreateSpec struct {
@@ -782,149 +827,156 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	switch msg.String() {
-	case "esc", "q", "up", "down", "tab", "shift+tab":
-		// Pure navigation — no field value changes, so a still-in-flight
-		// async prefill (see createDraft.FieldsDirty's doc comment) is
-		// still safe to apply once it lands.
-	default:
-		m.createDraft.FieldsDirty = true
-	}
-	var cmd tea.Cmd
-	switch msg.String() {
-	case "esc", "q":
-		m.overlay = overlayNone
-	case "up":
-		m.moveCreateField(-1)
-	case "down", "tab":
-		m.moveCreateField(1)
-	case "shift+tab":
-		m.moveCreateField(-1)
-	case "k":
-		if m.isCreateChoiceField() {
+	// Run the key through the form dispatch, then mark the draft dirty only
+	// if an editable value actually changed. Marking on any key outside a
+	// small navigation whitelist (the old behavior) meant a stray arrow, or
+	// Enter opening the file browser, counted as an edit: a still-in-flight
+	// async prefill (see createDraft.FieldsDirty's doc comment) was then
+	// skipped, and confirming merged the still-empty fields over the real
+	// base file — silently deleting ports/volumes/env/command.
+	before := m.createDraft.editableValues()
+	next, cmd := func() (Model, tea.Cmd) {
+		var cmd tea.Cmd
+		switch msg.String() {
+		case "esc", "q":
+			m.overlay = overlayNone
+		case "up":
 			m.moveCreateField(-1)
-			return m, nil
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "j":
-		if m.isCreateChoiceField() {
+		case "down", "tab":
 			m.moveCreateField(1)
-			return m, nil
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "left", "right", "shift+left", "shift+right",
-		"ctrl+left", "ctrl+right", "ctrl+shift+left", "ctrl+shift+right":
-		if m.isCreateChoiceField() {
-			// Only plain left/right cycle a choice — shift/ctrl variants
-			// have no meaning there (no selection, no words to jump).
-			switch msg.String() {
-			case "left":
-				m.cycleCreateChoice(-1)
-			case "right":
-				m.cycleCreateChoice(1)
+		case "shift+tab":
+			m.moveCreateField(-1)
+		case "k":
+			if m.isCreateChoiceField() {
+				m.moveCreateField(-1)
+				return m, nil
 			}
-			return m, nil
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "h":
-		if m.isCreateChoiceField() {
-			m.cycleCreateChoice(-1)
-			return m, nil
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "l":
-		if m.isCreateChoiceField() {
-			m.cycleCreateChoice(1)
-			return m, nil
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "enter":
-		if m.isCreateChoiceField() {
-			m.cycleCreateChoice(1)
-			return m, nil
-		}
-		if m.createField == createFieldComposeFile {
-			return m, m.openCreateFileBrowser()
-		}
-		m.moveCreateField(1)
-	case "ctrl+o":
-		m.createDraft.Mode = createModeCompose
-		m.createField = createFieldComposeFile
-		m.syncCreateFieldEditor()
-		return m, m.openCreateFileBrowser()
-	case "o":
-		// Bare "o" is a browse shortcut only on a choice field (Mode/
-		// Restart), which ignores letters anyway. Every text field — the
-		// Compose file row included — must accept "o" as ordinary input:
-		// plenty of real values contain it ("postgres", "sonarr", and
-		// "compose.yml" itself), and the Compose file field is exactly
-		// where someone would want to type a path by hand. Enter or
-		// Ctrl+O still open the browser from the Compose file field.
-		if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
+			cmd = m.forwardToFieldEditor(msg)
+		case "j":
+			if m.isCreateChoiceField() {
+				m.moveCreateField(1)
+				return m, nil
+			}
+			cmd = m.forwardToFieldEditor(msg)
+		case "left", "right", "shift+left", "shift+right",
+			"ctrl+left", "ctrl+right", "ctrl+shift+left", "ctrl+shift+right":
+			if m.isCreateChoiceField() {
+				// Only plain left/right cycle a choice — shift/ctrl variants
+				// have no meaning there (no selection, no words to jump).
+				switch msg.String() {
+				case "left":
+					m.cycleCreateChoice(-1)
+				case "right":
+					m.cycleCreateChoice(1)
+				}
+				return m, nil
+			}
+			cmd = m.forwardToFieldEditor(msg)
+		case "h":
+			if m.isCreateChoiceField() {
+				m.cycleCreateChoice(-1)
+				return m, nil
+			}
+			cmd = m.forwardToFieldEditor(msg)
+		case "l":
+			if m.isCreateChoiceField() {
+				m.cycleCreateChoice(1)
+				return m, nil
+			}
+			cmd = m.forwardToFieldEditor(msg)
+		case "enter":
+			if m.isCreateChoiceField() {
+				m.cycleCreateChoice(1)
+				return m, nil
+			}
+			if m.createField == createFieldComposeFile {
+				return m, m.openCreateFileBrowser()
+			}
+			m.moveCreateField(1)
+		case "ctrl+o":
+			m.createDraft.Mode = createModeCompose
 			m.createField = createFieldComposeFile
 			m.syncCreateFieldEditor()
 			return m, m.openCreateFileBrowser()
-		}
-		cmd = m.forwardToFieldEditor(msg)
-	case "[", "]":
-		m.cycleCreateMode()
-	case "ctrl+y":
-		// Ripple's own default keymap binds ctrl+y to Redo, but this app
-		// already uses ctrl+y globally for the Compose YAML editor — kept
-		// intercepted here unconditionally (even in standalone mode, where
-		// the body below does nothing) so it can never reach the field
-		// editor and mean something else there.
-		if m.createDraft.Mode == createModeCompose {
-			m.openCreateEditor()
-			return m, nil
-		}
-	case "ctrl+p":
-		if m.createDraft.Mode == createModeCompose {
-			m.openCreateCatalog()
-			return m, nil
-		}
-	case "ctrl+s":
-		m.validateCreateDraft()
-	case "ctrl+enter", "alt+enter":
-		if m.validateCreateDraft() {
-			m.createDraft.Confirming = true
-			switch {
-			case m.createDraft.IsStack():
-				m.status, m.statusErr = "confirm deploy stack "+m.createDraft.TargetName(), false
-			case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
-				m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
-			default:
-				m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
+		case "o":
+			// Bare "o" is a browse shortcut only on a choice field (Mode/
+			// Restart), which ignores letters anyway. Every text field — the
+			// Compose file row included — must accept "o" as ordinary input:
+			// plenty of real values contain it ("postgres", "sonarr", and
+			// "compose.yml" itself), and the Compose file field is exactly
+			// where someone would want to type a path by hand. Enter or
+			// Ctrl+O still open the browser from the Compose file field.
+			if m.createDraft.Mode == createModeCompose && m.isCreateChoiceField() {
+				m.createField = createFieldComposeFile
+				m.syncCreateFieldEditor()
+				return m, m.openCreateFileBrowser()
+			}
+			cmd = m.forwardToFieldEditor(msg)
+		case "[", "]":
+			m.cycleCreateMode()
+		case "ctrl+y":
+			// Ripple's own default keymap binds ctrl+y to Redo, but this app
+			// already uses ctrl+y globally for the Compose YAML editor — kept
+			// intercepted here unconditionally (even in standalone mode, where
+			// the body below does nothing) so it can never reach the field
+			// editor and mean something else there.
+			if m.createDraft.Mode == createModeCompose {
+				m.openCreateEditor()
+				return m, nil
+			}
+		case "ctrl+p":
+			if m.createDraft.Mode == createModeCompose {
+				m.openCreateCatalog()
+				return m, nil
+			}
+		case "ctrl+s":
+			m.validateCreateDraft()
+		case "ctrl+enter", "alt+enter":
+			if m.validateCreateDraft() {
+				m.createDraft.Confirming = true
+				m.prepareComposeConfirmDiff()
+				switch {
+				case m.createDraft.IsStack():
+					m.status, m.statusErr = "confirm deploy stack "+m.createDraft.TargetName(), false
+				case m.createDraft.Mode == createModeCompose && m.createDraft.BaseFileMissing:
+					m.status, m.statusErr = "confirm create & adopt "+m.createDraft.TargetName(), false
+				default:
+					m.status, m.statusErr = "confirm "+confirmStepLabel(m.createDraft.Editing)+" "+m.createDraft.TargetName(), false
+				}
+			}
+		case "backspace", "delete", "ctrl+z", "ctrl+c", "ctrl+x", "ctrl+v":
+			// These have no msg.Runes (they're control keys, not printable
+			// input), so they'd never reach the default case's Rune-gated
+			// forward below — copy/cut/paste/undo need their own case to ever
+			// get to the editor at all.
+			cmd = m.forwardToFieldEditor(msg)
+		case "home", "ctrl+a":
+			// This app has long treated ctrl+a as a Home alias, not Ripple's
+			// own default ctrl+a-selects-all — translate to a synthetic Home
+			// key instead of forwarding the raw one, so that convention holds
+			// (Shift+Home, in the case above, already gives a real "select to
+			// start of field" if that's what's wanted).
+			cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyHome})
+		case "end", "ctrl+e":
+			cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyEnd})
+		case "ctrl+u":
+			if !m.isCreateChoiceField() {
+				m.createFieldEditor.SelectAll()
+				m.createFieldEditor.DeleteSelection()
+				m.clearCreateNotice()
+				m.setCreateFieldValue(m.createFieldEditor.Value())
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				cmd = m.forwardToFieldEditor(msg)
 			}
 		}
-	case "backspace", "delete", "ctrl+z", "ctrl+c", "ctrl+x", "ctrl+v":
-		// These have no msg.Runes (they're control keys, not printable
-		// input), so they'd never reach the default case's Rune-gated
-		// forward below — copy/cut/paste/undo need their own case to ever
-		// get to the editor at all.
-		cmd = m.forwardToFieldEditor(msg)
-	case "home", "ctrl+a":
-		// This app has long treated ctrl+a as a Home alias, not Ripple's
-		// own default ctrl+a-selects-all — translate to a synthetic Home
-		// key instead of forwarding the raw one, so that convention holds
-		// (Shift+Home, in the case above, already gives a real "select to
-		// start of field" if that's what's wanted).
-		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyHome})
-	case "end", "ctrl+e":
-		cmd = m.forwardToFieldEditor(tea.KeyMsg{Type: tea.KeyEnd})
-	case "ctrl+u":
-		if !m.isCreateChoiceField() {
-			m.createFieldEditor.SelectAll()
-			m.createFieldEditor.DeleteSelection()
-			m.clearCreateNotice()
-			m.setCreateFieldValue(m.createFieldEditor.Value())
-		}
-	default:
-		if len(msg.Runes) > 0 {
-			cmd = m.forwardToFieldEditor(msg)
-		}
+		return m, cmd
+	}()
+	if next.createDraft.editableValues() != before {
+		next.createDraft.FieldsDirty = true
 	}
-	return m, cmd
+	return next, cmd
 }
 
 func (m *Model) openCreateCatalog() {
@@ -1157,9 +1209,6 @@ func (m *Model) loadCurrentCatalogEntry() error {
 
 func (m *Model) saveCurrentDraftToCatalog() error {
 	content := m.createDraft.Preview()
-	if m.createDraft.Mode == createModeCompose && m.createDraft.OverrideRawSet {
-		content = m.createDraft.OverrideRaw
-	}
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
@@ -2195,6 +2244,91 @@ func safeComposeFilename(value string) string {
 	return name
 }
 
+// composeBackupKeep is how many timestamped pre-apply snapshots of a base
+// compose file to retain. Backups are tiny (compose files are KB), so a
+// handful of generations is cheap insurance against a bad merge.
+const composeBackupKeep = 10
+
+// composeBackupPath is the timestamped snapshot path for a base compose
+// file. The timestamp is zero-padded UTC so names sort chronologically.
+func composeBackupPath(base string, at time.Time) string {
+	return base + ".whatthedock-" + at.UTC().Format("20060102-150405") + ".bak"
+}
+
+// backupComposeBase snapshots an existing base compose file to a timestamped
+// sibling immediately before an apply overwrites it, so a bad merge is always
+// recoverable. It is a no-op when the file doesn't exist yet (nothing to
+// lose). Pruning of older snapshots is best-effort.
+func backupComposeBase(base string) error {
+	info, err := os.Stat(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return nil
+	}
+	data, err := os.ReadFile(base)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(composeBackupPath(base, time.Now()), data, info.Mode().Perm()); err != nil {
+		return err
+	}
+	pruneComposeBaseBackups(base)
+	return nil
+}
+
+func pruneComposeBaseBackups(base string) {
+	matches, err := filepath.Glob(base + ".whatthedock-*.bak")
+	if err != nil || len(matches) <= composeBackupKeep {
+		return
+	}
+	sort.Strings(matches)
+	for _, old := range matches[:len(matches)-composeBackupKeep] {
+		_ = os.Remove(old)
+	}
+}
+
+// backupComposeBaseRemote is backupComposeBase's SSH counterpart. The
+// snapshot path is computed locally (same zero-padded UTC shape) so it can be
+// quoted safely as a single argument and returned for messages.
+func backupComposeBaseRemote(ctx context.Context, system config.System, base string) error {
+	if _, err := sshRun(ctx, system, "test -f "+systems.ShellQuote(base), ""); err != nil {
+		return nil
+	}
+	backup := composeBackupPath(base, time.Now())
+	if _, err := sshRun(ctx, system, "cp -p "+systems.ShellQuote(base)+" "+systems.ShellQuote(backup), ""); err != nil {
+		return err
+	}
+	pruneComposeBaseBackupsRemote(ctx, system, base)
+	return nil
+}
+
+func pruneComposeBaseBackupsRemote(ctx context.Context, system config.System, base string) {
+	// The glob's trailing `*` must stay outside the quoted prefix so the
+	// remote shell expands it; the prefix itself is still quoted for spaces.
+	out, err := sshRun(ctx, system, "ls -1 "+systems.ShellQuote(base)+".whatthedock-*.bak", "")
+	if err != nil {
+		return
+	}
+	var matches []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			matches = append(matches, line)
+		}
+	}
+	if len(matches) <= composeBackupKeep {
+		return
+	}
+	sort.Strings(matches)
+	for _, old := range matches[:len(matches)-composeBackupKeep] {
+		_, _ = sshRun(ctx, system, "rm -f "+systems.ShellQuote(old), "")
+	}
+}
+
 func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) error {
 	if strings.TrimSpace(spec.BaseFile) == "" {
 		return errors.New("compose file is required")
@@ -2368,6 +2502,10 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
+	if err := backupComposeBaseRemote(ctx, spec.System, spec.BaseFile); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
 	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
@@ -2400,6 +2538,10 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 			_ = os.Remove(tempBase)
 			return err
 		}
+		if err := backupComposeBase(spec.BaseFile); err != nil {
+			_ = os.Remove(tempBase)
+			return err
+		}
 		if err := os.Rename(tempBase, spec.BaseFile); err != nil {
 			_ = os.Remove(tempBase)
 			return err
@@ -2428,6 +2570,10 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	tempSpec.BaseFile = tempBase
 	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_ = os.Remove(tempBase)
+		return err
+	}
+	if err := backupComposeBase(spec.BaseFile); err != nil {
 		_ = os.Remove(tempBase)
 		return err
 	}
@@ -2497,6 +2643,10 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 			return err
 		}
+		if err := backupComposeBaseRemote(ctx, spec.System, spec.BaseFile); err != nil {
+			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+			return err
+		}
 		if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 			return err
@@ -2525,6 +2675,10 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	tempSpec.BaseFile = tempBase
 	composeProgress(spec, "validating "+spec.Service+"…")
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	if err := backupComposeBaseRemote(ctx, spec.System, spec.BaseFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
@@ -2623,7 +2777,20 @@ func defaultApplyComposeDelete(ctx context.Context, spec composeCreateSpec) erro
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(spec.BaseFile, updated, 0o644)
+	// Back up, then write atomically — delete used to overwrite the base
+	// file in place, so a crash or a bad edit left no recoverable copy.
+	if err := backupComposeBase(spec.BaseFile); err != nil {
+		return err
+	}
+	tempBase := spec.BaseFile + ".tmp"
+	if err := os.WriteFile(tempBase, updated, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+		_ = os.Remove(tempBase)
+		return err
+	}
+	return nil
 }
 
 // applyComposeDeleteRemote is defaultApplyComposeDelete's SSH counterpart.
@@ -2645,8 +2812,18 @@ func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error
 	if err != nil {
 		return err
 	}
-	_, err = sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(spec.BaseFile), string(updated))
-	return err
+	if err := backupComposeBaseRemote(ctx, spec.System, spec.BaseFile); err != nil {
+		return err
+	}
+	tempBase := spec.BaseFile + ".tmp"
+	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), string(updated)); err != nil {
+		return err
+	}
+	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
+		return err
+	}
+	return nil
 }
 
 // defaultApplyComposeDeleteStack permanently removes an entire project:
@@ -2676,6 +2853,9 @@ func defaultApplyComposeDeleteStack(ctx context.Context, spec composeCreateSpec)
 			return err
 		}
 	}
+	if err := backupComposeBase(spec.BaseFile); err != nil {
+		return err
+	}
 	return os.Remove(spec.BaseFile)
 }
 
@@ -2694,6 +2874,9 @@ func applyComposeDeleteStackRemote(ctx context.Context, spec composeCreateSpec) 
 		if _, err := sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(overridePath), ""); err != nil {
 			return err
 		}
+	}
+	if err := backupComposeBaseRemote(ctx, spec.System, spec.BaseFile); err != nil {
+		return err
 	}
 	_, err = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.BaseFile), "")
 	return err
@@ -3177,7 +3360,10 @@ func (d createDraft) Preview() string {
 	if d.Mode == createModeStandalone {
 		return d.standalonePreview()
 	}
-	if d.OverrideRawSet {
+	// Mirrors ComposeSpec's precedence: OverrideRaw only reflects what's on
+	// screen while no field has been edited (see FieldsDirty). Otherwise the
+	// confirm preview would show stale values the apply path won't write.
+	if d.OverrideRawSet && !d.FieldsDirty {
 		return d.OverrideRaw
 	}
 	return d.composePreview()

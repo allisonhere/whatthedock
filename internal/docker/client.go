@@ -35,9 +35,13 @@ func NewLocalProvider() (*LocalProvider, error) {
 }
 
 func NewProvider(id, name, dockerHost string) (*LocalProvider, error) {
+	// FromEnv must stay first so the Docker TLS/CA/cert and API-version env
+	// vars (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH, DOCKER_API_VERSION) are
+	// honored. An explicit host is appended after, so it still wins over
+	// DOCKER_HOST without discarding that TLS configuration.
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
 	if dockerHost != "" {
-		opts = append([]client.Opt{client.WithHost(dockerHost)}, client.WithAPIVersionNegotiation())
+		opts = append(opts, client.WithHost(dockerHost))
 	}
 	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {

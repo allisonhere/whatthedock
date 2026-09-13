@@ -166,10 +166,11 @@ func TestAnalyzeOpenAIMissingAPIKey(t *testing.T) {
 }
 
 func TestAnalyzeGeminiSendsRequestAndParsesResponse(t *testing.T) {
-	var gotPath, gotQuery string
+	var gotPath, gotHeader, gotQuery string
 	var gotBody geminiRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotHeader = r.Header.Get("x-goog-api-key")
 		gotQuery = r.URL.Query().Get("key")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"looks fine"}]}}]}`))
@@ -187,11 +188,32 @@ func TestAnalyzeGeminiSendsRequestAndParsesResponse(t *testing.T) {
 	if gotPath != "/v1beta/models/"+geminiDefaultModel+":generateContent" {
 		t.Fatalf("path = %q, want the default model's generateContent path", gotPath)
 	}
-	if gotQuery != "gm-test" {
-		t.Fatalf("key query param = %q, want gm-test", gotQuery)
+	if gotQuery != "" {
+		t.Fatalf("key query param = %q, want the key sent only as a header (a query key leaks into error text)", gotQuery)
+	}
+	if gotHeader != "gm-test" {
+		t.Fatalf("x-goog-api-key header = %q, want gm-test", gotHeader)
 	}
 	if len(gotBody.Contents) != 1 || len(gotBody.Contents[0].Parts) != 1 || gotBody.Contents[0].Parts[0].Text != "diagnose this" {
 		t.Fatalf("contents = %#v, want the prompt as the single part", gotBody.Contents)
+	}
+}
+
+// TestAnalyzeGeminiDoesNotLeakAPIKeyIntoErrors guards the reported bug: the
+// Gemini key used to ride in the URL query, and a failed request's
+// http.Client error embeds that URL, so the key showed up in the Problems
+// pane's user-visible (and copyable) error text.
+func TestAnalyzeGeminiDoesNotLeakAPIKeyIntoErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	server.Close()
+	withFakeUpstream(t, server)
+
+	_, err := Analyze(context.Background(), Config{Provider: ProviderGemini, APIKey: "super-secret-key"}, "p")
+	if err == nil {
+		t.Fatal("Analyze() error = nil, want a transport error")
+	}
+	if strings.Contains(err.Error(), "super-secret-key") {
+		t.Fatalf("error leaked the API key: %v", err)
 	}
 }
 

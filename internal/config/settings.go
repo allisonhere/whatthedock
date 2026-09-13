@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -101,6 +102,18 @@ func SaveSettings(path string, settings Settings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	// Never destroy a settings file we can't parse. A corrupt file (partial
+	// write, manual-edit typo) otherwise gets silently replaced by this
+	// default-valued save on the next launch, taking the user's only copy
+	// with it; move it aside first so it can be recovered.
+	if existing, err := os.ReadFile(path); err == nil {
+		var probe Settings
+		if json.Unmarshal(existing, &probe) != nil {
+			if err := backupCorruptSettings(path); err != nil {
+				return err
+			}
+		}
+	}
 	data, err := json.MarshalIndent(settings, "", "\t")
 	if err != nil {
 		return err
@@ -110,6 +123,23 @@ func SaveSettings(path string, settings Settings) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+// backupCorruptSettings renames path to a ".corrupt" sibling, avoiding
+// clobbering an existing backup from an earlier failure.
+func backupCorruptSettings(path string) error {
+	backup := path + ".corrupt"
+	for i := 1; ; i++ {
+		_, err := os.Stat(backup)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		backup = fmt.Sprintf("%s.%d", path+".corrupt", i)
+	}
+	return os.Rename(path, backup)
 }
 
 func DefaultSystem() System {

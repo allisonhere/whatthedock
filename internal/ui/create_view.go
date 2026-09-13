@@ -51,7 +51,14 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			if err != nil {
 				prompt = "Create Compose service " + name + "?"
 			} else {
-				prompt = "Write " + short(spec.OverrideFile, max(12, contentWidth-10)) + " and run compose up for " + name + "?"
+				// Name the file the apply will actually write: the base
+				// compose file for a merge into an existing service, the
+				// generated override for a brand-new service.
+				target := spec.OverrideFile
+				if m.createDraft.confirmDiffPath != "" {
+					target = m.createDraft.confirmDiffPath
+				}
+				prompt = "Write " + short(target, max(12, contentWidth-10)) + " and run compose up for " + name + "?"
 			}
 		default:
 			prompt = "Create and start standalone container " + name + "?"
@@ -81,12 +88,21 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		}
 		fixedRows := strings.Count(promptRendered, "\n") + 1 /* prompt */ + 1 /* blank above preview */ + 1 /* blank below preview */ + progressRows
 		previewBudget := max(3, m.softOverlayBodyBudget()-fixedRows)
-		previewLines := strings.Split(m.createDraft.Preview(), "\n")
-		previewText := m.createDraft.Preview()
-		if len(previewLines) > previewBudget {
-			hidden := len(previewLines) - (previewBudget - 1)
-			previewLines = append(previewLines[:previewBudget-1], fmt.Sprintf("… %d more lines — esc back, ctrl+y to review the full file", hidden))
-			previewText = strings.Join(previewLines, "\n")
+		var previewText string
+		if m.createDraft.confirmDiffLabel != "" {
+			// Show exactly what the apply will change in the target file,
+			// rather than the regenerated preview that could disagree with
+			// the merge actually written (the mismatch that hid the
+			// compose-edit data-loss bug).
+			previewText = renderConfirmDiff(m.createDraft.confirmDiffLabel, m.createDraft.confirmDiffLines, previewBudget)
+		} else {
+			previewLines := strings.Split(m.createDraft.Preview(), "\n")
+			previewText = m.createDraft.Preview()
+			if len(previewLines) > previewBudget {
+				hidden := len(previewLines) - (previewBudget - 1)
+				previewLines = append(previewLines[:previewBudget-1], fmt.Sprintf("… %d more lines — esc back, ctrl+y to review the full file", hidden))
+				previewText = strings.Join(previewLines, "\n")
+			}
 		}
 		actionRow := renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "y", Label: confirmLabel},
