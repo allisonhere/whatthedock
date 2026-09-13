@@ -409,3 +409,125 @@ func TestPluralCount(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctorFlagsGroupReadableSettings guards the settings-file permission
+// check: settings.json holds the AI API key, so a file readable by other
+// users must warn (SaveSettings tightens it on the next save).
+func TestDoctorFlagsGroupReadableSettings(t *testing.T) {
+	deps := baseDoctorDeps(t)
+	if err := os.WriteFile(deps.settingsPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(deps.settingsPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report := buildDoctorReport(context.Background(), deps)
+	c, ok := findCheck(report, sectionApp, "Config permissions")
+	if !ok {
+		t.Fatalf("missing Config permissions check:\n%s", renderDoctorText(report))
+	}
+	if c.Severity != sevWarn {
+		t.Fatalf("Config permissions severity = %v, want WARN for a 0644 settings file", c.Severity)
+	}
+}
+
+func TestDoctorPassesOwnerOnlySettings(t *testing.T) {
+	deps := baseDoctorDeps(t)
+	if err := os.WriteFile(deps.settingsPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(deps.settingsPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := buildDoctorReport(context.Background(), deps)
+	c, ok := findCheck(report, sectionApp, "Config permissions")
+	if !ok || c.Severity != sevPass {
+		t.Fatalf("Config permissions = %#v, want PASS for a 0600 settings file", c)
+	}
+}
+
+// TestDoctorComposeBackupDetectsLostUnmanagedKeys is the recovery check's
+// whole point: a live compose file that has lost unmanaged keys (here
+// container_name/network_mode/build) relative to its most recent pre-apply
+// backup must warn and point at the backup.
+func TestDoctorComposeBackupDetectsLostUnmanagedKeys(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yaml")
+	backup := base + ".whatthedock-20260101-000000.bak"
+	full := `services:
+  dash:
+    build: .
+    image: dash:latest
+    container_name: dash
+    restart: unless-stopped
+    network_mode: host
+`
+	reduced := "services:\n  dash:\n    image: dash:latest\n    restart: unless-stopped\n"
+	if err := os.WriteFile(base, []byte(reduced), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte(full), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := baseDoctorDeps(t)
+	deps.newDockerChecker = func(string) (dockerChecker, error) {
+		return &fakeDockerChecker{
+			version:    "27.0.0",
+			apiVersion: "1.47",
+			snapshot: domain.Snapshot{Standalone: []domain.Container{{
+				Compose: domain.ComposeRef{Project: "media", Service: "dash", ConfigFiles: base},
+			}}},
+		}, nil
+	}
+
+	report := buildDoctorReport(context.Background(), deps)
+	c, ok := findCheck(report, sectionBackups, "compose.yaml (dash)")
+	if !ok {
+		t.Fatalf("missing compose backup check:\n%s", renderDoctorText(report))
+	}
+	if c.Severity != sevWarn {
+		t.Fatalf("backup check severity = %v, want WARN", c.Severity)
+	}
+	for _, want := range []string{"build", "container_name", "network_mode"} {
+		if !strings.Contains(c.Message, want) {
+			t.Fatalf("backup check message = %q, missing %q", c.Message, want)
+		}
+	}
+	if !strings.Contains(c.Remediation, backup) {
+		t.Fatalf("backup check remediation = %q, want it to name the backup file", c.Remediation)
+	}
+}
+
+// TestDoctorComposeBackupCleanWhenNoKeysLost ensures the check stays quiet
+// when the file already contains everything the backup did.
+func TestDoctorComposeBackupCleanWhenNoKeysLost(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "compose.yaml")
+	backup := base + ".whatthedock-20260101-000000.bak"
+	full := "services:\n  dash:\n    image: dash:latest\n    container_name: dash\n    restart: unless-stopped\n"
+	for _, path := range []string{base, backup} {
+		if err := os.WriteFile(path, []byte(full), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deps := baseDoctorDeps(t)
+	deps.newDockerChecker = func(string) (dockerChecker, error) {
+		return &fakeDockerChecker{
+			snapshot: domain.Snapshot{Standalone: []domain.Container{{
+				Compose: domain.ComposeRef{Project: "media", Service: "dash", ConfigFiles: base},
+			}}},
+		}, nil
+	}
+
+	report := buildDoctorReport(context.Background(), deps)
+	if c, ok := findCheck(report, sectionBackups, "compose.yaml (dash)"); ok {
+		t.Fatalf("unexpected per-file backup warning: %#v", c)
+	}
+	if c, ok := findCheck(report, sectionBackups, "Compose files"); !ok || c.Severity != sevPass {
+		t.Fatalf("Compose files = %#v, want a PASS row", c)
+	}
+}

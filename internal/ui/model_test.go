@@ -6652,6 +6652,36 @@ func TestRecordAppLogSaveWritesFile(t *testing.T) {
 	}
 }
 
+// TestAppLogFileIsOwnerOnly checks the on-disk log is 0600 — it can carry
+// error text — and that an older 0644 log is tightened on the next write.
+func TestAppLogFileIsOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "whatthedock.log")
+	if err := os.WriteFile(logPath, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(logPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model := testModel()
+	model.settingsPath = filepath.Join(dir, "settings.json")
+	model.settings.AppLog = appLogSave
+	model.status, model.statusErr = "applying compose service web", false
+	model.recordAppLog("", false)
+	if model.appLogFile != nil {
+		defer model.appLogFile.Close()
+	}
+
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("whatthedock.log perms = %o, want 0600", perm)
+	}
+}
+
 // TestUpdateWrapperRecordsAppLog checks the real Update entry point (not
 // recordAppLog called directly) records a line when a message sets an error
 // status — this is what every one of Update's existing status-setting call

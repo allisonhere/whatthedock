@@ -4071,10 +4071,13 @@ func (m *Model) writeAppLogLine(line string) {
 		if path == "" {
 			return
 		}
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return
 		}
+		// The app log can carry error text; keep it owner-only, and tighten
+		// a log left behind at the old 0644 by an earlier version.
+		_ = f.Chmod(0o600)
 		m.appLogFile = f
 	}
 	fmt.Fprintln(m.appLogFile, line)

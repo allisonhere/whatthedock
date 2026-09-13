@@ -18,9 +18,11 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/allisonhere/whatthedock/internal/composefile"
 	"github.com/allisonhere/whatthedock/internal/config"
 	"github.com/allisonhere/whatthedock/internal/docker"
 	"github.com/allisonhere/whatthedock/internal/domain"
@@ -228,10 +230,11 @@ func buildDoctorReport(ctx context.Context, deps doctorDeps) doctorReport {
 	normalized := config.NormalizeSystems(raw)
 
 	appChecks(&report, deps, rawForSanity, rawErr, normalized)
-	dockerChecks(ctx, &report, deps, normalized)
+	snapshot, haveSnapshot := dockerChecks(ctx, &report, deps, normalized)
 	localSystemChecks(&report, deps, normalized)
 	remoteSystemChecks(&report, deps, normalized)
 	composeChecks(ctx, &report, deps, normalized)
+	composeBackupChecks(&report, snapshot, haveSnapshot)
 
 	return report
 }
@@ -269,6 +272,7 @@ func appChecks(report *doctorReport, deps doctorDeps, raw config.Settings, rawEr
 		} else {
 			report.add(sectionApp, "Config loads", sevPass, "ok", "")
 		}
+		checkSettingsPermissions(report, deps.settingsPath)
 	}
 
 	active := config.FindSystem(normalized.Systems, normalized.ActiveSystem)
@@ -353,7 +357,7 @@ func displaySystemName(sys config.System) string {
 
 const sectionDocker = "Docker"
 
-func dockerChecks(ctx context.Context, report *doctorReport, deps doctorDeps, normalized config.Settings) {
+func dockerChecks(ctx context.Context, report *doctorReport, deps doctorDeps, normalized config.Settings) (domain.Snapshot, bool) {
 	active := config.FindSystem(normalized.Systems, normalized.ActiveSystem)
 	if active == nil {
 		local := config.DefaultSystem()
@@ -365,13 +369,13 @@ func dockerChecks(ctx context.Context, report *doctorReport, deps doctorDeps, no
 
 	if active.Kind == "ssh" && !systems.IsLiveSocket(active.LocalSocket) {
 		report.add(sectionDocker, "Connection", sevWarn, "tunnel not active", "Switch to this system in WhatTheDock first to establish the tunnel — doctor never starts one itself.")
-		return
+		return domain.Snapshot{}, false
 	}
 
 	checker, err := deps.newDockerChecker(dockerHost)
 	if err != nil {
 		report.add(sectionDocker, "Client", sevFail, "could not create Docker client", err.Error())
-		return
+		return domain.Snapshot{}, false
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, dockerCheckTimeout)
@@ -379,7 +383,7 @@ func dockerChecks(ctx context.Context, report *doctorReport, deps doctorDeps, no
 	cancel()
 	if pingErr != nil {
 		report.add(sectionDocker, "Connection", sevFail, "unreachable", pingErr.Error())
-		return
+		return domain.Snapshot{}, false
 	}
 	report.add(sectionDocker, "Connection", sevPass, "reachable", "")
 
@@ -401,9 +405,10 @@ func dockerChecks(ctx context.Context, report *doctorReport, deps doctorDeps, no
 	cancel()
 	if snapErr != nil {
 		report.add(sectionDocker, "Containers", sevFail, "listing failed", snapErr.Error())
-		return
+		return domain.Snapshot{}, false
 	}
 	report.add(sectionDocker, "Containers", sevPass, fmt.Sprintf("%d visible", countContainers(snapshot)), "")
+	return snapshot, true
 }
 
 func countContainers(snapshot domain.Snapshot) int {
@@ -503,6 +508,121 @@ func staleTunnelSocketCheck(report *doctorReport, normalized config.Settings) {
 	default:
 		report.add(sectionLocal, "Tunnel sockets", sevPass, "none found", "")
 	}
+}
+
+// checkSettingsPermissions warns when settings.json is readable by users
+// other than its owner. It holds AIAPIKey, and while SaveSettings tightens
+// permissions to 0600 on every save, a file left over from before that
+// (or hand-edited) can still be looser until the next write.
+func checkSettingsPermissions(report *doctorReport, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return // no file yet (or unreadable) — nothing to report
+	}
+	mode := info.Mode().Perm()
+	if mode&0o077 != 0 {
+		report.add(sectionApp, "Config permissions", sevWarn,
+			fmt.Sprintf("%s is %o (readable by other users)", path, mode),
+			"It stores the AI API key; permissions are tightened to 0600 the next time settings are saved.")
+		return
+	}
+	report.add(sectionApp, "Config permissions", sevPass, fmt.Sprintf("%o", mode), "")
+}
+
+const sectionBackups = "Compose backups"
+
+// composeBackupChecks compares each backed-up base compose file against its
+// most recent pre-apply snapshot and warns when a service has lost an
+// unmanaged key (build, container_name, network_mode, depends_on, ...) that
+// the backup still had. The form never removes those, so their disappearance
+// is the fingerprint of the apply bug that wiped a live stack. Read-only:
+// the backup is reported, never restored.
+func composeBackupChecks(report *doctorReport, snapshot domain.Snapshot, haveSnapshot bool) {
+	if !haveSnapshot {
+		return
+	}
+	type target struct{ file, service string }
+	var targets []target
+	seen := map[string]bool{}
+	for _, ctr := range allDoctorContainers(snapshot) {
+		service := strings.TrimSpace(ctr.Compose.Service)
+		if ctr.Compose.Project == "" || service == "" {
+			continue
+		}
+		for _, file := range splitDoctorConfigFiles(ctr.Compose.ConfigFiles) {
+			key := file + "\x00" + service
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			targets = append(targets, target{file: file, service: service})
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].file != targets[j].file {
+			return targets[i].file < targets[j].file
+		}
+		return targets[i].service < targets[j].service
+	})
+
+	checked, warned := 0, 0
+	for _, t := range targets {
+		backups, err := filepath.Glob(t.file + ".whatthedock-*.bak")
+		if err != nil || len(backups) == 0 {
+			continue
+		}
+		sort.Strings(backups) // zero-padded timestamps sort chronologically
+		newest := backups[len(backups)-1]
+		current, err := os.ReadFile(t.file)
+		if err != nil {
+			continue
+		}
+		backup, err := os.ReadFile(newest)
+		if err != nil {
+			continue
+		}
+		lost, err := composefile.LostUnmanagedKeys(current, backup, t.service)
+		if err != nil {
+			continue
+		}
+		checked++
+		if len(lost) == 0 {
+			continue
+		}
+		warned++
+		report.add(sectionBackups, filepath.Base(t.file)+" ("+t.service+")", sevWarn,
+			"missing unmanaged key(s) its last backup had: "+strings.Join(lost, ", "),
+			"Restore "+newest+" if this loss was unintentional.")
+	}
+	if checked > 0 && warned == 0 {
+		report.add(sectionBackups, "Compose files", sevPass,
+			fmt.Sprintf("%d backed-up compose file(s) intact", checked), "")
+	}
+}
+
+// allDoctorContainers flattens a snapshot into every container it knows
+// about, mirroring countContainers' traversal.
+func allDoctorContainers(snapshot domain.Snapshot) []domain.Container {
+	var out []domain.Container
+	for _, project := range snapshot.Projects {
+		for _, service := range project.Services {
+			out = append(out, service.Containers...)
+		}
+	}
+	return append(out, snapshot.Standalone...)
+}
+
+// splitDoctorConfigFiles splits the comma/newline-separated
+// com.docker.compose.project.config_files label value.
+func splitDoctorConfigFiles(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '\n' })
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 const sectionRemote = "Remote systems"
