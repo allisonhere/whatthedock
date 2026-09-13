@@ -345,11 +345,10 @@ func aboutShipFinalFrameStart() int {
 // terminal prototype: a cycling arm-stroke glyph (aboutSwimArmGlyphs,
 // indexed by swimmerCol so the stroke advances in lockstep with movement)
 // trailing behind a head ('o') and a leading ">" marker — in that
-// left-to-right order, matching the direction of travel. The water from
-// aboutSwimStartColumn onward is repainted to the swim epilogue's own
-// brighter palette (aboutSwimWater) the whole time this function is active,
-// distinct from the darker storm-aftermath tone the settled-ocean frame
-// otherwise leaves there.
+// left-to-right order, matching the direction of travel. The settled middle
+// water row is repainted to the swim epilogue's own brighter palette
+// (aboutSwimWater) across the whole stage while this function is active, so
+// its left and right sides remain visually continuous.
 func overlayAboutSwimmerCells(cells []aboutCell, stageStart, stageWidth, elapsed int, text string) []aboutCell {
 	swimStart := aboutShipFinalFrameStart() + aboutSwimStartDelay
 	if elapsed < swimStart {
@@ -366,7 +365,7 @@ func overlayAboutSwimmerCells(cells []aboutCell, stageStart, stageWidth, elapsed
 	}
 	onStage := swimmerCol < stageWidth
 
-	for i := aboutSwimStartColumn; i < stageWidth; i++ {
+	for i := 0; i < stageWidth; i++ {
 		if pos := stageStart + i; pos >= 0 && pos < len(cells) {
 			cells[pos] = aboutCell{r: '~', color: aboutSwimWater}
 		}
