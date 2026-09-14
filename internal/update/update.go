@@ -37,6 +37,41 @@ var httpClient = &http.Client{}
 // caller passes a context without a deadline.
 const latestReleaseTimeout = 15 * time.Second
 
+// Response-size caps. The release binary is a few MB, so 200 MiB is already
+// far more than any real asset; a detached ed25519 signature is a fixed 64
+// bytes, so 4 KiB is generous. Without these a hostile or misbehaving server
+// (or a redirect to one) could stream unbounded data into memory or disk.
+const (
+	maxReleaseBinaryBytes = 200 << 20
+	maxSignatureBytes     = 4 << 10
+)
+
+// copyLimited copies from src to dst, failing if more than max bytes arrive.
+// It reads one byte past max so an over-limit body is detected rather than
+// silently truncated.
+func copyLimited(dst io.Writer, src io.Reader, max int64) (int64, error) {
+	n, err := io.Copy(dst, io.LimitReader(src, max+1))
+	if err != nil {
+		return n, err
+	}
+	if n > max {
+		return n, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return n, nil
+}
+
+// readAllLimited is copyLimited's in-memory counterpart.
+func readAllLimited(src io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(src, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
+
 // executableOverride is os.Executable behind a seam so tests can point
 // ReplaceRunningExecutable at a throwaway file instead of the real test
 // binary's own path.
@@ -162,7 +197,7 @@ func download(ctx context.Context, url, dir string) (string, error) {
 		return "", err
 	}
 	name := tmp.Name()
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	if _, err := copyLimited(tmp, resp.Body, maxReleaseBinaryBytes); err != nil {
 		tmp.Close()
 		os.Remove(name)
 		return "", err
@@ -195,7 +230,7 @@ func downloadBytes(ctx context.Context, url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download %s: unexpected status %s", url, resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	return readAllLimited(resp.Body, maxSignatureBytes)
 }
 
 // ReplaceRunningExecutable downloads version's release asset for repo,

@@ -150,10 +150,23 @@ func NormalizeSystems(settings Settings) Settings {
 	if len(settings.Systems) == 0 {
 		settings.Systems = []System{DefaultSystem()}
 	}
+	// IDs generated from names must be unique: two systems whose names slug
+	// to the same value previously ended up sharing a LocalSocket and a
+	// keychain service entry (so one could reuse the other's tunnel and
+	// stored password). Explicit IDs are left untouched — the doctor's config
+	// sanity check flags those as a real duplicate rather than silently
+	// renaming a user-chosen id here.
+	used := make(map[string]bool, len(settings.Systems))
+	for _, sys := range settings.Systems {
+		if sys.ID != "" {
+			used[sys.ID] = true
+		}
+	}
 	for i := range settings.Systems {
 		if settings.Systems[i].ID == "" {
-			settings.Systems[i].ID = systemID(settings.Systems[i].Name)
+			settings.Systems[i].ID = uniqueSystemID(used, systemID(settings.Systems[i].Name))
 		}
+		used[settings.Systems[i].ID] = true
 		if settings.Systems[i].Name == "" {
 			settings.Systems[i].Name = settings.Systems[i].ID
 		}
@@ -188,6 +201,24 @@ func NormalizeSystems(settings Settings) Settings {
 		settings.ActiveSystem = settings.Systems[0].ID
 	}
 	return settings
+}
+
+// uniqueSystemID returns base if it's unused, otherwise the first free
+// "base-N". Empty bases collapse to "system" so a blank name still gets a
+// usable, unique id.
+func uniqueSystemID(used map[string]bool, base string) string {
+	if base == "" {
+		base = "system"
+	}
+	if !used[base] {
+		return base
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%d", base, n)
+		if !used[candidate] {
+			return candidate
+		}
+	}
 }
 
 func splitSSHUserHost(value string) (string, string, bool) {

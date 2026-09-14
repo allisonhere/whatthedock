@@ -147,7 +147,8 @@ func TestComposeServiceFieldsFromContent(t *testing.T) {
 	if !ok {
 		t.Fatal("composeServiceFieldsFromContent() ok = false, want true")
 	}
-	if fields.Image != "redis:7" || fields.Restart != "unless-stopped" || len(fields.Ports) != 1 || fields.Ports[0] != "6379:6379" {
+	ports := normalizeComposePorts(fields.Ports)
+	if fields.Image != "redis:7" || fields.Restart != "unless-stopped" || len(ports) != 1 || ports[0] != "6379:6379" {
 		t.Fatalf("fields = %#v, unexpected values", fields)
 	}
 	if _, ok := composeServiceFieldsFromContent(content, "missing"); ok {

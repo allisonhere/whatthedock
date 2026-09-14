@@ -162,10 +162,10 @@ func mergeComposeServiceFields(base []byte, service string, fields composeOverri
 		setMappingScalar(value, "command", normalizeComposeCommand(fields.Command))
 	}
 	if changed&composeFieldPorts != 0 {
-		setMappingList(value, "ports", fields.Ports)
+		setMappingList(value, "ports", normalizeComposePorts(fields.Ports))
 	}
 	if changed&composeFieldVolumes != 0 {
-		setMappingList(value, "volumes", fields.Volumes)
+		setMappingList(value, "volumes", normalizeComposeVolumes(fields.Volumes))
 	}
 	if changed&composeFieldEnvironment != 0 {
 		setMappingList(value, "environment", normalizeComposeEnvironment(fields.Environment))

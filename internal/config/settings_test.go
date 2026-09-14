@@ -230,3 +230,41 @@ func TestSettingsPathUsesUserConfigDir(t *testing.T) {
 		t.Fatalf("SettingsPath() = %q, want %q", path, want)
 	}
 }
+
+// TestNormalizeSystemsGivesCollidingNamesDistinctIDs guards against two
+// systems whose names slugify to the same id: they used to share a
+// LocalSocket and keychain service entry, so one could reuse the other's
+// tunnel and stored password.
+func TestNormalizeSystemsGivesCollidingNamesDistinctIDs(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{
+			{Name: "Prod", Kind: "ssh", SSHHost: "a.example"},
+			{Name: "prod", Kind: "ssh", SSHHost: "b.example"},
+		},
+	})
+
+	first, second := settings.Systems[0], settings.Systems[1]
+	if first.ID == second.ID {
+		t.Fatalf("colliding names share id %q", first.ID)
+	}
+	if first.LocalSocket == second.LocalSocket {
+		t.Fatalf("colliding names share LocalSocket %q", first.LocalSocket)
+	}
+}
+
+// TestNormalizeSystemsGeneratedIDAvoidsExplicit checks a name-derived id
+// steps aside for an explicitly configured id, regardless of order.
+func TestNormalizeSystemsGeneratedIDAvoidsExplicit(t *testing.T) {
+	settings := NormalizeSystems(Settings{
+		Systems: []System{
+			{Name: "prod", Kind: "ssh", SSHHost: "a.example"},              // would slug to "prod"
+			{ID: "prod", Name: "other", Kind: "ssh", SSHHost: "b.example"}, // explicit "prod"
+		},
+	})
+	if settings.Systems[0].ID == "prod" {
+		t.Fatal("generated id collided with the explicit one")
+	}
+	if settings.Systems[1].ID != "prod" {
+		t.Fatalf("explicit id = %q, want it left untouched", settings.Systems[1].ID)
+	}
+}

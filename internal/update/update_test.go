@@ -1,6 +1,7 @@
 package update
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -246,5 +247,40 @@ func stubVerificationKey(t *testing.T, pub ed25519.PublicKey) func() {
 func TestHTTPClientHasNoFixedTimeout(t *testing.T) {
 	if httpClient.Timeout != 0 {
 		t.Fatalf("httpClient.Timeout = %v, want 0 (the caller's context owns the deadline)", httpClient.Timeout)
+	}
+}
+
+func TestCopyLimitedRejectsOversized(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := copyLimited(&buf, strings.NewReader("12345"), 4); err == nil {
+		t.Fatal("copyLimited() error = nil, want an over-limit error")
+	}
+	buf.Reset()
+	n, err := copyLimited(&buf, strings.NewReader("1234"), 4)
+	if err != nil || n != 4 {
+		t.Fatalf("copyLimited(exact) = %d/%v, want 4/nil", n, err)
+	}
+}
+
+func TestReadAllLimitedRejectsOversized(t *testing.T) {
+	if _, err := readAllLimited(strings.NewReader("12345"), 4); err == nil {
+		t.Fatal("readAllLimited() error = nil, want an over-limit error")
+	}
+	if _, err := readAllLimited(strings.NewReader("1234"), 4); err != nil {
+		t.Fatalf("readAllLimited(exact) error = %v, want nil", err)
+	}
+}
+
+func TestDownloadBytesRejectsOversizedSignature(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, maxSignatureBytes+1))
+	}))
+	defer server.Close()
+	original := httpClient
+	httpClient = &http.Client{Transport: rewriteHostTransport{target: server.URL, base: http.DefaultTransport}}
+	defer func() { httpClient = original }()
+
+	if _, err := downloadBytes(context.Background(), "https://example.invalid/sig"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("downloadBytes() error = %v, want an over-limit error", err)
 	}
 }

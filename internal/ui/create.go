@@ -2069,18 +2069,18 @@ func appendQuotedYAMLList(lines []string, title string, values []string, prefix 
 
 // composeOverrideDoc/composeOverrideService are the subset of Compose YAML
 // shape applyOverrideFieldsFromYAML reads back out of override content — the
-// mirror image of composeOverrideContent's generation. Environment and
-// Command are both typed as interface{} because Compose allows either of
-// them as more than one shape — Environment as a list ("KEY=value" entries)
-// or a map (KEY: value); Command as a single string or an exec-form list
-// (["sh", "-c", "..."]) — normalizeComposeEnvironment/normalizeComposeCommand
-// reconcile each into the single string/list form the rest of this file
-// works with. Decoding Command as a plain string used to hard-fail
-// yaml.Unmarshal on any real-world file with even one exec-form command
-// among its services — cannot unmarshal !!seq into string — which silently
-// aborted applyOverrideFieldsFromYAML before it ever got a chance to derive
-// anything, even though doc.Services had already been populated for every
-// service that didn't hit the mismatch.
+// mirror image of composeOverrideContent's generation. Environment, Command,
+// Ports and Volumes are all typed as interface{} because Compose allows each
+// in more than one shape: Environment as a list ("KEY=value") or a map
+// (KEY: value); Command as a plain string or an exec-form list
+// (["sh", "-c", "..."]); Ports/Volumes as a short string list or a long
+// mapping ({target: 80, published: 8080}). Decoding any of them as the single
+// shape used to hard-fail yaml.Unmarshal on a real-world file using the
+// other, which silently aborted applyOverrideFieldsFromYAML before it derived
+// anything at all — leaving every field, not just the one that couldn't be
+// parsed, stuck at its default. The normalize* helpers reconcile each shape
+// into the string/list form the rest of this file works with, and unknown
+// entries are skipped rather than aborting the load.
 type composeOverrideDoc struct {
 	Services map[string]composeOverrideService `yaml:"services"`
 }
@@ -2089,8 +2089,8 @@ type composeOverrideService struct {
 	Image       string      `yaml:"image"`
 	Restart     string      `yaml:"restart"`
 	Command     interface{} `yaml:"command"`
-	Ports       []string    `yaml:"ports"`
-	Volumes     []string    `yaml:"volumes"`
+	Ports       interface{} `yaml:"ports"`
+	Volumes     interface{} `yaml:"volumes"`
 	Environment interface{} `yaml:"environment"`
 }
 
@@ -2136,8 +2136,8 @@ func (d *createDraft) applyOverrideFieldsFromYAML(content string) {
 		d.Restart = svc.Restart
 	}
 	d.Command = normalizeComposeCommand(svc.Command)
-	d.Ports = strings.Join(svc.Ports, ", ")
-	d.Mounts = strings.Join(svc.Volumes, ", ")
+	d.Ports = strings.Join(normalizeComposePorts(svc.Ports), ", ")
+	d.Mounts = strings.Join(normalizeComposeVolumes(svc.Volumes), ", ")
 	d.Env = formatEnvEntries(normalizeComposeEnvironment(svc.Environment))
 }
 
@@ -2246,12 +2246,138 @@ func normalizeComposeEnvironment(v interface{}) []string {
 	case map[string]interface{}:
 		out := make([]string, 0, len(val))
 		for k, v := range val {
+			if v == nil {
+				// Compose's "environment:\n  FOO:" means pass the host's
+				// FOO through. The form can only represent KEY=value, so
+				// emit an empty value rather than the literal "<nil>" a
+				// bare %v produced — which silently set the variable to
+				// the string "<nil>".
+				out = append(out, k+"=")
+				continue
+			}
 			out = append(out, fmt.Sprintf("%s=%v", k, v))
 		}
 		sort.Strings(out)
 		return out
 	default:
 		return nil
+	}
+}
+
+// normalizeComposePorts reconciles Compose's short string list ("8080:80")
+// with the long mapping form ({target: 80, published: 8080, protocol: tcp})
+// into the short strings the form's Ports field uses. Entries that can't be
+// represented in the form (a container-only target with no published port,
+// or an unknown shape) are skipped rather than aborting the whole load — the
+// raw file keeps them, and the selective merge leaves them untouched unless
+// the user actually edits the ports.
+func normalizeComposePorts(v interface{}) []string {
+	items := toInterfaceSlice(v)
+	if items == nil {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		switch entry := item.(type) {
+		case string:
+			if strings.TrimSpace(entry) != "" {
+				out = append(out, entry)
+			}
+		case map[string]interface{}:
+			if s := longComposePortToShort(entry); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+func longComposePortToShort(m map[string]interface{}) string {
+	target := scalarString(m["target"])
+	published := scalarString(m["published"])
+	if target == "" || published == "" {
+		return "" // container-only ports can't be expressed in the form's parser
+	}
+	value := published + ":" + target
+	if hostIP := scalarString(m["host_ip"]); hostIP != "" {
+		value = hostIP + ":" + value
+	}
+	if protocol := scalarString(m["protocol"]); protocol != "" && !strings.EqualFold(protocol, "tcp") {
+		value += "/" + protocol
+	}
+	return value
+}
+
+// normalizeComposeVolumes is normalizeComposePorts' volume counterpart:
+// short strings pass through, long mappings ({type, source, target,
+// read_only}) become "source:target[:ro]", and anything without a source
+// (anonymous volumes can't be expressed as "source:target") is skipped.
+func normalizeComposeVolumes(v interface{}) []string {
+	items := toInterfaceSlice(v)
+	if items == nil {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		switch entry := item.(type) {
+		case string:
+			if strings.TrimSpace(entry) != "" {
+				out = append(out, entry)
+			}
+		case map[string]interface{}:
+			source := scalarString(entry["source"])
+			target := scalarString(entry["target"])
+			if source == "" || target == "" {
+				continue
+			}
+			value := source + ":" + target
+			if readOnly, ok := entry["read_only"].(bool); ok && readOnly {
+				value += ":ro"
+			}
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+// toInterfaceSlice normalizes a decoded YAML sequence to []interface{}.
+// yaml.Unmarshal into an interface{} yields []interface{}, but a Go literal
+// (tests, callers constructing a composeOverrideService directly) may supply
+// []string; both are accepted.
+func toInterfaceSlice(v interface{}) []interface{} {
+	switch s := v.(type) {
+	case []interface{}:
+		return s
+	case []string:
+		out := make([]interface{}, len(s))
+		for i, e := range s {
+			out[i] = e
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// scalarString renders a YAML-decoded scalar as the string the form fields
+// use, without the "<nil>" artifact fmt's %v produces for a null.
+func scalarString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(t)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", t))
 	}
 }
 
