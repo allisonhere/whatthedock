@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -326,5 +328,45 @@ func TestGenKeyPrintsMatchingKeypair(t *testing.T) {
 	sig := ed25519.Sign(ed25519.PrivateKey(priv), []byte("check"))
 	if !ed25519.Verify(ed25519.PublicKey(pub), []byte("check"), sig) {
 		t.Fatal("genKey() printed a public/private key pair that don't match each other")
+	}
+}
+
+// TestSigningKeyPreflightRejectsMismatchedKey checks the preflight refuses to
+// start a release when the configured key can't match the app's baked
+// verifier — an unrelated generated key never can.
+func TestSigningKeyPreflightRejectsMismatchedKey(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(signingKeyEnvVar, hex.EncodeToString(priv))
+
+	err = signingKeyPreflightErr()
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("signingKeyPreflightErr() = %v, want a key/verifier mismatch error", err)
+	}
+}
+
+func TestSigningKeyPreflightRejectsMalformedKey(t *testing.T) {
+	t.Setenv(signingKeyEnvVar, "not-hex")
+	if err := signingKeyPreflightErr(); err == nil {
+		t.Fatal("signingKeyPreflightErr() = nil, want a malformed-key error")
+	}
+}
+
+// TestSigningKeyPreflightAcceptsTheRepoKey is the invariant #1 fixed: when the
+// local signing key is present, it must match the public key baked into
+// internal/update. Skipped where there's no key (CI), which is exactly the
+// environment that can't cut a release anyway.
+func TestSigningKeyPreflightAcceptsTheRepoKey(t *testing.T) {
+	// The test's working directory is this package, not the repo root where
+	// the key file lives when a release actually runs.
+	data, err := os.ReadFile(filepath.Join("..", "..", signingKeyFile))
+	if err != nil {
+		t.Skip("no local signing key present")
+	}
+	t.Setenv(signingKeyEnvVar, strings.TrimSpace(string(data)))
+	if err := signingKeyPreflightErr(); err != nil {
+		t.Fatalf("signingKeyPreflightErr() = %v, want nil for the repo's own key", err)
 	}
 }

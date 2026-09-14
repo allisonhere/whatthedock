@@ -11,6 +11,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/allisonhere/whatthedock/internal/update"
 )
 
 // releasePlanSteps returns the checklist shown on screenConfirm/screenRunning
@@ -231,6 +233,27 @@ func latestTag() string {
 func tagExists(version string) bool {
 	_, err := runCmd("git", "rev-parse", "--verify", "-q", "refs/tags/"+version)
 	return err == nil
+}
+
+// signingKeyPreflightErr verifies the configured signing key actually
+// corresponds to the public key baked into internal/update, before a release
+// ever starts. Without this, a rotated key whose companion public key wasn't
+// updated (or vice versa) would build and sign successfully and only fail at
+// install time on every user's machine, with the updater refusing the
+// download. Returns nil when the key is present and matches.
+func signingKeyPreflightErr() error {
+	key, err := loadSigningKey()
+	if err != nil {
+		return err
+	}
+	matches, err := update.SigningKeyMatches(key)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return fmt.Errorf("the configured signing key does not match internal/update/verify.go's releasePublicKeyHex — every installed app would reject this release. Update the key or the constant so they match")
+	}
+	return nil
 }
 
 // commitLog returns the last n "<short-sha> <subject>" lines, most recent

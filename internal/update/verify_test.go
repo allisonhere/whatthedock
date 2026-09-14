@@ -3,6 +3,7 @@ package update
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"testing"
 )
 
@@ -78,5 +79,40 @@ func TestVerifyBinaryRejectsMalformedKeyWithoutPanicking(t *testing.T) {
 func TestReleasePublicKeyHexParsesToValidKeySize(t *testing.T) {
 	if len(verificationPublicKey) != ed25519.PublicKeySize {
 		t.Fatalf("verificationPublicKey length = %d, want %d", len(verificationPublicKey), ed25519.PublicKeySize)
+	}
+}
+
+// TestSigningKeyMatches checks the release preflight's key comparison: a
+// private key whose public half is the baked verifier must match, an
+// unrelated key must not, and malformed input is an error rather than a
+// silent false.
+func TestSigningKeyMatches(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := verificationPublicKey
+	verificationPublicKey = pub
+	defer func() { verificationPublicKey = original }()
+
+	ok, err := SigningKeyMatches(hex.EncodeToString(priv))
+	if err != nil || !ok {
+		t.Fatalf("SigningKeyMatches(matching) = %v/%v, want true/nil", ok, err)
+	}
+
+	_, other, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err = SigningKeyMatches(hex.EncodeToString(other))
+	if err != nil || ok {
+		t.Fatalf("SigningKeyMatches(unrelated) = %v/%v, want false/nil", ok, err)
+	}
+
+	if _, err := SigningKeyMatches("not-hex"); err == nil {
+		t.Fatal("SigningKeyMatches(not-hex) error = nil, want a decode error")
+	}
+	if _, err := SigningKeyMatches("abcd"); err == nil {
+		t.Fatal("SigningKeyMatches(short) error = nil, want a length error")
 	}
 }

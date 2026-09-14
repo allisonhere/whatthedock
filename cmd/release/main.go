@@ -93,6 +93,9 @@ func runAuto(version string, dryRun bool) error {
 	if tagExists(version) {
 		return fmt.Errorf("tag %s already exists — pass -version=vX.Y.Z with a version that hasn't been released yet", version)
 	}
+	if err := signingKeyPreflightErr(); err != nil {
+		return err
+	}
 	fmt.Println("whatthedock release", version)
 	if dryRun {
 		fmt.Println("(dry run — nothing will be tagged, pushed, or published)")

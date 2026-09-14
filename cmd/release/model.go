@@ -175,6 +175,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.versionErr = "tag " + m.versionInput + " already exists — pick a version that hasn't been released"
 				return m, nil
 			}
+			// Catch a signing-key/verifier mismatch here too: a build+sign
+			// that produces a release the installed app refuses to install
+			// is just as wasted as one that collides on a tag.
+			if err := signingKeyPreflightErr(); err != nil {
+				m.versionErr = err.Error()
+				return m, nil
+			}
 			m.versionErr = ""
 			m.steps = releasePlanSteps(m.versionInput)
 			m.screen = screenConfirm
