@@ -320,6 +320,18 @@ intentionally does.
 
 ## Current Limits
 
+- Applying a draft whose service already exists in the base file merges only
+  the fields that changed since the file was loaded; everything else —
+  unmanaged keys, comments, key order — is preserved. Every apply first
+  snapshots the target file to `*.whatthedock-YYYYMMDD-HHMMSS.bak` (newest ten
+  kept), the confirm screen shows the real diff of what will be written, and
+  `Ctrl+K → Restore last compose backup` (or `whatthedock doctor`) is the
+  recovery path.
+- Long-syntax `ports`/`volumes` and null `environment` values are normalized
+  into the form where representable when a file is loaded. Entries that can't
+  be represented (a container-only port with no published port, an anonymous
+  volume with no source) are skipped in the form; the file keeps them, and
+  they're left untouched unless you edit that field.
 - Base-file merge editing only touches the structured fields the create form
   itself exposes (`Image`, `Restart`, `Command`, `Ports`, `Mounts`, `Env`); it
   can't add or edit keys the form doesn't have a field for (`networks`,

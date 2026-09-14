@@ -167,6 +167,26 @@ Compose support is practical, not magical:
 - Local and SSH systems both work for Compose reads, writes, and `docker compose`
   runs.
 
+### Safe applies and recovery
+
+Writing to a Compose file is treated as something you may want to undo:
+
+- Before every apply, WhatTheDock snapshots the target file to a timestamped
+  sibling (`compose.yaml.whatthedock-YYYYMMDD-HHMMSS.bak`) and keeps the newest
+  ten.
+- The confirmation screen shows a real diff of the file that will be written —
+  the added and removed lines exactly as the merge will produce them — not just
+  a generated preview.
+- Only the fields you actually changed are merged in. Keys the form doesn't
+  manage (`build`, `container_name`, `network_mode`, depends-on, comments, ...)
+  are left untouched.
+- `Restore last compose backup` (from `Ctrl+K`) puts the newest backup back,
+  snapshotting the current file first so the restore is itself reversible. Run
+  `u` (Replicate) afterwards to bring the running service up to match. Works on
+  local and SSH systems.
+- `whatthedock doctor` (see below) also flags any Compose file that is missing
+  unmanaged keys its last backup still had.
+
 ## Compose Catalog
 
 The Compose catalog is a library of Compose files.
@@ -242,6 +262,11 @@ matching whatever system you're currently connected to. An itemized
 confirm screen lists exactly which containers will be stopped before
 anything happens.
 
+Confirmation is deliberately not a single keypress. Because the same actions
+are reachable from the command palette, the confirm screen requires you to
+type the host's own name before the action is armed, so a mis-highlighted row
+can't power off a machine by accident. `Esc` cancels.
+
 The OS command runs non-interactively (`sudo -n ...`) so it never hangs
 waiting for a password on a terminal that isn't there. If the host needs
 one, WhatTheDock asks for it in-app — a masked prompt, never a terminal
@@ -288,6 +313,14 @@ SSH auth modes:
 - `keychain`: store the SSH password in the OS keychain, not in
   `settings.json`.
 - `password prompt`: let `ssh` ask for the password each time.
+
+To add one: install Docker on the remote host and confirm your user can reach
+its socket there (`ssh user@host docker ps`), then give the system a name and
+the SSH host (either `user@host` or a host alias from `~/.ssh/config`).
+WhatTheDock opens a local unix socket and forwards the remote Docker socket
+over SSH, so nothing Docker-related needs to listen on the network. Key-based
+auth (or an agent) is the smoothest choice; if you use a password, the
+`keychain` mode keeps it in the OS keychain rather than `settings.json`.
 
 Settings live in your platform config directory. On Linux that is usually:
 
@@ -396,6 +429,29 @@ running binary, and restarts.
 The release signing key is baked into the app. Unsigned or invalid updates are
 rejected.
 
+Because the verifying key lives in the binary you are already running,
+rotating the release signing key needs one manual reinstall (for example with
+the install command above). An old binary cannot verify a release signed with
+the new key, so it refuses the very update that would move you onto it; after
+that one-time reinstall, self-updates resume. The release tool checks that the
+configured signing key matches the baked verifier before it will run.
+
+## Diagnostics
+
+```bash
+whatthedock doctor
+```
+
+`doctor` prints a read-only health report: app environment and config, Docker
+connectivity for the active system, config/log file permissions, remote system
+config and tunnel sockets, and every Compose file WhatTheDock has backed up
+(flagging one that has lost keys its last backup still had). It never changes
+anything — no tunnels started, no files written, no credentials read beyond a
+yes/no "is one stored" check.
+
+Add `--json` for machine-readable output. Exit codes are `0` (clean), `1`
+(warnings), and `2` (failures).
+
 ## Development
 
 Run the normal checks:
@@ -466,7 +522,14 @@ once with:
 go run ./cmd/release -genkey
 ```
 
-Keep the private key in `WHATTHEDOCK_SIGNING_KEY`. Do not commit it.
+Keep the private key in `WHATTHEDOCK_SIGNING_KEY`, or save it to the
+gitignored `.whatthedock-signing-key` so you don't have to export it each time
+(the environment variable wins if both are set). Do not commit it.
+
+The release tool refuses to run when the configured key doesn't match the
+public key baked into `internal/update/verify.go`, since a release signed that
+way would be rejected by every installed app. Update the two together when
+rotating.
 
 ## What It Uses TideUI For
 

@@ -1,5 +1,13 @@
 # WhatTheDock: Compose edit wholesale-overwrites base file
 
+> **Historical note — resolved.** This is the incident write-up from when the
+> Compose edit bug was first diagnosed. The fixes it describes are committed
+> (originally in `ef07228`); the sticky `FieldsDirty` flag it references was
+> later replaced by the baseline dirty model in `625d433`, and pre-apply
+> backups plus an in-app restore were added in `f639f0b`/`1d55c75`. The
+> "not yet committed" and live-incident status below reflect the moment it was
+> written, not the current state.
+
 ## Status as of writing
 - Bugs #1, #2, and #3 below are ALL FIXED and tested in the repo
   (fix for #3: `FullBase: d.OverrideRawBase && !d.FieldsDirty` in
