@@ -195,6 +195,7 @@ func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerC
 			Healthcheck:  healthcheck,
 		},
 		&container.HostConfig{
+			NetworkMode:    container.NetworkMode(spec.NetworkMode),
 			PortBindings:   portBindings,
 			Mounts:         createMounts(spec.Mounts),
 			Tmpfs:          spec.Tmpfs,
@@ -213,7 +214,7 @@ func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerC
 				Devices:  createDevices(spec.Devices),
 			},
 		},
-		createNetworkingConfig(spec.Networks),
+		createNetworkingConfig(spec.Networks, spec.NetworkMode),
 		nil,
 		spec.Name,
 	)
@@ -311,9 +312,10 @@ func createDevices(devices []domain.Device) []container.DeviceMapping {
 // but the implicit default bridge network. nil for zero networks (the
 // common, pre-existing case) rather than an empty-but-non-nil map, matching
 // what every caller that never sets spec.Networks already implicitly relied
-// on.
-func createNetworkingConfig(networks []app.NetworkAttachment) *networktypes.NetworkingConfig {
-	if len(networks) == 0 {
+// on. Also nil when networkMode is set ("host"/"none"): Docker rejects
+// combining an explicit network mode with an endpoint attachment.
+func createNetworkingConfig(networks []app.NetworkAttachment, networkMode string) *networktypes.NetworkingConfig {
+	if networkMode != "" || len(networks) == 0 {
 		return nil
 	}
 	endpoints := make(map[string]*networktypes.EndpointSettings, len(networks))
@@ -656,6 +658,7 @@ func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.C
 	}
 	if inspect.HostConfig != nil {
 		hc := inspect.HostConfig
+		ctr.NetworkMode = string(hc.NetworkMode)
 		ctr.RestartPolicy = string(hc.RestartPolicy.Name)
 		ctr.Privileged = hc.Privileged
 		ctr.CapAdd = append([]string(nil), []string(hc.CapAdd)...)

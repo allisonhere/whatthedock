@@ -6822,3 +6822,16 @@ func TestAppLogOverlayShowsCopyHint(t *testing.T) {
 		t.Fatalf("app-log overlay missing copy hint:\n%s", view)
 	}
 }
+
+// TestFriendlyDockerErrorExplainsMissingBindSource checks the raw Docker bind
+// error is rewritten to lead with the path and the fix, instead of the noisy
+// "invalid mount config for type ..." blob.
+func TestFriendlyDockerErrorExplainsMissingBindSource(t *testing.T) {
+	err := errors.New(`Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /home/allie/dash/data`)
+	got := friendlyDockerError(err)
+	for _, want := range []string{"/home/allie/dash/data", "doesn't exist", "placeholder"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("friendlyDockerError() = %q, missing %q", got, want)
+		}
+	}
+}

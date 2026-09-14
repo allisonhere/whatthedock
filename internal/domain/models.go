@@ -129,6 +129,12 @@ type Container struct {
 	Devices        []Device
 	ExposedPorts   []Port              // container-side only, no host binding (Public is always 0)
 	NetworkAliases map[string][]string // network name -> aliases
+	// NetworkMode is Docker's own HostConfig.NetworkMode ("host", "none",
+	// "bridge"/"default", or a user-defined network name). Only "host" and
+	// "none" are special: they can't be expressed as an endpoint attachment,
+	// so the Container Clipboard carries the mode through to create rather
+	// than treating "host" as a network to join (which Docker rejects).
+	NetworkMode    string
 	MemoryBytes    int64
 	NanoCPUs       int64
 	StopSignal     string

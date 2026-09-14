@@ -770,3 +770,137 @@ func TestRedirectMissingBindMountsOverSSHResolvesHomeAndCreatesDirectory(t *test
 		t.Fatalf("label = %q, want the original path %q", got, missing)
 	}
 }
+
+// TestPasteFormRedirectMissingBindMountsUnblocksDeploy is the regression test
+// for the reported "paste bounces back to the create dialog": taking Enter
+// (review/edit) on a paste with a missing bind source and then confirming used
+// to fail with a raw Docker error and silently return to the form. The form
+// now warns about the missing path and supports "t" to redirect it, after
+// which the deploy succeeds.
+func TestPasteFormRedirectMissingBindMountsUnblocksDeploy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	source := pasteSourceProvider()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	ctr := source.containers["src-1"]
+	ctr.Mounts = append(ctr.Mounts, domain.Mount{Type: "bind", Source: missing, Destination: "/config-extra", ReadWrite: true})
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	// The report's path: Enter into the form rather than "d".
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.overlay != overlayCreate {
+		t.Fatalf("overlay = %v, want overlayCreate", model.overlay)
+	}
+	if !strings.Contains(model.createNotice, "bind mount") {
+		t.Fatalf("createNotice = %q, want the missing-bind warning", model.createNotice)
+	}
+
+	// "t" in the form redirects to a placeholder and updates the draft.
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("t in the create form returned no redirect command")
+	}
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+	if len(pasteDraftBindConflicts(model.createDraft)) != 0 {
+		t.Fatalf("draft still has bind conflicts after redirect: %#v", pasteDraftBindConflicts(model.createDraft))
+	}
+	if strings.Contains(model.createDraft.Mounts, missing) {
+		t.Fatalf("Mounts = %q, want the missing path replaced", model.createDraft.Mounts)
+	}
+
+	// Confirm and deploy.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+	if model.statusErr {
+		t.Fatalf("paste failed after the form redirect: %s", model.status)
+	}
+	if len(dest.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one", dest.creates)
+	}
+}
+
+// TestPasteApplyFailureSurfacesInCreateNotice checks a deploy failure is shown
+// in the create overlay's own notice, not just the status bar hidden behind
+// it — the reason the failure looked like the dialog simply reopening.
+func TestPasteApplyFailureSurfacesInCreateNotice(t *testing.T) {
+	dest := pasteDestProvider()
+	dest.createErr = errors.New("invalid mount config")
+
+	model := modelWithSourceSelected(t, pasteSourceProvider())
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+
+	if !model.createNoticeErr || !strings.Contains(model.createNotice, "invalid mount config") {
+		t.Fatalf("createNotice/createNoticeErr = %q/%v, want the deploy error surfaced in the overlay", model.createNotice, model.createNoticeErr)
+	}
+}
+
+// TestPasteHostNetworkedContainerUsesHostMode is the regression for the
+// reported "cannot connect container to host network - container must be
+// created in host network mode": a host-networked source must be pasted with
+// NetworkMode=host and no network attachment, not as a join of the built-in
+// "host" network.
+func TestPasteHostNetworkedContainerUsesHostMode(t *testing.T) {
+	source := pasteSourceProvider()
+	ctr := source.containers["src-1"]
+	ctr.NetworkMode = "host"
+	ctr.Networks = []string{"host"}
+	ctr.NetworkAliases = nil
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+
+	dest := pasteDestProvider()
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, dest)
+	model = openPasteReview(t, model)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if strings.Contains(model.createDraft.Networks, "host") {
+		t.Fatalf("prefilled Networks = %q, want empty for host mode", model.createDraft.Networks)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	model = updated.(Model)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = updated.(Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+
+	if model.statusErr {
+		t.Fatalf("host-network paste failed: %s", model.status)
+	}
+	if len(dest.creates) != 1 {
+		t.Fatalf("creates = %#v, want exactly one", dest.creates)
+	}
+	got := dest.creates[0]
+	if got.NetworkMode != "host" {
+		t.Fatalf("created NetworkMode = %q, want host", got.NetworkMode)
+	}
+	if len(got.Networks) != 0 {
+		t.Fatalf("created Networks = %#v, want none for host mode", got.Networks)
+	}
+}

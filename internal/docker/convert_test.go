@@ -115,3 +115,21 @@ func TestFromEventMessageMapsContainerEvent(t *testing.T) {
 		t.Fatalf("Time = %v, want %v", got.Time, want)
 	}
 }
+
+// TestFromInspectCapturesNetworkMode guards the paste bug where a
+// host-networked container's "host" network was treated as a normal
+// attachment — Docker rejects that with "container must be created in host
+// network mode". The mode has to be carried through from inspect.
+func TestFromInspectCapturesNetworkMode(t *testing.T) {
+	ctr := FromInspect("local", container.InspectResponse{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			ID:         "abc",
+			Name:       "/dash",
+			HostConfig: &container.HostConfig{NetworkMode: "host"},
+		},
+		Config: &container.Config{Image: "dash:latest"},
+	})
+	if ctr.NetworkMode != "host" {
+		t.Fatalf("NetworkMode = %q, want host", ctr.NetworkMode)
+	}
+}

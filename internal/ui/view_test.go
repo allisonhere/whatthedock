@@ -633,3 +633,33 @@ func TestAboutOverlayAlwaysUsesFixedDarkGrayBackground(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateErrorNoticeIsProminentAndWrapped guards the reported "it just
+// takes me back to the create dialog": a create/apply error must render as a
+// noticeable banner (a ✗ marker, error-coloured) that wraps the full message,
+// rather than a single truncated line.
+func TestCreateErrorNoticeIsProminentAndWrapped(t *testing.T) {
+	model := testModel()
+	model.createNoticeErr = true
+	model.createNotice = `paste dash: Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /home/allie/dash/data`
+
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	got := ansi.Strip(model.createNoticeView(renderer, 40))
+
+	if !strings.Contains(got, "✗") {
+		t.Fatalf("error notice missing the marker:\n%s", got)
+	}
+	// The message wraps across lines, so flatten whitespace before checking
+	// that the whole thing survived (nothing truncated).
+	flat := strings.Join(strings.Fields(got), " ")
+	for _, want := range []string{"bind source path does not exist", "/home/allie/dash/data"} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("error notice truncated %q:\n%s", want, got)
+		}
+	}
+	for i, line := range strings.Split(got, "\n") {
+		if w := lipgloss.Width(line); w > 40 {
+			t.Fatalf("line %d is %d wide, want <= 40:\n%s", i, w, got)
+		}
+	}
+}

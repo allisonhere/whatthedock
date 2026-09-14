@@ -127,6 +127,9 @@ func (m Model) handlePasteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pastePlan = nil
 		m.openCreateOverlayWithDraft(draftFromPastePlan(plan))
 		m.status, m.statusErr = "review paste for "+plan.Spec.Name, false
+		if notice := pasteBindNotice(m.createDraft, m.provider.Host().Name); notice != "" {
+			m.setCreateNotice(notice, true)
+		}
 	case "d":
 		if plan.Blocked() {
 			m.status, m.statusErr = "cannot deploy: fix the blocking conflict(s) first — Enter to review/fix", true
@@ -160,6 +163,38 @@ func hasBlockingBindPathConflict(plan clipboard.PastePlan) bool {
 		}
 	}
 	return false
+}
+
+// pasteDraftBindConflicts returns a paste draft's still-blocking bind-path
+// conflicts, or nil for a non-paste draft. Used to warn on the form and to
+// gate the form-level "t" redirect.
+func pasteDraftBindConflicts(d createDraft) []clipboard.PasteConflict {
+	if !d.Pasting || d.PastePlan == nil {
+		return nil
+	}
+	var out []clipboard.PasteConflict
+	for _, c := range d.PastePlan.Conflicts {
+		if c.Kind == "bind-path" && c.Severity == clipboard.SeverityBlock {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// pasteBindNotice is the create-form warning shown when a paste draft still
+// has missing bind-mount sources — the case that otherwise only surfaced as
+// a raw Docker error after confirming.
+func pasteBindNotice(d createDraft, host string) string {
+	conflicts := pasteDraftBindConflicts(d)
+	if len(conflicts) == 0 {
+		return ""
+	}
+	paths := make([]string, 0, len(conflicts))
+	for _, c := range conflicts {
+		paths = append(paths, c.Detail)
+	}
+	return fmt.Sprintf("%d bind mount(s) missing on %s: %s — press t to redirect them to placeholders, or edit the Mounts field",
+		len(paths), host, strings.Join(paths, ", "))
 }
 
 // bindRedirectDoneMsg carries the result of redirectMissingBindMountsCmd

@@ -1795,20 +1795,39 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case bindRedirectDoneMsg:
 		if msg.err != nil {
 			m.status, m.statusErr = "redirect: "+friendlyDockerError(msg.err), true
+			if m.overlay == overlayCreate {
+				m.setCreateNotice("redirect: "+friendlyDockerError(msg.err), true)
+			}
 			return m, nil
 		}
 		plan := msg.plan
 		m.pastePlan = &plan
+		// Redirected from the create form (a paste draft) rather than the
+		// review screen: fold the placeholder paths back into the draft so
+		// the Mounts field and the next confirm reflect them.
+		if m.overlay == overlayCreate && m.createDraft.Pasting {
+			planCopy := plan
+			m.createDraft.PastePlan = &planCopy
+			m.createDraft.Mounts = formatSpecMounts(plan.Spec.Mounts)
+		}
+		message := ""
+		isErr := false
 		switch {
 		case msg.redirected > 0 && len(msg.failed) > 0:
-			m.status, m.statusErr = fmt.Sprintf("redirected %d bind mount(s), %d failed: %s",
-				msg.redirected, len(msg.failed), strings.Join(msg.failed, "; ")), true
+			message = fmt.Sprintf("redirected %d bind mount(s), %d failed: %s",
+				msg.redirected, len(msg.failed), strings.Join(msg.failed, "; "))
+			isErr = true
 		case msg.redirected > 0:
-			m.status, m.statusErr = fmt.Sprintf("redirected %d bind mount(s) to placeholder paths — originals saved as labels", msg.redirected), false
+			message = fmt.Sprintf("redirected %d bind mount(s) to placeholder paths — originals saved as labels", msg.redirected)
 		case len(msg.failed) > 0:
-			m.status, m.statusErr = "redirect failed: "+strings.Join(msg.failed, "; "), true
+			message = "redirect failed: " + strings.Join(msg.failed, "; ")
+			isErr = true
 		default:
-			m.status, m.statusErr = "nothing to redirect — no missing bind-mount paths", false
+			message = "nothing to redirect — no missing bind-mount paths"
+		}
+		m.status, m.statusErr = message, isErr
+		if m.overlay == overlayCreate && m.createDraft.Pasting {
+			m.setCreateNotice(message, isErr)
 		}
 		return m, nil
 	case createOverrideCheckMsg:
@@ -5408,9 +5427,12 @@ func (m Model) finishCreateDone(msg createDoneMsg) (tea.Model, tea.Cmd) {
 		// closing the overlay used to throw away everything they'd
 		// typed. Drop back out of the confirm step to the editable
 		// field list so they can fix it and retry; createDraft itself
-		// is untouched either way.
+		// is untouched either way. The error also goes into the
+		// create-local notice, since the status bar is hidden behind
+		// the overlay and a silent bounce reads as "it just closed".
 		if m.overlay == overlayCreate {
 			m.createDraft.Confirming = false
+			m.setCreateNotice(verb+" "+msg.name+": "+friendlyDockerError(msg.err), true)
 		}
 		return m, nil
 	}
@@ -5548,6 +5570,15 @@ func friendlyDockerError(err error) string {
 		return "Docker is unavailable; start Docker and refresh"
 	case strings.Contains(text, "predefined address pools have been fully subnetted"):
 		return "Docker's network address pool is full — press Ctrl+K → Curate Docker networks to remove unused ones (each stack's default network claims a whole address block; leftover ones from removed stacks add up)"
+	case strings.Contains(text, "bind source path does not exist"):
+		// Docker's raw text ("invalid mount config for type \"bind\": bind
+		// source path does not exist: /path") is noisy; lead with the path
+		// and the fix instead.
+		path := strings.TrimSpace(text[strings.LastIndex(text, ":")+1:])
+		if path != "" && !strings.Contains(path, " ") {
+			return fmt.Sprintf("bind-mount source %s doesn't exist on this host — create it, or (on a paste) press t to redirect it to a placeholder", path)
+		}
+		return "a bind-mount source doesn't exist on this host — create it, or redirect it to a placeholder"
 	default:
 		return text
 	}

@@ -69,6 +69,10 @@ type ContainerCreateSpec struct {
 	Networks      []NetworkAttachment
 	RestartPolicy string
 	Start         bool
+	// NetworkMode is an explicit Docker network mode ("host" or "none") when
+	// one was carried over from a paste — those can't be represented as
+	// Networks attachments. Empty means "derive from Networks (or default)".
+	NetworkMode string
 
 	Hostname       string
 	WorkingDir     string

@@ -813,6 +813,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				spec, err := m.createDraft.ComposeSpec(m.activeSystemConfig())
 				if err != nil {
 					m.createDraft.Confirming = false
+					m.setCreateNotice("can't confirm: "+err.Error(), true)
 					m.status, m.statusErr = "create: "+err.Error(), true
 					return m, nil
 				}
@@ -843,6 +844,7 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			spec, err := m.createDraft.ContainerSpec()
 			if err != nil {
 				m.createDraft.Confirming = false
+				m.setCreateNotice("can't confirm: "+err.Error(), true)
 				m.status, m.statusErr = "create: "+err.Error(), true
 				return m, nil
 			}
@@ -958,6 +960,16 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.createField = createFieldComposeFile
 			m.syncCreateFieldEditor()
 			return m, m.openCreateFileBrowser()
+		}
+		cmd = m.forwardToFieldEditor(msg)
+	case "t":
+		// A paste draft with a missing bind-mount source can redirect it to
+		// a placeholder directory from here, instead of backing all the way
+		// out to the paste review screen. Every other field still needs a
+		// literal "t", so fall through to the editor when there's nothing
+		// to redirect.
+		if m.createDraft.Pasting && len(pasteDraftBindConflicts(m.createDraft)) > 0 {
+			return m, m.redirectMissingBindMountsCmd(*m.createDraft.PastePlan)
 		}
 		cmd = m.forwardToFieldEditor(msg)
 	case "[", "]":
@@ -1880,6 +1892,11 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 	if d.Pasting && d.PastePlan != nil {
 		spec = d.PastePlan.Spec
 		spec.Networks = parseCreateNetworks(d.Networks, d.PastePlan.Spec.Networks)
+		if len(spec.Networks) > 0 {
+			// The user chose explicit networks on the form; that overrides a
+			// carried-over host/none mode, so the two can't conflict.
+			spec.NetworkMode = ""
+		}
 	}
 	spec.Name = strings.TrimSpace(d.ContainerName)
 	spec.Image = strings.TrimSpace(d.Image)

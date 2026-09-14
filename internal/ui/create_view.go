@@ -24,6 +24,9 @@ func (m Model) createOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			if n := placeholderBindMountCount(m.createDraft.PastePlan); n > 0 {
 				prompt += fmt.Sprintf("\n\n%d bind mount(s) are placeholders — no data was migrated.", n)
 			}
+			if conflicts := pasteDraftBindConflicts(m.createDraft); len(conflicts) > 0 {
+				prompt += fmt.Sprintf("\n\n%d bind mount source(s) don't exist on this host yet — esc back and press t to redirect them, or this deploy will fail.", len(conflicts))
+			}
 		case editing && m.createDraft.Mode != createModeCompose:
 			prompt = "Replace standalone container " + name + " with these changes?"
 		case m.createDraft.Mode == createModeCompose && m.createDraft.IsStack():
@@ -485,9 +488,44 @@ func (m Model) createNoticeView(renderer tideui.Renderer, width int) string {
 		return ""
 	}
 	if m.createNoticeErr {
-		return renderer.Styles.StatusError.Width(width).Render(short(notice, width))
+		return renderCreateError(renderer, notice, width)
 	}
 	return renderer.Styles.DetailMeta.Width(width).Render(short(notice, width))
+}
+
+// renderCreateError renders a create/catalog/editor error as a prominent,
+// wrapped, full-width banner instead of a single truncated line. A failed
+// confirm or apply otherwise showed up only in the status bar, which the
+// overlay hides — so a long daemon error (a missing bind-mount path, for
+// instance) was both invisible and, when it did render, cut off. The banner
+// inverts the theme's error colour for high contrast and wraps the whole
+// message so nothing is lost.
+func renderCreateError(renderer tideui.Renderer, notice string, width int) string {
+	width = max(8, width)
+	marker := "✗ "
+	markerWidth := lipgloss.Width(marker)
+	textWidth := max(4, width-markerWidth-2)
+	// lipgloss wraps block-styled text to Width, so the full message stays
+	// readable rather than being truncated.
+	body := lipgloss.NewStyle().Width(textWidth).Render(notice)
+	lines := strings.Split(body, "\n")
+
+	style := renderer.Styles.StatusError.Bold(true)
+	if errColor := renderer.Styles.Theme.Error; errColor != "" {
+		style = lipgloss.NewStyle().Background(errColor).Foreground(contrastFg(errColor)).Bold(true)
+	}
+	style = style.Width(width)
+
+	indent := strings.Repeat(" ", markerWidth)
+	out := make([]string, 0, len(lines))
+	for i, line := range lines {
+		prefix := indent
+		if i == 0 {
+			prefix = marker
+		}
+		out = append(out, style.Render(prefix+line))
+	}
+	return strings.Join(out, "\n")
 }
 
 // renderCreateModeTabs draws the Compose/standalone mode switch as a

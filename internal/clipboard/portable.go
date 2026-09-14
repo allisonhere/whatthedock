@@ -113,6 +113,10 @@ type PortableContainer struct {
 	Ports    []PortablePort
 	Mounts   []PortableMount
 	Networks []PortableNetwork
+	// NetworkMode is the source's Docker network mode ("host"/"none"), when
+	// it's one that can't be expressed as a network attachment — carried
+	// through to create instead of being treated as a network to join.
+	NetworkMode string
 
 	RestartPolicy string
 	HealthCheck   *domain.HealthCheck
@@ -183,6 +187,7 @@ func FromContainer(ctr domain.Container, sourceHost domain.Host) PortableContain
 		LogDriver:      ctr.LogDriver,
 		LogOptions:     copyStringMap(ctr.LogOptions),
 		Compose:        PortableCompose{Project: ctr.Compose.Project, Service: ctr.Compose.Service},
+		NetworkMode:    ctr.NetworkMode,
 	}
 
 	for _, e := range ctr.Env {
@@ -286,10 +291,35 @@ func (pc PortableContainer) ToCreateSpec() app.ContainerCreateSpec {
 		}
 		spec.Mounts = append(spec.Mounts, app.MountBinding{Type: m.Type, Source: m.Source, Destination: m.Target, ReadOnly: m.ReadOnly})
 	}
-	for _, n := range pc.Networks {
-		spec.Networks = append(spec.Networks, app.NetworkAttachment{Name: n.Name, Aliases: append([]string(nil), n.Aliases...)})
+	if mode := specialNetworkMode(pc.NetworkMode); mode != "" {
+		// "host"/"none" can't be expressed as an endpoint attachment — Docker
+		// rejects explicitly connecting a container to the "host" network
+		// ("cannot connect container to host network - container must be
+		// created in host network mode"). Carry the mode instead, with no
+		// network attachments.
+		spec.NetworkMode = mode
+	} else {
+		for _, n := range pc.Networks {
+			if isBuiltinNetwork(n.Name) {
+				continue // default bridge is implicit; host/none handled above
+			}
+			spec.Networks = append(spec.Networks, app.NetworkAttachment{Name: n.Name, Aliases: append([]string(nil), n.Aliases...)})
+		}
 	}
 	return spec
+}
+
+// specialNetworkMode returns "host" or "none" for the two Docker network
+// modes that can't be represented as a network attachment, else "".
+func specialNetworkMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "host":
+		return "host"
+	case "none":
+		return "none"
+	default:
+		return ""
+	}
 }
 
 // splitEnv splits a "KEY=VALUE" docker env entry. A malformed entry with no

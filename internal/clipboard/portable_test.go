@@ -473,3 +473,47 @@ func TestFromContainerThenToCreateSpecPreservesMultipleHostIPSpecificBindings(t 
 		t.Fatalf("port 53 binding = %#v, want udp protocol preserved", got)
 	}
 }
+
+// TestToCreateSpecCarriesHostNetworkMode guards the host-network paste
+// failure: "host" is a mode, not a network to attach, so the spec must carry
+// NetworkMode and attach nothing.
+func TestToCreateSpecCarriesHostNetworkMode(t *testing.T) {
+	pc := PortableContainer{
+		Name: "dash", Image: "dash:latest", NetworkMode: "host",
+		Networks: []PortableNetwork{{Name: "host"}},
+	}
+	spec := pc.ToCreateSpec()
+	if spec.NetworkMode != "host" {
+		t.Fatalf("NetworkMode = %q, want host", spec.NetworkMode)
+	}
+	if len(spec.Networks) != 0 {
+		t.Fatalf("Networks = %#v, want none for host mode", spec.Networks)
+	}
+}
+
+func TestToCreateSpecCarriesNoneNetworkMode(t *testing.T) {
+	pc := PortableContainer{Name: "x", Image: "img", NetworkMode: "none", Networks: []PortableNetwork{{Name: "none"}}}
+	spec := pc.ToCreateSpec()
+	if spec.NetworkMode != "none" || len(spec.Networks) != 0 {
+		t.Fatalf("NetworkMode/Networks = %q/%#v, want none/none", spec.NetworkMode, spec.Networks)
+	}
+}
+
+func TestToCreateSpecKeepsCustomNetworksAndImpliesDefaultBridge(t *testing.T) {
+	custom := PortableContainer{Name: "x", Image: "img", NetworkMode: "media_default",
+		Networks: []PortableNetwork{{Name: "media_default", Aliases: []string{"x"}}}}
+	spec := custom.ToCreateSpec()
+	if len(spec.Networks) != 1 || spec.Networks[0].Name != "media_default" {
+		t.Fatalf("Networks = %#v, want the custom network attached", spec.Networks)
+	}
+	if spec.NetworkMode != "" {
+		t.Fatalf("NetworkMode = %q, want empty for a custom network", spec.NetworkMode)
+	}
+
+	bridge := PortableContainer{Name: "y", Image: "img", NetworkMode: "default",
+		Networks: []PortableNetwork{{Name: "bridge"}}}
+	spec = bridge.ToCreateSpec()
+	if spec.NetworkMode != "" || len(spec.Networks) != 0 {
+		t.Fatalf("default bridge: mode/networks = %q/%#v, want implied default", spec.NetworkMode, spec.Networks)
+	}
+}
