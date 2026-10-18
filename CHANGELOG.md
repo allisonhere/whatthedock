@@ -6,6 +6,8 @@ only re-cut a build are folded into the nearest entry.
 ## [Unreleased]
 
 ### Added
+- `l` on a stack row shows the merged, service-tagged logs of every service in
+  the stack (filter, pause, follow and copy work as usual).
 - Pause/unpause (`Alt+p`) and kill (command palette) for the selected container.
 
 ### Fixed

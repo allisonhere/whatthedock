@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/allisonhere/ripple"
@@ -393,14 +394,18 @@ type Model struct {
 	inspectorDetailKind   string
 	inspectorDetailEditor ripple.Model
 
-	logLines          []string
-	logFilter         string
-	logDraft          string
-	logLevel          logSeverityFilter
-	logScroll         int
-	logFollow         bool
-	logViews          map[domain.ResourceID]logViewState
-	logViewID         domain.ResourceID
+	logLines  []string
+	logFilter string
+	logDraft  string
+	logLevel  logSeverityFilter
+	logScroll int
+	logFollow bool
+	logViews  map[domain.ResourceID]logViewState
+	logViewID domain.ResourceID
+	// stackLogs is the Compose project whose services' logs are merged into
+	// logChan/logLines, or "" for the usual single-container log view. It is
+	// cleared whenever a container detail load changes what the log pane shows.
+	stackLogs         string
 	logChan           chan string
 	logCancel         context.CancelFunc
 	logLoading        bool
@@ -898,6 +903,15 @@ type actionDoneMsg struct {
 	skipRefresh bool
 }
 
+// stackLogsStartedMsg is logsStartedMsg for a merged Compose-stack stream.
+type stackLogsStartedMsg struct {
+	project string
+	lines   <-chan string
+	cancel  context.CancelFunc
+	done    <-chan struct{}
+	err     error
+}
+
 type logsStartedMsg struct {
 	id     domain.ResourceID
 	lines  <-chan string
@@ -1350,7 +1364,8 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.saveLogViewState()
-		selectionChanged := m.selected == nil || msg.container.ID != m.selected.ID
+		selectionChanged := m.selected == nil || msg.container.ID != m.selected.ID || m.stackLogs != ""
+		m.stackLogs = ""
 		m.selected = &msg.container
 		if selectionChanged {
 			if m.logCancel != nil {
@@ -1397,6 +1412,28 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
 			return m, nil
 		}
+		m.logChan = make(chan string, 256)
+		m.logCancel = msg.cancel
+		go forwardLogs(msg.lines, m.logChan, msg.done)
+		return m, tickLogs()
+	case stackLogsStartedMsg:
+		if msg.project != m.stackLogs {
+			if msg.cancel != nil {
+				msg.cancel()
+			}
+			return m, nil
+		}
+		if m.logCancel != nil {
+			m.logCancel()
+		}
+		m.logErr = msg.err
+		m.logLoading = false
+		if msg.err != nil {
+			m.status, m.statusErr = friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		m.logLines = nil
+		m.logReplaceOnDrain = false
 		m.logChan = make(chan string, 256)
 		m.logCancel = msg.cancel
 		go forwardLogs(msg.lines, m.logChan, msg.done)
@@ -2191,6 +2228,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "l":
 		m.focus = paneActivity
 		m.mode = activityLogs
+		if row := m.currentRow(); row != nil && row.kind == rowProject {
+			return m, m.openStackLogs(row.project)
+		}
 		if m.selected != nil {
 			return m, m.startLogsCmd(m.selected.ID)
 		}
@@ -5343,6 +5383,74 @@ func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 		lines := make(chan string, 256)
 		go readLogLines(stream, lines, cancel, ctx.Done())
 		return logsStartedMsg{id: id, lines: lines, cancel: cancel, done: ctx.Done()}
+	}
+}
+
+// openStackLogs switches the log pane to the merged logs of every service
+// container in project. It reuses logChan/logLines/logCancel, so filtering,
+// pausing, following and copying behave exactly as for one container.
+func (m *Model) openStackLogs(project string) tea.Cmd {
+	var containers []domain.Container
+	for _, p := range m.snapshot.Projects {
+		if p.Name != project {
+			continue
+		}
+		for _, service := range p.Services {
+			containers = append(containers, service.Containers...)
+		}
+	}
+	if len(containers) == 0 {
+		return nil
+	}
+	m.saveLogViewState()
+	if m.logCancel != nil {
+		m.logCancel()
+		m.logCancel = nil
+	}
+	m.stackLogs = project
+	m.logChan, m.logLines, m.logErr = nil, nil, nil
+	m.logViewID = domain.ResourceID{ID: "stack:" + project}
+	m.restoreLogViewState(m.logViewID)
+	provider := m.provider
+	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(context.Background())
+		merged := make(chan string, 256)
+		var wg sync.WaitGroup
+		started := 0
+		var firstErr error
+		for _, ctr := range containers {
+			stream, err := provider.Logs(ctx, ctr.ID, app.LogOptions{Tail: "100", Follow: true})
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			started++
+			lines := make(chan string, 64)
+			go readLogLines(stream, lines, func() {}, ctx.Done())
+			tag := "[" + ctr.DisplayName() + "] "
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for line := range lines {
+					select {
+					case merged <- tag + line:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+		if started == 0 {
+			cancel()
+			return stackLogsStartedMsg{project: project, err: firstErr}
+		}
+		go func() {
+			wg.Wait()
+			close(merged)
+		}()
+		return stackLogsStartedMsg{project: project, lines: merged, cancel: cancel, done: ctx.Done()}
 	}
 }
 

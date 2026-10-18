@@ -98,6 +98,9 @@ func (m Model) activityHeader() (string, string) {
 		}
 		return "Stats", "activity"
 	default:
+		if m.stackLogs != "" {
+			return "Logs: stack " + m.stackLogs, "logs"
+		}
 		if selected := m.selectedContainer(); selected != nil {
 			return "Logs: " + containerTitle(*selected), "logs"
 		}

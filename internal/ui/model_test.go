@@ -7018,3 +7018,44 @@ func TestAltRRestartsSelectedContainer(t *testing.T) {
 		t.Fatalf("restarts = %d, want 1", provider.restarts)
 	}
 }
+
+func TestLogsKeyOnStackRowMergesServiceLogs(t *testing.T) {
+	model := testModel()
+	model.rows = model.buildRows()
+	for i, row := range model.rows {
+		if row.kind == rowProject && row.project == "media" {
+			model.cursor = i
+		}
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	model = updated.(Model)
+	if model.stackLogs != "media" {
+		t.Fatalf("stackLogs = %q, want media", model.stackLogs)
+	}
+	started, ok := runCmd(t, cmd).(stackLogsStartedMsg)
+	if !ok || started.err != nil {
+		t.Fatalf("msg = %#v, want successful stackLogsStartedMsg", started)
+	}
+	updated, _ = model.Update(started)
+	model = updated.(Model)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(model.logLines) < 4 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		model.drainLogs()
+	}
+	if len(model.logLines) != 4 {
+		t.Fatalf("logLines = %q, want 4 merged lines", model.logLines)
+	}
+	joined := strings.Join(model.logLines, "\n")
+	for _, want := range []string{"[radarr-1] one", "[jellyfin-1] two"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("merged logs missing %q:\n%s", want, joined)
+		}
+	}
+	if title, _ := model.activityHeader(); title != "Logs: stack media" {
+		t.Fatalf("title = %q, want Logs: stack media", title)
+	}
+	model.cleanup()
+}

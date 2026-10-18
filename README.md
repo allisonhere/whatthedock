@@ -125,7 +125,7 @@ That is usually faster than remembering every key.
 
 | Key | What it does |
 |---|---|
-| `l` | Show logs |
+| `l` | Show logs; on a stack row, the merged logs of all its services |
 | `L` | Expand logs across most of the screen |
 | `e` / `w` / `i` / `a` in Logs | Show errors, warnings, info, or all log lines |
 | `f` / `End` in Logs | Jump to the end and follow live output |
