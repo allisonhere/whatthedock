@@ -384,6 +384,10 @@ screen says so again right before you deploy.
 
 Open Settings with `,` or `Ctrl+,`.
 
+Settings has a section list on the left and the section's rows on the right.
+`j` / `k` switch sections, `Enter` or `l` moves into the rows, `h` / `l` change a
+value, and `Esc` steps back out (then closes).
+
 Settings include:
 
 - theme and graph style

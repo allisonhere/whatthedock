@@ -3279,68 +3279,123 @@ func (m Model) settingsBodyBudget() int {
 }
 
 func (m Model) settingsOverlay(renderer tideui.Renderer) *tideui.Overlay {
-	width := min(76, max(44, m.width-8))
+	width := min(92, max(44, m.width-8))
 	contentWidth := width - 4
+	// Too narrow for a sidebar: the pane gets the full width and its title row
+	// doubles as the section switcher (j/k while it is selected).
+	compact := contentWidth < 56
+	sideWidth := clamp(contentWidth/4, 14, 18)
+	paneWidth := contentWidth - sideWidth - 3
+	if compact {
+		sideWidth, paneWidth = 0, contentWidth
+	}
 
 	settingsRows := m.settingsRows()
-	lines := make([]string, 0, len(settingsRows)+4)
+	sections := settingsSections(settingsRows)
+	active := settingsSectionIndex(sections, m.settingsCursor)
+
+	side := make([]string, 0, len(sections)*2)
+	for i, section := range sections {
+		text := "  " + section.title
+		if i == active && m.settingsPaneFocus {
+			text = "› " + section.title
+		}
+		side = append(side, renderer.RenderSoftRow(tideui.SoftRow{Text: text, Selected: i == active && !m.settingsPaneFocus}, sideWidth))
+	}
+
+	var lines []string
 	cursorLine := 0
-	for i, row := range settingsRows {
-		if row.kind == settingsRowSection {
-			if len(lines) > 0 {
-				lines = append(lines, "")
+	if len(sections) > 0 {
+		section := sections[active]
+		title := tideui.SoftRow{Text: section.title, Muted: true}
+		if compact {
+			title = tideui.SoftRow{Text: fmt.Sprintf("‹ %s ›  %d/%d", section.title, active+1, len(sections)), Selected: !m.settingsPaneFocus}
+		}
+		lines = append(lines, renderer.RenderSoftRow(title, paneWidth), "")
+		for i := section.start; i < section.end; i++ {
+			row := settingsRows[i]
+			suffix := row.value
+			// Reset defaults has nothing dynamic to say, so it keeps the plain
+			// "enter" affordance — but Check for update's whole point is to
+			// show what the last check found (checking…/vX.Y.Z available/up to
+			// date/check failed), which "enter" was silently overwriting.
+			if row.kind == settingsRowAction && row.action != settingsActionCheckUpdate {
+				suffix = "enter"
 			}
-			lines = append(lines, renderer.Styles.DetailMeta.Render(row.label))
-			continue
-		}
-		suffix := row.value
-		// Reset defaults has nothing dynamic to say, so it keeps the plain
-		// "enter" affordance — but Check for update's whole point is to
-		// show what the last check found (checking…/vX.Y.Z available/up to
-		// date/check failed), which "enter" was silently overwriting.
-		if row.kind == settingsRowAction && row.action != settingsActionCheckUpdate {
-			suffix = "enter"
-		}
-		if m.settingsEditingField == row.label {
-			suffix = m.settingsEditValueWithCaret(row)
-		}
-		lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{Text: row.label, Suffix: suffix, Selected: i == m.settingsCursor}, contentWidth))
-		if i == m.settingsCursor {
-			cursorLine = len(lines) - 1
+			if m.settingsEditingField == row.label {
+				suffix = m.settingsEditValueWithCaret(row)
+			}
+			lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{Text: row.label, Suffix: suffix, Selected: m.settingsPaneFocus && i == m.settingsCursor}, paneWidth))
+			if i == m.settingsCursor {
+				cursorLine = len(lines) - 1
+			}
 		}
 	}
 
-	// The row list — unlike Help/AppLog's plain scrolled text — is
-	// cursor-driven: up/down already moves the selection, so the viewport
-	// auto-follows the cursor (windowAroundCursor, the same convention the
-	// Copy overlay uses) instead of needing separate scroll keys/state.
+	// The row list is cursor-driven, so the viewport auto-follows the
+	// cursor (windowAroundCursor, the same convention the Copy overlay
+	// uses) instead of needing separate scroll keys/state.
 	budget := m.settingsBodyBudget()
 	rowBudget := budget
 	if len(lines) > budget {
 		rowBudget = max(1, budget-2)
 	}
 	start, end := windowAroundCursor(len(lines), cursorLine, rowBudget)
-	visible := make([]string, 0, end-start+6)
+	pane := make([]string, 0, end-start+2)
 	if start > 0 {
-		visible = append(visible, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▲ %d more", start)))
+		pane = append(pane, renderer.RenderSoftRow(tideui.SoftRow{Text: fmt.Sprintf("▲ %d more", start), Muted: true}, paneWidth))
 	}
-	visible = append(visible, lines[start:end]...)
+	pane = append(pane, lines[start:end]...)
 	if end < len(lines) {
-		visible = append(visible, renderer.Styles.DetailMeta.Render(fmt.Sprintf("▼ %d more", len(lines)-end)))
+		pane = append(pane, renderer.RenderSoftRow(tideui.SoftRow{Text: fmt.Sprintf("▼ %d more", len(lines)-end), Muted: true}, paneWidth))
 	}
 
+	// Every cell, padding and divider included, goes through RenderSoftRow
+	// so it carries the panel's own surface colour rather than the theme Bg.
+	if compact {
+		side = nil
+	}
+	height := max(len(side), len(pane))
+	blankSide := renderer.RenderSoftRow(tideui.SoftRow{}, sideWidth)
+	blankPane := renderer.RenderSoftRow(tideui.SoftRow{}, paneWidth)
+	divider := renderer.RenderSoftRow(tideui.SoftRow{Text: " │", Muted: true}, 3)
+	rows := make([]string, height)
+	if compact {
+		divider, blankSide = "", ""
+	}
+	for i := range rows {
+		left, right := blankSide, blankPane
+		if i < len(side) {
+			left = side[i]
+		}
+		if i < len(pane) {
+			right = pane[i]
+		}
+		rows[i] = left + divider + right
+	}
+	body := strings.Join(rows, "\n")
+
+	visible := []string{body}
 	if m.settingsPath != "" {
 		visible = append(visible, "", renderer.Styles.DetailMeta.Width(contentWidth).Render("Config  "+m.settingsPath))
 	}
-	if m.settingsEditingField != "" {
+	switch {
+	case m.settingsEditingField != "":
 		visible = append(visible, "", renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "enter", Label: "save"},
 			tideui.SoftHint{Key: "esc", Label: "cancel"},
 		))
-	} else {
+	case m.settingsPaneFocus:
 		visible = append(visible, "", renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "enter/space", Label: "change"},
 			tideui.SoftHint{Key: "h/l", Label: "previous/next"},
+			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
+			tideui.SoftHint{Key: "esc", Label: "back"},
+		))
+	default:
+		visible = append(visible, "", renderer.RenderSoftHints(contentWidth,
+			tideui.SoftHint{Key: "j/k", Label: "section"},
+			tideui.SoftHint{Key: "enter/l", Label: "edit"},
 			tideui.SoftHint{Key: "ctrl+s", Label: "save"},
 			tideui.SoftHint{Key: "esc", Label: "cancel"},
 		))
@@ -3714,6 +3769,7 @@ var helpSections = []helpSection{
 	{
 		Title: "Settings And Systems",
 		Entries: []helpEntry{
+			{"Settings j / k", "switch section (sidebar) or move between rows; Esc steps back out"},
 			{"Settings Enter / Space", "edit text rows, trigger actions, or change choices"},
 			{"Settings h / l", "change choice rows"},
 			{"Settings Ctrl+S", "save settings"},

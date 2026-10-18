@@ -472,7 +472,12 @@ type Model struct {
 	settings       appSettings
 	settingsDraft  appSettings
 	settingsCursor int
-	settingsPath   string
+	// settingsPaneFocus is false while the section sidebar has focus and
+	// true once the cursor is inside the section's rows. settingsCursor
+	// stays a flat index into settingsRows(); the active section is
+	// whichever one contains it (see settingsSections).
+	settingsPaneFocus bool
+	settingsPath      string
 
 	// settingsEditingField is "" when no settings row is being text-edited,
 	// otherwise the label of the settingsRowText/settingsRowSecretText row
@@ -2719,15 +2724,46 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "esc", "q", ",", "ctrl+,":
+		if m.settingsPaneFocus && msg.String() == "esc" {
+			m.settingsPaneFocus = false
+			return m, nil
+		}
 		m.settingsDraft = m.settings
+		m.settingsPaneFocus = false
 		m.overlay = overlayNone
 	case "up", "k":
-		m.moveSettingsCursor(-1)
-	case "down", "j", "tab":
-		m.moveSettingsCursor(1)
+		if m.settingsPaneFocus {
+			m.moveSettingsCursor(-1)
+		} else {
+			m.moveSettingsSection(-1)
+		}
+	case "down", "j":
+		if m.settingsPaneFocus {
+			m.moveSettingsCursor(1)
+		} else {
+			m.moveSettingsSection(1)
+		}
+	case "tab":
+		if m.settingsPaneFocus {
+			m.moveSettingsCursor(1)
+		} else {
+			m.settingsPaneFocus = true
+		}
 	case "left", "h":
-		m.cycleSetting(m.settingsCursor, -1)
+		if !m.settingsPaneFocus {
+			return m, nil
+		}
+		rows := m.settingsRows()
+		if row := rows[clamp(m.settingsCursor, 0, len(rows)-1)]; row.kind == settingsRowSetting && row.action == settingsActionNone {
+			m.cycleSetting(m.settingsCursor, -1)
+		} else {
+			m.settingsPaneFocus = false
+		}
 	case "right", "l", "enter", " ":
+		if !m.settingsPaneFocus {
+			m.settingsPaneFocus = true
+			return m, nil
+		}
 		rows := m.settingsRows()
 		idx := clamp(m.settingsCursor, 0, len(rows)-1)
 		row := rows[idx]
@@ -3634,6 +3670,7 @@ func (m *Model) openSettingsOverlay() {
 	m.settingsDraft = m.settings
 	m.overlay = overlaySettings
 	m.settingsCursor = m.firstSettingsRow()
+	m.settingsPaneFocus = false
 }
 
 func (m *Model) openCopyOverlay() {
@@ -3946,19 +3983,54 @@ func (m Model) settingsForRows() appSettings {
 	return m.settings
 }
 
+// settingsSection is one sidebar entry: a section heading and the half-open
+// range [start, end) of its selectable rows in settingsRows().
+type settingsSection struct {
+	title      string
+	start, end int
+}
+
+func settingsSections(rows []settingsRow) []settingsSection {
+	var sections []settingsSection
+	for i, row := range rows {
+		switch {
+		case row.kind == settingsRowSection:
+			sections = append(sections, settingsSection{title: row.label, start: i + 1, end: i + 1})
+		case len(sections) > 0:
+			sections[len(sections)-1].end = i + 1
+		}
+	}
+	return sections
+}
+
+// settingsSectionIndex is the section containing cursor, or 0.
+func settingsSectionIndex(sections []settingsSection, cursor int) int {
+	for i, s := range sections {
+		if cursor >= s.start && cursor < s.end {
+			return i
+		}
+	}
+	return 0
+}
+
+// moveSettingsCursor moves within the active section, wrapping at its ends.
 func (m *Model) moveSettingsCursor(delta int) {
-	rows := m.settingsRows()
-	if len(rows) == 0 {
+	sections := settingsSections(m.settingsRows())
+	if len(sections) == 0 {
 		m.settingsCursor = 0
 		return
 	}
-	for i := 0; i < len(rows); i++ {
-		m.settingsCursor = modIndex(m.settingsCursor+delta, len(rows))
-		if rows[m.settingsCursor].kind != settingsRowSection {
-			return
-		}
+	s := sections[settingsSectionIndex(sections, m.settingsCursor)]
+	m.settingsCursor = s.start + modIndex(m.settingsCursor-s.start+delta, s.end-s.start)
+}
+
+// moveSettingsSection jumps to the first row of the previous/next section.
+func (m *Model) moveSettingsSection(delta int) {
+	sections := settingsSections(m.settingsRows())
+	if len(sections) == 0 {
+		return
 	}
-	m.settingsCursor = 0
+	m.settingsCursor = sections[modIndex(settingsSectionIndex(sections, m.settingsCursor)+delta, len(sections))].start
 }
 
 func (m Model) firstSettingsRow() int {

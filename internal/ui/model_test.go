@@ -2427,6 +2427,17 @@ func TestCommandPaletteOrderIsCategoryPriority(t *testing.T) {
 	}
 }
 
+// focusSettingsRow moves the Settings cursor onto the row labelled label and
+// focuses the pane, so view tests can show a row outside the first section.
+func focusSettingsRow(m *Model, label string) {
+	for i, row := range m.settingsRows() {
+		if row.label == label {
+			m.settingsCursor = i
+		}
+	}
+	m.settingsPaneFocus = true
+}
+
 func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 	model := testModel()
 	// Tall enough that every settings row (including the AI section) is
@@ -2443,15 +2454,22 @@ func TestSettingsKeyOpensAndCyclesSettings(t *testing.T) {
 		t.Fatalf("overlay = %v, want settings", model.overlay)
 	}
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"whatthedock · settings", "Stats", "Graph style", "wave", "Logs", "Log color", "full", "Behavior", "Maintenance", "Reset defaults", "ctrl+s save"} {
+	// Sidebar lists every section; the pane shows only the active one.
+	for _, want := range []string{"whatthedock · settings", "Stats", "Logs", "Behavior", "Maintenance", "Graph style", "wave", "ctrl+s save"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("settings view missing %q:\n%s", want, view)
 		}
 	}
-	if model.settingsCursor != 1 {
-		t.Fatalf("settingsCursor = %d, want first actionable row 1", model.settingsCursor)
+	if model.settingsCursor != 1 || model.settingsPaneFocus {
+		t.Fatalf("settingsCursor = %d, paneFocus = %v, want first row 1 with sidebar focus", model.settingsCursor, model.settingsPaneFocus)
 	}
 
+	// Enter moves focus into the pane without changing anything.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if !model.settingsPaneFocus || model.settingsDraft.GraphStyle != graphStyleWave {
+		t.Fatalf("paneFocus = %v, draft GraphStyle = %v, want pane focus and unchanged wave", model.settingsPaneFocus, model.settingsDraft.GraphStyle)
+	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if model.settingsDraft.GraphStyle != graphStyleBlocks {
@@ -2480,6 +2498,7 @@ func TestSettingsResetDefaults(t *testing.T) {
 	model.settings.StatsRefresh = 5 * time.Second
 	model.settings.DefaultActivity = activityStats
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 	rows := model.settingsRows()
 	for i, row := range rows {
 		if row.label == "Reset defaults" {
@@ -2518,6 +2537,7 @@ func TestSettingsResetDefaults(t *testing.T) {
 func TestSettingsEscCancelsDraft(t *testing.T) {
 	model := testModel()
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
@@ -2525,6 +2545,12 @@ func TestSettingsEscCancelsDraft(t *testing.T) {
 		t.Fatalf("draft GraphStyle = %v, want blocks", model.settingsDraft.GraphStyle)
 	}
 
+	// First esc leaves the pane, second closes and discards.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.overlay != overlaySettings || model.settingsPaneFocus {
+		t.Fatalf("overlay/paneFocus = %v/%v, want settings open with sidebar focus", model.overlay, model.settingsPaneFocus)
+	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = updated.(Model)
 	if model.overlay != overlayNone {
@@ -2668,6 +2694,7 @@ func TestSettingsStartInDashboardTogglePersists(t *testing.T) {
 	}
 
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 	rows := model.settingsRows()
 	cursor := -1
 	for i, row := range rows {
@@ -2773,6 +2800,7 @@ func TestSettingsSaveAfterChange(t *testing.T) {
 	model.systems = []config.System{{ID: "jarvis", Name: "Jarvis", Kind: "ssh", SSHHost: "allie@jarvis"}}
 	model.activeSystem = "jarvis"
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
@@ -2818,6 +2846,7 @@ func TestSettingsVimModeTogglePersistsAndAppliesToEditors(t *testing.T) {
 	model := testModel()
 	model.settingsPath = path
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 
 	rows := model.settingsRows()
 	cursor := -1
@@ -2879,6 +2908,7 @@ func TestSettingsModalShadowTogglePersistsAndAppliesToView(t *testing.T) {
 	viewWithShadow := model.View()
 
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 
 	rows := model.settingsRows()
 	cursor := -1
@@ -6055,6 +6085,7 @@ func TestUpdateProgressTickIgnoredWhenNotInstalling(t *testing.T) {
 func TestSettingsCheckForUpdateRowDispatchesCheck(t *testing.T) {
 	model := testModel()
 	model.openSettingsOverlay()
+	model.settingsPaneFocus = true
 	rows := model.settingsRows()
 	for i, row := range rows {
 		if row.action == settingsActionCheckUpdate {
@@ -6145,6 +6176,7 @@ func TestSettingsCheckForUpdateRowShowsStatus(t *testing.T) {
 	model.width, model.height = 100, 45
 	model.updateAvailableVersion = "v0.1.4"
 	model.openSettingsOverlay()
+	focusSettingsRow(&model, "Check for update")
 
 	view := ansi.Strip(model.View())
 	if !strings.Contains(view, "v0.1.4 available") {
@@ -6161,6 +6193,7 @@ func TestSettingsResetDefaultsRowStillShowsEnter(t *testing.T) {
 	// visible without scrolling to it first.
 	model.width, model.height = 100, 45
 	model.openSettingsOverlay()
+	focusSettingsRow(&model, "Reset defaults")
 
 	view := ansi.Strip(model.View())
 	if !strings.Contains(view, "Reset defaults") || !strings.Contains(view, "enter") {
@@ -6486,6 +6519,7 @@ func hasSettingsRow(rows []settingsRow, label string) bool {
 func TestSettingsTextEditRoundTrip(t *testing.T) {
 	model := testModel()
 	model.overlay = overlaySettings
+	model.settingsPaneFocus = true
 	rows := model.settingsRows()
 	for i, row := range rows {
 		if row.label == "AI API key" {
@@ -6541,6 +6575,7 @@ func TestSettingsAPIKeyRowIsMaskedNotPlaintext(t *testing.T) {
 	model.width, model.height = 100, 45
 	model.settings.AIAPIKey = "sk-super-secret-value"
 	model.openSettingsOverlay()
+	focusSettingsRow(&model, "AI API key")
 
 	view := ansi.Strip(model.View())
 	if strings.Contains(view, "sk-super-secret-value") {
@@ -6754,6 +6789,7 @@ func TestCycleSettingAppLog(t *testing.T) {
 func TestSettingsViewAppLogOpensOverlay(t *testing.T) {
 	model := testModel()
 	model.overlay = overlaySettings
+	model.settingsPaneFocus = true
 	model.appLogCopied = true
 	rows := model.settingsRows()
 	for i, row := range rows {
@@ -6903,5 +6939,45 @@ func TestStartStopLabelNamesTheActionAndContainer(t *testing.T) {
 	model.selected.Restarting = false
 	if got, want := model.startStopLabel(), "start "+model.selected.DisplayName(); got != want {
 		t.Fatalf("stopped label = %q, want %q", got, want)
+	}
+}
+
+func TestSettingsSidebarNavigationStaysInSections(t *testing.T) {
+	model := testModel()
+	model.openSettingsOverlay()
+	sections := settingsSections(model.settingsRows())
+
+	// Sidebar j/k jumps to the first row of the next/previous section.
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = updated.(Model)
+	if model.settingsCursor != sections[1].start || model.settingsPaneFocus {
+		t.Fatalf("cursor/paneFocus = %d/%v, want %d/false", model.settingsCursor, model.settingsPaneFocus, sections[1].start)
+	}
+
+	// Inside the pane, j wraps within the section instead of leaving it.
+	model.settingsPaneFocus = true
+	for range sections[1].end - sections[1].start {
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		model = updated.(Model)
+	}
+	if model.settingsCursor != sections[1].start {
+		t.Fatalf("cursor = %d, want wrapped back to section start %d", model.settingsCursor, sections[1].start)
+	}
+}
+
+func TestSettingsOverlayFitsNarrowTerminals(t *testing.T) {
+	for _, width := range []int{50, 70, 100} {
+		model := testModel()
+		model.width, model.height = width, 30
+		model.openSettingsOverlay()
+		for _, line := range strings.Split(ansi.Strip(model.View()), "\n") {
+			if got := ansi.StringWidth(line); got > width {
+				t.Fatalf("width %d: line is %d columns wide: %q", width, got, line)
+			}
+		}
+		view := ansi.Strip(model.View())
+		if !strings.Contains(view, "Graph style") {
+			t.Fatalf("width %d: settings view missing first row:\n%s", width, view)
+		}
 	}
 }
