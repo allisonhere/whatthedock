@@ -224,7 +224,7 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		}
 		return renderer.Styles.DetailMeta.Render("No containers found on this host.")
 	}
-	width := m.leftPaneWidth() - 4
+	width := m.leftPaneWidth() - 2
 	if width < 12 {
 		width = 12
 	}
@@ -335,7 +335,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 		content, width := m.renderProblemsSplit(renderer)
 		return m.withPaneActionStrip(renderer, paneActivity, width, content)
 	}
-	width := m.centerPaneWidth() - 4
+	width := m.centerPaneWidth() - 2
 	if width < 20 {
 		width = 20
 	}
@@ -672,7 +672,7 @@ func logSeverityColor(severity string) lipgloss.Color {
 
 func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 	ctr := m.selectedContainer()
-	width := m.centerPaneWidth() - 4
+	width := m.centerPaneWidth() - 2
 	if width < 20 {
 		width = 20
 	}
@@ -1539,7 +1539,7 @@ func (m Model) problemSelected(index int, problem problemRow) bool {
 // matches the highlighted row.
 func (m Model) renderProblemsSplit(renderer tideui.Renderer) (string, int) {
 	problems := m.snapshotProblems()
-	width := m.centerPaneWidth() - 4
+	width := m.centerPaneWidth() - 2
 	if width < 20 {
 		width = 20
 	}
@@ -2229,7 +2229,7 @@ func (m Model) renderInspector(renderer tideui.Renderer) string {
 	if m.selected == nil {
 		return renderer.Styles.DetailMeta.Render("No container selected.")
 	}
-	width := max(12, m.rightPaneWidth()-4)
+	width := max(12, m.rightPaneWidth()-2)
 	rows := m.inspectorRows()
 	labelWidth := inspectorLabelWidth(rows)
 
@@ -5409,19 +5409,22 @@ func (m Model) columnRatios() [3]float64 {
 	return [3]float64{3, 5, 4}
 }
 
-func (m Model) leftPaneWidth() int {
+// paneWidths mirrors tideui's columnSizes (unexported): the three borders'
+// columns come off the top before the ratios split the rest. Computing the
+// widths any other way (a plain share of m.width) leaves the Inspector's
+// content wider than its pane, so its right edge is clipped.
+func (m Model) paneWidths() [3]int {
 	r := m.columnRatios()
-	return max(1, int(float64(m.width)*r[0]/(r[0]+r[1]+r[2])))
+	total := r[0] + r[1] + r[2]
+	available := m.width - 3
+	first := int(float64(available) * r[0] / total)
+	second := int(float64(available) * r[1] / total)
+	return [3]int{max(1, 1+first), max(1, 1+second), max(1, 1+available-first-second)}
 }
 
-func (m Model) centerPaneWidth() int {
-	r := m.columnRatios()
-	return max(1, int(float64(m.width)*r[1]/(r[0]+r[1]+r[2])))
-}
-
-func (m Model) rightPaneWidth() int {
-	return max(1, m.width-m.leftPaneWidth()-m.centerPaneWidth())
-}
+func (m Model) leftPaneWidth() int   { return m.paneWidths()[0] }
+func (m Model) centerPaneWidth() int { return m.paneWidths()[1] }
+func (m Model) rightPaneWidth() int  { return m.paneWidths()[2] }
 
 func min(a, b int) int {
 	if a < b {

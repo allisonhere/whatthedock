@@ -576,7 +576,7 @@ func TestRenderProblemInsightDoesNotTruncateTypicalAIResponse(t *testing.T) {
 		"for instance), confirm that service is actually reachable from here. Once you find the real " +
 		"failure, either fix the underlying issue or loosen the health check's timing so it isn't so quick to flag."
 
-	width := model.centerPaneWidth() - 4
+	width := model.centerPaneWidth() - 2
 	got := ansi.Strip(model.renderProblemInsight(renderer, row, width))
 	if strings.Contains(got, "…") {
 		t.Fatalf("AI response was truncated despite being a normal length:\n%s", got)
