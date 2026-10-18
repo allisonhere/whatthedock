@@ -108,6 +108,7 @@ That is usually faster than remembering every key.
 | `r` | Refresh Docker state |
 | `s` | Start/stop the selected container |
 | `Alt+r` | Restart the selected container |
+| `Alt+p` | Pause or unpause the selected container (Kill is in `Ctrl+K`) |
 | `n` | Create a container or Compose service |
 | `m` | Edit the selected service; on a stack row, edit the whole stack |
 | `C` | Clone the selected container/service |

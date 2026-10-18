@@ -316,6 +316,28 @@ func (p *Provider) RestartContainer(_ context.Context, id domain.ResourceID) err
 	return nil
 }
 
+func (p *Provider) SetContainerPaused(_ context.Context, id domain.ResourceID, paused bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ctr, ok := p.containers[id.ID]
+	if !ok {
+		return fmt.Errorf("demo container %s no longer exists", id.ID)
+	}
+	if paused {
+		ctr.State = domain.StatePaused
+		ctr.Status = "Up 1 minute (Paused)"
+	} else {
+		ctr.State = domain.StateRunning
+		ctr.Status = "Up 1 minute"
+	}
+	p.containers[id.ID] = ctr
+	return nil
+}
+
+func (p *Provider) KillContainer(_ context.Context, id domain.ResourceID) error {
+	return p.StopContainer(context.Background(), id)
+}
+
 func (p *Provider) RemoveContainer(_ context.Context, id domain.ResourceID, _ bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

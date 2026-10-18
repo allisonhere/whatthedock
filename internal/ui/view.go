@@ -3657,6 +3657,7 @@ var helpSections = []helpSection{
 			{"/", "filter stacks and containers; in Logs, live-filter logs"},
 			{"r", "refresh Docker state"},
 			{"Alt+r", "restart selected container"},
+			{"Alt+p", "pause or unpause selected container"},
 			{"s", "start/stop selected container"},
 			{"n", "create container or Compose service"},
 			{"m", "edit selected service; on stack row, edit whole stack"},

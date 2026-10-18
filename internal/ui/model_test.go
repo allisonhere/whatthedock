@@ -35,6 +35,8 @@ type fakeProvider struct {
 	starts           int
 	stops            int
 	restarts         int
+	pauses           []bool
+	kills            int
 	creates          []app.ContainerCreateSpec
 	renamed          []string
 	removed          []domain.ResourceID
@@ -96,6 +98,14 @@ func (f *fakeProvider) StopContainer(context.Context, domain.ResourceID) error {
 }
 func (f *fakeProvider) RestartContainer(context.Context, domain.ResourceID) error {
 	f.restarts++
+	return nil
+}
+func (f *fakeProvider) SetContainerPaused(_ context.Context, id domain.ResourceID, paused bool) error {
+	f.pauses = append(f.pauses, paused)
+	return nil
+}
+func (f *fakeProvider) KillContainer(context.Context, domain.ResourceID) error {
+	f.kills++
 	return nil
 }
 func (f *fakeProvider) CreateContainer(_ context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {
@@ -6979,5 +6989,32 @@ func TestSettingsOverlayFitsNarrowTerminals(t *testing.T) {
 		if !strings.Contains(view, "Graph style") {
 			t.Fatalf("width %d: settings view missing first row:\n%s", width, view)
 		}
+	}
+}
+
+func TestAltPPausesSelectedRunningContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	provider := model.provider.(*fakeProvider)
+	if model.selectedContainer().State != domain.StateRunning {
+		t.Fatalf("container 1 state = %v, want running", model.selectedContainer().State)
+	}
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}, Alt: true})
+	if msg, ok := runCmd(t, cmd).(actionDoneMsg); !ok || msg.err != nil {
+		t.Fatalf("alt+p result = %#v, want successful actionDoneMsg", msg)
+	}
+	if len(provider.pauses) != 1 || !provider.pauses[0] {
+		t.Fatalf("pauses = %v, want [true]", provider.pauses)
+	}
+}
+
+func TestAltRRestartsSelectedContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	provider := model.provider.(*fakeProvider)
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}, Alt: true})
+	if msg, ok := runCmd(t, cmd).(actionDoneMsg); !ok || msg.err != nil {
+		t.Fatalf("alt+r result = %#v, want successful actionDoneMsg", msg)
+	}
+	if provider.restarts != 1 {
+		t.Fatalf("restarts = %d, want 1", provider.restarts)
 	}
 }

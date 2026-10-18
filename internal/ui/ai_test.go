@@ -227,6 +227,12 @@ func (noopProvider) StopContainer(context.Context, domain.ResourceID) error { pa
 func (noopProvider) RestartContainer(context.Context, domain.ResourceID) error {
 	panic("not implemented")
 }
+func (noopProvider) SetContainerPaused(context.Context, domain.ResourceID, bool) error {
+	panic("not implemented")
+}
+func (noopProvider) KillContainer(context.Context, domain.ResourceID) error {
+	panic("not implemented")
+}
 func (noopProvider) RemoveContainer(context.Context, domain.ResourceID, bool) error {
 	panic("not implemented")
 }

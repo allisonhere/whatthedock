@@ -20,6 +20,10 @@ type Provider interface {
 	StartContainer(context.Context, domain.ResourceID) error
 	StopContainer(context.Context, domain.ResourceID) error
 	RestartContainer(context.Context, domain.ResourceID) error
+	// SetContainerPaused freezes (paused) or thaws (!paused) a container.
+	SetContainerPaused(ctx context.Context, id domain.ResourceID, paused bool) error
+	// KillContainer sends SIGKILL; the container can be started again.
+	KillContainer(context.Context, domain.ResourceID) error
 	RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error
 	PullImage(ctx context.Context, image string, onProgress func(PullProgress)) error
 	Images(context.Context) ([]domain.Image, error)

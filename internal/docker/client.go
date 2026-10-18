@@ -419,6 +419,17 @@ func (p *LocalProvider) RestartContainer(ctx context.Context, id domain.Resource
 	return p.cli.ContainerRestart(ctx, id.ID, container.StopOptions{})
 }
 
+func (p *LocalProvider) SetContainerPaused(ctx context.Context, id domain.ResourceID, paused bool) error {
+	if paused {
+		return p.cli.ContainerPause(ctx, id.ID)
+	}
+	return p.cli.ContainerUnpause(ctx, id.ID)
+}
+
+func (p *LocalProvider) KillContainer(ctx context.Context, id domain.ResourceID) error {
+	return p.cli.ContainerKill(ctx, id.ID, "KILL")
+}
+
 func (p *LocalProvider) RemoveContainer(ctx context.Context, id domain.ResourceID, force bool) error {
 	return p.cli.ContainerRemove(ctx, id.ID, container.RemoveOptions{Force: force})
 }

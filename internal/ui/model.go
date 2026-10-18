@@ -2180,10 +2180,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openCopyOverlay()
 	case "o":
 		m.openOpenOverlay()
+	case "alt+r":
+		return m, m.actionCmd(actions.Restart, "restart")
+	case "alt+p":
+		return m, m.actionCmd(actions.Pause, m.pauseLabel())
 	case "r":
-		if msg.Alt {
-			return m, m.actionCmd(actions.Restart, "restart")
-		}
 		return m, m.refreshCmd()
 	case "s":
 		return m, m.actionCmd(actions.StartStop, m.startStopLabel())
@@ -3544,6 +3545,10 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		return m, m.actionCmd(actions.StartStop, m.startStopLabel())
 	case actions.Restart:
 		return m, m.actionCmd(actions.Restart, "restart")
+	case actions.Pause:
+		return m, m.actionCmd(actions.Pause, m.pauseLabel())
+	case actions.Kill:
+		return m, m.actionCmd(actions.Kill, "kill")
 	case actions.Delete:
 		if selected := m.selectedContainer(); selected != nil {
 			m.overlay = overlayDelete
@@ -5241,6 +5246,17 @@ func (m Model) startStopLabel() string {
 		verb = "stop"
 	}
 	return verb + " " + selected.DisplayName()
+}
+
+func (m Model) pauseLabel() string {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return "pause"
+	}
+	if selected.State == domain.StatePaused {
+		return "unpause " + selected.DisplayName()
+	}
+	return "pause " + selected.DisplayName()
 }
 
 func (m Model) actionCmd(id actions.ID, label string) tea.Cmd {

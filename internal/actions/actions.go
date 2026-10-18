@@ -15,6 +15,8 @@ const (
 	Create         ID = "create-container"
 	StartStop      ID = "start-stop-container"
 	Restart        ID = "restart-container"
+	Pause          ID = "pause-container"
+	Kill           ID = "kill-container"
 	Delete         ID = "delete-container"
 	Replicate      ID = "replicate-container"
 	RestoreBackup  ID = "restore-compose-backup"
@@ -62,11 +64,15 @@ func Catalog(selected *domain.Container) []Command {
 		canStartStop = selected.State == domain.StateRunning || selected.State == domain.StateRestarting || selected.State == domain.StateStopped || selected.State == domain.StateExited
 	}
 	canExec := selected != nil && selected.IsRunning()
+	canPause := selected != nil && (selected.State == domain.StateRunning || selected.State == domain.StatePaused)
+	canKill := selected != nil && (selected.IsRunning() || selected.State == domain.StatePaused)
 	return []Command{
 		{ID: Refresh, Name: "Refresh Docker state", Shortcut: "r", Aliases: []string{"reload"}, Enabled: true, Category: "Main"},
 		{ID: Create, Name: "Create container or Compose service", Shortcut: "n", Aliases: []string{"new", "run", "compose service"}, Enabled: true, Category: "Container Management"},
 		{ID: StartStop, Name: "Start or stop selected container", Shortcut: "s", Aliases: []string{"start", "stop"}, Enabled: canStartStop, Category: "Container Management", Run: startStop},
 		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Category: "Container Management", Run: restart},
+		{ID: Pause, Name: "Pause or unpause selected container", Shortcut: "alt+p", Aliases: []string{"pause", "unpause", "freeze", "resume"}, Enabled: canPause, Category: "Container Management", Run: pause},
+		{ID: Kill, Name: "Kill selected container (SIGKILL)", Shortcut: "", Aliases: []string{"sigkill", "force stop", "terminate"}, Enabled: canKill, Category: "Container Management", Run: kill},
 		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: Replicate, Name: "Replicate: pull latest image and recreate in place", Shortcut: "u", Aliases: []string{"update image", "pull", "recreate"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: RestoreBackup, Name: "Restore last compose backup", Shortcut: "", Aliases: []string{"undo apply", "revert compose", "recover compose", "backup"}, Enabled: hasComposeBackupTarget(selected), Category: "Container Management"},
@@ -146,4 +152,18 @@ func restart(ctx context.Context, provider app.Provider, selected *domain.Contai
 		return nil
 	}
 	return provider.RestartContainer(ctx, selected.ID)
+}
+
+func pause(ctx context.Context, provider app.Provider, selected *domain.Container) error {
+	if selected == nil {
+		return nil
+	}
+	return provider.SetContainerPaused(ctx, selected.ID, selected.State != domain.StatePaused)
+}
+
+func kill(ctx context.Context, provider app.Provider, selected *domain.Container) error {
+	if selected == nil {
+		return nil
+	}
+	return provider.KillContainer(ctx, selected.ID)
 }

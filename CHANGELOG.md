@@ -5,6 +5,13 @@ only re-cut a build are folded into the nearest entry.
 
 ## [Unreleased]
 
+### Added
+- Pause/unpause (`Alt+p`) and kill (command palette) for the selected container.
+
+### Fixed
+- `Alt+r` (restart) never fired: the key handler matched `r` and then checked
+  for Alt, but Bubble Tea reports the key as `alt+r`.
+
 ### Changed
 - Settings is now a split panel: a section list on the left and the selected
   section's rows on the right. `Esc` leaves the rows first, then closes.
