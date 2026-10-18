@@ -262,10 +262,21 @@ func IsLiveSocket(path string) bool {
 // and the native keychain tunnel (dialKeychainTunnel) — the exact same
 // stale-socket handling either way.
 func prepareLocalSocket(path string) (live bool, err error) {
-	if isLiveSocket(path) {
-		return true, nil
+	info, err := os.Lstat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect tunnel socket: %w", err)
 	}
-	_ = os.Remove(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return false, fmt.Errorf("refusing to replace non-socket path %q", path)
+		}
+		if isLiveSocket(path) {
+			return true, nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("remove stale tunnel socket: %w", err)
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false, err
 	}

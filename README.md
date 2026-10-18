@@ -247,7 +247,9 @@ The keys are the same in each one:
 | `y` / `Enter` | Confirm deletion |
 | `n` / `Esc` | Cancel |
 
-In-use items are shown, but they cannot be selected for removal.
+In-use items are shown, but they cannot be selected for removal. Long lists
+scroll with the selection and show the visible row range. Confirmation and
+result messages stay visible while you navigate.
 
 ## Shut Down / Reboot Host
 

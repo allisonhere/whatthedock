@@ -159,7 +159,9 @@ func (m Model) imageCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		lines = append(lines, "", "No images found on this Docker host.")
 	} else {
 		lines = append(lines, "", imageTableHeader(contentWidth))
-		for i, image := range m.imageItems {
+		start, end := visibleRange(len(m.imageItems), m.imageCursor, max(1, m.height-13))
+		for i := start; i < end; i++ {
+			image := m.imageItems[i]
 			marker := " "
 			if i == m.imageCursor {
 				marker = ">"
@@ -170,6 +172,7 @@ func (m Model) imageCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			}
 			lines = append(lines, imageTableRow(renderer, contentWidth, i, marker, i == m.imageCursor, selected, image))
 		}
+		lines = append(lines, fmt.Sprintf("rows %d-%d of %d", start+1, end, len(m.imageItems)))
 	}
 	// Keep this summary row present even with no selection so choosing the
 	// first image cannot change the modal height or move the table upward.

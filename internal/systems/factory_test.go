@@ -3,6 +3,7 @@ package systems
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -269,6 +270,33 @@ func TestDockerHostLabel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := DockerHostLabel(tt.system); got != tt.want {
 				t.Fatalf("DockerHostLabel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTunnelPreservesNonSocketPaths(t *testing.T) {
+	for _, kind := range []string{"file", "directory", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "docker.sock")
+			var err error
+			switch kind {
+			case "file":
+				err = os.WriteFile(path, []byte("keep me"), 0600)
+			case "directory":
+				err = os.Mkdir(path, 0700)
+			case "symlink":
+				err = os.Symlink("missing-target", path)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = SSHCommandArgs(config.System{Kind: "ssh", SSHHost: "example", LocalSocket: path})
+			if err == nil {
+				t.Error("expected a refusal to replace a non-socket path")
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("configured path was removed: %v", err)
 			}
 		})
 	}

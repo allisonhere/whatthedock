@@ -149,7 +149,9 @@ func (m Model) volumeCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		lines = append(lines, "", "No volumes found on this Docker host.")
 	} else {
 		lines = append(lines, "", volumeTableHeader(contentWidth))
-		for i, volume := range m.volumeItems {
+		start, end := visibleRange(len(m.volumeItems), m.volumeCursor, max(1, m.height-13))
+		for i := start; i < end; i++ {
+			volume := m.volumeItems[i]
 			marker := " "
 			if i == m.volumeCursor {
 				marker = ">"
@@ -160,6 +162,7 @@ func (m Model) volumeCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			}
 			lines = append(lines, volumeTableRow(renderer, contentWidth, i, marker, i == m.volumeCursor, selected, volume))
 		}
+		lines = append(lines, fmt.Sprintf("rows %d-%d of %d", start+1, end, len(m.volumeItems)))
 	}
 	// Keep this summary row present even with no selection so choosing the
 	// first volume cannot change the modal height or move the table upward.

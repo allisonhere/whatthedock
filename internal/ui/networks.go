@@ -149,7 +149,9 @@ func (m Model) networkCurationOverlay(renderer tideui.Renderer) *tideui.Overlay 
 		lines = append(lines, "", "No networks found on this Docker host.")
 	} else {
 		lines = append(lines, "", networkTableHeader(contentWidth))
-		for i, network := range m.networkItems {
+		start, end := visibleRange(len(m.networkItems), m.networkCursor, max(1, m.height-13))
+		for i := start; i < end; i++ {
+			network := m.networkItems[i]
 			marker := " "
 			if i == m.networkCursor {
 				marker = ">"
@@ -160,6 +162,7 @@ func (m Model) networkCurationOverlay(renderer tideui.Renderer) *tideui.Overlay 
 			}
 			lines = append(lines, networkTableRow(renderer, contentWidth, i, marker, i == m.networkCursor, selected, network))
 		}
+		lines = append(lines, fmt.Sprintf("rows %d-%d of %d", start+1, end, len(m.networkItems)))
 	}
 	// Keep this summary row present even with no selection so choosing the
 	// first network cannot change the modal height or move the table upward.
