@@ -236,12 +236,12 @@ type BindRedirect struct {
 //   - Destination — a durable comment on the created container itself,
 //     visible later via `docker inspect` or the app's own Inspector detail
 //     overlay, not just this one-time flow.
-//   - the matching "bind-path" conflict (matched by original Source, the
-//     same value BindPathConflict recorded as its Detail) is rewritten
-//     from SeverityBlock to SeverityWarn, naming both paths.
+//   - one matching "bind-path" conflict per redirected mount is rewritten
+//     from SeverityBlock to SeverityWarn. Mounts sharing a source retain a
+//     blocking conflict for each one whose placeholder creation failed.
 func RedirectMissingBindMounts(plan *PastePlan, placeholders map[string]string) []BindRedirect {
 	var redirects []BindRedirect
-	placeholderByOriginal := map[string]string{}
+	placeholderByOriginal := map[string][]string{}
 	for i, m := range plan.Spec.Mounts {
 		if m.Type != "bind" {
 			continue
@@ -257,16 +257,18 @@ func RedirectMissingBindMounts(plan *PastePlan, placeholders map[string]string) 
 		}
 		plan.Spec.Labels[BindRedirectLabelPrefix+m.Destination] = original
 		redirects = append(redirects, BindRedirect{Destination: m.Destination, OriginalSource: original, PlaceholderPath: placeholder})
-		placeholderByOriginal[original] = placeholder
+		placeholderByOriginal[original] = append(placeholderByOriginal[original], placeholder)
 	}
 	for i, c := range plan.Conflicts {
 		if c.Kind != "bind-path" || c.Severity != SeverityBlock {
 			continue
 		}
-		placeholder, ok := placeholderByOriginal[c.Detail]
-		if !ok {
+		paths := placeholderByOriginal[c.Detail]
+		if len(paths) == 0 {
 			continue
 		}
+		placeholder := paths[0]
+		placeholderByOriginal[c.Detail] = paths[1:]
 		plan.Conflicts[i] = PasteConflict{
 			Kind: "bind-path", Severity: SeverityWarn, Detail: placeholder,
 			Message: fmt.Sprintf("%s redirected to %s (original saved as a label)", c.Detail, placeholder),

@@ -48,7 +48,7 @@ func TestCreateOverlayOpensFromShortcutAndRendersPreview(t *testing.T) {
 		t.Fatalf("overlay = %v, want create", model.overlay)
 	}
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"whatthedock · create", "Compose service", "Standalone container", "services:", "radarr", "ctrl+s validate", "Draft looks good"} {
+	for _, want := range []string{"whatthedock · create", "Compose service", "Standalone container", "services:", "radarr", "ctrl+s validate", "image is required"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("create overlay missing %q:\n%s", want, view)
 		}
@@ -95,6 +95,7 @@ func TestCreateValidationAllowsRemoteComposeEditing(t *testing.T) {
 	model.activeSystem = "remote"
 	model.openCreateOverlay()
 	model.createDraft.Mode = createModeCompose
+	model.createDraft.Image = "nginx:alpine"
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
@@ -114,6 +115,7 @@ func TestCreateStandaloneConfirmsBeforeProviderCreate(t *testing.T) {
 	model := testModelWithSelectedContainer()
 	model.width, model.height = 120, 34
 	model.openCreateOverlay()
+	model.createDraft.Image = "nginx:alpine"
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
 	model = updated.(Model)
@@ -1065,6 +1067,7 @@ func TestCreateComposeConfirmsBeforeApply(t *testing.T) {
 	// test still exercises the normal, base-file-already-exists confirm
 	// path it's actually about; that new flow has its own dedicated tests.
 	model.createDraft.BaseFileMissing = false
+	model.createDraft.Image = "nginx:alpine"
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
 	model = updated.(Model)
@@ -1300,6 +1303,7 @@ func TestCreateComposeAdoptConfirmDispatchesAdoptCmd(t *testing.T) {
 	model.width, model.height = 120, 34
 	model.openCreateOverlay()
 	model.createDraft.BaseFileMissing = true
+	model.createDraft.Image = "nginx:alpine"
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
 	model = updated.(Model)
@@ -2855,7 +2859,7 @@ func TestValidateCatchesServiceNotDefinedInOverrideContent(t *testing.T) {
 		Mode:           createModeCompose,
 		Project:        "default",
 		Service:        "new-service",
-		Image:          "image:tag",
+		Image:          "nginx:alpine",
 		ComposeFile:    "compose.yml",
 		OverrideRaw:    "services:\n  web:\n    image: nginx:alpine\n",
 		OverrideRawSet: true,
@@ -3170,7 +3174,7 @@ func modelSelecting(project, service, composeFile string) Model {
 	ctr := domain.Container{
 		ID:    id,
 		Name:  service + "-1",
-		Image: "image:tag",
+		Image: "nginx:alpine",
 		Compose: domain.ComposeRef{
 			Project:     project,
 			Service:     service,
@@ -3607,6 +3611,26 @@ func TestAdoptFlowBackfillsPortsMountsEnvCommandLocally(t *testing.T) {
 	}
 	if model.createDraft.Restart != "unless-stopped" {
 		t.Fatalf("Restart = %q, want unless-stopped", model.createDraft.Restart)
+	}
+}
+
+// TestFreshCreateDraftDoesNotInheritSelectionOnMissingBase guards the plain
+// "n" flow: a blank new-service draft whose base file is missing must not be
+// backfilled from whichever container happens to be selected.
+func TestFreshCreateDraftDoesNotInheritSelectionOnMissingBase(t *testing.T) {
+	model := modelSelecting("media", "shelfmark", "/srv/media/compose.yml")
+	model.selected.Command = "run --flag"
+	model.selected.Mounts = []domain.Mount{{Source: "/srv/media/shelfmark", Destination: "/config", ReadWrite: true}}
+	model.openCreateOverlay()
+
+	updated, _ := model.Update(createOverrideCheckMsg{
+		service: model.createDraft.Service, base: model.createDraft.ComposeFile,
+		baseFileMissing: true, found: false,
+	})
+	model = updated.(Model)
+
+	if model.createDraft.Command != "" || model.createDraft.Mounts != "" {
+		t.Fatalf("fresh draft inherited Command=%q Mounts=%q from the selection", model.createDraft.Command, model.createDraft.Mounts)
 	}
 }
 

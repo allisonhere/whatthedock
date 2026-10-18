@@ -5009,6 +5009,22 @@ func TestSuccessfulSnapshotStillUpdatesRoutineStatus(t *testing.T) {
 	}
 }
 
+// TestFirstSnapshotReplacesConnectingPlaceholder guards the footer sticking on
+// "connecting to Docker" on a quiet host: the placeholder is not an explicit
+// status, so the very first snapshot must replace it rather than hold it
+// until some later refresh happens to arrive.
+func TestFirstSnapshotReplacesConnectingPlaceholder(t *testing.T) {
+	model := testModel()
+	model.status, model.statusErr = statusConnecting, false
+
+	updated, _ := model.Update(snapshotMsg{snapshot: model.provider.(*fakeProvider).snapshot})
+	got := updated.(Model)
+
+	if got.statusErr || got.status != "Docker connected" {
+		t.Fatalf("status/statusErr = %q/%v, want Docker connected/false after the first snapshot", got.status, got.statusErr)
+	}
+}
+
 // TestSuccessfulSnapshotHoldsARecentSuccessStatus is the success-side twin
 // of TestSuccessfulSnapshotDoesNotClearAnUnacknowledgedError: a freshly set
 // success status (e.g. Start/Stop or Restart's "…complete" message) must
@@ -6833,5 +6849,59 @@ func TestFriendlyDockerErrorExplainsMissingBindSource(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("friendlyDockerError() = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestBackgroundUpdateCheckKeepsStatusMessage(t *testing.T) {
+	model := testModel()
+	model.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+	model.status, model.statusErr = "couldn't connect to remote — using local Docker instead", true
+
+	updated, _ := model.Update(updateCheckMsg{})
+	got := updated.(Model)
+
+	if got.status != "couldn't connect to remote — using local Docker instead" || !got.statusErr {
+		t.Fatalf("status = %q (err=%v), want the existing message untouched", got.status, got.statusErr)
+	}
+	if got.updateLastCheck.IsZero() {
+		t.Fatal("updateLastCheck was not recorded")
+	}
+}
+
+// TestHelpLinesWrapToThePanelWidth guards against the help overlay clipping
+// long entries mid-sentence: every visible line must fit the panel, and
+// wrapping must not drop any text.
+func TestHelpLinesWrapToThePanelWidth(t *testing.T) {
+	model := testModel()
+	model.width = 120
+	limit := model.helpPanelWidth() - 6
+
+	var got []string
+	for _, line := range model.visibleHelpLines() {
+		if w := ansi.StringWidth(line); w > limit {
+			t.Fatalf("help line is %d wide, want <= %d: %q", w, limit, line)
+		}
+		got = append(got, line)
+	}
+	joined := strings.Join(strings.Fields(strings.Join(got, " ")), " ")
+	for _, section := range helpSections {
+		for _, entry := range section.Entries {
+			if !strings.Contains(joined, strings.Join(strings.Fields(entry.Text), " ")) {
+				t.Fatalf("wrapped help dropped text for %q: %q", entry.Key, entry.Text)
+			}
+		}
+	}
+}
+
+func TestStartStopLabelNamesTheActionAndContainer(t *testing.T) {
+	model := testModelWithSelectedContainer()
+	model.selected.State = domain.StateRunning
+	if got, want := model.startStopLabel(), "stop "+model.selected.DisplayName(); got != want {
+		t.Fatalf("running label = %q, want %q", got, want)
+	}
+	model.selected.State = domain.StateExited
+	model.selected.Restarting = false
+	if got, want := model.startStopLabel(), "start "+model.selected.DisplayName(); got != want {
+		t.Fatalf("stopped label = %q, want %q", got, want)
 	}
 }

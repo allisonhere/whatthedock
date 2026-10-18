@@ -1050,7 +1050,7 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		logFollow:            true,
 		collapsed:            map[string]bool{},
 		loading:              true,
-		status:               "connecting to Docker",
+		status:               statusConnecting,
 		appVersion:           "dev",
 		updateIgnoredVersion: persisted.UpdateIgnoredVersion,
 		updateLastCheck:      updateLastCheck,
@@ -1304,7 +1304,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastStatusText = m.status
 			m.statusSince = time.Now()
 		}
-		if m.status == "Docker connected" || time.Since(m.statusSince) >= statusHoldMinDuration {
+		if m.status == "Docker connected" || m.status == statusConnecting || time.Since(m.statusSince) >= statusHoldMinDuration {
 			m.status, m.statusErr = "Docker connected", false
 		}
 		if !m.focusedTreeKey.valid {
@@ -1559,7 +1559,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCheckMsg:
 		m.updateChecking = false
 		m.updateLastCheck = time.Now()
-		m.saveSettings()
+		m.saveSettingsQuietly()
 		if msg.err != nil {
 			m.updateCheckErr = msg.err
 			if msg.manual {
@@ -1793,6 +1793,10 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.overlay = overlayPaste
 		return m, nil
 	case bindRedirectDoneMsg:
+		if msg.fromForm && (m.overlay != overlayCreate || !m.createDraft.Pasting || m.createDraft.Mounts != msg.formMounts) {
+			m.status, m.statusErr = "mounts changed while redirecting — press t again to use the current draft", true
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status, m.statusErr = "redirect: "+friendlyDockerError(msg.err), true
 			if m.overlay == overlayCreate {
@@ -1846,7 +1850,9 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.createDraft.loadFields(msg.content)
 				}
 				m.status, m.statusErr = "loaded existing override for "+msg.service, false
-			} else if msg.baseFileMissing {
+			} else if msg.baseFileMissing && m.createDraft.Editing {
+				// Only the edit/adopt flow is about an existing container; a
+				// fresh create draft must not inherit the selection's shape.
 				m.backfillAdoptDraft(m.selectedContainer())
 			}
 		}
@@ -2175,7 +2181,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.refreshCmd()
 	case "s":
-		return m, m.actionCmd(actions.StartStop, "start/stop")
+		return m, m.actionCmd(actions.StartStop, m.startStopLabel())
 	case "l":
 		m.focus = paneActivity
 		m.mode = activityLogs
@@ -3499,7 +3505,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.Create:
 		return m, m.openCreateOverlay()
 	case actions.StartStop:
-		return m, m.actionCmd(actions.StartStop, "start/stop")
+		return m, m.actionCmd(actions.StartStop, m.startStopLabel())
 	case actions.Restart:
 		return m, m.actionCmd(actions.Restart, "restart")
 	case actions.Delete:
@@ -4133,17 +4139,28 @@ func (m Model) appLogFilePath() string {
 }
 
 func (m *Model) saveSettings() {
-	if m.settingsPath == "" {
-		return
-	}
-	if err := config.SaveSettings(m.settingsPath, m.persistedSettings()); err != nil {
-		m.status, m.statusErr = "settings: "+err.Error(), true
+	if !m.saveSettingsQuietly() {
 		return
 	}
 	if m.status == "settings reset to defaults" && !m.statusErr {
 		return
 	}
 	m.status, m.statusErr = "settings saved", false
+}
+
+// saveSettingsQuietly persists settings without announcing success, for saves
+// the user didn't ask for (e.g. the background update check) that must not
+// overwrite whatever the status bar is showing. It reports whether the write
+// succeeded; a failure is still surfaced.
+func (m *Model) saveSettingsQuietly() bool {
+	if m.settingsPath == "" {
+		return false
+	}
+	if err := config.SaveSettings(m.settingsPath, m.persistedSettings()); err != nil {
+		m.status, m.statusErr = "settings: "+err.Error(), true
+		return false
+	}
+	return true
 }
 
 func (s graphStyle) String() string {
@@ -5139,6 +5156,21 @@ func maxUint(a, b uint64) uint64 {
 	return b
 }
 
+// startStopLabel names the toggle by what it will actually do to the
+// selected container, so the completion/error status says "stop web" rather
+// than a generic "start/stop" that doesn't reveal which way it went.
+func (m Model) startStopLabel() string {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return "start/stop"
+	}
+	verb := "start"
+	if selected.IsRunning() {
+		verb = "stop"
+	}
+	return verb + " " + selected.DisplayName()
+}
+
 func (m Model) actionCmd(id actions.ID, label string) tea.Cmd {
 	selected := m.selectedContainer()
 	if selected == nil {
@@ -5239,6 +5271,11 @@ func tickAbout() tea.Cmd {
 // snapshotMsg case) is allowed to clear it back to "Docker connected" on
 // its own.
 const statusHoldMinDuration = 6 * time.Second
+
+// statusConnecting is the placeholder shown until the first snapshot lands.
+// It isn't an explicit status worth holding: nothing re-checks the hold on a
+// quiet host, so holding it would leave it on screen until the next refresh.
+const statusConnecting = "connecting to Docker"
 
 // tickStatusPulse drives the status bar's breathing connected-dot. Unlike
 // tickAbout it isn't scoped to an overlay — it reschedules itself

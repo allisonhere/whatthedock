@@ -368,6 +368,26 @@ func TestRedirectMissingBindMountsLeavesUnmatchedMountsAlone(t *testing.T) {
 	}
 }
 
+func TestRedirectMissingBindMountsSharedSourcePartialSuccessStaysBlocked(t *testing.T) {
+	plan := PastePlan{
+		Spec: app.ContainerCreateSpec{Mounts: []app.MountBinding{
+			{Type: "bind", Source: "/missing", Destination: "/first"},
+			{Type: "bind", Source: "/missing", Destination: "/second"},
+		}},
+		Conflicts: []PasteConflict{
+			{Kind: "bind-path", Severity: SeverityBlock, Detail: "/missing"},
+			{Kind: "bind-path", Severity: SeverityBlock, Detail: "/missing"},
+		},
+	}
+	redirects := RedirectMissingBindMounts(&plan, map[string]string{"/first": "/placeholder"})
+	if len(redirects) != 1 || plan.Spec.Mounts[1].Source != "/missing" {
+		t.Fatalf("partial redirect = %#v, mounts = %#v", redirects, plan.Spec.Mounts)
+	}
+	if !plan.Blocked() || !hasConflict(plan.Conflicts, "bind-path", SeverityWarn) {
+		t.Fatalf("conflicts = %#v, want one warning and one remaining block", plan.Conflicts)
+	}
+}
+
 func TestRedirectMissingBindMountsIgnoresNonBindMounts(t *testing.T) {
 	plan := planWithBindMounts()
 	// An entry keyed by the volume mount's destination must never redirect

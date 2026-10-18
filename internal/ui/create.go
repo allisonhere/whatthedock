@@ -638,7 +638,7 @@ func (m Model) defaultCreateDraft() createDraft {
 		Project:       "default",
 		Service:       "new-service",
 		ContainerName: "new-container",
-		Image:         "image:tag",
+		Image:         placeholderImage,
 		ImageAction:   imageActionKeep,
 		Restart:       "unless-stopped",
 		ComposeFile:   "compose.yml",
@@ -969,7 +969,12 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// literal "t", so fall through to the editor when there's nothing
 		// to redirect.
 		if m.createDraft.Pasting && len(pasteDraftBindConflicts(m.createDraft)) > 0 {
-			return m, m.redirectMissingBindMountsCmd(*m.createDraft.PastePlan)
+			plan, err := pastePlanForDraftMounts(m.createDraft)
+			if err != nil {
+				m.setCreateNotice(err.Error(), true)
+				return m, nil
+			}
+			return m, m.redirectMissingBindMountsCmd(plan)
 		}
 		cmd = m.forwardToFieldEditor(msg)
 	case "[", "]":
@@ -1808,6 +1813,10 @@ func lintComposeYAML(content string) error {
 	return yaml.Unmarshal([]byte(content), &doc)
 }
 
+// placeholderImage prefills a fresh draft's Image field as a hint. It is not
+// a real image, so Validate treats it as unset.
+const placeholderImage = "image:tag"
+
 func (d createDraft) Validate() error {
 	if d.Mode == createModeCompose {
 		if strings.TrimSpace(d.Project) == "" {
@@ -1825,7 +1834,7 @@ func (d createDraft) Validate() error {
 		if strings.TrimSpace(d.Service) == "" {
 			return errors.New("service name is required")
 		}
-		if strings.TrimSpace(d.Image) == "" {
+		if image := strings.TrimSpace(d.Image); image == "" || image == placeholderImage {
 			return errors.New("image is required")
 		}
 		// Hand-edited or loaded override content (OverrideRawSet) isn't
@@ -1857,7 +1866,7 @@ func (d createDraft) Validate() error {
 	if strings.TrimSpace(d.ContainerName) == "" {
 		return errors.New("container name is required")
 	}
-	if strings.TrimSpace(d.Image) == "" {
+	if image := strings.TrimSpace(d.Image); image == "" || image == placeholderImage {
 		return errors.New("image is required")
 	}
 	return nil

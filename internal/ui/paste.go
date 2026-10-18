@@ -197,10 +197,52 @@ func pasteBindNotice(d createDraft, host string) string {
 		len(paths), host, strings.Join(paths, ", "))
 }
 
+// pastePlanForDraftMounts uses the form's current mounts for a redirect and
+// keeps only bind conflicts that still correspond to those mounts.
+func pastePlanForDraftMounts(d createDraft) (clipboard.PastePlan, error) {
+	plan := *d.PastePlan
+	mounts, err := parseCreateMounts(d.Mounts)
+	if err != nil {
+		return clipboard.PastePlan{}, err
+	}
+	originalByTarget := map[string]app.MountBinding{}
+	for _, mount := range plan.Spec.Mounts {
+		originalByTarget[mount.Destination] = mount
+	}
+	remaining := map[string]int{}
+	for i := range mounts {
+		if original, ok := originalByTarget[mounts[i].Destination]; ok && original.Source == mounts[i].Source {
+			mounts[i].Type = original.Type
+		} else if filepath.IsAbs(mounts[i].Source) {
+			mounts[i].Type = "bind"
+		} else {
+			mounts[i].Type = "volume"
+		}
+		if mounts[i].Type == "bind" {
+			remaining[mounts[i].Source]++
+		}
+	}
+	plan.Spec.Mounts = mounts
+	conflicts := plan.Conflicts[:0:0]
+	for _, conflict := range plan.Conflicts {
+		if conflict.Kind == "bind-path" && conflict.Severity == clipboard.SeverityBlock {
+			if remaining[conflict.Detail] == 0 {
+				continue
+			}
+			remaining[conflict.Detail]--
+		}
+		conflicts = append(conflicts, conflict)
+	}
+	plan.Conflicts = conflicts
+	return plan, nil
+}
+
 // bindRedirectDoneMsg carries the result of redirectMissingBindMountsCmd
 // back into Update.
 type bindRedirectDoneMsg struct {
 	plan       clipboard.PastePlan
+	fromForm   bool
+	formMounts string
 	redirected int
 	failed     []string
 	err        error
@@ -216,6 +258,11 @@ type bindRedirectDoneMsg struct {
 // reason reported, rather than silently treated as redirected.
 func (m Model) redirectMissingBindMountsCmd(plan clipboard.PastePlan) tea.Cmd {
 	system := m.activeSystemConfig()
+	formMounts := ""
+	fromForm := m.overlay == overlayCreate && m.createDraft.Pasting
+	if fromForm {
+		formMounts = m.createDraft.Mounts
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -225,40 +272,27 @@ func (m Model) redirectMissingBindMountsCmd(plan clipboard.PastePlan) tea.Cmd {
 		}
 		placeholders := map[string]string{}
 		var failed []string
+		blockedSources := map[string]bool{}
 		for _, c := range plan.Conflicts {
-			if c.Kind != "bind-path" || c.Severity != clipboard.SeverityBlock {
-				continue
+			if c.Kind == "bind-path" && c.Severity == clipboard.SeverityBlock {
+				blockedSources[c.Detail] = true
 			}
-			destination := bindMountDestinationForSource(plan.Spec.Mounts, c.Detail)
-			if destination == "" {
+		}
+		for _, mount := range plan.Spec.Mounts {
+			if mount.Type != "bind" || !blockedSources[mount.Source] {
 				continue
 			}
 			placeholder := filepath.Join(home, ".local/share/whatthedock/paste-placeholders",
-				sanitizePathSegment(plan.Spec.Name), sanitizePathSegment(destination))
+				sanitizePathSegment(plan.Spec.Name), sanitizePathSegment(mount.Destination))
 			if err := mkdirOn(ctx, system, placeholder); err != nil {
-				failed = append(failed, c.Detail+": "+err.Error())
+				failed = append(failed, mount.Source+": "+err.Error())
 				continue
 			}
-			placeholders[destination] = placeholder
+			placeholders[mount.Destination] = placeholder
 		}
 		redirects := clipboard.RedirectMissingBindMounts(&plan, placeholders)
-		return bindRedirectDoneMsg{plan: plan, redirected: len(redirects), failed: failed}
+		return bindRedirectDoneMsg{plan: plan, fromForm: fromForm, formMounts: formMounts, redirected: len(redirects), failed: failed}
 	}
-}
-
-// bindMountDestinationForSource finds the container-side path for the
-// bind mount whose (original, pre-redirect) Source is source — the join
-// between a "bind-path" conflict (which only ever records the source, via
-// BindPathConflict's Detail) and the mount it came from, so
-// redirectMissingBindMountsCmd can key its placeholders map by
-// Destination the way clipboard.RedirectMissingBindMounts expects.
-func bindMountDestinationForSource(mounts []app.MountBinding, source string) string {
-	for _, m := range mounts {
-		if m.Type == "bind" && m.Source == source {
-			return m.Destination
-		}
-	}
-	return ""
 }
 
 // sanitizePathSegment flattens value into one filesystem-safe path

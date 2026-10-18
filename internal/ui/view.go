@@ -701,7 +701,7 @@ func (m Model) renderStatsContent(renderer tideui.Renderer) (string, int) {
 		renderStatRow(renderer, m.settings, width, "Disk IO", uintStatGraph(history.BlockTotal, history.maxBlock, byteLevel(statsBlockTotal(stats)), formatByteDelta, formatBytes), formatBytes(statsBlockRead(stats))+" / "+formatBytes(statsBlockWrite(stats)), activePalette.Warn),
 		"",
 		renderStatRow(renderer, restartsRowSettings(m.settings), width, "Restarts", staticStatGraph(staticGraphGlyph(m.settings, restartLevel(ctr.RestartCount)), restartLevel(ctr.RestartCount)), fmt.Sprintf("%d", ctr.RestartCount), restartColor(ctr.RestartCount)),
-		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), formatDuration(ctr.Created), activePalette.Alt2, uptimeColor(ctr.Created)),
+		renderStatRowSuffixColor(renderer, m.settings, width, "Uptime", staticStatGraph(staticGraphGlyph(m.settings, uptimeLevel(ctr.Created)), uptimeLevel(ctr.Created)), uptimeText(*ctr), activePalette.Alt2, uptimeColor(ctr.Created)),
 		renderStatRow(renderer, m.settings, width, "PIDs", uintStatGraph(history.PIDs, history.maxPIDs, pidsLevel(stats), formatCountDelta, formatPIDCount), formatPIDs(stats), "#6fd6c9"),
 		renderer.RenderRow(tideui.Row{Prefix: "State    ", Text: statusText(*ctr), Suffix: containerTitle(*ctr)}, width),
 	}
@@ -1466,6 +1466,15 @@ func restartsRowSettings(settings appSettings) appSettings {
 	return settings
 }
 
+// uptimeText shows how long a container has existed, but only while it is
+// running; a stopped container has no uptime to report.
+func uptimeText(ctr domain.Container) string {
+	if !ctr.IsRunning() {
+		return "-"
+	}
+	return formatDuration(ctr.Created)
+}
+
 func uptimeLevel(created time.Time) int {
 	if created.IsZero() {
 		return 1
@@ -1930,7 +1939,7 @@ func (m Model) inspectorRows() []inspectorRow {
 	addTitle(containerTitle(ctr))
 	addSection("Runtime")
 	addField("Status", inspectorStatusText(ctr), "", inspectorStatusColor(ctr), "")
-	addField("Uptime", formatDuration(ctr.Created), "", activePalette.Muted, "")
+	addField("Uptime", uptimeText(ctr), "", activePalette.Muted, "")
 	addField("Restart", ctr.RestartPolicy, "", "", "")
 	addField("Restarts", fmt.Sprintf("%d", ctr.RestartCount), "", restartCountColor(ctr.RestartCount), "")
 
@@ -2707,7 +2716,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	switch m.overlay {
 	case overlayHelp:
-		width := min(72, max(40, m.width-8))
+		width := m.helpPanelWidth()
 		budget := m.helpBodyBudget()
 		lines := m.visibleHelpLines()
 		scroll := clamp(m.helpScroll, 0, max(0, len(lines)-budget))
@@ -3723,14 +3732,23 @@ func helpText() string {
 }
 
 func helpLines() []string {
-	return helpLinesForSearch("")
+	return helpLinesForSearch("", 0)
+}
+
+// helpPanelWidth is the help overlay's width; the longest entries need more
+// than the old fixed 72 columns, so it grows with the terminal.
+func (m Model) helpPanelWidth() int {
+	return min(100, max(40, m.width-8))
 }
 
 func (m Model) visibleHelpLines() []string {
-	return helpLinesForSearch(m.helpSearch)
+	return helpLinesForSearch(m.helpSearch, m.helpPanelWidth()-6)
 }
 
-func helpLinesForSearch(query string) []string {
+// helpLinesForSearch returns the help text matching query, with entry text
+// wrapped to width columns (no wrapping when width <= 0) so a narrow panel
+// never clips an entry mid-sentence.
+func helpLinesForSearch(query string, width int) []string {
 	query = strings.ToLower(strings.TrimSpace(query))
 	lines := []string{}
 	for i, section := range helpSections {
@@ -3749,11 +3767,31 @@ func helpLinesForSearch(query string) []string {
 		}
 		lines = append(lines, section.Title+":")
 		for _, entry := range entries {
-			lines = append(lines, formatHelpEntry(entry))
+			lines = append(lines, wrapHelpEntry(entry, width)...)
 		}
 	}
 	if len(lines) == 0 {
 		return []string{"No help entries match " + strconv.Quote(query)}
+	}
+	return lines
+}
+
+// wrapHelpEntry formats a help entry wrapped to width columns (unwrapped when
+// width <= 0), with continuation lines indented under the entry text.
+func wrapHelpEntry(entry helpEntry, width int) []string {
+	line := formatHelpEntry(entry)
+	if width <= 0 || ansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	indent := 2
+	if entry.Key != "" {
+		indent = 21
+	}
+	wrapped := strings.Split(ansi.Wrap(entry.Text, max(10, width-indent), ""), "\n")
+	lines := make([]string, len(wrapped))
+	lines[0] = line[:len(line)-len(entry.Text)] + wrapped[0]
+	for i := 1; i < len(wrapped); i++ {
+		lines[i] = strings.Repeat(" ", indent) + wrapped[i]
 	}
 	return lines
 }

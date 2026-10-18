@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/allisonhere/tideui"
 	"github.com/charmbracelet/lipgloss"
@@ -661,5 +662,15 @@ func TestCreateErrorNoticeIsProminentAndWrapped(t *testing.T) {
 		if w := lipgloss.Width(line); w > 40 {
 			t.Fatalf("line %d is %d wide, want <= 40:\n%s", i, w, got)
 		}
+	}
+}
+
+func TestUptimeTextOnlyForRunningContainers(t *testing.T) {
+	created := time.Now().Add(-72 * time.Hour)
+	if got := uptimeText(domain.Container{State: domain.StateExited, Created: created}); got != "-" {
+		t.Fatalf("stopped container uptime = %q, want -", got)
+	}
+	if got := uptimeText(domain.Container{State: domain.StateRunning, Created: created}); got != "3d" {
+		t.Fatalf("running container uptime = %q, want 3d", got)
 	}
 }

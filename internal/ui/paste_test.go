@@ -833,6 +833,39 @@ func TestPasteFormRedirectMissingBindMountsUnblocksDeploy(t *testing.T) {
 	}
 }
 
+func TestPasteFormRedirectPreservesMountEdits(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := pasteSourceProvider()
+	missing := filepath.Join(t.TempDir(), "missing")
+	ctr := source.containers["src-1"]
+	ctr.Mounts = append(ctr.Mounts, domain.Mount{Type: "bind", Source: missing, Destination: "/extra", ReadWrite: true})
+	source.containers["src-1"] = ctr
+	source.snapshot = domain.BuildSnapshot(source.host, []domain.Container{ctr}, time.Unix(1, 0))
+	model := modelWithSourceSelected(t, source)
+	model = yankAndSwitch(t, model, pasteDestProvider())
+	model = openPasteReview(t, model)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	model.createDraft.Mounts += ", new-data:/new-data"
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("redirect command was nil")
+	}
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(Model)
+	if !strings.Contains(model.createDraft.Mounts, "new-data:/new-data") {
+		t.Fatalf("Mounts = %q, lost the edited mount", model.createDraft.Mounts)
+	}
+	spec, err := model.createDraft.ContainerSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 3 || spec.Mounts[2].Destination != "/new-data" {
+		t.Fatalf("created mounts = %#v, want the edited mount", spec.Mounts)
+	}
+}
+
 // TestPasteApplyFailureSurfacesInCreateNotice checks a deploy failure is shown
 // in the create overlay's own notice, not just the status bar hidden behind
 // it — the reason the failure looked like the dialog simply reopening.
