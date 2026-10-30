@@ -459,6 +459,13 @@ yes/no "is one stored" check.
 Add `--json` for machine-readable output. Exit codes are `0` (clean), `1`
 (warnings), and `2` (failures).
 
+## Support
+
+WhatTheDock is free and built and maintained by one person. If it saves you
+time, you can [sponsor it on GitHub](https://github.com/sponsors/allisonhere),
+one-time or monthly. Starring the repo and reporting bugs in
+[issues](https://github.com/allisonhere/whatthedock/issues) help too.
+
 ## Development
 
 Run the normal checks:
