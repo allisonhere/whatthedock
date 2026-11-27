@@ -3247,7 +3247,7 @@ func (m Model) currentSystem() config.System {
 }
 
 func (m *Model) startAddSystem() {
-	next := len(m.systems) + 1
+	next := m.nextFreeRemoteNumber()
 	m.systemDraft = config.System{
 		ID:           fmt.Sprintf("remote-%d", next),
 		Name:         fmt.Sprintf("remote %d", next),
@@ -3261,6 +3261,26 @@ func (m *Model) startAddSystem() {
 	m.systemField = systemFieldName
 	m.systemCursor = len([]rune(m.systemDraft.Name))
 	m.systemMode = systemModeEdit
+}
+
+// nextFreeRemoteNumber is the lowest N for which neither "remote-N" nor its
+// tunnel socket belongs to an existing system. It can't be len(systems)+1:
+// once a system has been deleted that lands on a number still in use, and two
+// systems with one ID share a tunnel socket and a keychain entry — saving the
+// second one's password would overwrite the first's.
+func (m Model) nextFreeRemoteNumber() int {
+	taken := map[string]bool{}
+	for _, system := range m.systems {
+		taken[system.ID] = true
+		taken[system.LocalSocket] = true
+	}
+	for n := 1; ; n++ {
+		id := fmt.Sprintf("remote-%d", n)
+		socket := filepath.Join(os.TempDir(), fmt.Sprintf("whatthedock-remote-%d.sock", n))
+		if !taken[id] && !taken[socket] {
+			return n
+		}
+	}
 }
 
 func (m *Model) startEditSystem() {
@@ -3484,6 +3504,16 @@ func (m *Model) saveSystemDraft() {
 		m.status, m.statusErr = "system: "+err.Error(), true
 		return
 	}
+	if m.systemDraftNew {
+		// Checked before anything is written to the keychain: a duplicate ID
+		// would store this password over the other system's.
+		for _, existing := range m.systems {
+			if existing.ID == m.systemDraft.ID {
+				m.status, m.statusErr = fmt.Sprintf("system: id %q is already used by %q", existing.ID, existing.Name), true
+				return
+			}
+		}
+	}
 	// A blank password field on an existing keychain-mode entry means
 	// "leave the already-stored password alone," not "clear it" — only a
 	// non-empty retype writes anything. A store failure (no keychain
@@ -3508,6 +3538,13 @@ func (m *Model) saveSystemDraft() {
 			// endpoint from adopting a live socket owned by that forward.
 			m.systemDraft.LocalSocket = filepath.Join(os.TempDir(), fmt.Sprintf("whatthedock-%s-%x.sock", safeComposeFilename(draft.ID), time.Now().UnixNano()))
 		}
+		if previous.Kind == "ssh" && previous.SSHAuth == "keychain" && m.forgetPassword != nil &&
+			(draft.Kind != "ssh" || draft.SSHAuth != "keychain") {
+			// No longer a keychain system: drop its stored password rather
+			// than leave a secret nothing will ever use (or that a later
+			// system with the same ID would silently pick up).
+			_ = m.forgetPassword(previous.ID)
+		}
 		m.systems[index] = m.systemDraft
 	}
 	m.systemMode = systemModeList
@@ -3526,7 +3563,7 @@ func (m *Model) deleteCurrentSystem() {
 		m.status, m.statusErr = "switch systems before deleting the active system", true
 		return
 	}
-	if deleted.SSHAuth == "keychain" && m.forgetPassword != nil {
+	if deleted.Kind == "ssh" && m.forgetPassword != nil {
 		_ = m.forgetPassword(deleted.ID) // best-effort: no orphaned secret left behind, but a deleted system shouldn't fail to delete over it
 	}
 	m.systems = append(m.systems[:index], m.systems[index+1:]...)

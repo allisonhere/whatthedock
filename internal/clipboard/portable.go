@@ -119,7 +119,11 @@ type PortableContainer struct {
 	NetworkMode string
 
 	RestartPolicy string
-	HealthCheck   *domain.HealthCheck
+	// RestartMaxRetries is the cap on an "on-failure" policy
+	// (--restart on-failure:5); zero means no cap, and it means nothing for
+	// any other policy.
+	RestartMaxRetries int
+	HealthCheck       *domain.HealthCheck
 
 	MemoryBytes int64
 	NanoCPUs    int64
@@ -158,36 +162,37 @@ func (pc PortableContainer) SecretEnvCount() int {
 // the HostID but not the display Name the topbar/review-screen want.
 func FromContainer(ctr domain.Container, sourceHost domain.Host) PortableContainer {
 	pc := PortableContainer{
-		SourceHost:     sourceHost.ID,
-		SourceHostName: sourceHost.Name,
-		YankedAt:       time.Now(),
-		Name:           ctr.DisplayName(),
-		Hostname:       ctr.Hostname,
-		Image:          ctr.Image,
-		ImageDigest:    ctr.ImageDigest,
-		Command:        ctr.Command,
-		Entrypoint:     ctr.Entrypoint,
-		Labels:         copyStringMap(ctr.Labels),
-		WorkingDir:     ctr.WorkingDir,
-		User:           ctr.User,
-		Privileged:     ctr.Privileged,
-		CapAdd:         append([]string(nil), ctr.CapAdd...),
-		CapDrop:        append([]string(nil), ctr.CapDrop...),
-		Devices:        append([]domain.Device(nil), ctr.Devices...),
-		RestartPolicy:  ctr.RestartPolicy,
-		HealthCheck:    ctr.HealthCheck,
-		MemoryBytes:    ctr.MemoryBytes,
-		NanoCPUs:       ctr.NanoCPUs,
-		StopSignal:     ctr.StopSignal,
-		StopTimeout:    ctr.StopTimeout,
-		DNS:            append([]string(nil), ctr.DNS...),
-		DNSSearch:      append([]string(nil), ctr.DNSSearch...),
-		ReadonlyRootfs: ctr.ReadonlyRootfs,
-		SecurityOpt:    append([]string(nil), ctr.SecurityOpt...),
-		LogDriver:      ctr.LogDriver,
-		LogOptions:     copyStringMap(ctr.LogOptions),
-		Compose:        PortableCompose{Project: ctr.Compose.Project, Service: ctr.Compose.Service},
-		NetworkMode:    ctr.NetworkMode,
+		SourceHost:        sourceHost.ID,
+		SourceHostName:    sourceHost.Name,
+		YankedAt:          time.Now(),
+		Name:              ctr.DisplayName(),
+		Hostname:          ctr.Hostname,
+		Image:             ctr.Image,
+		ImageDigest:       ctr.ImageDigest,
+		Command:           ctr.Command,
+		Entrypoint:        ctr.Entrypoint,
+		Labels:            copyStringMap(ctr.Labels),
+		WorkingDir:        ctr.WorkingDir,
+		User:              ctr.User,
+		Privileged:        ctr.Privileged,
+		CapAdd:            append([]string(nil), ctr.CapAdd...),
+		CapDrop:           append([]string(nil), ctr.CapDrop...),
+		Devices:           append([]domain.Device(nil), ctr.Devices...),
+		RestartPolicy:     ctr.RestartPolicy,
+		RestartMaxRetries: ctr.RestartMaxRetries,
+		HealthCheck:       ctr.HealthCheck,
+		MemoryBytes:       ctr.MemoryBytes,
+		NanoCPUs:          ctr.NanoCPUs,
+		StopSignal:        ctr.StopSignal,
+		StopTimeout:       ctr.StopTimeout,
+		DNS:               append([]string(nil), ctr.DNS...),
+		DNSSearch:         append([]string(nil), ctr.DNSSearch...),
+		ReadonlyRootfs:    ctr.ReadonlyRootfs,
+		SecurityOpt:       append([]string(nil), ctr.SecurityOpt...),
+		LogDriver:         ctr.LogDriver,
+		LogOptions:        copyStringMap(ctr.LogOptions),
+		Compose:           PortableCompose{Project: ctr.Compose.Project, Service: ctr.Compose.Service},
+		NetworkMode:       ctr.NetworkMode,
 	}
 
 	for _, e := range ctr.Env {
@@ -247,31 +252,32 @@ func FromContainer(ctr domain.Container, sourceHost domain.Host) PortableContain
 // the starting point.
 func (pc PortableContainer) ToCreateSpec() app.ContainerCreateSpec {
 	spec := app.ContainerCreateSpec{
-		Name:           pc.Name,
-		Image:          pc.Image,
-		Command:        splitFields(pc.Command),
-		Entrypoint:     splitFields(pc.Entrypoint),
-		Hostname:       pc.Hostname,
-		WorkingDir:     pc.WorkingDir,
-		User:           pc.User,
-		Labels:         filterComposeIdentityLabels(pc.Labels),
-		RestartPolicy:  pc.RestartPolicy,
-		Privileged:     pc.Privileged,
-		CapAdd:         append([]string(nil), pc.CapAdd...),
-		CapDrop:        append([]string(nil), pc.CapDrop...),
-		Devices:        append([]domain.Device(nil), pc.Devices...),
-		MemoryBytes:    pc.MemoryBytes,
-		NanoCPUs:       pc.NanoCPUs,
-		StopSignal:     pc.StopSignal,
-		StopTimeout:    pc.StopTimeout,
-		DNS:            append([]string(nil), pc.DNS...),
-		DNSSearch:      append([]string(nil), pc.DNSSearch...),
-		ReadonlyRootfs: pc.ReadonlyRootfs,
-		SecurityOpt:    append([]string(nil), pc.SecurityOpt...),
-		LogDriver:      pc.LogDriver,
-		LogOptions:     copyStringMap(pc.LogOptions),
-		Healthcheck:    pc.HealthCheck,
-		Start:          true,
+		Name:              pc.Name,
+		Image:             pc.Image,
+		Command:           splitFields(pc.Command),
+		Entrypoint:        splitFields(pc.Entrypoint),
+		Hostname:          pc.Hostname,
+		WorkingDir:        pc.WorkingDir,
+		User:              pc.User,
+		Labels:            filterComposeIdentityLabels(pc.Labels),
+		RestartPolicy:     pc.RestartPolicy,
+		RestartMaxRetries: pc.RestartMaxRetries,
+		Privileged:        pc.Privileged,
+		CapAdd:            append([]string(nil), pc.CapAdd...),
+		CapDrop:           append([]string(nil), pc.CapDrop...),
+		Devices:           append([]domain.Device(nil), pc.Devices...),
+		MemoryBytes:       pc.MemoryBytes,
+		NanoCPUs:          pc.NanoCPUs,
+		StopSignal:        pc.StopSignal,
+		StopTimeout:       pc.StopTimeout,
+		DNS:               append([]string(nil), pc.DNS...),
+		DNSSearch:         append([]string(nil), pc.DNSSearch...),
+		ReadonlyRootfs:    pc.ReadonlyRootfs,
+		SecurityOpt:       append([]string(nil), pc.SecurityOpt...),
+		LogDriver:         pc.LogDriver,
+		LogOptions:        copyStringMap(pc.LogOptions),
+		Healthcheck:       pc.HealthCheck,
+		Start:             true,
 	}
 	for _, e := range pc.Env {
 		spec.Env = append(spec.Env, e.Key+"="+e.Value)

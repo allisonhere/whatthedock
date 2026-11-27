@@ -3214,8 +3214,8 @@ func TestSystemsOverlaySavesTypedKeychainPassword(t *testing.T) {
 
 	model.saveSystemDraft()
 
-	if store["remote-2"] != "hunter2" {
-		t.Fatalf("stored passwords = %#v, want remote-2 -> hunter2", store)
+	if store["remote-1"] != "hunter2" {
+		t.Fatalf("stored passwords = %#v, want remote-1 -> hunter2", store)
 	}
 	if model.systemDraftPassword != "" {
 		t.Fatalf("systemDraftPassword = %q, want cleared after a successful store", model.systemDraftPassword)

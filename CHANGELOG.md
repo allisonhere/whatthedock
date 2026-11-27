@@ -35,6 +35,28 @@ only re-cut a build are folded into the nearest entry.
   (bundled into the binary) in a scrollable overlay.
 
 ### Fixed
+- Copy/paste and clone dropped an `on-failure` restart policy's retry cap; it is
+  kept now unless you change the policy. A pasted container with no restart
+  policy also stays "no restart" instead of becoming `unless-stopped`.
+- Editing a Compose service's ports or volumes deleted every entry the form
+  can't show (a container-only `target: 80` port, an anonymous or tmpfs volume)
+  and the extras on long-form entries you hadn't touched. Only entries you
+  removed or changed are rewritten now.
+- Editing a service defined in both the base file and a leftover override
+  reverted every setting only the override had. The override's fields are folded
+  into the base (ports and volumes added, environment merged by name), and an
+  override that still holds keys the form doesn't manage is kept without the
+  fields that moved. Local and SSH.
+- Adding a system after deleting one could reuse an ID that was still in use,
+  and with it the same tunnel socket and keychain entry. New systems get an
+  unused ID, and a duplicate is refused before anything is written to the
+  keychain.
+- Switching a system off keychain auth, or deleting it after that, left its
+  stored password behind. Both now remove it.
+- Env values named like `STRIPE_KEY`, `ENCRYPTION_KEY`, `DATABASE_URL`,
+  `REDIS_URL` or `MONGO_URI` were not masked in a copied container's preview.
+- Pasting or editing a container could turn a volume whose source looks like a
+  path into a bind mount; unchanged mounts keep their recorded type.
 - Keychain SSH can verify a saved host key when `known_hosts` also contains an
   `ssh-mldsa44-ed25519` host key.
 - `Alt+r` (restart) never fired: the key handler matched `r` and then checked

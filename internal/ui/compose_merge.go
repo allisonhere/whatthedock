@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -103,6 +104,99 @@ func setMappingList(node *yaml.Node, key string, values []string) {
 	)
 }
 
+// setMappingEntries replaces node's `key` sequence (ports, volumes) with
+// values, as setMappingList does, but without destroying what the form can't
+// represent. The form loads only entries it can express as one short string,
+// so rebuilding the list from it alone would silently delete the rest — a
+// container-only `{target: 80}` port, an anonymous or tmpfs `{type: volume,
+// target: /cache}` volume — the moment any other entry was edited.
+//
+// shortOf gives an existing entry's short form, or "" when the form can't
+// represent it. Entries whose short form is still in values keep their
+// original node (so long-form extras and quoting survive); new values get new
+// nodes; entries the form can't represent are kept after them; entries the
+// form could represent but no longer lists (the user removed them) are gone.
+func setMappingEntries(node *yaml.Node, key string, values []string, shortOf func(*yaml.Node) string) {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != key {
+			continue
+		}
+		seq := node.Content[i+1]
+		if seq.Kind != yaml.SequenceNode {
+			setMappingList(node, key, values)
+			return
+		}
+		type entry struct {
+			node  *yaml.Node
+			short string
+			used  bool
+		}
+		existing := make([]entry, len(seq.Content))
+		for j, item := range seq.Content {
+			existing[j] = entry{node: item, short: shortOf(item)}
+		}
+
+		var next []*yaml.Node
+		for _, value := range values {
+			reused := false
+			for j := range existing {
+				if !existing[j].used && existing[j].short == value {
+					existing[j].used = true
+					next = append(next, existing[j].node)
+					reused = true
+					break
+				}
+			}
+			if !reused {
+				next = append(next, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value})
+			}
+		}
+		for _, e := range existing {
+			// A blank scalar is nothing to keep; anything else the form
+			// couldn't read is.
+			if e.short == "" && !(e.node.Kind == yaml.ScalarNode && strings.TrimSpace(e.node.Value) == "") {
+				next = append(next, e.node)
+			}
+		}
+		if len(next) == 0 {
+			node.Content = append(node.Content[:i], node.Content[i+2:]...)
+			return
+		}
+		seq.Content = next
+		return
+	}
+	setMappingList(node, key, values)
+}
+
+// composePortShort is a ports entry's form representation: the string itself,
+// or the short form of a long mapping that has both target and published.
+func composePortShort(item *yaml.Node) string {
+	switch item.Kind {
+	case yaml.ScalarNode:
+		return item.Value
+	case yaml.MappingNode:
+		var entry map[string]interface{}
+		if item.Decode(&entry) == nil {
+			return longComposePortToShort(entry)
+		}
+	}
+	return ""
+}
+
+// composeVolumeShort is composePortShort's volumes counterpart.
+func composeVolumeShort(item *yaml.Node) string {
+	switch item.Kind {
+	case yaml.ScalarNode:
+		return item.Value
+	case yaml.MappingNode:
+		var entry map[string]interface{}
+		if item.Decode(&entry) == nil {
+			return longComposeVolumeToShort(entry)
+		}
+	}
+	return ""
+}
+
 func scalarSequence(values []string) *yaml.Node {
 	seq := &yaml.Node{Kind: yaml.SequenceNode}
 	for _, v := range values {
@@ -162,10 +256,10 @@ func mergeComposeServiceFields(base []byte, service string, fields composeOverri
 		setMappingScalar(value, "command", normalizeComposeCommand(fields.Command))
 	}
 	if changed&composeFieldPorts != 0 {
-		setMappingList(value, "ports", normalizeComposePorts(fields.Ports))
+		setMappingEntries(value, "ports", normalizeComposePorts(fields.Ports), composePortShort)
 	}
 	if changed&composeFieldVolumes != 0 {
-		setMappingList(value, "volumes", normalizeComposeVolumes(fields.Volumes))
+		setMappingEntries(value, "volumes", normalizeComposeVolumes(fields.Volumes), composeVolumeShort)
 	}
 	if changed&composeFieldEnvironment != 0 {
 		setMappingList(value, "environment", normalizeComposeEnvironment(fields.Environment))

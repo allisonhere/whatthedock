@@ -91,6 +91,11 @@ type createDraft struct {
 	// ContainerSpec starts from instead of a blank spec when Pasting.
 	Networks string
 
+	// RestartMaxRetries is the on-failure retry cap a Clone carries over from
+	// the container it copies. The form has no field for it, so it rides
+	// along unedited and is dropped only when the restart policy is changed.
+	RestartMaxRetries int
+
 	// Pasting and PastePlan mark a draft opened from the paste review
 	// screen (see draftFromPastePlan, paste.go) rather than a fresh Create
 	// (n), Clone (C), or Edit (e/m) — confirming this draft applies through
@@ -265,9 +270,15 @@ type composeCreateSpec struct {
 	// the loaded baseline. The base-file merge applies only these, so
 	// untouched (or never-prefilled) fields in the base file are preserved.
 	ChangedFields composeFieldSet
-	PullBeforeUp  bool
-	Progress      func(string)
-	System        config.System
+	// FoldOverride is set when the draft was loaded from an existing override
+	// of a service the base file also defines. Applying it folds the
+	// override's fields into the base (see foldOverrideIntoBase) and keeps
+	// whatever the override holds that the base merge can't carry, instead of
+	// deleting it and reverting every override-only setting.
+	FoldOverride bool
+	PullBeforeUp bool
+	Progress     func(string)
+	System       config.System
 }
 
 const (
@@ -764,6 +775,7 @@ func (m Model) defaultCloneDraft() createDraft {
 	draft.Env = formatEnvEntries(selected.Env)
 	if selected.RestartPolicy != "" {
 		draft.Restart = selected.RestartPolicy
+		draft.RestartMaxRetries = selected.RestartMaxRetries
 	}
 	draft.Command = selected.Command
 	if draft.Mode == createModeStandalone {
@@ -784,7 +796,6 @@ func standaloneSpec(selected domain.Container) app.ContainerCreateSpec {
 			})
 		}
 	}
-	spec.RestartMaxRetries = selected.RestartMaxRetries
 	if strings.HasPrefix(selected.NetworkMode, "container:") {
 		spec.NetworkMode = selected.NetworkMode
 		spec.Networks = nil
@@ -2026,13 +2037,49 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 		if err != nil {
 			return app.ContainerCreateSpec{}, err
 		}
+		// The form's "source:target" text has no type. Mounts the user
+		// didn't change keep the one the source recorded; a changed source
+		// is left to be inferred from its shape.
+		var original []app.MountBinding
+		switch {
+		case d.Pasting && d.PastePlan != nil:
+			original = d.PastePlan.Spec.Mounts
+		case d.standaloneSource != nil:
+			original = d.standaloneSource.Mounts
+		}
+		restoreMountTypes(spec.Mounts, original)
 	}
-	if d.standaloneSource == nil || d.Restart != d.baseline.Restart {
+	// The restart policy comes from the form for a draft with no source spec,
+	// or once the user changes it. Otherwise the source's policy rides along
+	// with its on-failure retry cap, which the form can't show or edit: a
+	// paste's plan, an edit's source, or (via d.RestartMaxRetries) a clone.
+	restartChanged := d.Restart != d.baseline.Restart
+	switch {
+	case d.standaloneSource == nil && !d.Pasting:
+		spec.RestartPolicy = normalizeRestartPolicy(d.Restart)
+		spec.RestartMaxRetries = 0
+		if !restartChanged {
+			spec.RestartMaxRetries = d.RestartMaxRetries
+		}
+	case restartChanged:
 		spec.RestartPolicy = normalizeRestartPolicy(d.Restart)
 		spec.RestartMaxRetries = 0
 	}
 
 	return spec, nil
+}
+
+// restoreMountTypes copies each original mount's Type onto the matching
+// (same destination, same source) entry of mounts.
+func restoreMountTypes(mounts, original []app.MountBinding) {
+	for i := range mounts {
+		for _, o := range original {
+			if o.Destination == mounts[i].Destination && o.Source == mounts[i].Source {
+				mounts[i].Type = o.Type
+				break
+			}
+		}
+	}
 }
 
 // parseCreateNetworks parses the Networks field's comma-joined destination
@@ -2132,6 +2179,7 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		// loaded (a superseded prefill) is left as the file had it rather
 		// than deleted.
 		ChangedFields: changed,
+		FoldOverride:  d.OverrideRawSet && !d.OverrideRawBase,
 		// FullBase tells mergeComposeCreateIntoBase it's safe to write
 		// Content over the base file wholesale instead of merging fields
 		// into it — only true when Content is still the complete,
@@ -2473,19 +2521,28 @@ func normalizeComposeVolumes(v interface{}) []string {
 				out = append(out, entry)
 			}
 		case map[string]interface{}:
-			source := scalarString(entry["source"])
-			target := scalarString(entry["target"])
-			if source == "" || target == "" {
-				continue
+			if value := longComposeVolumeToShort(entry); value != "" {
+				out = append(out, value)
 			}
-			value := source + ":" + target
-			if readOnly, ok := entry["read_only"].(bool); ok && readOnly {
-				value += ":ro"
-			}
-			out = append(out, value)
 		}
 	}
 	return out
+}
+
+// longComposeVolumeToShort is a long-syntax volume ({type, source, target,
+// read_only}) as the form's "source:target[:ro]", or "" for one it can't
+// express (no source: anonymous and tmpfs volumes).
+func longComposeVolumeToShort(entry map[string]interface{}) string {
+	source := scalarString(entry["source"])
+	target := scalarString(entry["target"])
+	if source == "" || target == "" {
+		return ""
+	}
+	value := source + ":" + target
+	if readOnly, ok := entry["read_only"].(bool); ok && readOnly {
+		value += ":ro"
+	}
+	return value
 }
 
 // toInterfaceSlice normalizes a decoded YAML sequence to []interface{}.
@@ -2978,11 +3035,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 		}
 		return composeUpService(ctx, baseOnly)
 	}
-	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
-	if !ok {
-		return fmt.Errorf("could not read fields for service %q", spec.Service)
-	}
-	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields, spec.ChangedFields)
+	merged, err := mergeBaseFields(baseContent, spec)
 	if err != nil {
 		return err
 	}
@@ -3008,8 +3061,12 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 		_ = os.Remove(tempBase)
 		return err
 	}
-	if strings.TrimSpace(spec.OverrideFile) != "" {
-		_ = os.Remove(spec.OverrideFile)
+	overrideRemains, err := retireOverrideLocal(spec)
+	if err != nil {
+		return err
+	}
+	if overrideRemains {
+		baseOnly.OverrideFile = spec.OverrideFile // still layered over the base
 	}
 	return composeUpService(ctx, baseOnly)
 }
@@ -3092,11 +3149,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 		}
 		return composeUpService(ctx, baseOnly)
 	}
-	fields, ok := composeServiceFieldsFromContent(spec.Content, spec.Service)
-	if !ok {
-		return fmt.Errorf("could not read fields for service %q", spec.Service)
-	}
-	merged, err := mergeComposeServiceFields(baseContent, spec.Service, fields, spec.ChangedFields)
+	merged, err := mergeBaseFields(baseContent, spec)
 	if err != nil {
 		return err
 	}
@@ -3122,8 +3175,12 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
-	if strings.TrimSpace(spec.OverrideFile) != "" {
-		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(spec.OverrideFile), "")
+	overrideRemains, err := retireOverrideRemote(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if overrideRemains {
+		baseOnly.OverrideFile = spec.OverrideFile // still layered over the base
 	}
 	return composeUpService(ctx, baseOnly)
 }
