@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/allisonhere/ripple"
 	"github.com/allisonhere/tideui"
@@ -308,6 +309,7 @@ const (
 	settingsActionCheckUpdate
 	settingsActionViewAppLog
 	settingsActionViewChangelog
+	settingsActionOpenAbout
 )
 
 type systemOverlayMode int
@@ -336,9 +338,11 @@ const (
 type providerFactory func(context.Context, config.System) (app.Provider, error)
 
 type Model struct {
-	provider app.Provider
-	theme    tideui.Theme
-	themes   tideui.ThemePicker
+	provider        app.Provider
+	systemEpoch     uint64
+	connectedSystem config.System
+	theme           tideui.Theme
+	themes          tideui.ThemePicker
 	// omarchySig/omarchyWatching back the same signature-based live-follow
 	// loop used by the other Tide apps. The resolver only runs after the
 	// active palette changes, not on every timer tick.
@@ -378,9 +382,14 @@ type Model struct {
 	selected             *domain.Container
 	filter               string
 	filterDraft          string
+	deleteContainer      *domain.Container
+	deleteProject        string
+	deleteFiles          []string
 	inspectorScroll      int
 	inspectorCursor      int
 	helpScroll           int
+	helpCategory         int
+	helpRight            bool
 	helpSearchActive     bool
 	helpSearch           string
 
@@ -486,6 +495,11 @@ type Model struct {
 	// changelogScroll is the changelog overlay's scroll position (Settings >
 	// View changelog), same role as appLogScroll for the app-log overlay.
 	changelogScroll int
+
+	// aboutFromSettings is true while the About screen was opened from
+	// Settings > About, so closing it returns there instead of to the main
+	// view.
+	aboutFromSettings bool
 
 	// lastStatusText/statusSince back the minimum-hold guard in the
 	// snapshotMsg handler: an explicit status (success or error) must stay
@@ -868,17 +882,20 @@ var applyComposeReplicate = defaultApplyComposeReplicate
 var composeCommand = runDockerCompose
 
 type snapshotMsg struct {
+	epoch    uint64
 	snapshot domain.Snapshot
 	err      error
 }
 
 type detailMsg struct {
+	epoch     uint64
 	id        domain.ResourceID
 	container domain.Container
 	err       error
 }
 
 type statsMsg struct {
+	epoch uint64
 	stats domain.ContainerStats
 	err   error
 }
@@ -936,6 +953,7 @@ type actionDoneMsg struct {
 
 // stackLogsStartedMsg is logsStartedMsg for a merged Compose-stack stream.
 type stackLogsStartedMsg struct {
+	epoch   uint64
 	project string
 	lines   <-chan string
 	cancel  context.CancelFunc
@@ -944,6 +962,7 @@ type stackLogsStartedMsg struct {
 }
 
 type logsStartedMsg struct {
+	epoch  uint64
 	id     domain.ResourceID
 	lines  <-chan string
 	cancel context.CancelFunc
@@ -956,20 +975,22 @@ type logsStartedMsg struct {
 }
 
 type eventsStartedMsg struct {
+	epoch  uint64
 	events <-chan domain.ContainerEvent
 	cancel context.CancelFunc
 	err    error
 }
 
 type containerEventMsg struct {
+	epoch uint64
 	event domain.ContainerEvent
 }
 
-type eventStreamClosedMsg struct{}
+type eventStreamClosedMsg struct{ epoch uint64 }
 
-type eventsReconnectTickMsg struct{}
+type eventsReconnectTickMsg struct{ epoch uint64 }
 
-type eventRefreshTickMsg struct{}
+type eventRefreshTickMsg struct{ epoch uint64 }
 
 type logTickMsg struct{}
 
@@ -1108,6 +1129,14 @@ func NewModelWithProviderFactory(provider app.Provider, persisted config.Setting
 		forgetPassword:       systems.ForgetPassword,
 		passwordFor:          systems.PasswordFor,
 		clipboard:            clipboard.NewDeploymentClipboard(),
+	}
+	if host := provider.Host(); host.ID != "demo" {
+		if system := config.FindSystem(m.systems, string(host.ID)); system != nil {
+			m.activeSystem, m.connectedSystem = system.ID, *system
+		} else {
+			m.connectedSystem = config.System{ID: string(host.ID), Name: host.Name, Kind: "local"}
+			m.activeSystem = m.connectedSystem.ID
+		}
 	}
 	if isMatchOmarchy(theme.Name) {
 		m.omarchyWatching = true
@@ -1327,6 +1356,9 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case snapshotMsg:
+		if msg.epoch != m.systemEpoch {
+			return m, nil
+		}
 		m.loading = false
 		if msg.err != nil {
 			m.status, m.statusErr = friendlyDockerError(msg.err), true
@@ -1385,8 +1417,23 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingSelectProject, m.pendingSelectService = "", ""
 		}
 		return m, m.restoreFocusedTreeRow(previousCursor, true)
+	case standaloneEditMsg:
+		selected := m.selectedContainer()
+		if msg.epoch != m.systemEpoch || m.overlay != overlayNone || selected == nil || selected.ID != msg.id {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.status, m.statusErr = "edit: "+friendlyDockerError(msg.err), true
+			return m, nil
+		}
+		if msg.container.ID != msg.id {
+			m.status, m.statusErr = "edit: container is no longer available", true
+			return m, nil
+		}
+		m.openStandaloneEdit(msg.container)
+		return m, nil
 	case detailMsg:
-		if msg.id != m.selectedID {
+		if msg.epoch != m.systemEpoch || msg.id != m.selectedID {
 			// A newer selection has since superseded this in-flight request; discard it.
 			return m, nil
 		}
@@ -1421,7 +1468,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.startLogsCmd(msg.container.ID)
 	case logsStartedMsg:
-		if msg.id != m.selectedID {
+		if msg.epoch != m.systemEpoch || msg.id != m.selectedID {
 			if msg.cancel != nil {
 				msg.cancel()
 			}
@@ -1448,7 +1495,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		go forwardLogs(msg.lines, m.logChan, msg.done)
 		return m, tickLogs()
 	case stackLogsStartedMsg:
-		if msg.project != m.stackLogs {
+		if msg.epoch != m.systemEpoch || msg.project != m.stackLogs {
 			if msg.cancel != nil {
 				msg.cancel()
 			}
@@ -1470,6 +1517,12 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		go forwardLogs(msg.lines, m.logChan, msg.done)
 		return m, tickLogs()
 	case eventsStartedMsg:
+		if msg.epoch != m.systemEpoch {
+			if msg.cancel != nil {
+				msg.cancel()
+			}
+			return m, nil
+		}
 		if msg.err != nil {
 			m.eventsReconnecting = true
 			m.advanceEventBackoff()
@@ -1479,15 +1532,21 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.eventChan = msg.events
 		m.eventCancel = msg.cancel
 		m.eventBackoff = 0
-		return m, waitForContainerEvent(m.eventChan)
+		return m, waitForContainerEvent(m.eventChan, m.systemEpoch)
 	case containerEventMsg:
+		if msg.epoch != m.systemEpoch {
+			return m, nil
+		}
 		alreadyDirty := m.snapshotDirty
 		m.snapshotDirty = true
 		if alreadyDirty {
-			return m, waitForContainerEvent(m.eventChan)
+			return m, waitForContainerEvent(m.eventChan, m.systemEpoch)
 		}
-		return m, tea.Batch(waitForContainerEvent(m.eventChan), eventRefreshTickCmd())
+		return m, tea.Batch(waitForContainerEvent(m.eventChan, m.systemEpoch), m.eventRefreshTickCmd())
 	case eventStreamClosedMsg:
+		if msg.epoch != m.systemEpoch {
+			return m, nil
+		}
 		m.eventChan = nil
 		if m.eventCancel != nil {
 			m.eventCancel()
@@ -1497,9 +1556,12 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.advanceEventBackoff()
 		return m, m.eventsReconnectCmd()
 	case eventsReconnectTickMsg:
+		if msg.epoch != m.systemEpoch {
+			return m, nil
+		}
 		return m, m.startEventsCmd()
 	case eventRefreshTickMsg:
-		if !m.snapshotDirty {
+		if msg.epoch != m.systemEpoch || !m.snapshotDirty {
 			return m, nil
 		}
 		m.snapshotDirty = false
@@ -1545,7 +1607,7 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tickOmarchyTheme()
 	case statsMsg:
-		if msg.stats.ID != m.selectedID {
+		if msg.epoch != m.systemEpoch || msg.stats.ID != m.selectedID {
 			return m, nil
 		}
 		m.statsLoading = false
@@ -1936,6 +1998,21 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case composeLayersMsg:
+		if msg.epoch != m.systemEpoch || m.overlay != overlayCreate || !m.createDraft.layersLoading || m.createDraft.ComposeFile != msg.base || m.createDraft.Service != msg.service {
+			return m, nil
+		}
+		m.createDraft.layersLoading = false
+		if msg.err != nil {
+			m.createDraft.layersError = "loading Compose layers: " + friendlyDockerError(msg.err)
+			m.setCreateNotice(m.createDraft.layersError, true)
+			return m, nil
+		}
+		if err := m.loadLayeredComposeFields(msg); err != nil {
+			m.createDraft.layersError = err.Error()
+			m.setCreateNotice(m.createDraft.layersError, true)
+		}
+		return m, nil
 	case createStackFileCheckMsg:
 		if m.overlay != overlayCreate || m.createDraft.Project != msg.project {
 			return m, nil
@@ -2028,6 +2105,8 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cleanup()
 		m.provider = msg.provider
 		m.activeSystem = msg.system.ID
+		m.connectedSystem = msg.system
+		m.systemEpoch++
 		m.overlay = overlayNone
 		m.resetDockerState()
 		m.saveSettings()
@@ -2068,19 +2147,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cleanup()
 		return m, tea.Quit
 	case "tab":
-		if !m.logsExpanded {
+		if !m.logsExpanded || m.compactLayout() {
 			m.focus = (m.focus + 1) % 3
 		}
 	case "shift+tab":
-		if !m.logsExpanded {
+		if !m.logsExpanded || m.compactLayout() {
 			m.focus = (m.focus + 2) % 3
 		}
 	case "left":
-		if !m.logsExpanded {
+		if !m.logsExpanded || m.compactLayout() {
 			m.focus = (m.focus + 2) % 3
 		}
 	case "right":
-		if !m.logsExpanded {
+		if !m.logsExpanded || m.compactLayout() {
 			m.focus = (m.focus + 1) % 3
 		}
 	case "L":
@@ -2138,6 +2217,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "esc":
+		if m.focus == paneTree && m.filter != "" {
+			cmd := m.applyTreeFilter("")
+			return m, cmd
+		}
 		if m.mode == activityLogs && (strings.TrimSpace(m.logFilter) != "" || m.logLevel != logSeverityAll) {
 			m.clearLogFilter()
 			return m, nil
@@ -2182,13 +2265,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/":
-		if m.mode == activityLogs {
+		if m.focus == paneActivity && m.mode == activityLogs {
 			m.focus = paneActivity
 			m.openLogFilter()
 			return m, nil
 		}
-		m.overlay = overlayFilter
-		m.filterDraft = m.filter
+		m.openTreeFilter()
 	case "a":
 		if m.focus == paneActivity && m.mode == activityLogs {
 			m.setLogSeverityFilter(logSeverityAll)
@@ -2216,10 +2298,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "?":
-		m.overlay = overlayHelp
-		m.helpScroll = 0
-		m.helpSearchActive = false
-		m.helpSearch = ""
+		m.openHelp()
 	case "A":
 		return m.openAboutOverlay()
 	case "d":
@@ -2285,6 +2364,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.loadStatsCmd(selected.ID)
 		}
 	case "D":
+		m.captureDeleteTarget()
 		// Same two entry points "m" (edit) already has — see that case's
 		// own comment for the reasoning. Delete is more dangerous than
 		// edit (irreversible, removes real files), so if ambiguous scope
@@ -2322,26 +2402,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// review flow (paste.go).
 		return m, m.preparePastePlanCmd()
 	case "m":
-		// Selecting the project/folder row directly and pressing "m" is
-		// an unambiguous "edit the whole project" signal — no prompt, the
-		// same way selecting a specific container unambiguously means
-		// "edit just this one." Checked before falling through to the
-		// selectedContainer()-based single-service path below, since
-		// selectedContainer() itself would otherwise fall back to
-		// whatever container was previously selected rather than
-		// recognizing "the cursor is on a project row right now."
-		if row := m.currentRow(); row != nil && row.kind == rowProject {
-			return m, m.openEditWholeStackOverlay(row.project)
-		}
-		if selected := m.selectedContainer(); selected != nil {
-			if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
-				m.overlay = overlayEditScope
-				return m, nil
-			}
-			return m, m.openEditOverlay()
-		}
+		return m.openEditSelection()
 	}
 	return m, nil
+}
+
+func (m Model) openEditSelection() (tea.Model, tea.Cmd) {
+	if row := m.currentRow(); row != nil && row.kind == rowProject {
+		cmd := m.openEditWholeStackOverlay(row.project)
+		return m, cmd
+	}
+	if selected := m.selectedContainer(); selected != nil {
+		if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
+			m.overlay = overlayEditScope
+			return m, nil
+		}
+		cmd := m.openEditOverlay()
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *Model) openTreeFilter() {
+	m.focus = paneTree
+	m.overlay = overlayFilter
+	m.filterDraft = m.filter
+}
+
+func (m *Model) applyTreeFilter(query string) tea.Cmd {
+	m.filter = strings.TrimSpace(query)
+	m.rows = m.buildRows()
+	if m.focusedTreeKey.valid && m.moveTreeCursorToKey(m.focusedTreeKey) {
+		return m.applyFocusedTreeRow()
+	}
+	// A filtered-out selection gives way to the first actual match.
+	m.focusedTreeKey = treeRowKey{}
+	return m.restoreFocusedTreeRow(0, true)
 }
 
 func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2352,15 +2448,13 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayNone
 			m.filterDraft = ""
 		case "enter":
-			m.filter = strings.TrimSpace(m.filterDraft)
 			m.overlay = overlayNone
-			previousCursor := m.cursor
-			m.rows = m.buildRows()
-			return m, m.restoreFocusedTreeRow(previousCursor, true)
+			cmd := m.applyTreeFilter(m.filterDraft)
+			return m, cmd
 		case "backspace":
-			if len(m.filterDraft) > 0 {
-				m.filterDraft = m.filterDraft[:len(m.filterDraft)-1]
-			}
+			m.filterDraft = dropLastRune(m.filterDraft)
+		case "ctrl+u":
+			m.filterDraft = ""
 		default:
 			if len(msg.Runes) > 0 {
 				m.filterDraft += string(msg.Runes)
@@ -2381,9 +2475,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.overlay = overlayNone
 		case "backspace":
-			if len(m.logDraft) > 0 {
-				m.logDraft = m.logDraft[:len(m.logDraft)-1]
-			}
+			m.logDraft = dropLastRune(m.logDraft)
+			m.applyLiveLogFilter()
+		case "ctrl+u":
+			m.logDraft = ""
 			m.applyLiveLogFilter()
 		default:
 			if len(msg.Runes) > 0 {
@@ -2392,51 +2487,7 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case overlayHelp:
-		if m.helpSearchActive {
-			switch msg.String() {
-			case "esc":
-				m.helpSearchActive = false
-				m.helpSearch = ""
-				m.helpScroll = 0
-			case "enter":
-				m.helpSearchActive = false
-			case "backspace":
-				if len(m.helpSearch) > 0 {
-					runes := []rune(m.helpSearch)
-					m.helpSearch = string(runes[:len(runes)-1])
-					m.helpScroll = 0
-				}
-			case "ctrl+u":
-				m.helpSearch = ""
-				m.helpScroll = 0
-			default:
-				if len(msg.Runes) > 0 {
-					m.helpSearch += string(msg.Runes)
-					m.helpScroll = 0
-				}
-			}
-			return m, nil
-		}
-		switch msg.String() {
-		case "esc", "q", "?":
-			m.overlay = overlayNone
-		case "/":
-			m.helpSearchActive = true
-			m.helpSearch = ""
-			m.helpScroll = 0
-		case "j", "down":
-			m.scrollHelp(1)
-		case "k", "up":
-			m.scrollHelp(-1)
-		case "pgdown":
-			m.scrollHelp(max(1, m.helpBodyBudget()-1))
-		case "pgup":
-			m.scrollHelp(-max(1, m.helpBodyBudget()-1))
-		case "g", "home":
-			m.scrollHelp(-len(m.visibleHelpLines()))
-		case "G", "end":
-			m.scrollHelp(len(m.visibleHelpLines()))
-		}
+		m.handleHelpKey(msg)
 	case overlayAppLog:
 		switch msg.String() {
 		case "esc", "q":
@@ -2481,7 +2532,12 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case overlayAbout:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
-			m.overlay = overlayNone
+			if m.aboutFromSettings {
+				m.aboutFromSettings = false
+				m.overlay = overlaySettings
+			} else {
+				m.overlay = overlayNone
+			}
 		}
 	case overlayDashboard:
 		switch msg.String() {
@@ -2598,10 +2654,27 @@ func (m Model) handleEditScopeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleDeleteKey gates the Delete confirmation the same way Systems' own
 // destructive delete does (systemModeDelete): esc/n/q cancels, y proceeds.
+func (m *Model) captureDeleteTarget() {
+	m.deleteContainer = m.selectedContainer()
+	m.deleteProject, m.deleteFiles = "", nil
+	if row := m.currentRow(); row != nil && row.kind == rowProject {
+		m.deleteProject = row.project
+		m.deleteFiles = m.resolveProjectComposeFiles(row.project)
+	}
+}
+
+func (m Model) deleteSelectedContainer() *domain.Container {
+	if m.deleteContainer != nil {
+		return m.deleteContainer
+	}
+	return m.selectedContainer()
+}
+
 func (m Model) handleDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "n", "q":
 		m.overlay = overlayNone
+		m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
 	case "y":
 		m.overlay = overlayNone
 		return m.startDelete()
@@ -2617,6 +2690,12 @@ func (m Model) handleDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // escalation) — same resolution shape handleEditScopeKey's "s" case
 // already uses.
 func (m Model) deleteStackTargetProject() string {
+	if m.deleteProject != "" {
+		return m.deleteProject
+	}
+	if m.deleteContainer != nil {
+		return m.deleteContainer.Compose.Project
+	}
 	if row := m.currentRow(); row != nil && row.kind == rowProject {
 		return row.project
 	}
@@ -2638,9 +2717,12 @@ func (m Model) handleDeleteScopeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.overlay = overlayNone
+		m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
 	case "enter", "d":
 		m.overlay = overlayDelete
 	case "s":
+		m.deleteProject = m.deleteStackTargetProject()
+		m.deleteFiles = m.resolveProjectComposeFiles(m.deleteProject)
 		m.overlay = overlayDeleteStackConfirm
 	}
 	return m, nil
@@ -2653,6 +2735,7 @@ func (m Model) handleDeleteStackConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 	switch msg.String() {
 	case "esc", "n", "q":
 		m.overlay = overlayNone
+		m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
 	case "y":
 		project := m.deleteStackTargetProject()
 		m.overlay = overlayNone
@@ -2678,12 +2761,18 @@ func (m Model) handleReplicateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // selected container, mirroring the same Compose-vs-standalone test
 // defaultCreateDraft already uses.
 func (m Model) startDelete() (tea.Model, tea.Cmd) {
-	selected := m.selectedContainer()
+	selected := m.deleteSelectedContainer()
+	m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
 	if selected == nil {
 		return m, nil
 	}
 	if selected.Compose.Project != "" {
-		spec, err := composeSpecForSelected(selected, m.activeSystemConfig())
+		system := m.activeSystemConfig()
+		if system.Kind == "demo" {
+			m.status, m.statusErr = "Compose actions are unavailable in demo mode", true
+			return m, nil
+		}
+		spec, err := composeSpecForSelected(selected, system)
 		if err != nil {
 			m.status, m.statusErr = "delete "+selected.Compose.Service+": "+err.Error(), true
 			return m, nil
@@ -2710,15 +2799,25 @@ func (m Model) startDelete() (tea.Model, tea.Cmd) {
 // either from the project/folder row directly (no container selected at
 // all) or from overlayDeleteScope's "s" escalation.
 func (m Model) startDeleteStack(project string) (tea.Model, tea.Cmd) {
-	composeFile := m.resolveProjectComposeFile(project)
-	if composeFile == "" {
+	files := m.deleteFiles
+	if m.deleteProject == "" {
+		files = m.resolveProjectComposeFiles(project)
+	}
+	m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
+	system := m.activeSystemConfig()
+	if system.Kind == "demo" {
+		m.status, m.statusErr = "Compose deletion is unavailable in demo mode", true
+		return m, nil
+	}
+	if len(files) == 0 {
 		m.status, m.statusErr = "delete stack "+project+": could not resolve a compose file", true
 		return m, nil
 	}
 	spec := composeCreateSpec{
-		Project:  project,
-		BaseFile: composeFile,
-		System:   m.activeSystemConfig(),
+		Project:         project,
+		BaseFile:        files[0],
+		AdditionalFiles: files[1:],
+		System:          system,
 	}
 	m.busy = true
 	m.status, m.statusErr = "deleting stack "+project+"…", false
@@ -2740,7 +2839,12 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if selected.Compose.Project != "" {
-		spec, err := composeSpecForSelected(selected, m.activeSystemConfig())
+		system := m.activeSystemConfig()
+		if system.Kind == "demo" {
+			m.status, m.statusErr = "Compose actions are unavailable in demo mode", true
+			return m, nil
+		}
+		spec, err := composeSpecForSelected(selected, system)
 		if err != nil {
 			m.status, m.statusErr = "replicate "+selected.Compose.Service+": "+err.Error(), true
 			return m, nil
@@ -2749,13 +2853,7 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 		m.status, m.statusErr = "replicating "+selected.Compose.Service+"…", false
 		return m, m.replicateComposeCmd(spec)
 	}
-	spec, err := replicateContainerSpec(*selected)
-	if err != nil {
-		m.status, m.statusErr = "replicate "+selected.DisplayName()+": "+err.Error(), true
-		return m, nil
-	}
-	provider := m.provider
-	id := selected.ID
+	provider, id := m.provider, selected.ID
 	image := selected.Image
 	label := "replicate " + selected.DisplayName()
 	progress := make(chan string, 16)
@@ -2764,11 +2862,18 @@ func (m Model) startReplicate() (tea.Model, tea.Cmd) {
 	m.actionProgressText = "pulling " + image + "…"
 	m.status, m.statusErr = "pulling "+image+"…", false
 	return m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // pulling an image can be slow
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_, err := replaceContainerInPlace(ctx, provider, id, spec, true, progress)
+		container, err := provider.Container(ctx, id)
+		if err == nil && container.ID != id {
+			err = errors.New("container is no longer available")
+		}
+		if err == nil {
+			_, err = replaceContainerInPlace(ctx, provider, id, standaloneSpec(container), true, progress)
+		}
 		return actionDoneMsg{label: label, err: err}
 	}
+
 }
 
 func (m Model) handleCopyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2880,6 +2985,11 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayChangelog
 			m.changelogScroll = 0
 			return m, nil
+		case settingsActionOpenAbout:
+			next, cmd := m.openAboutOverlay()
+			opened := next.(Model)
+			opened.aboutFromSettings = true // so closing About lands back here
+			return opened, cmd
 		}
 		if row.kind == settingsRowText || row.kind == settingsRowSecretText {
 			m.startSettingsTextEdit(row.label)
@@ -3391,6 +3501,13 @@ func (m *Model) saveSystemDraft() {
 		m.systemsCursor = len(m.systems) - 1
 	} else {
 		index := clamp(m.systemsCursor, 0, len(m.systems)-1)
+		previous, draft := m.systems[index], m.systemDraft
+		if previous.Kind == "ssh" && draft.Kind == "ssh" && draft.LocalSocket == previous.LocalSocket &&
+			(systems.SSHTarget(draft) != systems.SSHTarget(previous) || draft.SSHPort != previous.SSHPort || draft.RemoteSocket != previous.RemoteSocket) {
+			// The previous forward can outlive the UI. Keep a changed
+			// endpoint from adopting a live socket owned by that forward.
+			m.systemDraft.LocalSocket = filepath.Join(os.TempDir(), fmt.Sprintf("whatthedock-%s-%x.sock", safeComposeFilename(draft.ID), time.Now().UnixNano()))
+		}
 		m.systems[index] = m.systemDraft
 	}
 	m.systemMode = systemModeList
@@ -3419,7 +3536,12 @@ func (m *Model) deleteCurrentSystem() {
 }
 
 func (m Model) switchSystemCmd(system config.System) tea.Cmd {
-	if system.ID == "" || system.ID == m.activeSystem {
+	if m.activeSystemConfig().Kind == "demo" {
+		return func() tea.Msg {
+			return systemSwitchMsg{err: errors.New("system switching is unavailable in demo mode")}
+		}
+	}
+	if system.ID == "" || (system == m.connectedSystem && system.SSHAuth != "password") {
 		return nil
 	}
 	if m.providerFor == nil {
@@ -3444,6 +3566,11 @@ func (m Model) switchSystemCmd(system config.System) tea.Cmd {
 }
 
 func (m Model) testSystemCmd(system config.System) tea.Cmd {
+	if m.activeSystemConfig().Kind == "demo" {
+		return func() tea.Msg {
+			return systemTestMsg{system: system, err: errors.New("system testing is unavailable in demo mode")}
+		}
+	}
 	if m.providerFor == nil {
 		return func() tea.Msg {
 			return systemTestMsg{system: system, err: errors.New("system testing is unavailable in this build")}
@@ -3472,9 +3599,14 @@ func (m Model) testSystemCmd(system config.System) tea.Cmd {
 // resolution" — leave the subprocess env untouched rather than overriding
 // it with an empty value.
 func execShellCommand(system config.System, id domain.ResourceID) *exec.Cmd {
-	cmd := exec.Command("docker", "exec", "-it", id.ID, "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh")
-	if host := systems.DockerHostFor(system); host != "" {
-		cmd.Env = append(os.Environ(), "DOCKER_HOST="+host)
+	args := []string{"exec", "-it", id.ID, "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh"}
+	host := systems.DockerHostFor(system)
+	if host != "" {
+		args = append([]string{"--host", host}, args...)
+	}
+	cmd := exec.Command("docker", args...)
+	if host != "" {
+		cmd.Env = append(os.Environ(), "DOCKER_HOST="+host, "DOCKER_CONTEXT=")
 	}
 	return cmd
 }
@@ -3484,6 +3616,11 @@ func execShellCommand(system config.System, id domain.ResourceID) *exec.Cmd {
 // the SSH password prompt (see switchSystemCmd), just for a foreground
 // session the user directly controls instead of a backgrounded tunnel.
 func (m Model) execShellCmd(selected domain.Container) tea.Cmd {
+	if m.provider.Host().ID == "demo" {
+		return func() tea.Msg {
+			return execShellDoneMsg{name: selected.DisplayName(), err: errors.New("shell access is unavailable in demo mode")}
+		}
+	}
 	cmd := execShellCommand(m.activeSystemConfig(), selected.ID)
 	name := selected.DisplayName()
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
@@ -3573,6 +3710,7 @@ func systemAuthLabel(auth string) string {
 }
 
 func (m *Model) resetDockerState() {
+	m.deleteContainer, m.deleteProject, m.deleteFiles = nil, "", nil
 	m.loading = true
 	m.snapshot = domain.Snapshot{}
 	m.rows = nil
@@ -3584,6 +3722,8 @@ func (m *Model) resetDockerState() {
 	m.inspectorScroll = 0
 	m.inspectorCursor = 0
 	m.logLines = nil
+	m.stackLogs = ""
+	m.logViewID = domain.ResourceID{}
 	m.logChan = nil
 	m.logCancel = nil
 	m.logErr = nil
@@ -3602,32 +3742,38 @@ func (m *Model) resetDockerState() {
 
 func (m Model) handleCommandPaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	items := m.filteredCommands()
+	last := max(0, len(items)-1)
 	switch msg.String() {
 	case "esc":
 		m.overlay = overlayNone
-	case "up", "k":
-		if len(items) > 0 {
-			m.commandCursor = (m.commandCursor - 1 + len(items)) % len(items)
-		}
-	case "down", "j", "tab":
-		if len(items) > 0 {
-			m.commandCursor = (m.commandCursor + 1) % len(items)
-		}
+	case "up", "shift+tab":
+		m.commandCursor = clamp(m.commandCursor-1, 0, last)
+	case "down", "tab":
+		m.commandCursor = clamp(m.commandCursor+1, 0, last)
+	case "pgup":
+		m.commandCursor = clamp(m.commandCursor-m.commandListRows(), 0, last)
+	case "pgdown":
+		m.commandCursor = clamp(m.commandCursor+m.commandListRows(), 0, last)
+	case "home":
+		m.commandCursor = 0
+	case "end":
+		m.commandCursor = last
 	case "enter":
 		if len(items) == 0 {
 			return m, nil
 		}
-		item := items[clamp(m.commandCursor, 0, len(items)-1)]
+		item := items[clamp(m.commandCursor, 0, last)]
 		if !item.Enabled {
 			return m, nil
 		}
 		m.overlay = overlayNone
 		return m.executeCommand(item.ID)
 	case "backspace":
-		if len(m.commandFilter) > 0 {
-			m.commandFilter = m.commandFilter[:len(m.commandFilter)-1]
-			m.commandCursor = 0
-		}
+		m.commandFilter = dropLastRune(m.commandFilter)
+		m.commandCursor = 0
+	case "ctrl+u":
+		m.commandFilter = ""
+		m.commandCursor = 0
 	default:
 		if len(msg.Runes) > 0 {
 			m.commandFilter += string(msg.Runes)
@@ -3637,12 +3783,21 @@ func (m Model) handleCommandPaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func dropLastRune(value string) string {
+	_, size := utf8.DecodeLastRuneInString(value)
+	return value[:len(value)-size]
+}
+
 func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	switch id {
 	case actions.Refresh:
 		return m, m.refreshCmd()
 	case actions.Create:
 		return m, m.openCreateOverlay()
+	case actions.Edit:
+		return m.openEditSelection()
+	case actions.ShowDashboard:
+		return m.openDashboardOverlay()
 	case actions.StartStop:
 		return m, m.actionCmd(actions.StartStop, m.startStopLabel())
 	case actions.Restart:
@@ -3653,6 +3808,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 		return m, m.actionCmd(actions.Kill, "kill")
 	case actions.Delete:
 		if selected := m.selectedContainer(); selected != nil {
+			m.captureDeleteTarget()
 			m.overlay = overlayDelete
 		}
 	case actions.Replicate:
@@ -3684,11 +3840,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 			return m, m.execShellCmd(*selected)
 		}
 	case actions.FocusLogs:
-		m.focus = paneActivity
-		m.mode = activityLogs
-		if m.selected != nil {
-			return m, m.startLogsCmd(m.selected.ID)
-		}
+		return m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	case actions.ShowProblems:
 		m.focus = paneActivity
 		m.mode = activityProblems
@@ -3709,18 +3861,21 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.OpenMount:
 		m.openOpenOverlayFor(openKindMount)
 	case actions.OpenFilter:
-		m.overlay = overlayFilter
-		m.filterDraft = m.filter
+		m.openTreeFilter()
 	case actions.OpenLogFilter:
 		m.focus = paneActivity
 		m.mode = activityLogs
+		if row := m.currentRow(); row != nil && row.kind == rowProject && m.stackLogs != row.project {
+			cmd := m.openStackLogs(row.project)
+			m.openLogFilter()
+			return m, cmd
+		}
 		m.openLogFilter()
 		if m.selected != nil && m.logChan == nil && len(m.logLines) == 0 {
 			return m, m.startLogsCmd(m.selected.ID)
 		}
 	case actions.OpenHelp:
-		m.overlay = overlayHelp
-		m.helpScroll = 0
+		m.openHelp()
 	case actions.OpenAbout:
 		return m.openAboutOverlay()
 	case actions.OpenTheme:
@@ -3746,6 +3901,7 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 
 func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayAbout
+	m.aboutFromSettings = false // only Settings > About sets this, after opening
 	m.aboutFrame = 0
 	m.aboutSpotlights = newAboutSpotlights(aboutSpotlightCount, len(aboutLogo()), aboutContentWidth(m.width))
 	return m, tickAbout()
@@ -4033,7 +4189,8 @@ func (m Model) settingsRows() []settingsRow {
 		settingsRow{label: "Diagnostics", kind: settingsRowSection},
 		settingsRow{label: "App log", value: settings.AppLog.String()},
 		settingsRow{label: "View app log", value: "view", kind: settingsRowAction, action: settingsActionViewAppLog},
-		settingsRow{label: "Changelog", kind: settingsRowSection},
+		settingsRow{label: "About", kind: settingsRowSection},
+		settingsRow{label: "About WhatTheDock", value: "view", kind: settingsRowAction, action: settingsActionOpenAbout},
 		settingsRow{label: "View changelog", value: "view", kind: settingsRowAction, action: settingsActionViewChangelog},
 		settingsRow{label: "Maintenance", kind: settingsRowSection},
 		settingsRow{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
@@ -4675,63 +4832,94 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.overlay == overlayDashboard {
 		return m.handleDashboardMouse(msg)
 	}
+	if m.overlay == overlayHelp {
+		m.handleHelpMouse(msg)
+		return m, nil
+	}
+	if m.overlay != overlayNone && m.overlay != overlayLogFilter {
+		return m, nil
+	}
+	if msg.Y < 1 || msg.Y >= m.height-1 || msg.X < 0 || msg.X >= m.width {
+		return m, nil
+	}
+	hovered, bodyTop := m.focus, 2
+	if m.compactLayout() {
+		if msg.Y == 1 && msg.Button == tea.MouseButtonLeft && m.overlay == overlayNone {
+			tabWidth := max(1, m.width/3)
+			m.focus = pane(min(2, msg.X/tabWidth))
+			return m, nil
+		}
+	} else {
+		bodyTop = 3
+		switch {
+		case m.logsExpanded:
+			hovered = paneActivity
+		case msg.X < m.leftPaneWidth():
+			hovered = paneTree
+		case msg.X < m.leftPaneWidth()+m.centerPaneWidth():
+			hovered = paneActivity
+		default:
+			hovered = paneInspector
+		}
+	}
+	if m.overlay == overlayLogFilter && hovered != paneActivity {
+		return m, nil
+	}
+
 	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		switch {
-		case m.mouseInInspector(msg):
-			m.focus = paneInspector
-			m.moveInspectorCursor(-1)
-		case m.focus == paneActivity && m.mode == activityProblems:
-			m.moveProblemCursor(-1)
-		case m.focus == paneActivity && m.mode == activityLogs:
-			m.scrollLogs(-1)
-		case m.focus == paneInspector:
-			m.moveInspectorCursor(-1)
-		case m.focus == paneTree:
-			return m, m.focusTreeIndex(m.cursor - 1)
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		if msg.Y < bodyTop {
+			return m, nil
 		}
-		return m, nil
-	case tea.MouseButtonWheelDown:
-		switch {
-		case m.mouseInInspector(msg):
-			m.focus = paneInspector
-			m.moveInspectorCursor(1)
-		case m.focus == paneActivity && m.mode == activityProblems:
-			m.moveProblemCursor(1)
-		case m.focus == paneInspector:
-			m.moveInspectorCursor(1)
-		case m.focus == paneActivity && m.mode == activityLogs:
-			m.scrollLogs(1)
-		case m.focus == paneTree:
-			return m, m.focusTreeIndex(m.cursor + 1)
+		delta := 1
+		if msg.Button == tea.MouseButtonWheelUp {
+			delta = -1
 		}
-		return m, nil
+		m.focus = hovered
+		switch hovered {
+		case paneTree:
+			cmd := m.focusTreeIndex(m.cursor + delta)
+			return m, cmd
+		case paneActivity:
+			if m.mode == activityProblems {
+				m.moveProblemCursor(delta)
+			} else if m.mode == activityLogs {
+				m.scrollLogs(delta)
+			}
+		case paneInspector:
+			m.moveInspectorCursor(delta)
+		}
 	case tea.MouseButtonLeft:
-		treeRowOffset := msg.Y - 3
-		visibleTreeRows := min(len(m.rows), m.treeVisibleRows())
-		if msg.X < m.leftPaneWidth() && treeRowOffset >= 0 && treeRowOffset < visibleTreeRows {
-			m.focus = paneTree
-			return m, m.focusTreeIndex(m.treeVisibleStart() + treeRowOffset)
-		}
-		if msg.X >= m.leftPaneWidth() && msg.X < m.leftPaneWidth()+m.centerPaneWidth() && m.mode == activityProblems {
-			m.focus = paneActivity
-			return m.selectProblem(msg.Y - 4)
-		}
-		if m.mouseInInspector(msg) {
-			m.focus = paneInspector
-			if cursor, ok := m.inspectorCursorAtScreenY(msg.Y); ok {
+		previousFocus := m.focus
+		problemRows := max(1, m.problemsListRows()-1)
+		treeStart, treeRows := m.treeVisibleStart(), m.treeVisibleRows()
+		m.focus = hovered
+		offset := msg.Y - bodyTop
+		switch hovered {
+		case paneTree:
+			if offset >= 0 && offset < min(len(m.rows), treeRows) {
+				cmd := m.focusTreeIndex(treeStart + offset)
+				return m, cmd
+			}
+		case paneActivity:
+			if m.mode == activityProblems && offset >= 1 && offset <= problemRows {
+				problems := m.snapshotProblems()
+				start, end := 0, min(len(problems), problemRows)
+				if previousFocus == paneActivity {
+					start, end = visibleRange(len(problems), m.problemCursor, problemRows)
+				}
+				if index := start + offset - 1; index < end {
+					return m.selectProblem(index)
+				}
+			}
+		case paneInspector:
+			if cursor, ok := m.inspectorCursorAtScreenY(offset + 3); ok {
 				m.inspectorCursor = cursor
 				m.clampInspectorScroll(m.inspectorRows())
 			}
-			return m, nil
 		}
 	}
 	return m, nil
-}
-
-func (m Model) mouseInInspector(msg tea.MouseMsg) bool {
-	rightStart := m.leftPaneWidth() + m.centerPaneWidth()
-	return msg.X >= rightStart && msg.X < m.width
 }
 
 func (m Model) inspectorCursorAtScreenY(y int) (int, bool) {
@@ -4827,11 +5015,6 @@ func (m *Model) clampInspectorScroll(rows []inspectorRow) {
 	m.inspectorScroll = clamp(m.inspectorScroll, 0, max(0, total-budget))
 }
 
-func (m *Model) scrollHelp(delta int) {
-	maxScroll := max(0, len(m.visibleHelpLines())-m.helpBodyBudget())
-	m.helpScroll = clamp(m.helpScroll+delta, 0, maxScroll)
-}
-
 func (m *Model) scrollAppLog(delta int) {
 	maxScroll := max(0, len(m.appLogLines)-m.appLogBodyBudget())
 	m.appLogScroll = clamp(m.appLogScroll+delta, 0, maxScroll)
@@ -4852,6 +5035,9 @@ func (m Model) paneActionStripRows(pane pane) int {
 }
 
 func (m Model) paneContentRows() int {
+	if m.compactLayout() {
+		return max(1, m.height-3)
+	}
 	return max(1, m.height-5)
 }
 
@@ -4890,7 +5076,7 @@ func (m Model) selectProblem(index int) (tea.Model, tea.Cmd) {
 	}
 	index = clamp(index, 0, len(problems)-1)
 	m.problemCursor = index
-	if !m.moveTreeCursorTo(problems[index].id) {
+	if !m.revealTreeContainer(problems[index].id) {
 		return m, nil
 	}
 	m.focus = paneTree
@@ -4933,7 +5119,7 @@ func (m Model) dashboardOpenSelected() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	index := m.dashboardSelectedIndex(shown)
-	if !m.moveTreeCursorTo(shown[index].ID) {
+	if !m.revealTreeContainer(shown[index].ID) {
 		return m, nil
 	}
 	m.overlay = overlayNone
@@ -4959,6 +5145,34 @@ func (m *Model) moveTreeCursorTo(id domain.ResourceID) bool {
 			m.cursor = i
 			m.focusedTreeKey = row.key()
 			m.selectedID = id
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) revealTreeContainer(id domain.ResourceID) bool {
+	if m.moveTreeCursorTo(id) {
+		return true
+	}
+	for _, project := range m.snapshot.Projects {
+		for _, service := range project.Services {
+			for _, container := range service.Containers {
+				if container.ID == id && m.collapsed[project.Name] {
+					delete(m.collapsed, project.Name)
+					m.rows = m.buildRows()
+					if m.moveTreeCursorTo(id) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if m.filter != "" {
+		m.filter = ""
+		m.rows = m.buildRows()
+		if m.moveTreeCursorTo(id) {
+			m.status, m.statusErr = "Cleared the container filter to show the selected container", false
 			return true
 		}
 	}
@@ -5020,7 +5234,7 @@ func (m *Model) applyFocusedTreeRow() tea.Cmd {
 }
 
 func (m *Model) clearSelectedContainer() {
-	if m.selectedID.ID != "" {
+	if m.selectedID.ID != "" || m.stackLogs != "" {
 		m.saveLogViewState()
 	}
 	m.selectedID = domain.ResourceID{}
@@ -5040,6 +5254,7 @@ func (m *Model) clearSelectedContainer() {
 	m.logErr = nil
 	m.logReplaceOnDrain = false
 	m.logLoading = false
+	m.stackLogs = ""
 }
 
 func (m *Model) restoreFocusedTreeRow(previousCursor int, selectInitial bool) tea.Cmd {
@@ -5050,6 +5265,9 @@ func (m *Model) restoreFocusedTreeRow(previousCursor int, selectInitial bool) te
 		return nil
 	}
 	if m.focusedTreeKey.valid && m.moveTreeCursorToKey(m.focusedTreeKey) {
+		if row := m.currentRow(); row.kind == rowProject && row.project == m.stackLogs {
+			return nil
+		}
 		return m.applyFocusedTreeRow()
 	}
 	if !m.focusedTreeKey.valid && selectInitial {
@@ -5155,7 +5373,7 @@ func (m Model) buildRows() []treeRow {
 			rows = append(rows, stackRows[0])
 		default:
 			rows = append(rows, treeRow{kind: rowProject, label: project.Name, project: project.Name})
-			if !m.collapsed[project.Name] {
+			if query != "" || !m.collapsed[project.Name] {
 				for _, row := range stackRows {
 					row.depth = 1
 					rows = append(rows, row)
@@ -5179,7 +5397,7 @@ func (m Model) refreshCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		snapshot, err := m.provider.Snapshot(ctx)
-		return snapshotMsg{snapshot: snapshot, err: err}
+		return snapshotMsg{epoch: m.systemEpoch, snapshot: snapshot, err: err}
 	}
 }
 
@@ -5190,12 +5408,12 @@ func (m *Model) loadSelectedCmd() tea.Cmd {
 	}
 	id := selected.ID
 	m.selectedID = id
-	provider := m.provider
+	provider, epoch := m.provider, m.systemEpoch
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		ctr, err := provider.Container(ctx, id)
-		return detailMsg{id: id, container: ctr, err: err}
+		return detailMsg{epoch: epoch, id: id, container: ctr, err: err}
 	}
 }
 
@@ -5210,7 +5428,7 @@ func (m Model) loadStatsCmd(id domain.ResourceID) tea.Cmd {
 		if stats.ID.ID == "" {
 			stats.ID = id
 		}
-		return statsMsg{stats: stats, err: err}
+		return statsMsg{epoch: m.systemEpoch, stats: stats, err: err}
 	}
 }
 
@@ -5417,9 +5635,9 @@ func (m Model) startEventsCmd() tea.Cmd {
 		events, err := provider.Events(ctx)
 		if err != nil {
 			cancel()
-			return eventsStartedMsg{err: err}
+			return eventsStartedMsg{epoch: m.systemEpoch, err: err}
 		}
-		return eventsStartedMsg{events: events, cancel: cancel}
+		return eventsStartedMsg{epoch: m.systemEpoch, events: events, cancel: cancel}
 	}
 }
 
@@ -5439,20 +5657,20 @@ func (m Model) eventsReconnectCmd() tea.Cmd {
 	if backoff <= 0 {
 		backoff = time.Second
 	}
-	return tea.Tick(backoff, func(time.Time) tea.Msg { return eventsReconnectTickMsg{} })
+	return tea.Tick(backoff, func(time.Time) tea.Msg { return eventsReconnectTickMsg{epoch: m.systemEpoch} })
 }
 
-func eventRefreshTickCmd() tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return eventRefreshTickMsg{} })
+func (m Model) eventRefreshTickCmd() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return eventRefreshTickMsg{epoch: m.systemEpoch} })
 }
 
-func waitForContainerEvent(events <-chan domain.ContainerEvent) tea.Cmd {
+func waitForContainerEvent(events <-chan domain.ContainerEvent, epoch uint64) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-events
 		if !ok {
-			return eventStreamClosedMsg{}
+			return eventStreamClosedMsg{epoch: epoch}
 		}
-		return containerEventMsg{event: event}
+		return containerEventMsg{epoch: epoch, event: event}
 	}
 }
 
@@ -5465,11 +5683,11 @@ func (m Model) startLogsCmd(id domain.ResourceID) tea.Cmd {
 		stream, err := m.provider.Logs(ctx, id, app.LogOptions{Tail: "300", Follow: true})
 		if err != nil {
 			cancel()
-			return logsStartedMsg{id: id, err: err}
+			return logsStartedMsg{epoch: m.systemEpoch, id: id, err: err}
 		}
 		lines := make(chan string, 256)
 		go readLogLines(stream, lines, cancel, ctx.Done())
-		return logsStartedMsg{id: id, lines: lines, cancel: cancel, done: ctx.Done()}
+		return logsStartedMsg{epoch: m.systemEpoch, id: id, lines: lines, cancel: cancel, done: ctx.Done()}
 	}
 }
 
@@ -5531,13 +5749,13 @@ func (m *Model) openStackLogs(project string) tea.Cmd {
 		}
 		if started == 0 {
 			cancel()
-			return stackLogsStartedMsg{project: project, err: firstErr}
+			return stackLogsStartedMsg{epoch: m.systemEpoch, project: project, err: firstErr}
 		}
 		go func() {
 			wg.Wait()
 			close(merged)
 		}()
-		return stackLogsStartedMsg{project: project, lines: merged, cancel: cancel, done: ctx.Done()}
+		return stackLogsStartedMsg{epoch: m.systemEpoch, project: project, lines: merged, cancel: cancel, done: ctx.Done()}
 	}
 }
 
@@ -5816,7 +6034,10 @@ func (m *Model) drainLogs() {
 			}
 			m.logLines = append(m.logLines, line)
 			if len(m.logLines) > 1000 {
-				m.logLines = m.logLines[len(m.logLines)-1000:]
+				if !m.logFollow && m.logScroll > 0 && m.matchesLogFilter(m.logLines[0]) {
+					m.logScroll--
+				}
+				m.logLines = m.logLines[1:]
 			}
 			if m.logFollow {
 				m.clampLogScroll()
@@ -5843,6 +6064,13 @@ func (m Model) filteredCommands() []actions.Command {
 	selected := m.selectedContainer()
 	query := strings.ToLower(strings.TrimSpace(m.commandFilter))
 	items := actions.Catalog(selected)
+	stack := m.currentRow() != nil && m.currentRow().kind == rowProject
+	for i := range items {
+		switch items[i].ID {
+		case actions.Edit, actions.FocusLogs, actions.OpenLogFilter:
+			items[i].Enabled = items[i].Enabled || stack
+		}
+	}
 	if query != "" {
 		var filtered []actions.Command
 		for _, item := range items {

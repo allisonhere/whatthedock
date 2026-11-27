@@ -127,6 +127,11 @@ func (m Model) openHostPowerConfirm(kind hostPowerKind) (tea.Model, tea.Cmd) {
 		m.status, m.statusErr = "demo mode has no real host to "+kind.verb(), true
 		return m, nil
 	}
+	system := m.activeSystemConfig()
+	if system.Kind != "ssh" && system.DockerHost != "" && !strings.HasPrefix(system.DockerHost, "unix://") {
+		m.status, m.statusErr = "host power needs a local Unix socket or an SSH system", true
+		return m, nil
+	}
 	m.hostPowerKind = kind
 	m.hostPowerConfirmInput = nil
 	m.overlay = overlayHostPowerConfirm

@@ -48,6 +48,7 @@ func TestVersionStringIncludesBuildMetadata(t *testing.T) {
 // structured to make that convenient — see TestWithStatusOverrides
 // InitialConnectingMessage in internal/ui for the model-side half).
 func TestProviderForModeSurfacesErrorAndSystemName(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	settings := config.Settings{
 		ActiveSystem: "jarvis",
 		Systems: []config.System{{

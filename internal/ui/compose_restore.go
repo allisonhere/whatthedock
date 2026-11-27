@@ -124,6 +124,10 @@ func restoreComposeBackupRemote(ctx context.Context, system config.System, base 
 // whether a backup exists is decided when the command runs, since that may be
 // a remote round trip).
 func (m Model) openRestoreComposeConfirm() (tea.Model, tea.Cmd) {
+	if m.activeSystemConfig().Kind == "demo" {
+		m.status, m.statusErr = "Compose restore is unavailable in demo mode", true
+		return m, nil
+	}
 	selected := m.selectedContainer()
 	if selected == nil {
 		m.status, m.statusErr = "no container selected", true

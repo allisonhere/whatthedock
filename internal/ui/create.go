@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -65,20 +64,25 @@ type createDraft struct {
 	// by EditingID in place instead of creating a new one. A fresh Create
 	// draft (n) or a Clone draft (C) never set these — both are meant to
 	// produce something new, never to silently overwrite what's selected.
-	Editing   bool
-	EditingID domain.ResourceID
+	Editing          bool
+	EditingID        domain.ResourceID
+	standaloneSource *app.ContainerCreateSpec
 
-	Project       string
-	Service       string
-	ContainerName string
-	Image         string
-	ImageAction   string
-	Command       string
-	Ports         string
-	Mounts        string
-	Env           string
-	Restart       string
-	ComposeFile   string
+	Project          string
+	Service          string
+	ContainerName    string
+	Image            string
+	ImageAction      string
+	Command          string
+	Ports            string
+	Mounts           string
+	Env              string
+	Restart          string
+	ComposeFile      string
+	composeLayers    []string
+	composeStackEdit bool
+	layersLoading    bool
+	layersError      string
 	// Networks is a comma-joined list of destination network names, editable
 	// only on a paste draft (see visibleCreateFields) — a plain standalone
 	// create has no field for it at all; every other field a yanked
@@ -250,12 +254,13 @@ func (d *createDraft) loadFields(content string) {
 }
 
 type composeCreateSpec struct {
-	Project      string
-	Service      string
-	BaseFile     string
-	OverrideFile string
-	Content      string
-	FullBase     bool
+	Project         string
+	Service         string
+	BaseFile        string
+	AdditionalFiles []string
+	OverrideFile    string
+	Content         string
+	FullBase        bool
 	// ChangedFields is the set of service fields the user edited relative to
 	// the loaded baseline. The base-file merge applies only these, so
 	// untouched (or never-prefilled) fields in the base file are preserved.
@@ -304,6 +309,9 @@ func (m *Model) checkComposeOverrideCmd() tea.Cmd {
 		return nil
 	}
 	system := m.activeSystemConfig()
+	if system.Kind == "demo" {
+		return nil
+	}
 	if system.Kind == "ssh" {
 		return checkRemoteOverrideCmd(system, m.createDraft.ComposeFile, m.createDraft.Service)
 	}
@@ -352,12 +360,22 @@ func (m *Model) openEditOverlay() tea.Cmd {
 		return nil
 	}
 	if selected.Compose.Project != "" {
+		if m.activeSystemConfig().Kind == "demo" {
+			m.status, m.statusErr = "Compose editing is unavailable in demo mode", true
+			return nil
+		}
+		draft := m.selectionCreateDraft()
+		if len(draft.composeLayers) > 0 {
+			draft.Editing, draft.layersLoading = true, true
+			m.openCreateOverlayWithDraft(draft)
+			return m.loadComposeLayersCmd(draft)
+		}
 		// Not openCreateOverlay: that opens the blank, generic-placeholder
 		// draft (see defaultCreateDraft's doc comment) — editing needs the
 		// selected service's real project/service/compose file so the
 		// override check below looks in the right place, not "new-service"
 		// beside "compose.yml".
-		m.openCreateOverlayWithDraft(m.selectionCreateDraft())
+		m.openCreateOverlayWithDraft(draft)
 		m.createDraft.Editing = true
 		cmd := m.checkComposeOverrideCmd()
 		if m.createDraft.BaseFileMissing && !m.createDraft.OverrideRawSet {
@@ -368,10 +386,43 @@ func (m *Model) openEditOverlay() tea.Cmd {
 		}
 		return batchCreateCmds(cmd, m.loadSelectedComposeFileCmd(m.createDraft.ComposeFile))
 	}
-	m.openCreateOverlayWithDraft(m.defaultEditDraft())
-	m.createDraft.Editing = true
+	if m.selected != nil && m.selected.ID == selected.ID {
+		m.openStandaloneEdit(*m.selected)
+		return nil
+	}
+	provider, id, epoch := m.provider, selected.ID, m.systemEpoch
+	m.status, m.statusErr = "inspecting "+selected.DisplayName()+"…", false
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		container, err := provider.Container(ctx, id)
+		return standaloneEditMsg{epoch: epoch, id: id, container: container, err: err}
+	}
+}
+
+type standaloneEditMsg struct {
+	epoch     uint64
+	id        domain.ResourceID
+	container domain.Container
+	err       error
+}
+
+func (m *Model) openStandaloneEdit(selected domain.Container) {
+	draft := m.defaultCreateDraft()
+	draft.Mode = createModeStandalone
+	draft.Editing = true
+	draft.EditingID = selected.ID
+	draft.ContainerName = selected.DisplayName()
+	draft.Image = selected.Image
+	draft.Command = selected.Command
+	spec := standaloneSpec(selected)
+	draft.Ports = formatSpecPorts(spec.Ports)
+	draft.Mounts = formatSpecMounts(spec.Mounts)
+	draft.Env = formatEnvEntries(spec.Env)
+	draft.Restart = normalizeRestartPolicy(spec.RestartPolicy)
+	draft.standaloneSource = &spec
+	m.openCreateOverlayWithDraft(draft)
 	m.status, m.statusErr = "edit draft ready for "+selected.DisplayName(), false
-	return nil
 }
 
 // backfillAdoptDraft populates Command/Ports/Mounts/Env/Restart/Labels
@@ -434,24 +485,27 @@ func siblingServiceCount(snapshot domain.Snapshot, project string) int {
 	return 0
 }
 
-// resolveProjectComposeFile finds project's base compose file path by
-// reading any of its services' containers' own Compose.ConfigFiles label
-// — every service in a normal compose deployment shares one base file,
-// so the first one found is as good as any.
-func (m Model) resolveProjectComposeFile(project string) string {
+// resolveProjectComposeFiles reads the recorded layer order and includes
+// per-service overrides when containers record different file lists.
+func (m Model) resolveProjectComposeFiles(project string) []string {
+	var files []string
+	seen := map[string]bool{}
 	for _, p := range m.snapshot.Projects {
 		if p.Name != project {
 			continue
 		}
 		for _, svc := range p.Services {
 			for _, ctr := range svc.Containers {
-				if files := splitComposeConfigFiles(ctr.Compose.ConfigFiles); len(files) > 0 {
-					return files[0]
+				for _, file := range splitComposeConfigFiles(ctr.Compose.ConfigFiles) {
+					if !seen[file] {
+						seen[file] = true
+						files = append(files, file)
+					}
 				}
 			}
 		}
 	}
-	return ""
+	return files
 }
 
 // openEditWholeStackOverlay opens the create form seeded to edit an
@@ -467,13 +521,26 @@ func (m Model) resolveProjectComposeFile(project string) string {
 // file and reconciles with `up -d` (defaultApplyComposeStack) — no new
 // apply logic, just seeded differently than a fresh stack paste.
 func (m *Model) openEditWholeStackOverlay(project string) tea.Cmd {
-	composeFile := m.resolveProjectComposeFile(project)
-	m.openCreateOverlayWithDraft(createDraft{
-		Mode:        createModeCompose,
-		Editing:     true,
-		Project:     project,
-		ComposeFile: composeFile,
-	})
+	if m.activeSystemConfig().Kind == "demo" {
+		m.status, m.statusErr = "Compose editing is unavailable in demo mode", true
+		return nil
+	}
+	files := m.resolveProjectComposeFiles(project)
+	composeFile := ""
+	if len(files) > 0 {
+		composeFile = files[0]
+	}
+	draft := createDraft{
+		Mode:             createModeCompose,
+		Editing:          true,
+		Project:          project,
+		ComposeFile:      composeFile,
+		composeStackEdit: true,
+	}
+	if len(files) > 1 {
+		draft.composeLayers = files[1:]
+	}
+	m.openCreateOverlayWithDraft(draft)
 	if composeFile == "" {
 		m.status, m.statusErr = "could not resolve a compose file for "+project, true
 		return nil
@@ -633,8 +700,12 @@ func checkRemoteOverrideCmd(system config.System, base, service string) tea.Cmd 
 // are the intentional "start from what's selected" actions — see
 // selectionCreateDraft, which they use instead.
 func (m Model) defaultCreateDraft() createDraft {
+	mode := createModeCompose
+	if m.activeSystemConfig().Kind == "demo" {
+		mode = createModeStandalone
+	}
 	return createDraft{
-		Mode:          createModeCompose,
+		Mode:          mode,
 		Project:       "default",
 		Service:       "new-service",
 		ContainerName: "new-container",
@@ -670,6 +741,7 @@ func (m Model) selectionCreateDraft() createDraft {
 		files := splitComposeConfigFiles(selected.Compose.ConfigFiles)
 		if len(files) > 0 {
 			draft.ComposeFile = files[0]
+			draft.composeLayers = files[1:]
 		}
 	}
 	return draft
@@ -702,41 +774,23 @@ func (m Model) defaultCloneDraft() createDraft {
 	return draft
 }
 
-// defaultEditDraft mirrors defaultCloneDraft's full-shape prefill (it starts
-// from the exact same base) but keeps the container's real name instead of
-// a "-clone" suffix, and records EditingID so confirm dispatch
-// (handleCreateKey) knows which container to replace. Standalone only —
-// openEditOverlay handles Compose services through openCreateOverlay's
-// existing already-managed-service path instead.
-func (m Model) defaultEditDraft() createDraft {
-	draft := m.defaultCloneDraft()
-	selected := m.selectedContainer()
-	if selected == nil {
-		return draft
+func standaloneSpec(selected domain.Container) app.ContainerCreateSpec {
+	spec := clipboard.FromContainer(selected, domain.Host{ID: selected.ID.Host}).ToCreateSpec()
+	if selected.ConfiguredPorts != nil {
+		spec.Ports = nil
+		for _, port := range selected.ConfiguredPorts {
+			spec.Ports = append(spec.Ports, app.PortBinding{
+				HostIP: port.IP, HostPort: port.Public, ContainerPort: port.Private, Protocol: port.Type,
+			})
+		}
 	}
-	draft.ContainerName = selected.DisplayName()
-	draft.EditingID = selected.ID
-	return draft
-}
-
-// replicateContainerSpec builds an app.ContainerCreateSpec identical to
-// selected's current shape (same name, image, ports, mounts, env, restart,
-// command) — used by Replicate's standalone path to recreate the container
-// in place after pulling a fresh image. Reuses the same field-mapping
-// defaultCloneDraft uses, minus the "-clone" identity suffix, and the
-// existing createDraft.ContainerSpec() parsing instead of duplicating it.
-func replicateContainerSpec(selected domain.Container) (app.ContainerCreateSpec, error) {
-	draft := createDraft{
-		Mode:          createModeStandalone,
-		ContainerName: selected.DisplayName(),
-		Image:         selected.Image,
-		Command:       selected.Command,
-		Ports:         formatDraftPorts(selected.Ports),
-		Mounts:        formatDraftMounts(selected.Mounts),
-		Env:           formatEnvEntries(selected.Env),
-		Restart:       selected.RestartPolicy,
+	spec.RestartMaxRetries = selected.RestartMaxRetries
+	if strings.HasPrefix(selected.NetworkMode, "container:") {
+		spec.NetworkMode = selected.NetworkMode
+		spec.Networks = nil
 	}
-	return draft.ContainerSpec()
+	spec.Start = selected.IsRunning() || selected.State == domain.StatePaused
+	return spec
 }
 
 // formatDraftPorts renders a container's published ports into the
@@ -810,6 +864,11 @@ func (m Model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status, m.statusErr = "create cancelled", false
 		case "y":
 			if m.createDraft.Mode == createModeCompose {
+				if m.activeSystemConfig().Kind == "demo" {
+					m.createDraft.Confirming = false
+					m.setCreateNotice("Compose deployment is unavailable in demo mode", true)
+					return m, nil
+				}
 				spec, err := m.createDraft.ComposeSpec(m.activeSystemConfig())
 				if err != nil {
 					m.createDraft.Confirming = false
@@ -1324,23 +1383,20 @@ func pullThenCreate(ctx context.Context, provider app.Provider, spec app.Contain
 	return provider.CreateContainer(ctx, spec)
 }
 
-// replaceContainerInPlace is the one safe sequence for swapping id's live
-// container for a fresh one built from spec — used by both "edit"
-// (editContainerCmd) and standalone "pull latest and recreate"
-// (startReplicate's non-Compose branch), so this safety-critical ordering
-// only has to be gotten right in one place.
-//
-// Pulling and creating a stopped replacement (under a temporary name, so it
-// can never collide with id's own name/ports while both exist) happen
-// before removing the current container, so a registry failure or
-// create-time validation failure does not delete the user's still-working
-// original. Starting still happens after removal, and after renaming to
-// spec's real name, because Docker cannot run two containers with the same
-// published ports/name at once — that final window (original already gone,
-// replacement not yet renamed/started) is the one failure region this
-// can't fully protect against; see the inline comments below for exactly
-// what's preserved at each point.
-func replaceContainerInPlace(ctx context.Context, provider app.Provider, id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) (domain.ResourceID, error) {
+// Keep the original available until the replacement has been promoted and
+// reached the requested running state. Rollback has its own bounded context
+// because a canceled apply may still have renamed or stopped the original.
+func replaceContainerInPlace(ctx context.Context, provider app.Provider, id domain.ResourceID, spec app.ContainerCreateSpec, pullFirst bool, progress chan string) (newID domain.ResourceID, resultErr error) {
+	original, err := provider.Container(ctx, id)
+	if err != nil {
+		return domain.ResourceID{}, fmt.Errorf("inspecting original container: %w", err)
+	}
+	if original.ID != id {
+		return domain.ResourceID{}, errors.New("original container is no longer available")
+	}
+	if original.AutoRemove && (original.IsRunning() || original.State == domain.StatePaused) {
+		return domain.ResourceID{}, errors.New("this container removes itself when stopped and cannot be replaced safely")
+	}
 	if pullFirst {
 		onProgress := func(p app.PullProgress) {
 			sendActionProgress(progress, formatPullProgress(spec.Image, p))
@@ -1353,35 +1409,78 @@ func replaceContainerInPlace(ctx context.Context, provider app.Provider, id doma
 	tempSpec.Name = editReplacementName(spec.Name)
 	tempSpec.Start = false
 	sendActionProgress(progress, "creating replacement for "+spec.Name+"…")
-	newID, err := provider.CreateContainer(ctx, tempSpec)
+	replacement, err := provider.CreateContainer(ctx, tempSpec)
 	if err != nil {
 		return domain.ResourceID{}, err
 	}
-	cleanupReplacement := true
+	originalName := original.DisplayName()
+	backupName := tempSpec.Name + "-original"
+	paused := original.State == domain.StatePaused
+	active := original.IsRunning() || paused
+	renamed, stopped, unpaused, committed := false, false, false, false
 	defer func() {
-		if cleanupReplacement {
-			_ = provider.RemoveContainer(context.Background(), newID, true)
+		if committed {
+			return
 		}
+		recovery, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var rollbackErrors []error
+		if err := provider.RemoveContainer(recovery, replacement, true); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("removing failed replacement: %w", err))
+		}
+		if renamed {
+			if err := provider.RenameContainer(recovery, id, originalName); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restoring original name (original kept as %s): %w", backupName, err))
+			}
+		}
+		if stopped {
+			if err := provider.StartContainer(recovery, id); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restarting original container: %w", err))
+			}
+		}
+		if unpaused {
+			if err := provider.SetContainerPaused(recovery, id, true); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restoring original pause: %w", err))
+			}
+		}
+		resultErr = errors.Join(append([]error{resultErr}, rollbackErrors...)...)
 	}()
-	sendActionProgress(progress, "removing "+spec.Name+"…")
-	if err := provider.RemoveContainer(ctx, id, true); err != nil {
-		return domain.ResourceID{}, err
+	if err := provider.RenameContainer(ctx, id, backupName); err != nil {
+		return domain.ResourceID{}, fmt.Errorf("saving original container: %w", err)
 	}
-	// The original is gone as of here, so the replacement must never be
-	// cleaned up past this point no matter what fails next — deleting it
-	// once the original is already gone would leave the user with neither
-	// container. cleanupReplacement exists only to undo the replacement
-	// create itself, while the original is still safely in place.
-	cleanupReplacement = false
-	sendActionProgress(progress, "renaming replacement to "+spec.Name+"…")
-	if err := provider.RenameContainer(ctx, newID, spec.Name); err != nil {
-		return newID, err
+	renamed = true
+	if paused {
+		if err := provider.SetContainerPaused(ctx, id, false); err != nil {
+			return domain.ResourceID{}, err
+		}
+		unpaused = true
 	}
-	sendActionProgress(progress, "starting "+spec.Name+"…")
-	if err := provider.StartContainer(ctx, newID); err != nil {
-		return newID, err
+	if active {
+		sendActionProgress(progress, "stopping "+originalName+"…")
+		if err := provider.StopContainer(ctx, id); err != nil {
+			return domain.ResourceID{}, fmt.Errorf("stopping original container: %w", err)
+		}
+		stopped = true
 	}
-	return newID, nil
+	if err := provider.RenameContainer(ctx, replacement, spec.Name); err != nil {
+		return domain.ResourceID{}, fmt.Errorf("renaming replacement: %w", err)
+	}
+	if spec.Start {
+		sendActionProgress(progress, "starting "+spec.Name+"…")
+		if err := provider.StartContainer(ctx, replacement); err != nil {
+			return domain.ResourceID{}, fmt.Errorf("starting replacement: %w", err)
+		}
+		if paused {
+			if err := provider.SetContainerPaused(ctx, replacement, true); err != nil {
+				return domain.ResourceID{}, fmt.Errorf("pausing replacement: %w", err)
+			}
+		}
+	}
+	committed = true
+	if err := provider.RemoveContainer(ctx, id, false); err != nil {
+		return replacement, fmt.Errorf("replacement is in place; could not remove original %s: %w", backupName, err)
+	}
+	return replacement, nil
 }
 
 // editContainerCmd replaces id in place with a fresh container built from
@@ -1500,6 +1599,7 @@ func (m Model) handleCreateFileBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if entry.Dir {
 			return m, m.browseCreateDir(entry.Path)
 		}
+		m.clearComposeLayers()
 		m.createDraft.ComposeFile = entry.Path
 		m.syncCreateFieldEditor()
 		m.createBrowsing = false
@@ -1776,11 +1876,18 @@ func (m *Model) moveCreateFileCursor(delta int) {
 }
 
 func (m Model) activeSystemConfig() config.System {
-	settings := config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems})
-	if system := config.FindSystem(settings.Systems, settings.ActiveSystem); system != nil {
-		return *system
+	if m.provider.Host().ID == "demo" {
+		return config.System{ID: "demo", Name: m.provider.Host().Name, Kind: "demo"}
 	}
-	return config.DefaultSystem()
+	system := m.connectedSystem
+	if system.ID != m.activeSystem {
+		settings := config.NormalizeSystems(config.Settings{ActiveSystem: m.activeSystem, Systems: m.systems})
+		system = *config.FindSystem(settings.Systems, settings.ActiveSystem)
+	}
+	if endpoint, ok := m.provider.(interface{ DockerEndpoint() string }); ok && system.Kind == "local" {
+		system.DockerHost = endpoint.DockerEndpoint()
+	}
+	return system
 }
 
 func (m *Model) validateCreateDraft() bool {
@@ -1818,6 +1925,12 @@ func lintComposeYAML(content string) error {
 const placeholderImage = "image:tag"
 
 func (d createDraft) Validate() error {
+	if d.Mode == createModeCompose && d.layersLoading {
+		return errors.New("waiting for the merged Compose configuration")
+	}
+	if d.Mode == createModeCompose && d.layersError != "" {
+		return errors.New(d.layersError)
+	}
 	if d.Mode == createModeCompose {
 		if strings.TrimSpace(d.Project) == "" {
 			return errors.New("stack is required")
@@ -1826,9 +1939,9 @@ func (d createDraft) Validate() error {
 			return errors.New("compose file is required")
 		}
 		if d.IsStack() {
-			// No single Service/Image to require — the content itself
-			// (already confirmed to define more than one service, or
-			// IsStack wouldn't be true) is what gets written.
+			if !d.OverrideRawSet {
+				return errors.New("load or enter the Compose YAML before deploying the stack")
+			}
 			return nil
 		}
 		if strings.TrimSpace(d.Service) == "" {
@@ -1879,42 +1992,46 @@ func (d createDraft) ContainerSpec() (app.ContainerCreateSpec, error) {
 	if err := d.Validate(); err != nil {
 		return app.ContainerCreateSpec{}, err
 	}
-	ports, err := parseCreatePorts(d.Ports)
-	if err != nil {
-		return app.ContainerCreateSpec{}, err
+	spec := app.ContainerCreateSpec{Start: true}
+	if d.standaloneSource != nil {
+		spec = *d.standaloneSource
 	}
-	mounts, err := parseCreateMounts(d.Mounts)
-	if err != nil {
-		return app.ContainerCreateSpec{}, err
-	}
-	env, err := parseCreateEnv(d.Env)
-	if err != nil {
-		return app.ContainerCreateSpec{}, err
-	}
-	// A paste draft starts from the yanked container's full spec —
-	// everything the form doesn't expose (privileged, capabilities,
-	// devices, resource limits, healthcheck, DNS, ...) rides along
-	// unedited — and only overwrites the fields the form actually lets the
-	// user change below. A fresh/cloned/edited draft has no such spec to
-	// start from, so every field comes from the form as it always has.
-	spec := app.ContainerCreateSpec{}
 	if d.Pasting && d.PastePlan != nil {
 		spec = d.PastePlan.Spec
 		spec.Networks = parseCreateNetworks(d.Networks, d.PastePlan.Spec.Networks)
 		if len(spec.Networks) > 0 {
-			// The user chose explicit networks on the form; that overrides a
-			// carried-over host/none mode, so the two can't conflict.
 			spec.NetworkMode = ""
 		}
 	}
 	spec.Name = strings.TrimSpace(d.ContainerName)
 	spec.Image = strings.TrimSpace(d.Image)
-	spec.Command = splitCommand(d.Command)
-	spec.Env = env
-	spec.Ports = ports
-	spec.Mounts = mounts
-	spec.RestartPolicy = normalizeRestartPolicy(d.Restart)
-	spec.Start = true
+	if d.standaloneSource == nil || d.Command != d.baseline.Command {
+		spec.Command = splitCommand(d.Command)
+	}
+	var err error
+	if d.standaloneSource == nil || d.Env != d.baseline.Env {
+		spec.Env, err = parseCreateEnv(d.Env)
+		if err != nil {
+			return app.ContainerCreateSpec{}, err
+		}
+	}
+	if d.standaloneSource == nil || d.Ports != d.baseline.Ports {
+		spec.Ports, err = parseCreatePorts(d.Ports)
+		if err != nil {
+			return app.ContainerCreateSpec{}, err
+		}
+	}
+	if d.standaloneSource == nil || d.Mounts != d.baseline.Mounts {
+		spec.Mounts, err = parseCreateMounts(d.Mounts)
+		if err != nil {
+			return app.ContainerCreateSpec{}, err
+		}
+	}
+	if d.standaloneSource == nil || d.Restart != d.baseline.Restart {
+		spec.RestartPolicy = normalizeRestartPolicy(d.Restart)
+		spec.RestartMaxRetries = 0
+	}
+
 	return spec, nil
 }
 
@@ -1953,11 +2070,12 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		// (there's no single service field they'd belong to) — the whole
 		// document is the base file's own content.
 		return composeCreateSpec{
-			Project:  strings.TrimSpace(d.Project),
-			BaseFile: strings.TrimSpace(d.ComposeFile),
-			Content:  d.OverrideRaw,
-			FullBase: true,
-			System:   system,
+			Project:         strings.TrimSpace(d.Project),
+			BaseFile:        strings.TrimSpace(d.ComposeFile),
+			AdditionalFiles: d.composeLayers,
+			Content:         d.OverrideRaw,
+			FullBase:        true,
+			System:          system,
 		}, nil
 	}
 	if _, err := parseCreatePorts(d.Ports); err != nil {
@@ -1971,19 +2089,22 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 	}
 	base := strings.TrimSpace(d.ComposeFile)
 	service := strings.TrimSpace(d.Service)
-	overrideName := "compose.whatthedock." + safeComposeFilename(service) + ".yml"
-	var override string
-	if system.Kind == "ssh" {
-		// The base file lives on the remote host, so its directory is a
-		// POSIX remote path regardless of what OS whatthedock itself runs
-		// on — use "path", not "filepath", for this join.
-		override = path.Join(path.Dir(base), overrideName)
-	} else {
-		override = filepath.Join(filepath.Dir(base), overrideName)
-	}
+	override := layeredServiceOverridePath(system, base, service, d.composeLayers)
 	content := d.composeOverrideContent()
 	changed := d.changedComposeFields()
+	if len(d.composeLayers) != 0 && d.Editing && changed != 0 {
+		var err error
+		content, err = layeredComposeChanges(d, service)
+		if err != nil {
+			return composeCreateSpec{}, err
+		}
+	}
 	switch {
+	case len(d.composeLayers) != 0 && d.Editing && changed != 0:
+		// The generated override already contains the exact form changes.
+	case len(d.composeLayers) != 0 && d.Editing && (!d.OverrideRawSet || d.OverrideLoaded):
+		content, override = "", ""
+
 	case d.OverrideRawSet && changed == 0:
 		// Nothing on the form diverges from what was loaded, so OverrideRaw
 		// is still an accurate stand-in and may carry content the per-field
@@ -2000,11 +2121,12 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		}
 	}
 	return composeCreateSpec{
-		Project:      strings.TrimSpace(d.Project),
-		Service:      service,
-		BaseFile:     base,
-		OverrideFile: override,
-		Content:      content,
+		Project:         strings.TrimSpace(d.Project),
+		Service:         service,
+		BaseFile:        base,
+		AdditionalFiles: d.composeLayers,
+		OverrideFile:    override,
+		Content:         content,
 		// ChangedFields is the set of fields the user actually edited; the
 		// base-file merge applies only these, so a field the form never
 		// loaded (a superseded prefill) is left as the file had it rather
@@ -2626,6 +2748,9 @@ func remotePromoteComposeTemp(ctx context.Context, system config.System, temp, f
 }
 
 func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) error {
+	if len(spec.AdditionalFiles) > 0 && spec.OverrideFile == "" {
+		return composeUpService(ctx, spec)
+	}
 	if strings.TrimSpace(spec.BaseFile) == "" {
 		return errors.New("compose file is required")
 	}
@@ -2637,7 +2762,7 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if err != nil {
 		return friendlyComposeBaseFileError(err, spec)
 	}
-	if baseComposeDefinesService(baseContent, spec.Service) {
+	if len(spec.AdditionalFiles) == 0 && baseComposeDefinesService(baseContent, spec.Service) {
 		return mergeComposeCreateIntoBase(ctx, spec, baseContent)
 	}
 	if err := os.MkdirAll(filepath.Dir(spec.OverrideFile), 0o755); err != nil {
@@ -2652,6 +2777,12 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_ = os.Remove(tempSpec.OverrideFile)
 		return err
+	}
+	if len(spec.AdditionalFiles) > 0 {
+		if err := backupComposeBase(spec.OverrideFile); err != nil {
+			_ = os.Remove(tempSpec.OverrideFile)
+			return err
+		}
 	}
 	if err := promoteComposeTemp(tempSpec.OverrideFile, spec.OverrideFile); err != nil {
 		_ = os.Remove(tempSpec.OverrideFile)
@@ -2889,6 +3020,9 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 // validating a temp override before promoting it, exactly like the local
 // path — just with `test`/`mkdir`/`cat >`/`mv` in place of the os package.
 func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error {
+	if len(spec.AdditionalFiles) > 0 && spec.OverrideFile == "" {
+		return composeUpService(ctx, spec)
+	}
 	composeProgress(spec, "validating "+spec.Service+"…")
 	if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
 		return fmt.Errorf("compose file %s not found on %s (deployed via Portainer or another tool that manages it elsewhere?): %w", spec.BaseFile, spec.System.Name, err)
@@ -2897,7 +3031,7 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 	if err != nil {
 		return err
 	}
-	if baseComposeDefinesService(baseContent, spec.Service) {
+	if len(spec.AdditionalFiles) == 0 && baseComposeDefinesService(baseContent, spec.Service) {
 		return mergeComposeCreateIntoBaseRemote(ctx, spec, baseContent)
 	}
 	if _, err := sshRun(ctx, spec.System, "mkdir -p "+systems.ShellQuote(path.Dir(spec.OverrideFile)), ""); err != nil {
@@ -2912,6 +3046,12 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
 		return err
+	}
+	if len(spec.AdditionalFiles) > 0 {
+		if err := backupComposeBaseRemote(ctx, spec.System, spec.OverrideFile); err != nil {
+			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
+			return err
+		}
 	}
 	if err := remotePromoteComposeTemp(ctx, spec.System, tempSpec.OverrideFile, spec.OverrideFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
@@ -3021,8 +3161,13 @@ func composeSpecForSelected(selected *domain.Container, system config.System) (c
 	}
 	if files := splitComposeConfigFiles(selected.Compose.ConfigFiles); len(files) > 0 {
 		draft.ComposeFile = files[0]
+		draft.composeLayers = files[1:]
 	}
-	return draft.ComposeSpec(system)
+	spec, err := draft.ComposeSpec(system)
+	if len(spec.AdditionalFiles) > 0 {
+		spec.OverrideFile = ""
+	}
+	return spec, err
 }
 
 // withExistingOverrideOnly clears spec.OverrideFile if no WhatTheDock
@@ -3031,6 +3176,9 @@ func composeSpecForSelected(selected *domain.Container, system config.System) (c
 // on a missing -f target. Delete and Replicate both need this since,
 // unlike Create, neither is ever about to write one.
 func withExistingOverrideOnly(ctx context.Context, spec composeCreateSpec) composeCreateSpec {
+	if spec.OverrideFile == "" {
+		return spec
+	}
 	if spec.System.Kind == "ssh" {
 		if _, err := sshRun(ctx, spec.System, "test -f "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
 			spec.OverrideFile = ""
@@ -3053,6 +3201,9 @@ func withExistingOverrideOnly(ctx context.Context, spec composeCreateSpec) compo
 // behavior earlier versions of Delete used, which left the container
 // running under its base definition instead of actually removing it.
 func defaultApplyComposeDelete(ctx context.Context, spec composeCreateSpec) error {
+	if len(spec.AdditionalFiles) > 0 {
+		return deleteLayeredComposeService(ctx, spec)
+	}
 	if spec.System.Kind == "ssh" {
 		return applyComposeDeleteRemote(ctx, spec)
 	}
@@ -3133,6 +3284,9 @@ func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error
 // project-wide equivalent of "the service's definition" is the base file
 // itself, so it goes too, not just the containers it was running.
 func defaultApplyComposeDeleteStack(ctx context.Context, spec composeCreateSpec) error {
+	if len(spec.AdditionalFiles) > 0 {
+		return deleteLayeredComposeStack(ctx, spec)
+	}
 	if spec.System.Kind == "ssh" {
 		return applyComposeDeleteStackRemote(ctx, spec)
 	}
@@ -3191,33 +3345,8 @@ func defaultApplyComposeReplicate(ctx context.Context, spec composeCreateSpec) e
 }
 
 func runDockerCompose(ctx context.Context, spec composeCreateSpec, args ...string) error {
-	baseArgs := []string{"compose"}
-	if strings.TrimSpace(spec.Project) != "" {
-		baseArgs = append(baseArgs, "-p", spec.Project)
-	}
-	baseArgs = append(baseArgs, "-f", spec.BaseFile)
-	if strings.TrimSpace(spec.OverrideFile) != "" {
-		baseArgs = append(baseArgs, "-f", spec.OverrideFile)
-	}
-	baseArgs = append(baseArgs, args...)
-	if spec.System.Kind == "ssh" {
-		quoted := make([]string, len(baseArgs))
-		for i, a := range baseArgs {
-			quoted[i] = systems.ShellQuote(a)
-		}
-		_, err := sshRun(ctx, spec.System, "docker "+strings.Join(quoted, " "), "")
-		return friendlyComposeBaseFileError(err, spec)
-	}
-	cmd := exec.CommandContext(ctx, "docker", baseArgs...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		text := strings.TrimSpace(string(output))
-		if text == "" {
-			text = err.Error()
-		}
-		return friendlyComposeBaseFileError(errors.New(text), spec)
-	}
-	return nil
+	_, err := dockerComposeOutput(ctx, spec.System, spec.Project, spec.files(), args...)
+	return friendlyComposeBaseFileError(err, spec)
 }
 
 // friendlyComposeBaseFileError catches the one error every Compose action
@@ -3586,6 +3715,9 @@ func (m *Model) setCreateFieldValue(value string) {
 	case createFieldEnv:
 		m.createDraft.Env = value
 	case createFieldComposeFile:
+		if value != m.createDraft.ComposeFile {
+			m.clearComposeLayers()
+		}
 		m.createDraft.ComposeFile = value
 	case createFieldNetworks:
 		m.createDraft.Networks = value
@@ -3606,6 +3738,9 @@ func (mode createMode) String() string {
 // for free, since nothing was ever set to begin with. Only meaningful for
 // createModeCompose; standalone drafts have no override content at all.
 func (d createDraft) IsStack() bool {
+	if d.composeStackEdit && d.Mode == createModeCompose {
+		return true
+	}
 	return d.Mode == createModeCompose && d.OverrideRawSet && len(allOverrideServiceNames(d.OverrideRaw)) > 1
 }
 

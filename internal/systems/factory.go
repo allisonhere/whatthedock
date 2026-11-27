@@ -2,6 +2,7 @@ package systems
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -124,18 +125,57 @@ func sshCommandArgs(system config.System, interactive bool) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if live {
+	control := ""
+	controlLive := false
+	if system.SSHAuth == "password" {
+		control, err = passwordControlPath(system)
+		if err != nil {
+			return nil, err
+		}
+		controlLive, err = prepareLocalSocket(control)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if live && (!interactive || control == "" || controlLive) {
 		return nil, nil
 	}
+	if controlLive {
+		args := []string{"-S", control, "-O", "forward"}
+		if system.SSHPort != "" {
+			args = append(args, "-p", system.SSHPort)
+		}
+		return append(args, "-L", system.LocalSocket+":"+system.RemoteSocket, SSHTarget(system)), nil
+	}
 	args := []string{"-fN"}
+	if control != "" {
+		if err := os.MkdirAll(filepath.Dir(control), 0o700); err != nil {
+			return nil, fmt.Errorf("creating SSH control socket directory: %w", err)
+		}
+		args = append(args, "-M", "-S", control, "-o", "ExitOnForwardFailure=yes")
+	}
 	if !interactive {
 		args = append(args, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 	}
 	if system.SSHPort != "" {
 		args = append(args, "-p", system.SSHPort)
 	}
-	args = append(args, "-L", system.LocalSocket+":"+system.RemoteSocket, SSHTarget(system))
-	return args, nil
+	if !live {
+		args = append(args, "-L", system.LocalSocket+":"+system.RemoteSocket)
+	}
+	return append(args, SSHTarget(system)), nil
+}
+
+// A password session is reusable only for its exact SSH endpoint and
+// forwarding configuration. Store its control socket in the user's cache.
+func passwordControlPath(system config.System) (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving SSH control socket directory: %w", err)
+	}
+	fields := []string{system.ID, SSHTarget(system), system.SSHPort, system.LocalSocket, system.RemoteSocket}
+	hash := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return filepath.Join(dir, "whatthedock", fmt.Sprintf("ssh-%x.sock", hash[:10])), nil
 }
 
 func SSHTarget(system config.System) string {
@@ -165,6 +205,14 @@ func RemoteCommand(ctx context.Context, system config.System, script string) (*e
 		return nil, fmt.Errorf("ssh host is required")
 	}
 	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
+	if system.SSHAuth == "password" {
+		system = config.NormalizeSystems(config.Settings{ActiveSystem: system.ID, Systems: []config.System{system}}).Systems[0]
+		control, err := passwordControlPath(system)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "-S", control, "-o", "ControlMaster=no")
+	}
 	if system.SSHPort != "" {
 		args = append(args, "-p", system.SSHPort)
 	}
@@ -181,11 +229,8 @@ func RemoteCommand(ctx context.Context, system config.System, script string) (*e
 // Go SSH client (never touching a subprocess's argv or environment — see
 // dialKeychainTunnel), everything else shells out via RemoteCommand.
 //
-// A password-prompt system (SSHAuth=="password") has no stored credential
-// to use here — by design, that mode only ever prompts on a real terminal
-// handoff (SSHCommand/tea.ExecProcess), which this headless path doesn't
-// have. It still goes through RemoteCommand and, thanks to BatchMode, fails
-// fast with a clear error instead of hanging.
+// Password-prompt systems reuse the OpenSSH master established by the
+// interactive connection. BatchMode prevents a prompt if it is unavailable.
 func RemoteExec(ctx context.Context, system config.System, script string, stdin string) ([]byte, error) {
 	if system.SSHAuth == "keychain" {
 		password, err := PasswordFor(system.ID)

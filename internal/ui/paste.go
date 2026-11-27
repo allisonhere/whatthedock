@@ -258,6 +258,11 @@ type bindRedirectDoneMsg struct {
 // reason reported, rather than silently treated as redirected.
 func (m Model) redirectMissingBindMountsCmd(plan clipboard.PastePlan) tea.Cmd {
 	system := m.activeSystemConfig()
+	if system.Kind == "demo" {
+		return func() tea.Msg {
+			return bindRedirectDoneMsg{err: errors.New("filesystem changes are unavailable in demo mode")}
+		}
+	}
 	formMounts := ""
 	fromForm := m.overlay == overlayCreate && m.createDraft.Pasting
 	if fromForm {

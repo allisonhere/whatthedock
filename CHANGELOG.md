@@ -27,8 +27,9 @@ only re-cut a build are folded into the nearest entry.
   did). `gauge` and `bars` fill a bar with the latest value (thin, or chunky
   with eighth-cell precision); `wave`, `blocks` and `braille` draw the recent
   history of each metric.
-- Settings has a **Changelog** section with **View changelog**, which shows this
-  file (bundled into the binary) in a scrollable overlay.
+- Settings has an **About** section with **About WhatTheDock** (the About screen;
+  `Esc` returns to Settings) and **View changelog**, which shows this file
+  (bundled into the binary) in a scrollable overlay.
 
 ### Fixed
 - `Alt+r` (restart) never fired: the key handler matched `r` and then checked

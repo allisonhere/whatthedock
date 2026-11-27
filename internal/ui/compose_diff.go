@@ -88,6 +88,10 @@ func (d createDraft) composeChangePreview(system config.System) (target, before,
 		return spec.BaseFile, d.OverrideRaw, spec.Content, true
 	}
 	switch {
+	case len(d.composeLayers) > 0 && spec.OverrideFile == "":
+		return "", "", "", false
+	case len(d.composeLayers) > 0:
+		return spec.OverrideFile, d.OverrideRaw, spec.Content, true
 	case d.BaseFileMissing:
 		return spec.BaseFile, "", spec.Content, true
 	case d.OverrideRawBase && d.OverrideRawSet:

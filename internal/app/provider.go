@@ -67,12 +67,13 @@ type ContainerCreateSpec struct {
 	// distinct from a PortBinding whose HostPort happens to be 0 (which
 	// Docker would treat as "publish on a random host port", not "don't
 	// publish at all").
-	ExposedPorts  []ExposedPort
-	Mounts        []MountBinding
-	Tmpfs         map[string]string // mount target -> options string
-	Networks      []NetworkAttachment
-	RestartPolicy string
-	Start         bool
+	ExposedPorts      []ExposedPort
+	Mounts            []MountBinding
+	Tmpfs             map[string]string // mount target -> options string
+	Networks          []NetworkAttachment
+	RestartPolicy     string
+	RestartMaxRetries int
+	Start             bool
 	// NetworkMode is an explicit Docker network mode ("host" or "none") when
 	// one was carried over from a paste — those can't be represented as
 	// Networks attachments. Empty means "derive from Networks (or default)".

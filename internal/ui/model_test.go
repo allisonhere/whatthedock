@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +83,7 @@ func (f *fakeProvider) Events(context.Context) (<-chan domain.ContainerEvent, er
 func (f *fakeProvider) StartContainer(_ context.Context, id domain.ResourceID) error {
 	f.starts++
 	f.started = append(f.started, id)
-	if f.startErr != nil {
+	if f.startErr != nil && strings.HasPrefix(id.ID, "created-") {
 		return f.startErr
 	}
 	if ctr, ok := f.containers[id.ID]; ok {
@@ -1336,7 +1337,7 @@ func TestLogFilterEscClearsWhileEditing(t *testing.T) {
 	}
 }
 
-func TestSlashSearchesLogsWhenLogsAreVisibleFromTreeFocus(t *testing.T) {
+func TestSlashFiltersTheFocusedTreeWhenLogsAreVisible(t *testing.T) {
 	model := testModel()
 	model.width, model.height = 100, 30
 	model.focus = paneTree
@@ -1347,11 +1348,8 @@ func TestSlashSearchesLogsWhenLogsAreVisibleFromTreeFocus(t *testing.T) {
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	model = updated.(Model)
-	if model.focus != paneActivity || model.overlay != overlayLogFilter {
-		t.Fatalf("focus/overlay = %v/%v, want activity/log filter", model.focus, model.overlay)
-	}
-	if model.overlay == overlayFilter {
-		t.Fatal("slash opened project filter while logs were visible")
+	if model.focus != paneTree || model.overlay != overlayFilter {
+		t.Fatalf("focus/overlay = %v/%v, want tree/container filter", model.focus, model.overlay)
 	}
 }
 
@@ -3437,6 +3435,7 @@ func modelSelectingStandalone(name, image string) Model {
 	model := modelSelecting("", "", "")
 	model.selected.Name = name
 	model.selected.Image = image
+	model.selected.State = domain.StateRunning
 	model.selectedID = model.selected.ID
 	if fp, ok := model.provider.(*fakeProvider); ok {
 		fp.containers[model.selected.ID.ID] = *model.selected
@@ -3908,7 +3907,7 @@ func TestConfirmEditStandaloneReplacesContainerInPlace(t *testing.T) {
 	if len(fp.creates) != 1 || !strings.HasPrefix(fp.creates[0].Name, "whatthedock-edit-grafana-") || fp.creates[0].Start || fp.creates[0].RestartPolicy != "unless-stopped" {
 		t.Fatalf("creates = %#v, want one stopped replacement create with the edited restart policy", fp.creates)
 	}
-	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
+	if len(fp.renamed) != 2 || !strings.HasSuffix(fp.renamed[1], "=grafana") {
 		t.Fatalf("renamed = %#v, want replacement renamed to grafana", fp.renamed)
 	}
 	if fp.starts != 1 {
@@ -3942,7 +3941,7 @@ func TestConfirmEditStandalonePullsImageWhenRequested(t *testing.T) {
 	if len(fp.creates) != 1 || !strings.HasPrefix(fp.creates[0].Name, "whatthedock-edit-grafana-") || fp.creates[0].Start {
 		t.Fatalf("creates = %#v, want stopped replacement created after pull", fp.creates)
 	}
-	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") || fp.starts != 1 {
+	if len(fp.renamed) != 2 || !strings.HasSuffix(fp.renamed[1], "=grafana") || fp.starts != 1 {
 		t.Fatalf("renamed/starts = %#v/%d, want replacement renamed and started", fp.renamed, fp.starts)
 	}
 }
@@ -3991,119 +3990,30 @@ func TestConfirmEditStandaloneDoesNotRemoveWhenReplacementCreateFails(t *testing
 	}
 }
 
-func TestConfirmEditStandaloneKeepsReplacementWhenRenameFailsAfterRemoval(t *testing.T) {
+func TestConfirmEditStandaloneRollsBackOnReplacementStartFailure(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
-	oldID := model.selectedContainer().ID
-	model.provider.(*fakeProvider).renameErr = errors.New("container name already in use")
+	oldID := model.selected.ID
+	provider := model.provider.(*fakeProvider)
+	provider.startErr = errors.New("driver failed programming external connectivity")
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 	model = updated.(Model)
 	model.createDraft.Confirming = true
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	done := runCmd(t, cmd).(createDoneMsg)
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
-	msg := runCmd(t, cmd).(createDoneMsg)
-	if msg.err == nil || !strings.Contains(msg.err.Error(), "already in use") {
-		t.Fatalf("createDoneMsg.err = %v, want the rename error", msg.err)
+	if !errors.Is(done.err, provider.startErr) {
+		t.Fatalf("createDoneMsg.err = %v, want the start error", done.err)
 	}
-	fp := model.provider.(*fakeProvider)
-	// The original was already removed by the time rename failed — the
-	// replacement (still under its temp name) must survive that failure
-	// instead of being cleaned up, or the user is left with no container
-	// at all.
-	if len(fp.removed) != 1 || fp.removed[0] != oldID {
-		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	replacement := domain.ResourceID{Host: oldID.Host, ID: "created-" + provider.creates[0].Name}
+	if !slices.Equal(provider.removed, []domain.ResourceID{replacement}) {
+		t.Fatalf("removed = %v, want only failed replacement %v", provider.removed, replacement)
 	}
-	if len(fp.renamed) != 1 {
-		t.Fatalf("renamed = %#v, want one rename attempt", fp.renamed)
+	if !slices.Equal(provider.started, []domain.ResourceID{replacement, oldID}) {
+		t.Fatalf("started = %v, want failed replacement followed by restored original", provider.started)
 	}
-	if len(fp.creates) != 1 {
-		t.Fatalf("creates = %#v, want one replacement create", fp.creates)
-	}
-	replacementID := "created-" + fp.creates[0].Name
-	if _, ok := fp.containers[replacementID]; !ok {
-		t.Fatalf("replacement container %s was removed after rename failure, want it kept", replacementID)
-	}
-	if fp.starts != 0 {
-		t.Fatalf("starts = %d, want no start attempt after rename failure", fp.starts)
-	}
-}
-
-// TestConfirmEditStandaloneCleansUpReplacementWhenOriginalRemovalFails
-// checks the other side of editContainerCmd's cleanup boundary: if removing
-// the original fails (it's still in use, still running with something
-// holding it open, ...), the just-created temp-named replacement must be
-// torn down again — and that cleanup must target the replacement's ID,
-// never the original's, which is still safely in place.
-func TestConfirmEditStandaloneCleansUpReplacementWhenOriginalRemovalFails(t *testing.T) {
-	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
-	oldID := model.selectedContainer().ID
-	fp := model.provider.(*fakeProvider)
-	fp.removeErr = errors.New("container is in use")
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
-	model = updated.(Model)
-	model.createDraft.Confirming = true
-
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
-	msg := runCmd(t, cmd).(createDoneMsg)
-	if msg.err == nil || !strings.Contains(msg.err.Error(), "container is in use") {
-		t.Fatalf("createDoneMsg.err = %v, want the remove error", msg.err)
-	}
-
-	if len(fp.creates) != 1 {
-		t.Fatalf("creates = %#v, want exactly one replacement create attempt", fp.creates)
-	}
-	tempID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
-	if len(fp.removed) != 2 || fp.removed[0] != oldID || fp.removed[1] != tempID {
-		t.Fatalf("removed = %#v, want [original %v, replacement %v] in that order", fp.removed, oldID, tempID)
-	}
-	if len(fp.renamed) != 0 || fp.starts != 0 {
-		t.Fatalf("renamed/starts = %#v/%d, want neither once removal of the original fails", fp.renamed, fp.starts)
-	}
-}
-
-// TestConfirmEditStandaloneKeepsReplacementWhenStartFails checks the final
-// failure point in editContainerCmd: rename succeeds but starting the
-// replacement fails. The renamed replacement must survive — it's the only
-// container left, correctly configured even if not running.
-func TestConfirmEditStandaloneKeepsReplacementWhenStartFails(t *testing.T) {
-	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
-	oldID := model.selectedContainer().ID
-	fp := model.provider.(*fakeProvider)
-	fp.startErr = errors.New("driver failed programming external connectivity")
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
-	model = updated.(Model)
-	model.createDraft.Confirming = true
-
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
-	msg := runCmd(t, cmd).(createDoneMsg)
-	if msg.err == nil || !strings.Contains(msg.err.Error(), "external connectivity") {
-		t.Fatalf("createDoneMsg.err = %v, want the start error", msg.err)
-	}
-
-	if len(fp.removed) != 1 || fp.removed[0] != oldID {
-		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
-	}
-	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
-		t.Fatalf("renamed = %#v, want the replacement renamed to grafana before the start attempt", fp.renamed)
-	}
-	newID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
-	if len(fp.started) != 1 || fp.started[0] != newID {
-		t.Fatalf("started = %#v, want exactly one start attempt on the replacement", fp.started)
-	}
-	replacement, ok := fp.containers[newID.ID]
-	if !ok {
-		t.Fatal("replacement container removed after start failure, want it kept")
-	}
-	if replacement.Name != "grafana" {
-		t.Fatalf("replacement name = %q, want grafana", replacement.Name)
-	}
-	if replacement.State == domain.StateRunning {
-		t.Fatal("replacement reports running despite StartContainer returning an error")
+	if original := provider.containers[oldID.ID]; original.Name != "grafana" || original.State != domain.StateRunning {
+		t.Fatalf("restored original = %#v", original)
 	}
 }
 
@@ -4153,6 +4063,7 @@ func TestHandleReplicateKeyStandaloneUsesCreateBeforeRemoveSequence(t *testing.T
 	model.selected.Mounts = []domain.Mount{{Type: "bind", Source: "/srv/grafana", Destination: "/var/lib/grafana", ReadWrite: true}}
 	model.selected.Env = []string{"GF_AUTH=none"}
 	model.selected.RestartPolicy = "unless-stopped"
+	model.provider.(*fakeProvider).containers[oldID.ID] = *model.selected
 	model.overlay = overlayReplicate
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
@@ -4206,7 +4117,7 @@ func TestHandleReplicateKeyStandaloneUsesCreateBeforeRemoveSequence(t *testing.T
 	if len(fp.removed) != 1 || fp.removed[0] != oldID {
 		t.Fatalf("removed = %#v, want a single call for the original %v, after create succeeded", fp.removed, oldID)
 	}
-	if len(fp.renamed) != 1 || fp.renamed[0] != "created-"+created.Name+"=grafana" {
+	if len(fp.renamed) != 2 || fp.renamed[1] != "created-"+created.Name+"=grafana" {
 		t.Fatalf("renamed = %#v, want the replacement renamed to grafana", fp.renamed)
 	}
 	newID := domain.ResourceID{Host: "local", ID: "created-" + created.Name}
@@ -4272,109 +4183,45 @@ func TestHandleReplicateKeyStandaloneDoesNotRemoveWhenReplacementCreateFails(t *
 	}
 }
 
-// TestHandleReplicateKeyStandaloneCleansUpReplacementWhenOriginalRemovalFails
-// checks that a failed original-removal (original still occupied, e.g. a
-// stop error under force-remove) triggers cleanup of the just-created
-// temp-named replacement — and that cleanup targets the replacement's own
-// ID, never the original's.
-func TestHandleReplicateKeyStandaloneCleansUpReplacementWhenOriginalRemovalFails(t *testing.T) {
+func TestHandleReplicateKeyKeepsWorkingReplacementIfOriginalCleanupFails(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
 	oldID := model.selected.ID
-	fp := model.provider.(*fakeProvider)
-	fp.removeErr = errors.New("container is in use")
+	provider := model.provider.(*fakeProvider)
+	provider.removeErr = errors.New("container is in use")
 	model.overlay = overlayReplicate
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	done := runCmd(t, cmd).(actionDoneMsg)
-	if done.err == nil || !strings.Contains(done.err.Error(), "container is in use") {
-		t.Fatalf("actionDoneMsg.err = %v, want the remove error", done.err)
+	if !errors.Is(done.err, provider.removeErr) {
+		t.Fatalf("actionDoneMsg.err = %v, want the cleanup error", done.err)
 	}
-
-	if len(fp.creates) != 1 {
-		t.Fatalf("creates = %#v, want exactly one replacement create attempt", fp.creates)
+	replacement := "created-" + provider.creates[0].Name
+	if ctr := provider.containers[replacement]; ctr.Name != "grafana" || ctr.State != domain.StateRunning {
+		t.Fatalf("replacement = %#v, want a working container under the requested name", ctr)
 	}
-	tempID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
-	// removeErr makes every RemoveContainer call fail — both the attempt on
-	// the original (which the sequence itself makes) and the deferred
-	// cleanup attempt on the replacement land in fp.removed. Both must
-	// target the correct, distinct IDs: never the same one twice, never
-	// the wrong one.
-	if len(fp.removed) != 2 || fp.removed[0] != oldID || fp.removed[1] != tempID {
-		t.Fatalf("removed = %#v, want [original %v, replacement %v] in that order", fp.removed, oldID, tempID)
-	}
-	if len(fp.renamed) != 0 || fp.starts != 0 {
-		t.Fatalf("renamed/starts = %#v/%d, want neither once removal of the original fails", fp.renamed, fp.starts)
+	if ctr := provider.containers[oldID.ID]; !strings.HasSuffix(ctr.Name, "-original") {
+		t.Fatalf("original = %#v, want the original retained under its backup name", ctr)
 	}
 }
 
-func TestHandleReplicateKeyStandaloneKeepsReplacementWhenRenameFailsAfterRemoval(t *testing.T) {
+func TestHandleReplicateKeyCleansUpReplacementIfOriginalRenameFails(t *testing.T) {
 	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
 	oldID := model.selected.ID
-	fp := model.provider.(*fakeProvider)
-	fp.renameErr = errors.New("container name already in use")
+	provider := model.provider.(*fakeProvider)
+	provider.renameErr = errors.New("container name already in use")
 	model.overlay = overlayReplicate
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
+	_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	done := runCmd(t, cmd).(actionDoneMsg)
-	if done.err == nil || !strings.Contains(done.err.Error(), "already in use") {
+	if !errors.Is(done.err, provider.renameErr) {
 		t.Fatalf("actionDoneMsg.err = %v, want the rename error", done.err)
 	}
-
-	if len(fp.removed) != 1 || fp.removed[0] != oldID {
-		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
+	replacement := domain.ResourceID{Host: oldID.Host, ID: "created-" + provider.creates[0].Name}
+	if !slices.Equal(provider.removed, []domain.ResourceID{replacement}) {
+		t.Fatalf("removed = %v, want only failed replacement %v", provider.removed, replacement)
 	}
-	if len(fp.creates) != 1 {
-		t.Fatalf("creates = %#v, want one replacement create", fp.creates)
-	}
-	replacementID := "created-" + fp.creates[0].Name
-	if _, ok := fp.containers[replacementID]; !ok {
-		t.Fatalf("replacement container %s was removed after rename failure, want it kept — the original is already gone", replacementID)
-	}
-	if fp.starts != 0 {
-		t.Fatalf("starts = %d, want no start attempt after rename failure", fp.starts)
-	}
-}
-
-// TestHandleReplicateKeyStandaloneKeepsReplacementWhenStartFails checks the
-// last failure point: rename succeeds (replacement now bears the real
-// name) but starting it fails. The replacement must survive under its real
-// name rather than being torn down — it's the only container left, and
-// it's fully configured even if not running.
-func TestHandleReplicateKeyStandaloneKeepsReplacementWhenStartFails(t *testing.T) {
-	model := modelSelectingStandalone("grafana", "grafana/grafana:latest")
-	oldID := model.selected.ID
-	fp := model.provider.(*fakeProvider)
-	fp.startErr = errors.New("driver failed programming external connectivity")
-	model.overlay = overlayReplicate
-
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = updated.(Model)
-	done := runCmd(t, cmd).(actionDoneMsg)
-	if done.err == nil || !strings.Contains(done.err.Error(), "external connectivity") {
-		t.Fatalf("actionDoneMsg.err = %v, want the start error", done.err)
-	}
-
-	if len(fp.removed) != 1 || fp.removed[0] != oldID {
-		t.Fatalf("removed = %#v, want the original removed exactly once", fp.removed)
-	}
-	if len(fp.renamed) != 1 || !strings.HasSuffix(fp.renamed[0], "=grafana") {
-		t.Fatalf("renamed = %#v, want the replacement renamed to grafana before the start attempt", fp.renamed)
-	}
-	newID := domain.ResourceID{Host: "local", ID: "created-" + fp.creates[0].Name}
-	if len(fp.started) != 1 || fp.started[0] != newID {
-		t.Fatalf("started = %#v, want exactly one start attempt on the replacement", fp.started)
-	}
-	replacement, ok := fp.containers[newID.ID]
-	if !ok {
-		t.Fatal("replacement container removed after start failure, want it kept")
-	}
-	if replacement.Name != "grafana" {
-		t.Fatalf("replacement name = %q, want grafana (renamed before start was attempted)", replacement.Name)
-	}
-	if replacement.State == domain.StateRunning {
-		t.Fatal("replacement reports running despite StartContainer returning an error")
+	if original := provider.containers[oldID.ID]; original.Name != "grafana" || provider.stops != 0 {
+		t.Fatalf("original = %#v, stops = %d, want the original untouched", original, provider.stops)
 	}
 }
 
@@ -4452,7 +4299,7 @@ func TestExecShellCommandUsesDockerHostForSSHSystem(t *testing.T) {
 
 	cmd := execShellCommand(system, id)
 
-	wantArgs := []string{"docker", "exec", "-it", "abc123", "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh"}
+	wantArgs := []string{"docker", "--host", "unix:///tmp/wtd-jarvis.sock", "exec", "-it", "abc123", "sh", "-c", "[ -x /bin/bash ] && exec bash || exec sh"}
 	if len(cmd.Args) != len(wantArgs) {
 		t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
 	}
@@ -5193,162 +5040,143 @@ func TestOverlaysRenderSoftPanelChrome(t *testing.T) {
 	}
 }
 
-func TestHelpMentionsSystemsOverlayCommands(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 42
-	model.overlay = overlayHelp
-
-	view := ansi.Strip(model.View())
-	for _, want := range []string{
-		"Main:",
-		"create container or Compose service",
-		"open shell in selected running container",
-		"Activity:",
-	} {
+func TestHelpShowsCategoriesAndReadsOneAtATime(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 100, 34
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	m = next.(Model)
+	view := ansi.Strip(m.View())
+	for _, want := range []string{"Main", "Activity", "Settings And Systems", "create container or Compose service"} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("help view missing %q:\n%s", want, view)
+			t.Fatalf("initial help missing %q", want)
 		}
 	}
-	for _, want := range []string{
-		"open the create/edit Compose catalog picker",
-		"add draft from URL or path",
-		"browse for a Compose file and add it as a draft",
-		"create a blank draft",
-		"Curators:",
-		"Settings And Systems:",
-	} {
-		if !strings.Contains(helpText(), want) {
-			t.Fatalf("help text missing %q", want)
-		}
+	if strings.Contains(view, "test selected system") {
+		t.Fatal("help rendered details from an unselected category")
 	}
+	for _, msg := range []tea.KeyMsg{{Type: tea.KeyEnd}, {Type: tea.KeyUp}, {Type: tea.KeyEnter}} {
+		next, _ = m.Update(msg)
+		m = next.(Model)
+	}
+	view = ansi.Strip(m.View())
+	if !m.helpRight || !strings.Contains(view, "switch to selected Docker system") || !strings.Contains(view, "save system") {
+		t.Fatalf("system controls missing from selected category:\n%s", view)
+	}
+}
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
-	model = updated.(Model)
-	if model.helpScroll == 0 {
-		t.Fatal("helpScroll = 0 after G, want scrolled to bottom")
+func TestHelpSearchAcrossCategoriesKeepsTermUntilCleared(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 100, 24
+	m.openHelp()
+	for _, msg := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{'/'}},
+		{Type: tea.KeyRunes, Runes: []rune("add draft界")},
+		{Type: tea.KeyBackspace},
+	} {
+		next, _ := m.Update(msg)
+		m = next.(Model)
 	}
-	view = ansi.Strip(model.View())
-	for _, want := range []string{"Settings Ctrl+S", "Systems Enter", "Systems a / e", "System edit Ctrl+S"} {
+	view := ansi.Strip(m.View())
+	if !m.helpSearchActive || m.helpSearch != "add draft" || !strings.Contains(view, "add draft from URL or path") || !strings.Contains(view, "/ add draft") {
+		t.Fatalf("live help search did not show the matching entry:\n%s", view)
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.helpSearchActive || m.helpSearch != "add draft" || m.overlay != overlayHelp {
+		t.Fatal("Enter did not keep the filtered help results")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.helpSearch != "" || m.overlay != overlayHelp {
+		t.Fatal("Escape should clear the applied filter and keep Help open")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if next.(Model).overlay != overlayNone {
+		t.Fatal("Escape with no filter should close Help")
+	}
+}
+
+func TestHelpStatusColorsIsSelectable(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 100, 30
+	m.openHelp()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	view := ansi.Strip(next.(Model).View())
+	for _, want := range []string{"Status colors:", "healthy / running", "restarting", "stopped, exited cleanly", "dead", "unhealthy"} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("help view missing %q after scrolling to bottom:\n%s", want, view)
+			t.Fatalf("selected Status Colors category missing %q:\n%s", want, view)
 		}
 	}
 }
 
-func TestHelpOverlaySearchFiltersSections(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 24
-	model.overlay = overlayHelp
+func TestHelpNavigationAndDetailScrolling(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 100, 14
+	m.openHelp()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = next.(Model)
+	if m.helpCategory != 1 || m.helpScroll != 0 {
+		t.Fatal("j should choose the next category in the sidebar")
+	}
+	for _, msg := range []tea.KeyMsg{{Type: tea.KeyRight}, {Type: tea.KeyPgDown}} {
+		next, _ = m.Update(msg)
+		m = next.(Model)
+	}
+	if !m.helpRight || m.helpCategory != 1 || m.helpScroll == 0 {
+		t.Fatal("Page Down should scroll the selected category's detail")
+	}
+	for _, msg := range []tea.KeyMsg{{Type: tea.KeyLeft}, {Type: tea.KeyUp}} {
+		next, _ = m.Update(msg)
+		m = next.(Model)
+	}
+	if m.helpRight || m.helpCategory != 0 || m.helpScroll != 0 {
+		t.Fatal("changing categories should reset the detail scroll")
+	}
+}
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-	model = updated.(Model)
-	if !model.helpSearchActive {
-		t.Fatal("helpSearchActive = false after /, want active search")
+func TestHelpCompactViewOpensAndReturnsToCategoryList(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 40, 12
+	m.openHelp()
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "Activity") || !strings.Contains(view, "enter open") {
+		t.Fatalf("compact Help category list or hints missing:\n%s", view)
 	}
-	for _, r := range "catalog" {
-		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-		model = updated.(Model)
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	view = ansi.Strip(m.View())
+	if !strings.Contains(view, "Tab / Shift+Tab") || !strings.Contains(view, "← categories") {
+		t.Fatalf("compact Help detail or return hint missing:\n%s", view)
 	}
-	if model.helpSearch != "catalog" {
-		t.Fatalf("helpSearch = %q, want catalog", model.helpSearch)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if next.(Model).helpRight {
+		t.Fatal("Left should return to the category list")
 	}
+}
 
-	view := ansi.Strip(model.View())
-	for _, want := range []string{
-		"/catalog|",
-		"Compose Catalog Curator:",
-		"add draft from URL or path",
-		"open the create/edit Compose catalog picker",
-	} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("filtered help missing %q:\n%s", want, view)
+func TestHelpMouseChoosesCategoryAndScrollsUnderPointer(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 100, 17
+	m.openHelp()
+	layout := m.helpLayout()
+	view := ansi.Strip(m.View())
+	for y, line := range strings.Split(view, "\n") {
+		if before, _, ok := strings.Cut(line, "Activity"); ok {
+			x := ansi.StringWidth(before)
+			next, _ := m.Update(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+			m = next.(Model)
+			if m.helpCategory != 1 || m.helpRight || m.helpScroll != 0 {
+				t.Fatalf("category click did not select Activity: category %d, detail focus %t, scroll %d", m.helpCategory, m.helpRight, m.helpScroll)
+			}
+			next, _ = m.Update(tea.MouseMsg{X: x + layout.left + 1, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+			m = next.(Model)
+			if m.helpCategory != 1 || m.helpRight || m.helpScroll == 0 {
+				t.Fatal("wheel over the detail pane did not scroll independently of keyboard focus")
+			}
+			return
 		}
 	}
-	if strings.Contains(view, "Curators:") {
-		t.Fatalf("filtered help included unrelated Curators section:\n%s", view)
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyBackspace})
-	model = updated.(Model)
-	if model.helpSearch != "catalo" {
-		t.Fatalf("helpSearch after backspace = %q, want catalo", model.helpSearch)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
-	model = updated.(Model)
-	if model.helpSearch != "" || !model.helpSearchActive {
-		t.Fatalf("after ctrl+u helpSearch/helpSearchActive = %q/%v, want empty/active", model.helpSearch, model.helpSearchActive)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	model = updated.(Model)
-	if model.helpSearchActive || model.overlay != overlayHelp {
-		t.Fatalf("after esc searchActive/overlay = %v/%v, want false/overlayHelp", model.helpSearchActive, model.overlay)
-	}
-}
-
-func TestHelpOverlayShowsStatusLegend(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 30
-	model.overlay = overlayHelp
-
-	view := ansi.Strip(model.View())
-	for _, want := range []string{
-		"Status colors:",
-		"healthy / running",
-		"restarting",
-		"stopped, exited cleanly",
-		"dead",
-		"unhealthy",
-	} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("help view missing status legend entry %q:\n%s", want, view)
-		}
-	}
-}
-
-// TestHelpOverlayLegendStaysVisibleWhileScrolled guards the "always
-// visible, not part of the scrollable list" property statusLegendLines is
-// meant to have: scrolling the keybinding list must never scroll the
-// legend out of view along with it.
-func TestHelpOverlayLegendStaysVisibleWhileScrolled(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 20
-	model.overlay = overlayHelp
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
-	model = updated.(Model)
-
-	view := ansi.Strip(model.View())
-	if !strings.Contains(view, "Status colors:") {
-		t.Fatalf("legend missing after scrolling to bottom:\n%s", view)
-	}
-}
-
-func TestHelpOverlayScrollsWithJK(t *testing.T) {
-	model := testModel()
-	model.width, model.height = 100, 20
-	model.overlay = overlayHelp
-
-	if budget := model.helpBodyBudget(); budget >= len(helpLines()) {
-		t.Fatalf("helpBodyBudget() = %d, want < %d so this test actually exercises scrolling", budget, len(helpLines()))
-	}
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	model = updated.(Model)
-	if model.helpScroll != 1 {
-		t.Fatalf("helpScroll after j = %d, want 1", model.helpScroll)
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
-	model = updated.(Model)
-	if model.helpScroll != 0 {
-		t.Fatalf("helpScroll after k = %d, want 0", model.helpScroll)
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
-	model = updated.(Model)
-	if model.helpScroll != 0 {
-		t.Fatalf("helpScroll should not go below 0, got %d", model.helpScroll)
-	}
+	t.Fatalf("could not find Activity category:\n%s", view)
 }
 
 func TestAboutOverlayOpensAnimatesAndCloses(t *testing.T) {
@@ -5652,13 +5480,13 @@ func TestWaitForContainerEventReturnsEventOrClosedSignal(t *testing.T) {
 	ch := make(chan domain.ContainerEvent, 1)
 	ch <- domain.ContainerEvent{ID: domain.ResourceID{Host: "local", ID: "1"}, Action: "start"}
 
-	msg := runCmd(t, waitForContainerEvent(ch))
+	msg := runCmd(t, waitForContainerEvent(ch, 0))
 	if _, ok := msg.(containerEventMsg); !ok {
 		t.Fatalf("msg = %#v, want containerEventMsg", msg)
 	}
 
 	close(ch)
-	msg = runCmd(t, waitForContainerEvent(ch))
+	msg = runCmd(t, waitForContainerEvent(ch, 0))
 	if _, ok := msg.(eventStreamClosedMsg); !ok {
 		t.Fatalf("msg = %#v, want eventStreamClosedMsg", msg)
 	}
@@ -6924,22 +6752,19 @@ func TestBackgroundUpdateCheckKeepsStatusMessage(t *testing.T) {
 // long entries mid-sentence: every visible line must fit the panel, and
 // wrapping must not drop any text.
 func TestHelpLinesWrapToThePanelWidth(t *testing.T) {
-	model := testModel()
-	model.width = 120
-	limit := model.helpPanelWidth() - 6
-
-	var got []string
-	for _, line := range model.visibleHelpLines() {
-		if w := ansi.StringWidth(line); w > limit {
-			t.Fatalf("help line is %d wide, want <= %d: %q", w, limit, line)
-		}
-		got = append(got, line)
-	}
-	joined := strings.Join(strings.Fields(strings.Join(got, " ")), " ")
-	for _, section := range helpSections {
-		for _, entry := range section.Entries {
-			if !strings.Contains(joined, strings.Join(strings.Fields(entry.Text), " ")) {
-				t.Fatalf("wrapped help dropped text for %q: %q", entry.Key, entry.Text)
+	for _, width := range []int{28, 56, 74} {
+		for _, section := range helpSections {
+			lines := helpDetailLines(section, width)
+			for _, line := range lines {
+				if size := ansi.StringWidth(line); size > width {
+					t.Fatalf("help line is %d wide, want <= %d: %q", size, width, line)
+				}
+			}
+			joined := strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
+			for _, entry := range section.Entries {
+				if !strings.Contains(joined, strings.Join(strings.Fields(entry.Text), " ")) {
+					t.Fatalf("wrapped help dropped text for %q: %q", entry.Key, entry.Text)
+				}
 			}
 		}
 	}

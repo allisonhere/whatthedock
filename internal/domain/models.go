@@ -69,6 +69,7 @@ type Port struct {
 }
 
 type Mount struct {
+	Name        string
 	Type        string
 	Source      string
 	Destination string
@@ -134,18 +135,21 @@ type Container struct {
 	// "none" are special: they can't be expressed as an endpoint attachment,
 	// so the Container Clipboard carries the mode through to create rather
 	// than treating "host" as a network to join (which Docker rejects).
-	NetworkMode    string
-	MemoryBytes    int64
-	NanoCPUs       int64
-	StopSignal     string
-	StopTimeout    *int
-	DNS            []string
-	DNSSearch      []string
-	ReadonlyRootfs bool
-	SecurityOpt    []string
-	LogDriver      string
-	LogOptions     map[string]string
-	Tmpfs          map[string]string // mount target -> options string (e.g. "size=64m")
+	NetworkMode       string
+	ConfiguredPorts   []Port
+	RestartMaxRetries int
+	AutoRemove        bool
+	MemoryBytes       int64
+	NanoCPUs          int64
+	StopSignal        string
+	StopTimeout       *int
+	DNS               []string
+	DNSSearch         []string
+	ReadonlyRootfs    bool
+	SecurityOpt       []string
+	LogDriver         string
+	LogOptions        map[string]string
+	Tmpfs             map[string]string // mount target -> options string (e.g. "size=64m")
 }
 
 // Image describes one image in a Docker host's local image store.

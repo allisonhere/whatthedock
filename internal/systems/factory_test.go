@@ -301,3 +301,44 @@ func TestTunnelPreservesNonSocketPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestPasswordTunnelAndRemoteCommandShareControlSocket(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	system := config.System{
+		ID: "password-host", Kind: "ssh", SSHHost: "ssh.example", SSHUser: "me",
+		SSHPort: "2222", SSHAuth: "password", LocalSocket: filepath.Join(dir, "docker.sock"),
+		RemoteSocket: "/run/user/1000/docker.sock",
+	}
+	tunnel, err := SSHCommand(system)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote, err := RemoteCommand(t.Context(), system, "pwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlSocket := func(args []string) string {
+		for i, arg := range args[:len(args)-1] {
+			if arg == "-S" {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	start, reuse := controlSocket(tunnel.Args), controlSocket(remote.Args)
+	if start == "" || start != reuse {
+		t.Fatalf("control socket options differ: tunnel = %v, remote = %v", tunnel.Args, remote.Args)
+	}
+	hasArg := func(args []string, want string) bool {
+		for _, arg := range args {
+			if arg == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasArg(tunnel.Args, "-M") || hasArg(tunnel.Args, "BatchMode=yes") || !hasArg(remote.Args, "BatchMode=yes") {
+		t.Fatalf("interactive authentication or batch reuse flags are incorrect: %v / %v", tunnel.Args, remote.Args)
+	}
+}

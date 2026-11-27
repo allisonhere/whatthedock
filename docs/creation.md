@@ -275,9 +275,11 @@ that recreates it. For a standalone container, Delete is a real `docker rm
 container/service in place, under its existing identity (name stays the
 same). For a Compose service: `docker compose pull <service>` then
 `up -d <service>` — Compose's own `up -d` recreates the container when the
-image changed. For a standalone container: pull the image, stop and remove
-the existing container, then recreate it with an identical spec (same name,
-ports, mounts, env, restart policy, command). Confirm with `y`, cancel with
+image changed. For a standalone container, WhatTheDock inspects the existing container,
+pulls the image, and stages its replacement with the inspected configuration.
+It keeps the original container until the replacement can use the name and
+reach the requested running state. If promotion or startup fails, WhatTheDock
+attempts to restore the original name and running state. Confirm with `y`, cancel with
 `n`/`Esc`.
 
 Create and Edit show progress inside the confirmation overlay after you press
@@ -308,19 +310,22 @@ the Compose definition before you change it. It then re-applies via
 `docker compose up -d <service>` on confirm. Single-service Create/Edit forms
 also show `Image action`: `keep` leaves the local image cache alone, while
 `pull latest` runs `docker compose pull <service>` before `up -d`. For a
-standalone container, Edit prefills the full current shape (image, ports,
-mounts, env, restart policy, command) the same way Clone does, but confirming
-stops and removes the *existing* container and recreates it under the same
-name with your changes, instead of creating an independent second one. Its
-`pull latest` action pulls the image before removing the existing container;
-if the pull fails, the existing container is left alone.
+standalone container, Edit prefills the form from the Docker inspect
+response. Unedited settings supported by WhatTheDock carry over, including
+network mode, named volumes, entrypoint, and restart policy. Confirming uses
+the same staged replacement and recovery sequence as `u`.
 `n` (Create) is deliberately left alone by this — it always defaults to a
 fresh draft and never silently overwrites a selected container the way Edit
 intentionally does.
 
 ## Current Limits
 
-- Applying a draft whose service already exists in the base file merges only
+- Multi-file Compose projects use their recorded file order. Service form
+  edits update a generated override. Deleting a service validates the edited
+  layers before removing containers, then removes its definitions from the
+  recorded files. A whole-stack delete backs up each recorded file before
+  bringing the stack down and removing those files.
+- For a single Compose file, applying a draft whose service already exists in the base file merges only
   the fields that changed since the file was loaded; everything else —
   unmanaged keys, comments, key order — is preserved. Every apply first
   snapshots the target file to `*.whatthedock-YYYYMMDD-HHMMSS.bak` (newest ten

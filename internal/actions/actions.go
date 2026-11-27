@@ -11,6 +11,8 @@ import (
 type ID string
 
 const (
+	Edit           ID = "edit"
+	ShowDashboard  ID = "dashboard"
 	Refresh        ID = "refresh"
 	Create         ID = "create-container"
 	StartStop      ID = "start-stop-container"
@@ -69,8 +71,9 @@ func Catalog(selected *domain.Container) []Command {
 	return []Command{
 		{ID: Refresh, Name: "Refresh Docker state", Shortcut: "r", Aliases: []string{"reload"}, Enabled: true, Category: "Main"},
 		{ID: Create, Name: "Create container or Compose service", Shortcut: "n", Aliases: []string{"new", "run", "compose service"}, Enabled: true, Category: "Container Management"},
+		{ID: Edit, Name: "Edit container or Compose configuration", Shortcut: "m", Aliases: []string{"modify", "edit stack"}, Enabled: hasContainer, Category: "Container Management"},
 		{ID: StartStop, Name: "Start or stop selected container", Shortcut: "s", Aliases: []string{"start", "stop"}, Enabled: canStartStop, Category: "Container Management", Run: startStop},
-		{ID: Restart, Name: "Restart selected container", Shortcut: "r", Aliases: []string{"bounce"}, Enabled: hasContainer, Category: "Container Management", Run: restart},
+		{ID: Restart, Name: "Restart selected container", Shortcut: "alt+r", Aliases: []string{"bounce"}, Enabled: hasContainer, Category: "Container Management", Run: restart},
 		{ID: Pause, Name: "Pause or unpause selected container", Shortcut: "alt+p", Aliases: []string{"pause", "unpause", "freeze", "resume"}, Enabled: canPause, Category: "Container Management", Run: pause},
 		{ID: Kill, Name: "Kill selected container (SIGKILL)", Shortcut: "", Aliases: []string{"sigkill", "force stop", "terminate"}, Enabled: canKill, Category: "Container Management", Run: kill},
 		{ID: Delete, Name: "Delete container or Compose service", Shortcut: "D", Aliases: []string{"remove", "rm", "delete override"}, Enabled: hasContainer, Category: "Container Management"},
@@ -85,6 +88,7 @@ func Catalog(selected *domain.Container) []Command {
 		{ID: CurateCompose, Name: "Curate Compose files", Shortcut: "", Aliases: []string{"compose files", "compose catalog", "stacks", "unused compose", "deploy compose"}, Enabled: true, Category: "Docker Resources"},
 		{ID: ExecShell, Name: "Open a shell inside the selected container", Shortcut: "e", Aliases: []string{"exec", "shell", "terminal", "ssh into container"}, Enabled: canExec, Category: "Container Info"},
 		{ID: FocusLogs, Name: "Show logs", Shortcut: "l", Aliases: []string{"tail"}, Enabled: hasContainer, Category: "Container Info"},
+		{ID: ShowDashboard, Name: "Open dashboard", Shortcut: "d", Aliases: []string{"overview", "fleet"}, Enabled: true, Category: "Container Info"},
 		{ID: ShowProblems, Name: "Show problems", Shortcut: "p", Aliases: []string{"issues", "health", "unhealthy", "restarting"}, Enabled: true, Category: "Container Info"},
 		{ID: ShowStats, Name: "Show stats", Shortcut: "g", Aliases: []string{"graphs", "sparklines", "metrics", "cpu", "memory"}, Enabled: true, Category: "Container Info"},
 		{ID: OpenCopy, Name: "Copy selected detail", Shortcut: "c", Aliases: []string{"clipboard", "copy id", "copy port", "copy label", "copy mount"}, Enabled: hasContainer, Category: "Container Info"},

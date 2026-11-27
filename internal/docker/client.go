@@ -63,6 +63,8 @@ func NewProvider(id, name, dockerHost string) (*LocalProvider, error) {
 
 func (p *LocalProvider) Host() domain.Host { return p.host }
 
+func (p *LocalProvider) DockerEndpoint() string { return p.cli.DaemonHost() }
+
 func (p *LocalProvider) Ping(ctx context.Context) error {
 	_, err := p.cli.Ping(ctx)
 	return err
@@ -290,7 +292,7 @@ func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerC
 			PortBindings:   portBindings,
 			Mounts:         createMounts(spec.Mounts),
 			Tmpfs:          spec.Tmpfs,
-			RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyMode(spec.RestartPolicy)},
+			RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyMode(spec.RestartPolicy), MaximumRetryCount: spec.RestartMaxRetries},
 			Privileged:     spec.Privileged,
 			CapAdd:         spec.CapAdd,
 			CapDrop:        spec.CapDrop,
@@ -762,6 +764,31 @@ func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.C
 		hc := inspect.HostConfig
 		ctr.NetworkMode = string(hc.NetworkMode)
 		ctr.RestartPolicy = string(hc.RestartPolicy.Name)
+		ctr.RestartMaxRetries = hc.RestartPolicy.MaximumRetryCount
+		ctr.AutoRemove = hc.AutoRemove
+		if hc.PortBindings != nil {
+			ctr.ConfiguredPorts = []domain.Port{}
+			for port, bindings := range hc.PortBindings {
+				for _, binding := range bindings {
+					ctr.ConfiguredPorts = append(ctr.ConfiguredPorts, domain.Port{
+						IP: binding.HostIP, Private: uint16(port.Int()), Public: parsePort(binding.HostPort), Type: port.Proto(),
+					})
+				}
+			}
+			sort.Slice(ctr.ConfiguredPorts, func(i, j int) bool {
+				a, b := ctr.ConfiguredPorts[i], ctr.ConfiguredPorts[j]
+				if a.Private != b.Private {
+					return a.Private < b.Private
+				}
+				if a.Type != b.Type {
+					return a.Type < b.Type
+				}
+				if a.Public != b.Public {
+					return a.Public < b.Public
+				}
+				return a.IP < b.IP
+			})
+		}
 		ctr.Privileged = hc.Privileged
 		ctr.CapAdd = append([]string(nil), []string(hc.CapAdd)...)
 		ctr.CapDrop = append([]string(nil), []string(hc.CapDrop)...)
@@ -877,6 +904,7 @@ func fromMounts(mounts []container.MountPoint) []domain.Mount {
 	for _, mount := range mounts {
 		out = append(out, domain.Mount{
 			Type:        string(mount.Type),
+			Name:        mount.Name,
 			Source:      mount.Source,
 			Destination: mount.Destination,
 			Mode:        mount.Mode,

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -1072,6 +1071,9 @@ func (m Model) deployComposeCatalogEntry(entry catalog.Entry, target string) err
 }
 
 func (m Model) prepareComposeDeploy(entry catalog.Entry, target string) (Model, error) {
+	if m.activeSystemConfig().Kind == "demo" {
+		return m, errors.New("Compose deployment is unavailable in demo mode")
+	}
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return m, errors.New("deploy path is required")
@@ -1104,6 +1106,9 @@ func (m Model) prepareComposeDeploy(entry catalog.Entry, target string) (Model, 
 }
 
 func (m Model) finishComposeDeploy(entry catalog.Entry, target string) error {
+	if m.activeSystemConfig().Kind == "demo" {
+		return errors.New("Compose deployment is unavailable in demo mode")
+	}
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return errors.New("deploy path is required")
@@ -1211,32 +1216,8 @@ func deployTargets(system config.System, target string, files []catalog.FileCont
 }
 
 func runDockerComposeFiles(ctx context.Context, system config.System, project string, files []string, args ...string) error {
-	baseArgs := []string{"compose"}
-	if strings.TrimSpace(project) != "" {
-		baseArgs = append(baseArgs, "-p", project)
-	}
-	for _, file := range files {
-		baseArgs = append(baseArgs, "-f", file)
-	}
-	baseArgs = append(baseArgs, args...)
-	if system.Kind == "ssh" {
-		quoted := make([]string, len(baseArgs))
-		for i, arg := range baseArgs {
-			quoted[i] = systems.ShellQuote(arg)
-		}
-		_, err := sshRun(ctx, system, "docker "+strings.Join(quoted, " "), "")
-		return err
-	}
-	cmd := exec.CommandContext(ctx, "docker", baseArgs...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		text := strings.TrimSpace(string(output))
-		if text == "" {
-			text = err.Error()
-		}
-		return errors.New(text)
-	}
-	return nil
+	_, err := dockerComposeOutput(ctx, system, project, files, args...)
+	return err
 }
 
 func defaultComposeDeployPath(entry catalog.Entry, system config.System) string {

@@ -79,6 +79,19 @@ func main() {
 		// and the broken system can be repaired (or switched away from)
 		// from inside it.
 		local := config.DefaultSystem()
+		if configured := config.FindSystem(settings.Systems, local.ID); configured != nil {
+			if configured.Kind == "local" {
+				local = *configured
+			} else {
+				local.ID = ""
+				settings.Systems = append(settings.Systems, local)
+				settings = config.NormalizeSystems(settings)
+				local = settings.Systems[len(settings.Systems)-1]
+			}
+		} else {
+			settings.Systems = append(settings.Systems, local)
+		}
+		settings.ActiveSystem = local.ID
 		provider, err = factory.Provider(context.Background(), local)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "whatthedock: %v\n", err)

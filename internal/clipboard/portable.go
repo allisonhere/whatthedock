@@ -219,8 +219,12 @@ func FromContainer(ctr domain.Container, sourceHost domain.Host) PortableContain
 	}
 
 	for _, m := range ctr.Mounts {
+		source := m.Source
+		if m.Type == "volume" && m.Name != "" {
+			source = m.Name
+		}
 		pc.Mounts = append(pc.Mounts, PortableMount{
-			Type: normalizeMountType(m.Type), Source: m.Source, Target: m.Destination, ReadOnly: !m.ReadWrite,
+			Type: normalizeMountType(m.Type), Source: source, Target: m.Destination, ReadOnly: !m.ReadWrite,
 		})
 	}
 	for target, options := range ctr.Tmpfs {

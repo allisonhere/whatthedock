@@ -41,7 +41,7 @@ func (m Model) View() string {
 		inspectorTitle = "Inspector: " + containerTitle(*selected)
 	}
 	treeContent, inspectorContent := m.renderTree(renderer), m.renderInspector(renderer)
-	if m.logsExpanded {
+	if m.logsExpanded && !m.compactLayout() {
 		// Skip the real (and, at sliver width, likely garbled) content
 		// entirely — just an icon indicating each pane is collapsed, not
 		// gone. See columnRatios' doc comment for why the width these
@@ -56,14 +56,21 @@ func (m Model) View() string {
 		{Title: inspectorTitle, Hint: "details", Content: inspectorContent, Focused: m.focus == paneInspector},
 	}
 	modal := m.renderOverlay(renderer)
-	status := &tideui.StatusBar{
-		Left:  m.statusLeft(renderer),
-		Right: "j/k move  space expand  / filter  n create  l logs  L expand  p problems  g stats  S systems  , settings  ctrl+k commands  ? help  A about  q quit",
+	hints := "? help  ctrl+k commands  tab panes"
+	if m.width < 60 {
+		hints = "? help  ^K cmds  Tab"
+	}
+	status := &tideui.StatusBar{Left: m.statusLeft(renderer), Right: hints}
+	mode := tideui.ThreeColumn
+	if m.compactLayout() {
+		mode = tideui.Tabbed
+		panes[paneInspector].Title = "Inspector"
+		panes[paneActivity].Title = emptyAs(strings.SplitN(activityTitle, ":", 2)[0], "Activity")
 	}
 	return topbar + "\n" + renderer.Render(tideui.Layout{
 		Width:        m.width,
 		Height:       m.height - 1,
-		Mode:         tideui.ThreeColumn,
+		Mode:         mode,
 		Panes:        panes,
 		Status:       status,
 		Modal:        modal,
@@ -156,6 +163,13 @@ func (m Model) renderTopbar(renderer tideui.Renderer) string {
 	}
 	right := fmt.Sprintf("Docker connected · %d stacks · %d containers · %d problems",
 		m.snapshotStackRowCount(), m.snapshotContainerCount(), len(m.snapshotProblems()))
+	if m.compactLayout() {
+		left = short(m.provider.Host().Name, max(5, width/3))
+		right = fmt.Sprintf("%d containers · %d problems", m.snapshotContainerCount(), len(m.snapshotProblems()))
+	}
+	if m.loading && m.snapshot.Refreshed.IsZero() {
+		right = "Connecting to Docker…"
+	}
 	if m.statusErr {
 		right = topbarStatusLine(m.status)
 	}
@@ -215,18 +229,16 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 	if m.statusErr && len(m.rows) == 0 {
 		return renderer.Styles.DetailMeta.Render("Docker state is unavailable.\n\n" + m.status)
 	}
+	width := max(1, m.leftPaneWidth()-2)
 	if len(m.rows) == 0 {
-		if m.loading {
-			return renderer.Styles.DetailMeta.Render("Loading containers...")
+		message := "No containers found on this host."
+		switch {
+		case m.loading:
+			message = "Loading containers..."
+		case m.filter != "":
+			message = "No matches for " + m.filter
 		}
-		if strings.TrimSpace(m.filter) != "" {
-			return renderer.Styles.DetailMeta.Render("No stacks or containers match " + m.filter + ".")
-		}
-		return renderer.Styles.DetailMeta.Render("No containers found on this host.")
-	}
-	width := m.leftPaneWidth() - 2
-	if width < 12 {
-		width = 12
+		return m.withPaneActionStrip(renderer, paneTree, width, padPlainLine(renderer.Styles.DetailMeta, message, width))
 	}
 	lines := make([]string, 0, len(m.rows))
 	for i, row := range m.rows {
@@ -236,7 +248,7 @@ func (m Model) renderTree(renderer tideui.Renderer) string {
 		text := row.label
 		switch row.kind {
 		case rowProject:
-			if m.collapsed[row.project] {
+			if m.filter == "" && m.collapsed[row.project] {
 				prefix += "▸ "
 			} else {
 				prefix += "▾ "
@@ -339,14 +351,18 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	if width < 20 {
 		width = 20
 	}
-	if m.selected == nil {
+	if m.selected == nil && m.stackLogs == "" {
 		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Select a container to view live logs."))
 	}
 	if m.logErr != nil {
 		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.StatusError.Render(friendlyDockerError(m.logErr)))
 	}
 	if len(m.logLines) == 0 {
-		return m.withPaneActionStrip(renderer, paneActivity, width, renderer.Styles.DetailMeta.Render("Waiting for logs from "+containerTitle(*m.selected)+"..."))
+		target := m.stackLogs
+		if m.selected != nil {
+			target = containerTitle(*m.selected)
+		}
+		return m.withPaneActionStrip(renderer, paneActivity, width, padPlainLine(renderer.Styles.DetailMeta, "Waiting for logs from "+target+"…", width))
 	}
 	filtered := m.visibleLogLines()
 	if len(filtered) == 0 {
@@ -357,7 +373,7 @@ func (m Model) renderActivity(renderer tideui.Renderer) string {
 	end := min(len(filtered), start+visible)
 	lines := make([]string, 0, end-start+1)
 	header := m.logPositionIndicator(len(filtered), visible)
-	if m.settings.LogHealthColor {
+	if m.settings.LogHealthColor && m.selected != nil {
 		healthColor := inspectorStatusColor(*m.selected)
 		baseFg := styleForeground(renderer.Styles.DetailMeta, renderer.Styles.Theme.Dimmed)
 		header = healthSpan(statusGlyph(*m.selected), healthColor, baseFg) + " " +
@@ -464,15 +480,20 @@ func (m Model) visibleLogLines() []string {
 	}
 	lines := make([]string, 0, len(m.logLines))
 	for _, line := range m.logLines {
-		if query != "" && !strings.Contains(strings.ToLower(line), query) {
-			continue
-		}
-		if !logLineMatchesSeverity(line, m.logLevel) {
+		if !matchesLogFilter(line, query, m.logLevel) {
 			continue
 		}
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func (m Model) matchesLogFilter(line string) bool {
+	return matchesLogFilter(line, strings.ToLower(strings.TrimSpace(m.logFilter)), m.logLevel)
+}
+
+func matchesLogFilter(line, query string, level logSeverityFilter) bool {
+	return (query == "" || strings.Contains(strings.ToLower(line), query)) && logLineMatchesSeverity(line, level)
 }
 
 func logLineMatchesSeverity(line string, filter logSeverityFilter) bool {
@@ -2668,13 +2689,17 @@ func (m Model) logFilterFieldAction() paneAction {
 func (m Model) paneActions(pane pane) []paneAction {
 	switch pane {
 	case paneTree:
-		actions := []paneAction{
-			{key: "enter", label: "select"},
-			{key: "space", label: "fold"},
-			{key: "/", label: "filter"},
-			{key: "r", label: "refresh"},
-			{key: "n", label: "new"},
+		var actions []paneAction
+		if m.filter != "" {
+			actions = append(actions, paneAction{key: "esc", label: "clear filter"})
 		}
+		actions = append(actions,
+			paneAction{key: "/", label: "filter"},
+			paneAction{key: "enter", label: "select"},
+			paneAction{key: "space", label: "fold"},
+			paneAction{key: "r", label: "refresh"},
+			paneAction{key: "n", label: "new"},
+		)
 		if row := m.currentRow(); row != nil && row.container != nil {
 			actions = append(actions, paneAction{key: "s", label: "start/stop"})
 		}
@@ -2728,30 +2753,7 @@ func (m Model) paneActions(pane pane) []paneAction {
 func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	switch m.overlay {
 	case overlayHelp:
-		width := m.helpPanelWidth()
-		budget := m.helpBodyBudget()
-		lines := m.visibleHelpLines()
-		scroll := clamp(m.helpScroll, 0, max(0, len(lines)-budget))
-		end := min(len(lines), scroll+budget)
-		searchLabel := "search"
-		if m.helpSearch != "" || m.helpSearchActive {
-			searchLabel = "/" + m.helpSearch
-			if m.helpSearchActive {
-				searchLabel += "|"
-			}
-		}
-		hints := []tideui.SoftHint{
-			{Key: "esc/?/q", Label: "close"},
-			{Key: "/", Label: searchLabel},
-		}
-		if len(lines) > budget {
-			hints = append(hints, tideui.SoftHint{Key: "j/k", Label: fmt.Sprintf("scroll (%d/%d)", end, len(lines))})
-		}
-		content := renderer.RenderSoftBody(width, strings.Join(lines[scroll:end], "\n")+"\n\n"+
-			strings.Join(statusLegendLines(renderer), "\n")+"\n\n"+
-			renderer.RenderSoftHints(width-4, hints...))
-		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "help", Content: content, Width: width})
-		return &overlay
+		return m.helpOverlay(renderer)
 	case overlayAppLog:
 		width := min(96, max(40, m.width-8))
 		budget := m.appLogBodyBudget()
@@ -2929,7 +2931,16 @@ func (m Model) deleteStackConfirmOverlay(renderer tideui.Renderer) *tideui.Overl
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
 	project := m.deleteStackTargetProject()
-	composeFile := m.resolveProjectComposeFile(project)
+	files := m.deleteFiles
+	if m.deleteProject == "" {
+		files = m.resolveProjectComposeFiles(project)
+	}
+	composeFile := "its Compose file"
+	if len(files) > 1 {
+		composeFile = fmt.Sprintf("all %d recorded Compose files", len(files))
+	} else if len(files) == 1 {
+		composeFile = files[0]
+	}
 	var names []string
 	for _, p := range m.snapshot.Projects {
 		if p.Name != project {
@@ -3086,9 +3097,9 @@ func (m Model) deleteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := min(72, max(40, m.width-8))
 	contentWidth := width - 4
 	prompt := "No container selected."
-	if selected := m.selectedContainer(); selected != nil {
+	if selected := m.deleteSelectedContainer(); selected != nil {
 		if selected.Compose.Project != "" {
-			prompt = "Delete service " + selected.Compose.Service + "? This stops and removes its container."
+			prompt = "Delete service " + selected.Compose.Service + "? This stops and removes its containers and removes its definition from the Compose files."
 		} else {
 			prompt = "Remove container " + selected.DisplayName() + "?"
 		}
@@ -3538,42 +3549,55 @@ func emptyAsDefault(value string) string {
 	return value
 }
 
+func (m Model) commandListRows() int {
+	return max(1, m.height-8)
+}
+
 func (m Model) commandPaletteOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	items := m.filteredCommands()
-	width := min(76, max(44, m.width-8))
+	width := min(76, max(16, m.width-2))
 	contentWidth := width - 4
-	input := renderer.Styles.InputFocused.Width(contentWidth - 4).Render(m.commandFilter)
-	var rows []string
-	rows = append(rows, input)
+	query := m.commandFilter + "│"
+	inputWidth := max(1, contentWidth-2)
+	if overflow := lipgloss.Width(query) - inputWidth; overflow > 0 {
+		query = ansi.Cut(query, overflow, lipgloss.Width(query))
+	}
+	input := padPlainLine(renderer.Styles.OverlayBody.Copy().Bold(true), "> "+query, contentWidth)
 
-	// filteredCommands() returns rows already grouped in category-priority
-	// order, so emit a header whenever the category changes. The same slice
-	// backs m.commandCursor in handleCommandPaletteKey, keeping the
-	// highlighted row and the command Enter runs in lockstep.
-	itemIndex := 0
+	var rows []string
+	selectedRow := 0
 	lastCategory := ""
-	for _, item := range items {
+	cursor := clamp(m.commandCursor, 0, max(0, len(items)-1))
+	for i, item := range items {
 		if item.Category != lastCategory {
-			rows = append(rows, renderer.Styles.DetailMeta.Render(strings.ToUpper(item.Category)))
+			rows = append(rows, padPlainLine(renderer.Styles.DetailMeta, strings.ToUpper(item.Category), contentWidth))
 			lastCategory = item.Category
+		}
+		if i == cursor {
+			selectedRow = len(rows)
 		}
 		rows = append(rows, renderer.RenderSoftRow(tideui.SoftRow{
 			Text:     item.Name,
 			Suffix:   item.Shortcut,
-			Selected: itemIndex == m.commandCursor,
+			Selected: i == cursor,
 			Muted:    !item.Enabled,
 		}, contentWidth))
-		itemIndex++
 	}
-
+	hint := "↑↓ move  esc close  enter run"
 	if len(items) == 0 {
 		rows = append(rows, renderer.Styles.DetailMeta.Render("No matching commands."))
+		hint = "esc close  ctrl+u clear"
+	} else if !items[cursor].Enabled {
+		hint = "Unavailable  esc close  ↑↓ move"
 	}
-	rows = append(rows, "", renderer.RenderSoftHints(contentWidth,
-		tideui.SoftHint{Key: "enter", Label: "run"},
-		tideui.SoftHint{Key: "esc", Label: "close"},
-	))
-	content := renderer.RenderSoftBody(width, strings.Join(rows, "\n"))
+	start, end := visibleRange(len(rows), selectedRow, m.commandListRows())
+	if len(rows) > end-start {
+		hint = fmt.Sprintf("%d/%d  %s", cursor+1, len(items), hint)
+	}
+	body := []string{input}
+	body = append(body, rows[start:end]...)
+	body = append(body, padPlainLine(renderer.Styles.DetailMeta, hint, contentWidth))
+	content := renderer.RenderSoftBody(width, strings.Join(body, "\n"))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "command", Content: content, Width: width})
 	return &overlay
 }
@@ -3645,237 +3669,6 @@ func spinnerGlyph(frame int) string {
 	return busySpinnerFrames[frame%len(busySpinnerFrames)]
 }
 
-type helpEntry struct {
-	Key  string
-	Text string
-}
-
-type helpSection struct {
-	Title   string
-	Entries []helpEntry
-}
-
-// helpSections is the full keyboard-help content. The render path turns it
-// into lines so the help overlay can window it against the terminal height
-// instead of relying on renderOverlay's silent bottom-truncation, which drops
-// any line past the terminal edge.
-var helpSections = []helpSection{
-	{
-		Title: "Main",
-		Entries: []helpEntry{
-			{"Tab / Shift+Tab", "move focus between tree, activity, inspector"},
-			{"Left / Right", "move focus between panes"},
-			{"j / k or Up / Down", "move selection or scroll focused pane"},
-			{"Enter", "select/open focused row"},
-			{"Space", "expand/collapse stack row; pause/resume logs in Logs"},
-			{"/", "filter stacks and containers; in Logs, live-filter logs"},
-			{"r", "refresh Docker state"},
-			{"Alt+r", "restart selected container"},
-			{"Alt+p", "pause or unpause selected container"},
-			{"s", "start/stop selected container"},
-			{"n", "create container or Compose service"},
-			{"m", "edit selected service; on stack row, edit whole stack"},
-			{"C", "clone selected container or Compose service under a new name"},
-			{"y", "Container Clipboard: yank selected container's configuration"},
-			{"P", "Container Clipboard: paste the yanked container onto this host"},
-			{"D", "delete selected container/service; stack row deletes stack + file"},
-			{"u", "replicate: pull latest image and recreate in place"},
-			{"c", "copy selected detail; inspector focus copies current row; Logs focus copies visible log lines"},
-			{"o", "open selected port, mount, or compose path"},
-			{"e", "open shell in selected running container"},
-			{"q / Ctrl+C", "quit"},
-		},
-	},
-	{
-		Title: "Activity",
-		Entries: []helpEntry{
-			{"l", "show logs for the selected container"},
-			{"L", "expand logs across the width"},
-			{"e / w / i / a", "filter logs to errors, warnings, info, or all"},
-			{"f / End", "jump logs to end and follow live output"},
-			{"Home / PgUp / PgDn", "move through logs"},
-			{"c", "copy all currently visible (filtered) log lines"},
-			{"Esc", "clear the active log filter"},
-			{"p", "show problems"},
-			{"a", "analyze selected problem with AI while Problems is focused"},
-			{"g", "show stats graphs"},
-		},
-	},
-	{
-		Title: "Create And Edit",
-		Entries: []helpEntry{
-			{"[ / ]", "cycle standalone, Compose service, and Compose stack modes"},
-			{"Up / Down / Tab", "move between fields"},
-			{"h / l or Left / Right", "change choices or move the text cursor"},
-			{"Enter", "advance field; on Compose file field, browse"},
-			{"Ctrl+O", "browse for a Compose file"},
-			{"Ctrl+Y", "edit Compose YAML in the embedded editor"},
-			{"Ctrl+P", "open the create/edit Compose catalog picker"},
-			{"Ctrl+S", "validate or save form/editor changes"},
-			{"Ctrl+Enter / Alt+Enter", "confirm create/apply/deploy"},
-			{"Esc / q", "close or cancel"},
-		},
-	},
-	{
-		Title: "Compose Catalog Curator",
-		Entries: []helpEntry{
-			{"Ctrl+K", "open command palette, then run Curate Compose files"},
-			{"Tab", "switch library, live, and unused views"},
-			{"j / k", "move catalog selection"},
-			{"f", "filter catalog entries"},
-			{"A", "add draft from URL or path"},
-			{"B", "browse for a Compose file and add it as a draft"},
-			{"N", "create a blank draft"},
-			{"Enter / l", "preview catalog entry"},
-			{"e", "edit catalog entry in the Compose editor"},
-			{"c", "create a runnable draft from a live stack"},
-			{"S", "save a live stack as a draft"},
-			{"M / p", "make catalog entry live"},
-			{"s", "status: draft, live, or archived"},
-			{"m", "toggle missing/unused review"},
-			{"n / t", "edit note or tags; notes are kept as Compose comments"},
-			{"a", "archive or unarchive"},
-			{"D", "delete catalog entry"},
-		},
-	},
-	{
-		Title: "Curators",
-		Entries: []helpEntry{
-			{"Ctrl+K", "open image, network, volume, or Compose curators"},
-			{"j / k", "move through images, networks, or volumes"},
-			{"Space", "select removable image, network, or volume"},
-			{"r", "reload curator data"},
-			{"d", "delete selected removable items"},
-			{"y / Enter", "confirm curator deletion"},
-			{"n / Esc", "cancel curator deletion"},
-		},
-	},
-	{
-		// Container Clipboard: yank a container's configuration on one
-		// Docker host, switch to another configured system, paste it there.
-		// v1 clones configuration only — never volume/bind-mount data, and
-		// never touches the source container.
-		Title: "Container Clipboard",
-		Entries: []helpEntry{
-			{"y", "yank the selected container's configuration"},
-			{"P", "paste the yanked container onto the current host"},
-			{"Enter", "on the paste review screen: open it for editing before deploying"},
-			{"d", "on the paste review screen: deploy without further edits"},
-			{"t", "on the paste review screen: redirect missing bind-mount paths to a placeholder"},
-			{"Esc", "on the paste review screen: cancel (the clipboard item is kept)"},
-		},
-	},
-	{
-		Title: "Overlays",
-		Entries: []helpEntry{
-			{"Ctrl+K", "command palette; type to search commands, Enter runs"},
-			{"?", "keyboard help"},
-			{"/", "search inside Help while Help is open"},
-			{"d", "dashboard: fleet summary and container stats"},
-			{"Dashboard Enter", "open highlighted container"},
-			{"Dashboard s", "cycle sort: name, CPU, memory, network"},
-			{"Dashboard g", "group the list by Compose stack"},
-			{"Dashboard p", "jump from dashboard to Problems"},
-			{"T", "theme picker"},
-			{", / Ctrl+,", "settings"},
-			{"S", "systems"},
-			{"A", "about screen"},
-			{"Esc / q", "close the current overlay"},
-		},
-	},
-	{
-		Title: "Settings And Systems",
-		Entries: []helpEntry{
-			{"Settings j / k", "switch section (sidebar) or move between rows; Esc steps back out"},
-			{"Settings Enter / Space", "edit text rows, trigger actions, or change choices"},
-			{"Settings h / l", "change choice rows"},
-			{"Settings Ctrl+S", "save settings"},
-			{"Systems Enter", "switch to selected Docker system"},
-			{"Systems t", "test selected system"},
-			{"Systems a / e", "add or edit a system"},
-			{"Systems d", "delete inactive system"},
-			{"System edit Ctrl+S", "save system"},
-			{"Ctrl+K", "shut down or reboot the current host (stops containers first, not available in demo mode)"},
-		},
-	},
-}
-
-func helpText() string {
-	return strings.Join(helpLines(), "\n")
-}
-
-func helpLines() []string {
-	return helpLinesForSearch("", 0)
-}
-
-// helpPanelWidth is the help overlay's width; the longest entries need more
-// than the old fixed 72 columns, so it grows with the terminal.
-func (m Model) helpPanelWidth() int {
-	return min(100, max(40, m.width-8))
-}
-
-func (m Model) visibleHelpLines() []string {
-	return helpLinesForSearch(m.helpSearch, m.helpPanelWidth()-6)
-}
-
-// helpLinesForSearch returns the help text matching query, with entry text
-// wrapped to width columns (no wrapping when width <= 0) so a narrow panel
-// never clips an entry mid-sentence.
-func helpLinesForSearch(query string, width int) []string {
-	query = strings.ToLower(strings.TrimSpace(query))
-	lines := []string{}
-	for i, section := range helpSections {
-		sectionMatches := query != "" && strings.Contains(strings.ToLower(section.Title), query)
-		entries := make([]helpEntry, 0, len(section.Entries))
-		for _, entry := range section.Entries {
-			if query == "" || sectionMatches || strings.Contains(strings.ToLower(entry.Key+" "+entry.Text), query) {
-				entries = append(entries, entry)
-			}
-		}
-		if len(entries) == 0 {
-			continue
-		}
-		if len(lines) > 0 && i > 0 {
-			lines = append(lines, "")
-		}
-		lines = append(lines, section.Title+":")
-		for _, entry := range entries {
-			lines = append(lines, wrapHelpEntry(entry, width)...)
-		}
-	}
-	if len(lines) == 0 {
-		return []string{"No help entries match " + strconv.Quote(query)}
-	}
-	return lines
-}
-
-// wrapHelpEntry formats a help entry wrapped to width columns (unwrapped when
-// width <= 0), with continuation lines indented under the entry text.
-func wrapHelpEntry(entry helpEntry, width int) []string {
-	line := formatHelpEntry(entry)
-	if width <= 0 || ansi.StringWidth(line) <= width {
-		return []string{line}
-	}
-	indent := 2
-	if entry.Key != "" {
-		indent = 21
-	}
-	wrapped := strings.Split(ansi.Wrap(entry.Text, max(10, width-indent), ""), "\n")
-	lines := make([]string, len(wrapped))
-	lines[0] = line[:len(line)-len(entry.Text)] + wrapped[0]
-	for i := 1; i < len(wrapped); i++ {
-		lines[i] = strings.Repeat(" ", indent) + wrapped[i]
-	}
-	return lines
-}
-
-func formatHelpEntry(entry helpEntry) string {
-	if entry.Key == "" {
-		return "  " + entry.Text
-	}
-	return fmt.Sprintf("  %-18s %s", entry.Key, entry.Text)
-}
-
 // statusLegendEntries mirrors inspectorStatusColor/statusGlyph exactly —
 // same glyphs, same colors, same order a container could actually be
 // found in — so the legend never drifts out of sync with what the tree
@@ -3892,15 +3685,11 @@ var statusLegendEntries = []struct {
 	{"!", activePalette.Bad, "unhealthy"},
 }
 
-// statusLegendLineCount is statusLegendLines' fixed output size (1 header
-// + one row per statusLegendEntries entry) — helpBodyBudget needs this as
-// a plain count, without a renderer, to reserve room for it.
+// statusLegendLineCount includes the heading and one line per status.
 var statusLegendLineCount = 1 + len(statusLegendEntries)
 
 // statusLegendLines renders the same container-status glyphs and colors
-// used in the tree/inspector panes as a small always-visible legend below
-// the scrollable keybinding list, so "what does red/grey/yellow mean" has
-// an answer right in Help instead of needing to be guessed at or asked.
+// used in the tree/inspector panes for the Status Colors help category.
 // Every segment gets the panel's own background and foreground explicitly,
 // the same way create_view.go's preview column does — RenderSoftBody skips
 // applying its own default styling to any line that already contains an
@@ -3929,14 +3718,6 @@ func statusLegendLines(renderer tideui.Renderer) []string {
 // line every soft overlay in this file appends after its list/text body.
 func (m Model) softOverlayBodyBudget() int {
 	return max(3, (m.height-1)-6)
-}
-
-// helpBodyBudget is how many helpLines rows fit in the help overlay at
-// once — softOverlayBodyBudget's usual allowance, minus the always-visible
-// status legend (statusLegendLineCount rows) and the blank line separating
-// it from the scrollable keybinding list above it.
-func (m Model) helpBodyBudget() int {
-	return max(3, m.softOverlayBodyBudget()-statusLegendLineCount-1)
 }
 
 // appLogBodyBudget is how many appLogLines rows fit in the app-log overlay
@@ -5593,7 +5374,14 @@ func (m Model) columnRatios() [3]float64 {
 // columns come off the top before the ratios split the rest. Computing the
 // widths any other way (a plain share of m.width) leaves the Inspector's
 // content wider than its pane, so its right edge is clipped.
+func (m Model) compactLayout() bool {
+	return m.width > 0 && m.width < 88
+}
+
 func (m Model) paneWidths() [3]int {
+	if m.compactLayout() {
+		return [3]int{m.width, m.width, m.width}
+	}
 	r := m.columnRatios()
 	total := r[0] + r[1] + r[2]
 	available := m.width - 3

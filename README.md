@@ -78,7 +78,9 @@ Run it:
 whatthedock
 ```
 
-Run the demo if you do not have Docker handy:
+Run the demo if you do not have Docker handy. It uses an in-memory Docker
+provider. Compose deployment, host power, shell access, and switching to real
+systems are disabled.
 
 ```bash
 whatthedock --demo
@@ -88,10 +90,13 @@ whatthedock --demo
 
 There are two search helpers:
 
-- Press `Ctrl+K` for the command palette. Type what you want, then press
-  `Enter`.
-- Press `?` for Help. Inside Help, press `/` and type a word like `catalog`,
-  `logs`, `delete`, or `systems`.
+- Press `Ctrl+K` for the command palette. Type to search, use the arrow
+  keys or `Page Up` and `Page Down` to browse, and press `Enter` to run the
+  highlighted command.
+- Press `?` for Help. Use `↑` and `↓` to choose a category and `→` or
+  `Enter` to focus its shortcuts. Use `←` to return to the categories.
+  Press `/` to search across categories. `Enter` keeps the results and
+  `Esc` clears a search before closing Help.
 
 That is usually faster than remembering every key.
 
@@ -104,7 +109,8 @@ That is usually faster than remembering every key.
 | `Left` / `Right` | Move between panes |
 | `Enter` | Open/select the focused item |
 | `Space` | Expand/collapse a stack row; pause/resume logs in Logs |
-| `/` | Filter containers and stacks; in Logs, filter log lines |
+| `/` | Filter containers and stacks. With Logs focused, filter log lines. |
+| `Esc` | Clear a container or log filter |
 | `r` | Refresh Docker state |
 | `s` | Start/stop the selected container |
 | `Alt+r` | Restart the selected container |
@@ -166,7 +172,11 @@ Compose support is practical, not magical:
 - Editing one service in a stack asks whether you mean that service or the
   whole stack.
 - Local and SSH systems both work for Compose reads, writes, and `docker compose`
-  runs.
+  runs against the selected Docker endpoint.
+- Edit, delete, and pull operations preserve the recorded order of multi-file
+  Compose projects. The service form loads the merged configuration and writes
+  field edits to a WhatTheDock override. Replacing inherited lists requires
+  Compose support for `!override`.
 
 ### Safe applies and recovery
 
@@ -315,7 +325,9 @@ SSH auth modes:
 - `config/agent`: use your normal SSH config, keys, and agent.
 - `keychain`: store the SSH password in the OS keychain, not in
   `settings.json`.
-- `password prompt`: let `ssh` ask for the password each time.
+- `password prompt`: authenticate interactively when establishing the tunnel.
+  Compose and other remote commands reuse that authenticated SSH connection.
+  Select the system again to reconnect if the connection has expired.
 
 To add one: install Docker on the remote host and confirm your user can reach
 its socket there (`ssh user@host docker ps`), then give the system a name and
@@ -398,8 +410,9 @@ Settings include:
 - editor mode
 - AI provider/model/API key/base URL
 - app activity log options
-- a changelog viewer (**Changelog > View changelog**) with what changed in each
-  release, bundled into the app; `j` / `k` scroll, `Esc` returns to Settings
+- an **About** section: **About WhatTheDock** opens the About screen, and **View
+  changelog** shows what changed in each release (bundled into the app; `j` / `k`
+  scroll). `Esc` returns to Settings from both
 - update checks
 
 Press `Ctrl+S` to save.
