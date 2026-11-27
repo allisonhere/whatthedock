@@ -5159,7 +5159,17 @@ func TestHelpMouseChoosesCategoryAndScrollsUnderPointer(t *testing.T) {
 	m.width, m.height = 100, 17
 	m.openHelp()
 	layout := m.helpLayout()
+	if layout.left != 22 {
+		t.Fatalf("Help category pane is %d columns wide, want 22", layout.left)
+	}
 	view := ansi.Strip(m.View())
+	if !strings.Contains(view, " │ Main") {
+		t.Fatal("Help divider should have a space on both sides")
+	}
+	focused, _ := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if !strings.Contains(ansi.Strip(focused.(Model).View()), " ┃ Main") {
+		t.Fatal("focusing the Help details should highlight the divider without shifting the heading")
+	}
 	for y, line := range strings.Split(view, "\n") {
 		if before, _, ok := strings.Cut(line, "Activity"); ok {
 			x := ansi.StringWidth(before)
@@ -5168,7 +5178,7 @@ func TestHelpMouseChoosesCategoryAndScrollsUnderPointer(t *testing.T) {
 			if m.helpCategory != 1 || m.helpRight || m.helpScroll != 0 {
 				t.Fatalf("category click did not select Activity: category %d, detail focus %t, scroll %d", m.helpCategory, m.helpRight, m.helpScroll)
 			}
-			next, _ = m.Update(tea.MouseMsg{X: x + layout.left + 1, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+			next, _ = m.Update(tea.MouseMsg{X: x + layout.left + ansi.StringWidth(helpPaneDivider), Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
 			m = next.(Model)
 			if m.helpCategory != 1 || m.helpRight || m.helpScroll == 0 {
 				t.Fatal("wheel over the detail pane did not scroll independently of keyboard focus")

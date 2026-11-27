@@ -138,6 +138,22 @@ func (m Model) handleImageCurationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.imageCursor = clamp(m.imageCursor+1, 0, max(0, len(m.imageItems)-1))
 			}
 		}
+	case "enter":
+		if len(m.imageItems) == 0 {
+			return m, nil
+		}
+		ref := runnableImageRef(m.imageItems[m.imageCursor])
+		if ref == "" {
+			m.imageError = "this image has no tag, so there is nothing to run it by; pull or tag it first"
+			return m, nil
+		}
+		draft := m.defaultCreateDraft()
+		draft.Mode = createModeStandalone
+		draft.Image = ref
+		draft.ContainerName = containerNameForImage(ref)
+		draft.Service = draft.ContainerName
+		m.openCreateOverlayWithDraft(draft)
+		return m, nil
 	case "d":
 		if m.selectedImageCount() > 0 {
 			m.imageConfirming = true
@@ -190,7 +206,7 @@ func (m Model) imageCurationOverlay(renderer tideui.Renderer) *tideui.Overlay {
 }
 
 func (m Model) imageCommandStrip(renderer tideui.Renderer, width int) string {
-	text := "space select   d delete   r refresh   esc close"
+	text := "enter run   space select   d delete   r refresh   esc close"
 	fg := renderer.Styles.Theme.Fg
 	bg := renderer.Styles.Theme.StatusBar
 	bold := false
@@ -210,6 +226,39 @@ func (m Model) imageCommandStrip(renderer tideui.Renderer, width int) string {
 	}
 	text = ansi.Truncate(" "+text, max(1, width), "…")
 	return lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(bold).Width(width).Render(text)
+}
+
+// runnableImageRef is the reference a container for image is created from:
+// its first tag, which is what a person would type. An untagged image (only
+// <none>:<none>, or a bare digest) has no such name.
+func runnableImageRef(image domain.Image) string {
+	for _, tag := range image.RepoTags {
+		if tag != "" && !strings.HasPrefix(tag, "<none>") {
+			return tag
+		}
+	}
+	return ""
+}
+
+// containerNameForImage suggests a container name from an image reference:
+// its last path segment without the tag or digest, so
+// "codeberg.org/forgejo/forgejo:17.0.2" suggests "forgejo".
+func containerNameForImage(ref string) string {
+	name := ref
+	if i := strings.Index(name, "@"); i >= 0 {
+		name = name[:i]
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if i := strings.Index(name, ":"); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.Trim(name, "-_.")
+	if name == "" {
+		return "new-container"
+	}
+	return name
 }
 
 func shortImageRef(ref string) string {

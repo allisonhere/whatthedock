@@ -262,6 +262,12 @@ In-use items are shown, but they cannot be selected for removal. Long lists
 scroll with the selection and show the visible row range. Confirmation and
 result messages stay visible while you navigate.
 
+In **Curate Docker images**, `Enter` on an image opens the create form for a
+plain Docker container, prefilled with that image and a name suggested from it
+(for example `forgejo` from `codeberg.org/forgejo/forgejo`). An image with no
+tag can't be run this way. The curator's other keys (`Space`, `d`) only select
+and delete, so `Esc` closes it without changing anything.
+
 ## Shut Down / Reboot Host
 
 Open from `Ctrl+K`:

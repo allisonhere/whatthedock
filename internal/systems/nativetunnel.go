@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/allisonhere/whatthedock/internal/config"
 )
@@ -98,6 +99,56 @@ func dialKeychainTunnel(ctx context.Context, system config.System, password stri
 // native-Go-SSH connection either way, so the keychain password never
 // touches a subprocess's argv or environment.
 func dialKeychainClient(ctx context.Context, system config.System, password string) (*ssh.Client, error) {
+	client, err := dialKeychainClientWith(ctx, system, password, nil)
+	// Go's SSH client offers host-key algorithms in its own order and takes
+	// whichever the server prefers, then checks that key against
+	// known_hosts. A host recorded there under one key type (say ed25519) but
+	// which negotiates another (ecdsa, rsa) fails as "key mismatch" even
+	// though the host is trusted — OpenSSH avoids this by asking for the
+	// types it has on file. Do the same: retry once, restricted to the key
+	// types known_hosts holds for this host. A genuinely changed key of the
+	// same type still fails the retry the same way.
+	var keyErr *knownhosts.KeyError
+	if err == nil || !errors.As(err, &keyErr) {
+		return client, err
+	}
+	algorithms := hostKeyAlgorithmsFor(keyErr.Want)
+	if len(algorithms) == 0 {
+		return client, err
+	}
+	return dialKeychainClientWith(ctx, system, password, algorithms)
+}
+
+// hostKeyAlgorithmsFor lists the signature algorithms that can verify the
+// given known_hosts keys, strongest first. An RSA key is verifiable by three
+// algorithms; every other key type is its own algorithm name.
+func hostKeyAlgorithmsFor(known []knownhosts.KnownKey) []string {
+	var algorithms []string
+	seen := map[string]bool{}
+	add := func(names ...string) {
+		for _, name := range names {
+			if !seen[name] {
+				seen[name] = true
+				algorithms = append(algorithms, name)
+			}
+		}
+	}
+	for _, key := range known {
+		switch keyType := key.Key.Type(); {
+		case keyType == ssh.KeyAlgoRSA:
+			add(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
+		case strings.HasSuffix(keyType, "-cert-v01@openssh.com"):
+			// known_hosts holds plain keys; a certificate type isn't one.
+		default:
+			add(keyType)
+		}
+	}
+	return algorithms
+}
+
+// dialKeychainClientWith is one connection attempt. A non-empty algorithms
+// restricts the host-key algorithms offered to the server.
+func dialKeychainClientWith(ctx context.Context, system config.System, password string, algorithms []string) (*ssh.Client, error) {
 	hostKeyCallback, err := loadKnownHosts(knownHostsPath())
 	if err != nil {
 		return nil, fmt.Errorf("read known_hosts: %w — connect once with ssh first to add %s", err, system.SSHHost)
@@ -108,10 +159,11 @@ func dialKeychainClient(ctx context.Context, system config.System, password stri
 		port = "22"
 	}
 	cfg := &ssh.ClientConfig{
-		User:            system.SSHUser,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         sshHandshakeTimeout,
+		User:              system.SSHUser,
+		Auth:              []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: algorithms,
+		Timeout:           sshHandshakeTimeout,
 	}
 	addr := net.JoinHostPort(system.SSHHost, port)
 

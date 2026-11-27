@@ -9,6 +9,9 @@ only re-cut a build are folded into the nearest entry.
 - `l` on a stack row shows the merged, service-tagged logs of every service in
   the stack (filter, pause, follow and copy work as usual).
 - Pause/unpause (`Alt+p`) and kill (command palette) for the selected container.
+- Curate Docker images: `Enter` on an image opens the create form for a Docker
+  container prefilled with that image and a suggested name. The curator used to
+  be delete-only, with no way to run what it lists.
 - Dashboard: `s` sorts the list by name, CPU, memory, or network (heaviest
   first), and the header marks the active column. The highlight follows its
   container when a refresh reorders the rows.
@@ -64,6 +67,14 @@ only re-cut a build are folded into the nearest entry.
   `0644`, making a `0600` file with secrets world-readable, and replaced a
   symlinked file with a regular one. The original mode is now kept (remotely via
   `cp -p`) and writes go through a symlink to its target.
+- Keychain-mode SSH failed with `knownhosts: key mismatch` for a trusted host
+  whenever the server negotiated a different host-key type (say ECDSA) than the
+  one in `known_hosts` (say ed25519). It now retries once, offering only the key
+  types `known_hosts` has for that host, as OpenSSH does. A genuinely changed key
+  of the same type is still refused.
+- An SSH tunnel whose remote end refuses the Docker socket (the remote user isn't
+  in the `docker` group) showed only `connection reset by peer`; the status line
+  now says the remote socket refused the connection and what to check.
 
 ### Changed
 - Settings is now a split panel: a section list on the left and the selected

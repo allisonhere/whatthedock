@@ -162,6 +162,7 @@ var helpSections = []helpSection{
 }
 
 const helpStatusTitle = "Status Colors"
+const helpPaneDivider = " │ "
 
 func filterHelpSections(query string) []helpSection {
 	query = strings.ToLower(strings.TrimSpace(query))
@@ -207,8 +208,8 @@ func (m Model) helpLayout() helpLayout {
 	inner := width - 4
 	layout := helpLayout{width: width, right: inner, rows: max(1, rows), footer: footer}
 	if width >= 64 {
-		layout.left = min(24, inner/3)
-		layout.right = inner - layout.left - 1
+		layout.left = min(24, inner/3) - 2
+		layout.right = inner - layout.left - ansi.StringWidth(helpPaneDivider)
 	}
 	return layout
 }
@@ -371,8 +372,6 @@ func (m Model) helpOverlay(renderer tideui.Renderer) *tideui.Overlay {
 		detail := helpDetailLines(sections[category], layout.right)
 		if helpShowsStatusLegend(sections[category], layout.right) {
 			detail = statusLegendLines(renderer)
-		} else if m.helpRight {
-			detail[0] = "› " + detail[0]
 		}
 		start := clamp(m.helpScroll, 0, max(0, len(detail)-layout.rows))
 		detail = detail[start:min(start+layout.rows, len(detail))]
@@ -382,7 +381,10 @@ func (m Model) helpOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			}
 		} else {
 			left := m.helpCategoryRows(renderer, sections, category, layout.left, layout.rows)
-			divider := style.Render("│")
+			divider := style.Render(helpPaneDivider)
+			if m.helpRight {
+				divider = style.Copy().Foreground(renderer.Styles.Theme.BorderFocus).Render(" ┃ ")
+			}
 			for i, row := range left {
 				text := ""
 				if i < len(detail) {
@@ -407,11 +409,7 @@ func (m Model) helpCategoryRows(renderer tideui.Renderer, sections []helpSection
 	start, end := visibleRange(len(sections), category, rows)
 	lines := make([]string, 0, rows)
 	for i := start; i < end; i++ {
-		label := sections[i].Title
-		if i == category && m.helpRight {
-			label = "› " + label
-		}
-		lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{Text: label, Selected: i == category && !m.helpRight}, width))
+		lines = append(lines, renderer.RenderSoftRow(tideui.SoftRow{Text: sections[i].Title, Selected: i == category}, width))
 	}
 	for len(lines) < rows {
 		lines = append(lines, padPlainLine(renderer.Styles.OverlayBody, "", width))
@@ -460,6 +458,9 @@ func (m *Model) handleHelpMouse(msg tea.MouseMsg) {
 	}
 	categoryPane := !m.helpRight
 	if layout.left > 0 {
+		if x >= layout.left && x < layout.left+ansi.StringWidth(helpPaneDivider) {
+			return
+		}
 		categoryPane = x < layout.left
 	}
 	switch msg.Button {

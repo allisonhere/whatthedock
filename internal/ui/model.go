@@ -6144,6 +6144,11 @@ func friendlyDockerError(err error) string {
 			return fmt.Sprintf("bind-mount source %s doesn't exist on this host — create it, or (on a paste) press t to redirect it to a placeholder", path)
 		}
 		return "a bind-mount source doesn't exist on this host — create it, or redirect it to a placeholder"
+	case strings.Contains(text, "connection reset by peer") && strings.Contains(text, ".sock"):
+		// An SSH tunnel's local socket accepted the connection, then the far
+		// end refused to open the remote Docker socket (typically the remote
+		// user isn't in the docker group) and ssh dropped it.
+		return "the SSH tunnel is up but the remote Docker socket refused the connection; check the remote user can use Docker (for example, is in the docker group)"
 	default:
 		return text
 	}
