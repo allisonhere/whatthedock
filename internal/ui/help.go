@@ -167,7 +167,7 @@ const helpPaneDivider = " │ "
 func filterHelpSections(query string) []helpSection {
 	query = strings.ToLower(strings.TrimSpace(query))
 	status := helpSection{Title: helpStatusTitle}
-	for _, entry := range statusLegendEntries {
+	for _, entry := range statusLegendEntries() {
 		status.Entries = append(status.Entries, helpEntry{entry.glyph, entry.label})
 	}
 	categories := make([]helpSection, 0, len(helpSections)+1)
@@ -353,7 +353,7 @@ func (m *Model) moveHelp(delta int) {
 }
 
 func helpShowsStatusLegend(section helpSection, width int) bool {
-	return section.Title == helpStatusTitle && len(section.Entries) == len(statusLegendEntries) && width >= 28
+	return section.Title == helpStatusTitle && len(section.Entries) == len(statusLegendEntries()) && width >= 28
 }
 
 func (m Model) helpOverlay(renderer tideui.Renderer) *tideui.Overlay {

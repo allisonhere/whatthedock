@@ -114,9 +114,12 @@ type createDraft struct {
 	// That precedence is only correct while OverrideRaw actually reflects
 	// what's on screen, though — see baseline below and
 	// composeContentChanged.
-	OverrideRaw     string
-	OverrideRawSet  bool
-	OverrideLoaded  bool
+	OverrideRaw    string
+	OverrideRawSet bool
+	OverrideLoaded bool
+	// catalogLoaded marks OverrideRaw as a catalog template rather than a copy
+	// of the base file's own service (see composeCreateSpec.Unchanged).
+	catalogLoaded   bool
 	OverrideRawBase bool
 
 	// baseline is the set of editable field values the draft last loaded —
@@ -276,6 +279,11 @@ type composeCreateSpec struct {
 	// whatever the override holds that the base merge can't carry, instead of
 	// deleting it and reverting every override-only setting.
 	FoldOverride bool
+	// Unchanged is set when the form was loaded from the base file itself and
+	// nothing was edited. The base on disk is then the source of truth — the
+	// copy read when the form opened may be stale — so applying writes nothing
+	// and just brings the service up.
+	Unchanged    bool
 	PullBeforeUp bool
 	Progress     func(string)
 	System       config.System
@@ -449,18 +457,32 @@ func (m *Model) openStandaloneEdit(selected domain.Container) {
 // state, which has none) so composeOverrideContent can detect a
 // paste-redirect placeholder mount (clipboard.BindRedirectLabelPrefix)
 // and comment it out instead of emitting it as if it were real.
+//
+// It runs after an async check (over SSH), so the user may already have typed
+// into the form: a field that differs from the baseline is theirs and is left
+// alone, the same rule the override-found branch applies via
+// composeContentChanged.
 func (m *Model) backfillAdoptDraft(selected *domain.Container) {
 	if selected == nil {
 		return
 	}
-	m.createDraft.Command = selected.Command
-	m.createDraft.Ports = formatDraftPorts(selected.Ports)
-	m.createDraft.Mounts = formatDraftMounts(selected.Mounts)
-	m.createDraft.Env = formatEnvEntries(selected.Env)
-	if rp := strings.TrimSpace(selected.RestartPolicy); rp != "" {
-		m.createDraft.Restart = rp
+	d := &m.createDraft
+	if d.Command == d.baseline.Command {
+		d.Command = selected.Command
 	}
-	m.createDraft.Labels = selected.Labels
+	if d.Ports == d.baseline.Ports {
+		d.Ports = formatDraftPorts(selected.Ports)
+	}
+	if d.Mounts == d.baseline.Mounts {
+		d.Mounts = formatDraftMounts(selected.Mounts)
+	}
+	if d.Env == d.baseline.Env {
+		d.Env = formatEnvEntries(selected.Env)
+	}
+	if rp := strings.TrimSpace(selected.RestartPolicy); rp != "" && d.Restart == d.baseline.Restart {
+		d.Restart = rp
+	}
+	d.Labels = selected.Labels
 }
 
 func batchCreateCmds(cmds ...tea.Cmd) tea.Cmd {
@@ -1331,6 +1353,7 @@ func (m *Model) loadCurrentCatalogEntry() error {
 	m.createDraft.OverrideRawSet = strings.TrimSpace(m.createDraft.OverrideRaw) != ""
 	m.createDraft.OverrideLoaded = true
 	m.createDraft.OverrideRawBase = true
+	m.createDraft.catalogLoaded = true
 	m.createDraft.loadFields(m.createDraft.OverrideRaw)
 	m.revalidateCreateField()
 	m.status, m.statusErr = "loaded catalog entry "+entry.Name, false
@@ -2186,11 +2209,22 @@ func (d createDraft) ComposeSpec(system config.System) (composeCreateSpec, error
 		// unmodified base document (OverrideRawBase with nothing changed).
 		// Once a field differs from the baseline, Content is a sparse
 		// field-only document and wholesale-writing it would delete
-		// container_name, network_mode, build, and every comment.
-		FullBase:     d.OverrideRawBase && changed == 0,
+		// container_name, network_mode, build, and every comment. A copy
+		// still exactly as loaded from the base file (Unchanged) is not
+		// written back at all, so a concurrent edit to the file survives; only
+		// YAML the user hand-edited or a catalog template is written over it.
+		FullBase:     d.OverrideRawBase && changed == 0 && !d.loadedUnchangedFromBase(),
+		Unchanged:    d.OverrideRawBase && changed == 0 && d.loadedUnchangedFromBase(),
 		PullBeforeUp: d.pullImageBeforeApply(),
 		System:       system,
 	}, nil
+}
+
+// loadedUnchangedFromBase reports whether OverrideRaw is still the copy of the
+// base file read when the form opened: not hand-edited in the YAML editor and
+// not a catalog template.
+func (d createDraft) loadedUnchangedFromBase() bool {
+	return d.OverrideLoaded && !d.catalogLoaded
 }
 
 func (d createDraft) pullImageBeforeApply() bool {
@@ -2476,11 +2510,11 @@ func normalizeComposePorts(v interface{}) []string {
 	for _, item := range items {
 		switch entry := item.(type) {
 		case string:
-			if strings.TrimSpace(entry) != "" {
-				out = append(out, entry)
+			if s := composePortFormEntry(entry); s != "" {
+				out = append(out, s)
 			}
 		case map[string]interface{}:
-			if s := longComposePortToShort(entry); s != "" {
+			if s := composePortFormEntry(longComposePortToShort(entry)); s != "" {
 				out = append(out, s)
 			}
 		}
@@ -2517,16 +2551,44 @@ func normalizeComposeVolumes(v interface{}) []string {
 	for _, item := range items {
 		switch entry := item.(type) {
 		case string:
-			if strings.TrimSpace(entry) != "" {
-				out = append(out, entry)
+			if s := composeVolumeFormEntry(entry); s != "" {
+				out = append(out, s)
 			}
 		case map[string]interface{}:
-			if value := longComposeVolumeToShort(entry); value != "" {
-				out = append(out, value)
+			if s := composeVolumeFormEntry(longComposeVolumeToShort(entry)); s != "" {
+				out = append(out, s)
 			}
 		}
 	}
 	return out
+}
+
+// composePortFormEntry is entry if the form's Ports field can hold it — i.e.
+// parseCreatePorts accepts it — else "". Compose also allows a container-only
+// "80" or "80/udp", "127.0.0.1::80", and published ranges; loading one into
+// the field would pass Validate and then fail when applying, so such entries
+// stay out of the form and are left untouched in the file (see
+// setMappingEntries).
+func composePortFormEntry(entry string) string {
+	if strings.TrimSpace(entry) == "" {
+		return ""
+	}
+	if _, err := parseCreatePorts(entry); err != nil {
+		return ""
+	}
+	return entry
+}
+
+// composeVolumeFormEntry is composePortFormEntry's counterpart for volumes:
+// anonymous volumes ("/data") have no source and can't go in the field.
+func composeVolumeFormEntry(entry string) string {
+	if strings.TrimSpace(entry) == "" {
+		return ""
+	}
+	if _, err := parseCreateMounts(entry); err != nil {
+		return ""
+	}
+	return entry
 }
 
 // longComposeVolumeToShort is a long-syntax volume ({type, source, target,
@@ -2668,7 +2730,7 @@ func backupComposeBase(base string) error {
 }
 
 func pruneComposeBaseBackups(base string) {
-	matches, err := filepath.Glob(base + ".whatthedock-*.bak")
+	matches, err := composeBackups(base)
 	if err != nil || len(matches) <= composeBackupKeep {
 		return
 	}
@@ -3007,6 +3069,11 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 // and drops any override left over from before this service existed in
 // base, so there's exactly one place the service is defined going forward.
 func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	if spec.Unchanged {
+		baseOnly := spec
+		baseOnly.OverrideFile = ""
+		return composeUpService(ctx, baseOnly)
+	}
 	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
 		baseOnly := spec
 		baseOnly.OverrideFile = ""
@@ -3121,6 +3188,11 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 // counterpart — every filesystem step runs remotely over sshRun instead of
 // the os package.
 func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpec, baseContent []byte) error {
+	if spec.Unchanged {
+		baseOnly := spec
+		baseOnly.OverrideFile = ""
+		return composeUpService(ctx, baseOnly)
+	}
 	if spec.FullBase && singleComposeServiceName(spec.Content) == spec.Service && singleComposeServiceName(string(baseContent)) == spec.Service {
 		baseOnly := spec
 		baseOnly.OverrideFile = ""

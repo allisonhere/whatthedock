@@ -42,8 +42,9 @@ const latestReleaseTimeout = 15 * time.Second
 // bytes, so 4 KiB is generous. Without these a hostile or misbehaving server
 // (or a redirect to one) could stream unbounded data into memory or disk.
 const (
-	maxReleaseBinaryBytes = 200 << 20
-	maxSignatureBytes     = 4 << 10
+	maxReleaseBinaryBytes   = 200 << 20
+	maxSignatureBytes       = 4 << 10
+	maxReleaseMetadataBytes = 1 << 20 // the GitHub release JSON is a few KB; 1 MiB is generous
 )
 
 // copyLimited copies from src to dst, failing if more than max bytes arrive.
@@ -102,8 +103,12 @@ func LatestRelease(ctx context.Context, repo string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("github: unexpected status %s", resp.Status)
 	}
+	body, err := readAllLimited(resp.Body, maxReleaseMetadataBytes)
+	if err != nil {
+		return "", fmt.Errorf("github: release response: %w", err)
+	}
 	var rel release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.Unmarshal(body, &rel); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(rel.TagName) == "" {

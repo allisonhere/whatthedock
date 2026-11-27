@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -146,6 +147,20 @@ func hostKeyAlgorithmsFor(known []knownhosts.KnownKey) []string {
 	return algorithms
 }
 
+// sshLoginUser is the user to authenticate as. The shelled-out ssh omits an
+// empty SSHUser (see SSHTarget) and lets ssh use the current OS user; this
+// client has no such fallback, and sending an empty name makes the server
+// reject the password.
+func sshLoginUser(system config.System) string {
+	if system.SSHUser != "" {
+		return system.SSHUser
+	}
+	if current, err := user.Current(); err == nil && current.Username != "" {
+		return current.Username
+	}
+	return os.Getenv("USER")
+}
+
 // dialKeychainClientWith is one connection attempt. A non-empty algorithms
 // restricts the host-key algorithms offered to the server.
 func dialKeychainClientWith(ctx context.Context, system config.System, password string, algorithms []string) (*ssh.Client, error) {
@@ -159,7 +174,7 @@ func dialKeychainClientWith(ctx context.Context, system config.System, password 
 		port = "22"
 	}
 	cfg := &ssh.ClientConfig{
-		User:              system.SSHUser,
+		User:              sshLoginUser(system),
 		Auth:              []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback:   hostKeyCallback,
 		HostKeyAlgorithms: algorithms,

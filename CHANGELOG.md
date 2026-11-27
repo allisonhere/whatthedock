@@ -35,6 +35,33 @@ only re-cut a build are folded into the nearest entry.
   (bundled into the binary) in a scrollable overlay.
 
 ### Fixed
+- An empty argument in a container's command was dropped when the command was
+  shown or edited as text (`a "" b` became `a b`); it is quoted now so it
+  round-trips.
+- After a theme change the FLEET card and the help legend kept the default
+  theme's status colors.
+- The update check read GitHub's release JSON with no size limit; it is capped
+  at 1 MiB like the binary and signature downloads.
+- Restoring or pruning Compose backups found nothing when the compose file's path
+  contained `[`, `]`, `*` or `?`.
+- Confirming an edit of a Compose service with nothing changed rewrote the
+  compose file from the copy read when the form opened, undoing any edit made to
+  the file in between. It now just brings the service up.
+- A Compose service with a container-only port (`"80"`, `80/udp`,
+  `127.0.0.1::80`) or an anonymous volume (`/data`) loaded into the edit form
+  but could never be applied. Those entries stay out of the form and are left
+  untouched in the file.
+- Editing an adopted container over SSH could have fields you had already typed
+  into replaced by the live container's values when the file check returned.
+- Ranged port bindings (`8000-8010/tcp`) showed up as container port 0 in Edit
+  and Clone; they are expanded to one entry per port.
+- The command palette's Delete skipped the multi-service stack warning that the
+  `D` key shows.
+- `Ctrl+C` did nothing in the shutdown/reboot confirm; it now cancels, like `Esc`.
+- Keychain SSH systems with no username sent an empty one and failed to log in;
+  the current OS user is used, as the `ssh` command does.
+- Container memory on cgroup v1 subtracted `inactive_file` instead of
+  `total_inactive_file`; it now matches `docker stats`.
 - Copy/paste and clone dropped an `on-failure` restart policy's retry cap; it is
   kept now unless you change the policy. A pasted container with no restart
   policy also stays "no restart" instead of becoming `unless-stopped`.

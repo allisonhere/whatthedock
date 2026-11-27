@@ -465,12 +465,18 @@ func onlineCPUs(stats container.StatsResponse) float64 {
 	return float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
 }
 
+// memoryUsage is the container's memory without page cache, the way
+// `docker stats` computes it (calculateMemUsageUnixNoCache in docker/cli):
+// cgroup v1 reports total_inactive_file, cgroup v2 only inactive_file. v1's
+// memory.stat also has a per-cgroup inactive_file, so the order matters —
+// total_inactive_file has to win. The pre-19.03 "cache" key is not used.
 func memoryUsage(stats container.MemoryStats) uint64 {
 	usage := stats.Usage
-	for _, key := range []string{"inactive_file", "total_inactive_file", "cache"} {
-		if cache := stats.Stats[key]; cache > 0 && cache < usage {
-			return usage - cache
-		}
+	if v, ok := stats.Stats["total_inactive_file"]; ok && v < usage {
+		return usage - v
+	}
+	if v := stats.Stats["inactive_file"]; v < usage {
+		return usage - v
 	}
 	return usage
 }
@@ -770,9 +776,7 @@ func FromInspect(host domain.HostID, inspect container.InspectResponse) domain.C
 			ctr.ConfiguredPorts = []domain.Port{}
 			for port, bindings := range hc.PortBindings {
 				for _, binding := range bindings {
-					ctr.ConfiguredPorts = append(ctr.ConfiguredPorts, domain.Port{
-						IP: binding.HostIP, Private: uint16(port.Int()), Public: parsePort(binding.HostPort), Type: port.Proto(),
-					})
+					ctr.ConfiguredPorts = append(ctr.ConfiguredPorts, expandPortBinding(port, binding)...)
 				}
 			}
 			sort.Slice(ctr.ConfiguredPorts, func(i, j int) bool {
@@ -910,6 +914,33 @@ func fromMounts(mounts []container.MountPoint) []domain.Mount {
 			Mode:        mount.Mode,
 			ReadWrite:   mount.RW,
 		})
+	}
+	return out
+}
+
+// expandPortBinding is one binding of a PortMap key as domain.Ports. A key
+// can name a range ("8000-8010/tcp") when a client other than the docker CLI
+// published one; port.Int() is 0 for those, which showed up as a bogus
+// container port 0. Container port start+i pairs with host port start+i when
+// the host side is a range of the same length; otherwise every port gets the
+// host side's first port.
+func expandPortBinding(port nat.Port, binding nat.PortBinding) []domain.Port {
+	single := domain.Port{IP: binding.HostIP, Private: uint16(port.Int()), Public: parsePort(binding.HostPort), Type: port.Proto()}
+	start, end, err := port.Range()
+	if err != nil || start == end {
+		return []domain.Port{single}
+	}
+	hostStart, hostEnd, err := nat.ParsePortRangeToInt(binding.HostPort)
+	if err != nil {
+		return []domain.Port{single}
+	}
+	out := make([]domain.Port, 0, end-start+1)
+	for i := 0; i <= end-start; i++ {
+		public := hostStart
+		if hostEnd-hostStart == end-start {
+			public = hostStart + i
+		}
+		out = append(out, domain.Port{IP: binding.HostIP, Private: uint16(start + i), Public: uint16(public), Type: port.Proto()})
 	}
 	return out
 }

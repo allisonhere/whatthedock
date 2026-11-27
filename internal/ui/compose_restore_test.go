@@ -47,7 +47,7 @@ func TestRestoreComposeBackupLocalRestoresNewestAndSnapshotsCurrent(t *testing.T
 
 	// The broken current content must have been snapshotted first, so the
 	// restore itself is reversible.
-	matches, _ := filepath.Glob(composeBackupGlob(base))
+	matches, _ := composeBackups(base)
 	foundSnapshotOfBroken := false
 	for _, m := range matches {
 		if m == older || m == newer {

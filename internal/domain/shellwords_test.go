@@ -59,3 +59,13 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// Docker's Cmd may hold an empty argument; written bare it would vanish.
+func TestJoinThenSplitShellWordsKeepsEmptyArguments(t *testing.T) {
+	for _, args := range [][]string{{"a", "", "b"}, {""}, {"x", ""}, {"", "x"}} {
+		joined := JoinShellWords(args)
+		if got := SplitShellWords(joined); !equalStrings(got, args) {
+			t.Fatalf("round trip of %#v via %q produced %#v", args, joined, got)
+		}
+	}
+}

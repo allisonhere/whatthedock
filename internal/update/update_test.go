@@ -284,3 +284,27 @@ func TestDownloadBytesRejectsOversizedSignature(t *testing.T) {
 		t.Fatalf("downloadBytes() error = %v, want an over-limit error", err)
 	}
 }
+
+// The binary and signature downloads are size-capped; the release JSON must be
+// too, or a hostile server could stream it into memory.
+func TestLatestReleaseRejectsOversizedMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"tag_name":"v0.1.4","pad":"`))
+		chunk := []byte(strings.Repeat("x", 64<<10))
+		for i := 0; i < (maxReleaseMetadataBytes/len(chunk))+2; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`"}`))
+	}))
+	defer server.Close()
+
+	original := httpClient
+	httpClient = &http.Client{Transport: rewriteHostTransport{target: server.URL, base: http.DefaultTransport}}
+	defer func() { httpClient = original }()
+
+	if tag, err := LatestRelease(context.Background(), "allisonhere/whatthedock"); err == nil {
+		t.Fatalf("LatestRelease() = %q, want an error for a body over the cap", tag)
+	}
+}

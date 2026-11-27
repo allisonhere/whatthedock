@@ -173,11 +173,11 @@ func setMappingEntries(node *yaml.Node, key string, values []string, shortOf fun
 func composePortShort(item *yaml.Node) string {
 	switch item.Kind {
 	case yaml.ScalarNode:
-		return item.Value
+		return composePortFormEntry(item.Value)
 	case yaml.MappingNode:
 		var entry map[string]interface{}
 		if item.Decode(&entry) == nil {
-			return longComposePortToShort(entry)
+			return composePortFormEntry(longComposePortToShort(entry))
 		}
 	}
 	return ""
@@ -187,11 +187,11 @@ func composePortShort(item *yaml.Node) string {
 func composeVolumeShort(item *yaml.Node) string {
 	switch item.Kind {
 	case yaml.ScalarNode:
-		return item.Value
+		return composeVolumeFormEntry(item.Value)
 	case yaml.MappingNode:
 		var entry map[string]interface{}
 		if item.Decode(&entry) == nil {
-			return longComposeVolumeToShort(entry)
+			return composeVolumeFormEntry(longComposeVolumeToShort(entry))
 		}
 	}
 	return ""

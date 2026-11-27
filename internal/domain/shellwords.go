@@ -23,13 +23,14 @@ import (
 // arguments need it; SplitShellWords is its inverse.
 
 // JoinShellWords encodes args into one space-separated string, wrapping
-// any argument that contains whitespace or a double quote in double
-// quotes (embedded quotes doubled) so SplitShellWords can recover it as a
-// single argument.
+// any argument that is empty or contains whitespace or a double quote in
+// double quotes (embedded quotes doubled) so SplitShellWords can recover it
+// as a single argument. An empty argument has to be written as "" — bare, it
+// would vanish from the joined text — and Docker's Cmd may legally hold one.
 func JoinShellWords(args []string) string {
 	parts := make([]string, 0, len(args))
 	for _, a := range args {
-		if strings.ContainsAny(a, " \t\n\"") {
+		if a == "" || strings.ContainsAny(a, " \t\n\"") {
 			a = `"` + strings.ReplaceAll(a, `"`, `""`) + `"`
 		}
 		parts = append(parts, a)

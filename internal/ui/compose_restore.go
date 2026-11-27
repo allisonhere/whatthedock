@@ -16,10 +16,30 @@ import (
 	"github.com/allisonhere/whatthedock/internal/systems"
 )
 
-// composeBackupGlob is the sibling glob every pre-apply snapshot matches.
-// Kept in one place so the writer (create.go) and the reader here agree.
-func composeBackupGlob(base string) string {
-	return base + ".whatthedock-*.bak"
+// composeBackups lists base's WhatTheDock pre-apply snapshots (see
+// composeBackupPath). It filters the directory listing instead of globbing
+// base+".whatthedock-*.bak": a path containing [, ], * or ? is a legal file
+// name but not a literal glob, and the pattern would then match no backup.
+// The writer (create.go) and the reader here share it so they agree.
+func composeBackups(base string) ([]string, error) {
+	dir := filepath.Dir(base)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := filepath.Base(base) + ".whatthedock-"
+	var out []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && len(name) >= len(prefix)+len(".bak") &&
+			strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".bak") {
+			out = append(out, filepath.Join(dir, name))
+		}
+	}
+	return out, nil
 }
 
 // newestComposeBackup returns the most recent path from a list of backup
@@ -61,7 +81,7 @@ func restoreComposeBackupCmd(system config.System, base string) tea.Cmd {
 }
 
 func restoreComposeBackupLocal(base string) (string, error) {
-	matches, err := filepath.Glob(composeBackupGlob(base))
+	matches, err := composeBackups(base)
 	if err != nil {
 		return "", err
 	}

@@ -110,7 +110,7 @@ func (m Model) dashboardCards(renderer tideui.Renderer, summary dashboardSummary
 		}},
 		{"FLEET", fleetTint, func(cw int) (string, string) {
 			var parts []string
-			for _, entry := range statusLegendEntries {
+			for _, entry := range statusLegendEntries() {
 				count := summary.counts[entry.glyph]
 				if entry.glyph != "●" && count == 0 {
 					continue
@@ -182,9 +182,9 @@ func renderDashboardCard(renderer tideui.Renderer, title string, tint lipgloss.C
 // visible.
 func dashboardStatusBar(renderer tideui.Renderer, summary dashboardSummary, width int, bg lipgloss.Color) string {
 	width = max(1, width)
-	counts := make([]int, len(statusLegendEntries))
+	counts := make([]int, len(statusLegendEntries()))
 	total, present := 0, 0
-	for i, entry := range statusLegendEntries {
+	for i, entry := range statusLegendEntries() {
 		counts[i] = summary.counts[entry.glyph]
 		total += counts[i]
 		if counts[i] > 0 {
@@ -211,7 +211,7 @@ func dashboardStatusBar(renderer tideui.Renderer, summary dashboardSummary, widt
 	cells[largest] = max(1, cells[largest]+width-assigned)
 
 	var b strings.Builder
-	for i, entry := range statusLegendEntries {
+	for i, entry := range statusLegendEntries() {
 		if cells[i] > 0 {
 			b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(entry.color).Bold(true).Render(strings.Repeat("━", cells[i])))
 		}

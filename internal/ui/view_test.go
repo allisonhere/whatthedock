@@ -97,7 +97,7 @@ func TestStatusLegendLinesUsesTheSameGlyphsAndColorsAsTheTree(t *testing.T) {
 		wantGlyph := statusGlyph(ctr)
 		wantColor := inspectorStatusColor(ctr)
 		found := false
-		for _, entry := range statusLegendEntries {
+		for _, entry := range statusLegendEntries() {
 			if entry.label == label {
 				found = true
 				if entry.glyph != wantGlyph {

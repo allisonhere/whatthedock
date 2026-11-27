@@ -3672,21 +3672,30 @@ func spinnerGlyph(frame int) string {
 // statusLegendEntries mirrors inspectorStatusColor/statusGlyph exactly —
 // same glyphs, same colors, same order a container could actually be
 // found in — so the legend never drifts out of sync with what the tree
-// and inspector panes actually show.
-var statusLegendEntries = []struct {
+// and inspector panes actually show. It is a function, not a package
+// variable: the colors come from activePalette, which View refreshes every
+// frame, and a value built once at init would keep the default theme's
+// colors after a theme change.
+func statusLegendEntries() []struct {
 	glyph string
 	color lipgloss.Color
 	label string
-}{
-	{"●", activePalette.OK, "healthy / running"},
-	{"▲", activePalette.Warn, "restarting"},
-	{"○", activePalette.Muted, "stopped, exited cleanly"},
-	{"✖", activePalette.Bad, "dead"},
-	{"!", activePalette.Bad, "unhealthy"},
+} {
+	return []struct {
+		glyph string
+		color lipgloss.Color
+		label string
+	}{
+		{"●", activePalette.OK, "healthy / running"},
+		{"▲", activePalette.Warn, "restarting"},
+		{"○", activePalette.Muted, "stopped, exited cleanly"},
+		{"✖", activePalette.Bad, "dead"},
+		{"!", activePalette.Bad, "unhealthy"},
+	}
 }
 
 // statusLegendLineCount includes the heading and one line per status.
-var statusLegendLineCount = 1 + len(statusLegendEntries)
+var statusLegendLineCount = 1 + len(statusLegendEntries())
 
 // statusLegendLines renders the same container-status glyphs and colors
 // used in the tree/inspector panes for the Status Colors help category.
@@ -3703,7 +3712,7 @@ func statusLegendLines(renderer tideui.Renderer) []string {
 	panel := lipgloss.NewStyle().Background(panelBG).Foreground(textFg)
 	lines := make([]string, 0, statusLegendLineCount)
 	lines = append(lines, panel.Render("Status colors:"))
-	for _, entry := range statusLegendEntries {
+	for _, entry := range statusLegendEntries() {
 		raw := healthSpan(entry.glyph, entry.color, textFg) + "  " + entry.label
 		lines = append(lines, panel.Render(raw))
 	}
@@ -4290,7 +4299,7 @@ func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardS
 	}
 
 	var counts []segment
-	for _, entry := range statusLegendEntries {
+	for _, entry := range statusLegendEntries() {
 		count := summary.counts[entry.glyph]
 		if entry.glyph != "●" && count == 0 {
 			continue

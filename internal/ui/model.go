@@ -2373,13 +2373,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayDeleteStackConfirm
 			return m, nil
 		}
-		if selected := m.selectedContainer(); selected != nil {
-			if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
-				m.overlay = overlayDeleteScope
-				return m, nil
-			}
-			m.overlay = overlayDelete
-		}
+		m.openDeleteForSelectedContainer()
 	case "u":
 		if selected := m.selectedContainer(); selected != nil {
 			m.overlay = overlayReplicate
@@ -2405,6 +2399,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.openEditSelection()
 	}
 	return m, nil
+}
+
+// openDeleteForSelectedContainer opens the delete confirm for the selected
+// container — through the scope warning first when it belongs to a stack with
+// other services, since deleting one service then also touches the shared
+// compose file. Both the D key and the command palette go through here.
+func (m *Model) openDeleteForSelectedContainer() {
+	selected := m.selectedContainer()
+	if selected == nil {
+		return
+	}
+	if selected.Compose.Project != "" && siblingServiceCount(m.snapshot, selected.Compose.Project) > 1 {
+		m.overlay = overlayDeleteScope
+		return
+	}
+	m.overlay = overlayDelete
 }
 
 func (m Model) openEditSelection() (tea.Model, tea.Cmd) {
@@ -3844,9 +3854,9 @@ func (m Model) executeCommand(id actions.ID) (tea.Model, tea.Cmd) {
 	case actions.Kill:
 		return m, m.actionCmd(actions.Kill, "kill")
 	case actions.Delete:
-		if selected := m.selectedContainer(); selected != nil {
+		if m.selectedContainer() != nil {
 			m.captureDeleteTarget()
-			m.overlay = overlayDelete
+			m.openDeleteForSelectedContainer()
 		}
 	case actions.Replicate:
 		if selected := m.selectedContainer(); selected != nil {

@@ -160,7 +160,7 @@ func (m Model) hostPowerConfirmMatches() bool {
 // only esc (and ctrl+c) get out.
 func (m Model) handleHostPowerConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "ctrl+c":
 		m.hostPowerConfirmInput = nil
 		m.overlay = overlayNone
 	case "backspace", "ctrl+h":
