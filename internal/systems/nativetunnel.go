@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/allisonhere/whatthedock/internal/config"
 )
@@ -99,7 +98,7 @@ func dialKeychainTunnel(ctx context.Context, system config.System, password stri
 // native-Go-SSH connection either way, so the keychain password never
 // touches a subprocess's argv or environment.
 func dialKeychainClient(ctx context.Context, system config.System, password string) (*ssh.Client, error) {
-	hostKeyCallback, err := knownhosts.New(knownHostsPath())
+	hostKeyCallback, err := loadKnownHosts(knownHostsPath())
 	if err != nil {
 		return nil, fmt.Errorf("read known_hosts: %w — connect once with ssh first to add %s", err, system.SSHHost)
 	}

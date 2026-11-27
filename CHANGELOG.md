@@ -32,6 +32,8 @@ only re-cut a build are folded into the nearest entry.
   (bundled into the binary) in a scrollable overlay.
 
 ### Fixed
+- Keychain SSH can verify a saved host key when `known_hosts` also contains an
+  `ssh-mldsa44-ed25519` host key.
 - `Alt+r` (restart) never fired: the key handler matched `r` and then checked
   for Alt, but Bubble Tea reports the key as `alt+r`.
 - Dashboard: fleet RAM summed every container's limit, so containers without a

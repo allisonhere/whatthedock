@@ -323,8 +323,10 @@ Supported system types:
 SSH auth modes:
 
 - `config/agent`: use your normal SSH config, keys, and agent.
-- `keychain`: store the SSH password in the OS keychain, not in
-  `settings.json`.
+- `keychain`: store the SSH password in the OS keychain. WhatTheDock verifies
+  the server against a supported key in `~/.ssh/known_hosts`. An additional
+  `ssh-mldsa44-ed25519` host key can coexist with a supported key such as
+  `ssh-ed25519`.
 - `password prompt`: authenticate interactively when establishing the tunnel.
   Compose and other remote commands reuse that authenticated SSH connection.
   Select the system again to reconnect if the connection has expired.
