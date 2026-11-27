@@ -2776,6 +2776,8 @@ func (m Model) renderOverlay(renderer tideui.Renderer) *tideui.Overlay {
 			renderer.RenderSoftHints(width-4, hints...))
 		overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "app log", Content: content, Width: width})
 		return &overlay
+	case overlayChangelog:
+		return m.changelogOverlay(renderer)
 	case overlayAbout:
 		width := min(82, max(46, m.width-8))
 		contentWidth := aboutContentWidth(m.width)

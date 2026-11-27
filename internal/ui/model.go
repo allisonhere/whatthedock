@@ -69,6 +69,7 @@ const (
 	overlayReplicate
 	overlayUpdate
 	overlayAppLog
+	overlayChangelog
 	overlayDashboard
 	overlayEditScope
 	overlayDeleteScope
@@ -306,6 +307,7 @@ const (
 	settingsActionResetDefaults
 	settingsActionCheckUpdate
 	settingsActionViewAppLog
+	settingsActionViewChangelog
 )
 
 type systemOverlayMode int
@@ -480,6 +482,10 @@ type Model struct {
 	appLogFile   *os.File
 	appLogScroll int
 	appLogCopied bool
+
+	// changelogScroll is the changelog overlay's scroll position (Settings >
+	// View changelog), same role as appLogScroll for the app-log overlay.
+	changelogScroll int
 
 	// lastStatusText/statusSince back the minimum-hold guard in the
 	// snapshotMsg handler: an explicit status (success or error) must stay
@@ -2456,6 +2462,23 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "G", "end":
 			m.scrollAppLog(len(m.appLogLines))
 		}
+	case overlayChangelog:
+		switch msg.String() {
+		case "esc", "q":
+			m.overlay = overlaySettings // back to where it was opened from
+		case "j", "down":
+			m.scrollChangelog(1)
+		case "k", "up":
+			m.scrollChangelog(-1)
+		case "pgdown", " ":
+			m.scrollChangelog(max(1, m.changelogBodyBudget()-1))
+		case "pgup":
+			m.scrollChangelog(-max(1, m.changelogBodyBudget()-1))
+		case "g", "home":
+			m.scrollChangelog(-m.changelogLineCount())
+		case "G", "end":
+			m.scrollChangelog(m.changelogLineCount())
+		}
 	case overlayAbout:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "A" {
 			m.overlay = overlayNone
@@ -2852,6 +2875,10 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayAppLog
 			m.appLogScroll = max(0, len(m.appLogLines)-m.appLogBodyBudget())
 			m.appLogCopied = false
+			return m, nil
+		case settingsActionViewChangelog:
+			m.overlay = overlayChangelog
+			m.changelogScroll = 0
 			return m, nil
 		}
 		if row.kind == settingsRowText || row.kind == settingsRowSecretText {
@@ -4006,6 +4033,8 @@ func (m Model) settingsRows() []settingsRow {
 		settingsRow{label: "Diagnostics", kind: settingsRowSection},
 		settingsRow{label: "App log", value: settings.AppLog.String()},
 		settingsRow{label: "View app log", value: "view", kind: settingsRowAction, action: settingsActionViewAppLog},
+		settingsRow{label: "Changelog", kind: settingsRowSection},
+		settingsRow{label: "View changelog", value: "view", kind: settingsRowAction, action: settingsActionViewChangelog},
 		settingsRow{label: "Maintenance", kind: settingsRowSection},
 		settingsRow{label: "Reset defaults", value: "apply", kind: settingsRowAction, action: settingsActionResetDefaults},
 		settingsRow{label: "Check for update", value: m.updateCheckRowValue(), kind: settingsRowAction, action: settingsActionCheckUpdate},

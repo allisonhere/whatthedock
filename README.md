@@ -398,6 +398,8 @@ Settings include:
 - editor mode
 - AI provider/model/API key/base URL
 - app activity log options
+- a changelog viewer (**Changelog > View changelog**) with what changed in each
+  release, bundled into the app; `j` / `k` scroll, `Esc` returns to Settings
 - update checks
 
 Press `Ctrl+S` to save.
