@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -72,7 +73,20 @@ func dialKeychainTunnel(ctx context.Context, system config.System, password stri
 		return fmt.Errorf("listen on %s: %w", system.LocalSocket, err)
 	}
 
-	go serveKeychainTunnel(listener, client, system.RemoteSocket)
+	tunnel := &keychainTunnel{
+		client:       client,
+		remoteSocket: system.RemoteSocket,
+		// Re-read the password from the keychain on reconnect rather than
+		// holding it in memory for the life of the process.
+		redial: func(ctx context.Context) (*ssh.Client, error) {
+			password, err := PasswordFor(system.ID)
+			if err != nil {
+				return nil, err
+			}
+			return dialKeychainClient(ctx, system, password)
+		},
+	}
+	go serveKeychainTunnel(listener, tunnel)
 	return nil
 }
 
@@ -98,7 +112,7 @@ func dialKeychainClient(ctx context.Context, system config.System, password stri
 		User:            system.SSHUser,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+		Timeout:         sshHandshakeTimeout,
 	}
 	addr := net.JoinHostPort(system.SSHHost, port)
 
@@ -114,11 +128,18 @@ func dialKeychainClient(ctx context.Context, system config.System, password stri
 	}
 	done := make(chan handshakeResult, 1)
 	go func() {
+		// cfg.Timeout only bounds ssh.Dial; NewClientConn on an already
+		// dialed conn has no timeout of its own, so a server that accepts
+		// the TCP connection and then goes silent would hang here forever
+		// whenever ctx carries no deadline. Bound the handshake explicitly,
+		// then lift the deadline so it doesn't cut the live session short.
+		_ = conn.SetDeadline(time.Now().Add(sshHandshakeTimeout))
 		sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 		if err != nil {
 			done <- handshakeResult{err: err}
 			return
 		}
+		_ = conn.SetDeadline(time.Time{})
 		done <- handshakeResult{client: ssh.NewClient(sshConn, chans, reqs)}
 	}()
 
@@ -180,13 +201,143 @@ func remoteKeychainCommand(ctx context.Context, system config.System, password, 
 	return output, nil
 }
 
+// sshHandshakeTimeout bounds one SSH handshake (a var so tests can shorten
+// it). tunnelProbeTimeout bounds opening a channel (or a liveness probe) on
+// an established connection, which otherwise blocks indefinitely on a
+// half-open TCP connection after sleep/wake or network loss;
+// tunnelRedialTimeout bounds a whole reconnect.
+var sshHandshakeTimeout = 10 * time.Second
+
+const (
+	tunnelProbeTimeout  = 10 * time.Second
+	tunnelRedialTimeout = 30 * time.Second
+)
+
+// keychainTunnel owns the SSH connection behind a keychain-mode Docker
+// socket tunnel and re-establishes it when it dies. Without that, a dropped
+// connection left the local listener up — so isLiveSocket kept reporting a
+// healthy tunnel and nothing ever reconnected until the app restarted.
+type keychainTunnel struct {
+	mu           sync.Mutex
+	client       *ssh.Client
+	remoteSocket string
+	redial       func(context.Context) (*ssh.Client, error)
+}
+
+// open dials the remote Docker socket, reconnecting SSH first if the
+// existing connection is dead. A failure on a still-healthy connection (the
+// remote daemon is down, say) is returned as-is: reconnecting wouldn't help
+// and would just burn password-auth attempts.
+func (t *keychainTunnel) open() (net.Conn, error) {
+	t.mu.Lock()
+	client := t.client
+	t.mu.Unlock()
+	if client != nil {
+		conn, err := dialRemote(client, t.remoteSocket)
+		if err == nil {
+			return conn, nil
+		}
+		if connAlive(client) {
+			return nil, err
+		}
+		t.discard(client)
+	}
+	client, err := t.reconnect()
+	if err != nil {
+		return nil, err
+	}
+	return dialRemote(client, t.remoteSocket)
+}
+
+func (t *keychainTunnel) discard(dead *ssh.Client) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client == dead {
+		t.client = nil
+	}
+	_ = dead.Close()
+}
+
+// reconnect returns the current client, dialing a new one only if none
+// exists — concurrent callers serialize here, so one reconnect serves all.
+func (t *keychainTunnel) reconnect() (*ssh.Client, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client != nil {
+		return t.client, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tunnelRedialTimeout)
+	defer cancel()
+	client, err := t.redial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.client = client
+	return client, nil
+}
+
+func (t *keychainTunnel) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client != nil {
+		_ = t.client.Close()
+		t.client = nil
+	}
+}
+
+// dialRemote opens a channel to socket over client, giving up (and closing
+// client, which fails the pending open) if the transport is stalled.
+func dialRemote(client *ssh.Client, socket string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := client.Dial("unix", socket)
+		ch <- result{conn, err}
+	}()
+	timer := time.NewTimer(tunnelProbeTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-timer.C:
+		_ = client.Close()
+		if r := <-ch; r.conn != nil {
+			_ = r.conn.Close()
+		}
+		return nil, errors.New("ssh tunnel stalled")
+	}
+}
+
+// connAlive reports whether client's transport still answers. The request's
+// own reply (OpenSSH accepts keepalive@openssh.com; others may refuse it)
+// doesn't matter — only whether the round trip completes without an error.
+func connAlive(client *ssh.Client) bool {
+	ch := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		ch <- err
+	}()
+	timer := time.NewTimer(tunnelProbeTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		return err == nil
+	case <-timer.C:
+		_ = client.Close()
+		return false
+	}
+}
+
 // serveKeychainTunnel accepts local connections on listener and pipes each
-// one to a freshly opened channel to remoteSocket over client, until
-// listener is closed (which callers never do explicitly today — it lives
-// for the process's lifetime, same as the socket a shelled-out `-fN`
-// tunnel leaves behind).
-func serveKeychainTunnel(listener net.Listener, client *ssh.Client, remoteSocket string) {
-	defer client.Close()
+// one to a freshly opened channel to the remote socket, until listener is
+// closed (which callers never do explicitly today — it lives for the
+// process's lifetime, same as the socket a shelled-out `-fN` tunnel leaves
+// behind).
+func serveKeychainTunnel(listener net.Listener, tunnel *keychainTunnel) {
+	defer tunnel.close()
 	defer listener.Close()
 	for {
 		local, err := listener.Accept()
@@ -195,7 +346,7 @@ func serveKeychainTunnel(listener net.Listener, client *ssh.Client, remoteSocket
 		}
 		go func() {
 			defer local.Close()
-			remote, err := client.Dial("unix", remoteSocket)
+			remote, err := tunnel.open()
 			if err != nil {
 				return
 			}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -19,6 +20,7 @@ import (
 	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 
 	"github.com/allisonhere/whatthedock/internal/app"
@@ -28,6 +30,9 @@ import (
 type LocalProvider struct {
 	host domain.Host
 	cli  *client.Client
+
+	cpuMu   sync.Mutex
+	cpuPrev map[string]cpuSample
 }
 
 func NewLocalProvider() (*LocalProvider, error) {
@@ -147,21 +152,107 @@ func (p *LocalProvider) ContainerStats(ctx context.Context, id domain.ResourceID
 	if err := json.NewDecoder(reader.Body).Decode(&stats); err != nil {
 		return domain.ContainerStats{}, err
 	}
+	p.primeCPU(id.ID, &stats, time.Now())
 	return FromStats(p.host.ID, id.ID, stats), nil
 }
 
+// minCPUSampleGap is the shortest interval between two CPU samples worth
+// differencing. Concurrent pollers (the selected-container loop and the
+// dashboard fan-out) can hit the same container within microseconds of each
+// other; a delta over that window is mostly noise, so such a sample is
+// computed against the older baseline instead of replacing it.
+const minCPUSampleGap = 500 * time.Millisecond
+
+// cpuSampleTTL drops baselines for containers nobody has polled lately (and
+// for containers that no longer exist) so cpuPrev can't grow without bound.
+const cpuSampleTTL = time.Minute
+
+type cpuSample struct {
+	total, system uint64
+	at            time.Time
+}
+
+// primeCPU fills stats.PreCPUStats from the previous poll of the same
+// container. A one-shot stats response carries no precpu_stats (Docker only
+// primes them when it waits for a second sample), so without this cpuPercent
+// would divide the container's lifetime CPU time by the host's uptime — a
+// lifetime average that never reflects current load. The first poll of a
+// container has no baseline and reports 0 rather than that average.
+func (p *LocalProvider) primeCPU(id string, stats *container.StatsResponse, now time.Time) {
+	if stats.PreCPUStats.CPUUsage.TotalUsage != 0 || stats.PreCPUStats.SystemUsage != 0 {
+		return // the daemon already supplied a baseline
+	}
+	p.cpuMu.Lock()
+	defer p.cpuMu.Unlock()
+	if p.cpuPrev == nil {
+		p.cpuPrev = map[string]cpuSample{}
+	}
+	for key, sample := range p.cpuPrev {
+		if now.Sub(sample.at) > cpuSampleTTL {
+			delete(p.cpuPrev, key)
+		}
+	}
+	prev, ok := p.cpuPrev[id]
+	if ok {
+		stats.PreCPUStats.CPUUsage.TotalUsage = prev.total
+		stats.PreCPUStats.SystemUsage = prev.system
+	} else {
+		stats.PreCPUStats.CPUUsage.TotalUsage = stats.CPUStats.CPUUsage.TotalUsage
+		stats.PreCPUStats.SystemUsage = stats.CPUStats.SystemUsage
+	}
+	if !ok || now.Sub(prev.at) >= minCPUSampleGap {
+		p.cpuPrev[id] = cpuSample{total: stats.CPUStats.CPUUsage.TotalUsage, system: stats.CPUStats.SystemUsage, at: now}
+	}
+}
+
+// Logs returns the container's log stream as plain text lines. Docker frames
+// a non-TTY container's logs in a multiplexed stdout/stderr protocol whose
+// 8-byte headers contain arbitrary length bytes (including '\n'), so the
+// stream is demultiplexed here with stdcopy rather than guessed at per line
+// by callers. TTY containers are not framed and pass through untouched.
 func (p *LocalProvider) Logs(ctx context.Context, id domain.ResourceID, options app.LogOptions) (io.ReadCloser, error) {
 	tail := options.Tail
 	if tail == "" {
 		tail = "200"
 	}
-	return p.cli.ContainerLogs(ctx, id.ID, container.LogsOptions{
+	inspect, err := p.cli.ContainerInspect(ctx, id.ID)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := p.cli.ContainerLogs(ctx, id.ID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     options.Follow,
 		Tail:       tail,
 		Timestamps: true,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if inspect.Config != nil && inspect.Config.Tty {
+		return stream, nil
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		_, copyErr := stdcopy.StdCopy(pw, pw, stream)
+		_ = stream.Close()
+		_ = pw.CloseWithError(copyErr) // nil copyErr closes with io.EOF
+	}()
+	return &demuxedLogs{Reader: pr, pipe: pr, source: stream}, nil
+}
+
+// demuxedLogs closes both ends of the demultiplexing pipe: closing the
+// source unblocks a StdCopy stuck reading from Docker, and closing the pipe
+// reader unblocks one stuck writing to a consumer that has gone away.
+type demuxedLogs struct {
+	io.Reader
+	pipe   *io.PipeReader
+	source io.Closer
+}
+
+func (d *demuxedLogs) Close() error {
+	_ = d.pipe.Close()
+	return d.source.Close()
 }
 
 func (p *LocalProvider) CreateContainer(ctx context.Context, spec app.ContainerCreateSpec) (domain.ResourceID, error) {

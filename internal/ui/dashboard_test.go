@@ -237,8 +237,9 @@ func TestDashboardOverlayShowsSummaryAndRunningContainer(t *testing.T) {
 	if !strings.Contains(view, "radarr-1") {
 		t.Fatalf("view missing the running container's row:\n%s", view)
 	}
-	if !strings.Contains(view, "! 1 UNHEALTHY") {
-		t.Fatalf("view missing the unhealthy-count summary:\n%s", view)
+	// At 120x34 the header is stat cards; the FLEET card carries the counts.
+	if !strings.Contains(view, "╭─ FLEET") || !strings.Contains(view, "! 1") {
+		t.Fatalf("view missing the FLEET card's unhealthy count:\n%s", view)
 	}
 }
 
@@ -318,7 +319,7 @@ func TestDashboardHeaderRowAlignsWithRowNumbers(t *testing.T) {
 	var row string
 	for _, ctr := range model.snapshotContainers() {
 		if ctr.IsRunning() {
-			row = ansi.Strip(model.dashboardRow(renderer, ctr, width, false))
+			row = ansi.Strip(model.dashboardRow(renderer, ctr, width, false, false))
 			break
 		}
 	}
@@ -326,12 +327,14 @@ func TestDashboardHeaderRowAlignsWithRowNumbers(t *testing.T) {
 		t.Fatal("no running container found to render a row for")
 	}
 
-	cpuHeaderEnd := strings.Index(header, "CPU") + len("CPU")
-	cpuDataIdx := strings.Index(row, "41.5%")
-	if cpuDataIdx < 0 {
+	// Compare display columns, not byte offsets: the header carries
+	// multi-byte sort arrows ahead of the CPU label.
+	column := func(s, needle string) int { return lipgloss.Width(s[:strings.Index(s, needle)]) }
+	if strings.Index(row, "41.5%") < 0 {
 		t.Fatalf("row missing the expected CPU number:\n%s", row)
 	}
-	cpuDataEnd := cpuDataIdx + len("41.5%")
+	cpuHeaderEnd := column(header, "CPU") + len("CPU")
+	cpuDataEnd := column(row, "41.5%") + len("41.5%")
 	if cpuHeaderEnd != cpuDataEnd {
 		t.Fatalf("CPU header right edge = %d, data right edge = %d, want equal:\nheader: %q\nrow:    %q", cpuHeaderEnd, cpuDataEnd, header, row)
 	}
@@ -420,7 +423,7 @@ func TestDashboardRowTintsHotContainers(t *testing.T) {
 	runningRow := func(m Model) string {
 		for _, ctr := range m.snapshotContainers() {
 			if ctr.IsRunning() {
-				return m.dashboardRow(renderer, ctr, 140, false)
+				return m.dashboardRow(renderer, ctr, 140, false, false)
 			}
 		}
 		t.Fatal("no running container in fixture")
@@ -555,7 +558,7 @@ func TestDashboardRowAndSummaryLineNeverFallShortOfContentWidth(t *testing.T) {
 			if !ctr.IsRunning() {
 				continue
 			}
-			row := dashboardPadLine(renderer, model.dashboardRow(renderer, ctr, width, false), width)
+			row := dashboardPadLine(renderer, model.dashboardRow(renderer, ctr, width, false, false), width)
 			if got := len([]rune(ansi.Strip(row))); got != width {
 				t.Fatalf("width=%d: padded row visible width = %d, want exactly %d\nrow: %q", width, got, width, ansi.Strip(row))
 			}
@@ -592,7 +595,7 @@ func TestDashboardGlyphsCarryExplicitBackground(t *testing.T) {
 	var row string
 	for _, ctr := range model.snapshotContainers() {
 		if ctr.IsRunning() {
-			row = model.dashboardRow(renderer, ctr, 120, false)
+			row = model.dashboardRow(renderer, ctr, 120, false, false)
 			break
 		}
 	}
@@ -708,192 +711,6 @@ func TestDashboardNetGraphColorBoundaries(t *testing.T) {
 	}
 }
 
-// TestDashboardMemMeterSqrtScaling is the regression test for the
-// redesign's own worked examples: 0.4% and 2.7% utilization must land on
-// 1 and 2 filled cells of a 10-wide meter respectively — a plain linear
-// pct/100 scale would round both down to 0, indistinguishable from true
-// zero usage and useless for comparing healthy containers against each
-// other (see dashboardMemMeter's doc comment).
-func TestDashboardMemMeterSqrtScaling(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	cases := []struct {
-		pct    float64
-		filled int
-	}{
-		{0, 0},
-		{0.4, 1},
-		{2.7, 2},
-		{100, 10},
-	}
-	for _, c := range cases {
-		out := ansi.Strip(dashboardMemMeter(renderer, defaultSettings(), c.pct, true, 10, "#000000"))
-		if got := strings.Count(out, "█"); got != c.filled {
-			t.Fatalf("dashboardMemMeter(%v%%) filled = %d (%q), want %d", c.pct, got, out, c.filled)
-		}
-		if got := len([]rune(out)); got != 10 {
-			t.Fatalf("dashboardMemMeter(%v%%) width = %d, want 10", c.pct, got)
-		}
-	}
-}
-
-// TestDashboardMemMeterNoLimitIsDashedNotRed checks the "unknown, not
-// necessarily bad" fallback: a container with no reported memory limit
-// gets a dim dashed meter, never a threshold color guessed from nothing.
-func TestDashboardMemMeterNoLimitIsDashedNotRed(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	out := ansi.Strip(dashboardMemMeter(renderer, defaultSettings(), 0, false, 10, "#000000"))
-	if out != strings.Repeat("─", 10) {
-		t.Fatalf("dashboardMemMeter(hasLimit=false) = %q, want 10 dashes", out)
-	}
-}
-
-// TestDashboardMemMeterGaugeStyleUsesGaugeBar checks that choosing the
-// Gauge Graph style in Settings actually changes the Dashboard's memory
-// meter shape — a single proportional "━"/"╸"/"─" bar, the same look
-// graphStyleGauge gives every stat row in the single-container Stats pane
-// — rather than the block meter's "█"/"░" cells.
-func TestDashboardMemMeterGaugeStyleUsesGaugeBar(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	settings := defaultSettings()
-	settings.GraphStyle = graphStyleGauge
-
-	out := ansi.Strip(dashboardMemMeter(renderer, settings, 50, true, 10, "#000000"))
-	if strings.ContainsAny(out, "█░") {
-		t.Fatalf("dashboardMemMeter(gauge style) = %q, want the gauge bar's ━/╸/─ glyphs, not the block meter's █/░", out)
-	}
-	if !strings.ContainsAny(out, "━╸") {
-		t.Fatalf("dashboardMemMeter(gauge style) = %q, want at least one ━ or ╸ gauge glyph", out)
-	}
-}
-
-// TestDashboardSparkGaugeStyleUsesGaugeBar is TestDashboardMemMeterGaugeStyleUsesGaugeBar's
-// counterpart for the CPU/network sparkline shape.
-func TestDashboardSparkGaugeStyleUsesGaugeBar(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	settings := defaultSettings()
-	settings.GraphStyle = graphStyleGauge
-
-	graph := statGraph{values: []float64{10, 20, 50}, maxValue: 100}
-	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
-	out := ansi.Strip(dashboardSpark(renderer, settings, graph, flatColor, 10, "#000000"))
-	if strings.ContainsAny(out, "▁▂▃▄▅▆▇█") {
-		t.Fatalf("dashboardSpark(gauge style) = %q, want the gauge bar's ━/╸/─ glyphs, not per-sample block glyphs", out)
-	}
-	if !strings.ContainsAny(out, "━╸") {
-		t.Fatalf("dashboardSpark(gauge style) = %q, want at least one ━ or ╸ gauge glyph for a nonzero value", out)
-	}
-}
-
-// TestDashboardSparkHonorsGraphStyleGlyphSet checks that non-gauge Graph
-// styles change the sparkline's glyph set the same way they do for the
-// single-container Stats pane's own sparkline (graphGlyphs is the exact
-// function both paths call) — Braille's glyphs are a completely disjoint
-// Unicode block from Blocks/Bars/the default Wave, so this is an
-// unambiguous signal the setting is actually being consulted.
-func TestDashboardSparkHonorsGraphStyleGlyphSet(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	graph := statGraph{values: []float64{10, 90}, maxValue: 100}
-
-	blocks := defaultSettings()
-	blocks.GraphStyle = graphStyleBlocks
-	braille := defaultSettings()
-	braille.GraphStyle = graphStyleBraille
-
-	flatColor := func(float64) lipgloss.Color { return "#7dcfff" }
-	blocksOut := ansi.Strip(dashboardSpark(renderer, blocks, graph, flatColor, 10, "#000000"))
-	brailleOut := ansi.Strip(dashboardSpark(renderer, braille, graph, flatColor, 10, "#000000"))
-	// Braille style now composes its own dot patterns (renderBrailleGraph)
-	// rather than picking from a fixed 4-glyph set, so any rune in the
-	// Unicode Braille Patterns block (U+2800-U+28FF) counts, not just the
-	// old 4 pre-made glyphs.
-	isBraille := func(r rune) bool { return r >= 0x2800 && r <= 0x28FF }
-	if strings.ContainsFunc(blocksOut, isBraille) {
-		t.Fatalf("dashboardSpark(blocks style) = %q, want block glyphs (▁-█), not Braille", blocksOut)
-	}
-	if !strings.ContainsFunc(brailleOut, isBraille) {
-		t.Fatalf("dashboardSpark(braille style) = %q, want at least one Braille dot pattern", brailleOut)
-	}
-}
-
-// TestDashboardSparkColorsEachGlyphByItsOwnValue is the regression test
-// for a spike getting flattened to whatever color the *latest* sample
-// grades to: a historical spike sitting among quiet neighbors must render
-// its own glyph in its own (hotter) color, not the line's single most
-// recent value's color — see dashboardSpark's doc comment for why that's
-// safe now that colorFor grades on absolute thresholds.
-func TestDashboardSparkColorsEachGlyphByItsOwnValue(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	graph := statGraph{values: []float64{2, 2, 95, 2}, maxValue: 100}
-
-	out := dashboardSpark(renderer, defaultSettings(), graph, dashboardGraphColor, 10, "#000000")
-
-	sgrFor := func(color lipgloss.Color) string {
-		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
-		return rendered[:strings.Index(rendered, "x")]
-	}
-	redSGR := sgrFor("#e06c75")
-	greenSGR := sgrFor("#80c990")
-
-	if !strings.Contains(out, redSGR) {
-		t.Fatalf("dashboardSpark output = %q, want the spike sample's own red foreground SGR (%q)", out, redSGR)
-	}
-	if !strings.Contains(out, greenSGR) {
-		t.Fatalf("dashboardSpark output = %q, want a quiet neighbor sample's own green foreground SGR (%q)", out, greenSGR)
-	}
-}
-
-// TestDashboardSparkColorsQuietTrafficByShapeNotAbsoluteRate is the
-// regression guard for a Dashboard reported live as having entirely
-// colorless NET sparklines. Glyph color used to come from colorFor's
-// absolute byte-rate scale, whose landmarks are tens of megabytes per
-// second — so a normal home fleet idling in the hundreds of bytes graded
-// every single sample to the gradient's cold end and every glyph rendered
-// the identical flat identity blue, carrying no information whatever.
-// Color now keys off the glyph's drawn height, so a sparkline with any
-// shape to it always has color that varies with that shape.
-func TestDashboardSparkColorsQuietTrafficByShapeNotAbsoluteRate(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-	// Byte rates from a real quiet container: peaks at ~1.5K/s, which is
-	// thousands of times below the absolute scale's first landmark.
-	graph := statGraph{values: []float64{0, 200, 1500, 400, 1500, 0}, maxValue: 1500}
-
-	netColor := func(v float64) lipgloss.Color { return dashboardNetGraphColor(uint64(v)) }
-	out := dashboardSpark(renderer, defaultSettings(), graph, netColor, 12, "#000000")
-
-	sgrFor := func(color lipgloss.Color) string {
-		rendered := lipgloss.NewStyle().Foreground(color).Render("x")
-		return rendered[:strings.Index(rendered, "x")]
-	}
-	for _, want := range []lipgloss.Color{"#80c990", "#e06c75"} {
-		if !strings.Contains(out, sgrFor(want)) {
-			t.Fatalf("quiet-traffic sparkline = %q, want it to span the palette including %q — a flat one-color line means color is keyed on an absolute scale this fleet never reaches", out, want)
-		}
-	}
-}
-
-// TestDashboardGraphColorSettingDoesNotAffectDashboardColors is the
-// regression test for the whole point of dashboardThresholdColor:
-// changing settings.GraphColor (which switches the single-container Stats
-// pane between its relative heat gradient, a flat per-metric color, and
-// monochrome) must not change what color the Dashboard's memory meter
-// picks for a given percentage — that color comes from the absolute
-// dashboardWarnPct/dashboardCritPct cutoffs only.
-func TestDashboardGraphColorSettingDoesNotAffectDashboardColors(t *testing.T) {
-	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
-
-	var outputs []string
-	for _, mode := range []graphColorMode{graphColorGradient, graphColorMetric, graphColorMono} {
-		settings := defaultSettings()
-		settings.GraphColor = mode
-		outputs = append(outputs, dashboardMemMeter(renderer, settings, 2.7, true, 10, "#000000"))
-	}
-	for i := 1; i < len(outputs); i++ {
-		if outputs[i] != outputs[0] {
-			t.Fatalf("dashboardMemMeter output changed across GraphColor modes: %q vs %q — want it independent of that setting", outputs[0], outputs[i])
-		}
-	}
-}
-
 // TestDashboardNetSparkQuietWhenZero is the regression test for goal #4's
 // "zero traffic should appear visually quiet": a container with no
 // network history, or whose *entire* visible history is zero, must render
@@ -1006,7 +823,7 @@ func TestDashboardRowNeverExceedsWidth(t *testing.T) {
 				if !ctr.IsRunning() {
 					continue
 				}
-				row := model.dashboardRow(renderer, ctr, width, selected)
+				row := model.dashboardRow(renderer, ctr, width, selected, false)
 				if got := len([]rune(ansi.Strip(row))); got > width {
 					t.Fatalf("width=%d selected=%v: row visible width = %d, want <= %d\nrow: %q", width, selected, got, width, ansi.Strip(row))
 				}
@@ -1050,34 +867,276 @@ func TestDashboardProblemsRowWarnsOnlyWhenStopped(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	defer lipgloss.SetColorProfile(original)
 
-	model := testModel()
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	stopped := func(names ...string) []attentionItem {
+		items := make([]attentionItem, len(names))
+		for i, name := range names {
+			items[i] = attentionItem{name: name, reason: "stopped", rank: 3}
+		}
+		return items
+	}
 
-	warn := ansi.Strip(model.dashboardProblemsRow(renderer, 3, 0, 80))
+	warn := ansi.Strip(model.dashboardProblemsRow(renderer, stopped("a", "b", "c"), 0, 80))
 	if !strings.Contains(warn, "⚠ 3 containers need attention") || !strings.Contains(warn, "View problems") {
 		t.Fatalf("dashboardProblemsRow(3) = %q, want a warning naming the count plus the View problems action", warn)
 	}
 
-	singular := ansi.Strip(model.dashboardProblemsRow(renderer, 1, 0, 80))
+	singular := ansi.Strip(model.dashboardProblemsRow(renderer, stopped("a"), 0, 80))
 	if !strings.Contains(singular, "1 container needs attention") {
 		t.Fatalf("dashboardProblemsRow(1) = %q, want singular \"container needs\"", singular)
 	}
 
-	healthy := ansi.Strip(model.dashboardProblemsRow(renderer, 0, 0, 80))
+	healthy := ansi.Strip(model.dashboardProblemsRow(renderer, nil, 0, 80))
 	if !strings.Contains(healthy, "All monitored containers healthy") || strings.Contains(healthy, "⚠") {
-		t.Fatalf("dashboardProblemsRow(0) = %q, want a quiet all-clear line with no warning glyph", healthy)
+		t.Fatalf("dashboardProblemsRow(none) = %q, want a quiet all-clear line with no warning glyph", healthy)
 	}
 
 	// The warning line breathes on the pulse clock: two different frames
 	// (a sine trough vs. peak) must pick visibly different amber shades,
 	// while the healthy all-clear line stays byte-identical frame to frame.
-	warnLo := model.dashboardProblemsRow(renderer, 3, 18, 80) // sine trough → dim amber
-	warnHi := model.dashboardProblemsRow(renderer, 3, 6, 80)  // sine peak → bright amber
+	warnLo := model.dashboardProblemsRow(renderer, stopped("a", "b", "c"), 18, 80) // sine trough → dim amber
+	warnHi := model.dashboardProblemsRow(renderer, stopped("a", "b", "c"), 6, 80)  // sine peak → bright amber
 	if warnLo == warnHi {
 		t.Fatalf("dashboardProblemsRow warning did not change between pulse trough and peak:\n%q", warnLo)
 	}
-	if model.dashboardProblemsRow(renderer, 0, 6, 80) != model.dashboardProblemsRow(renderer, 0, 18, 80) {
+	if model.dashboardProblemsRow(renderer, nil, 6, 80) != model.dashboardProblemsRow(renderer, nil, 18, 80) {
 		t.Fatal("dashboardProblemsRow all-clear line must not animate")
+	}
+}
+
+// The bottom row names the offenders, worst first, and says how many more
+// there are when they don't fit — never overflowing its width.
+func TestDashboardProblemsRowNamesOffenders(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	items := []attentionItem{
+		{name: "postgres", reason: "dead", rank: 0},
+		{name: "radarr", reason: "unhealthy", rank: 1},
+		{name: "adguardhome", reason: "stopped", rank: 3},
+		{name: "prowlarr", reason: "stopped", rank: 3},
+		{name: "sonarr", reason: "stopped", rank: 3},
+	}
+
+	wide := ansi.Strip(model.dashboardProblemsRow(renderer, items, 0, 100))
+	if !strings.Contains(wide, "postgres (dead) · radarr (unhealthy)") {
+		t.Fatalf("row = %q, want the worst offenders named first, with their reasons", wide)
+	}
+	if got := lipgloss.Width(wide); got > 100 {
+		t.Fatalf("row width = %d, want <= 100: %q", got, wide)
+	}
+
+	mid := ansi.Strip(model.dashboardProblemsRow(renderer, items, 0, 80))
+	if !strings.Contains(mid, "more") || !strings.Contains(mid, "View problems") {
+		t.Fatalf("row = %q, want a \"+N more\" tail and the action still visible", mid)
+	}
+	if got := lipgloss.Width(mid); got > 80 {
+		t.Fatalf("row width = %d, want <= 80: %q", got, mid)
+	}
+
+	narrow := ansi.Strip(model.dashboardProblemsRow(renderer, items, 0, 50))
+	if strings.Contains(narrow, "postgres") || !strings.Contains(narrow, "⚠ 5 containers need attention") {
+		t.Fatalf("row = %q, want only the count when no name fits", narrow)
+	}
+}
+
+// An unhealthy-but-running container needs attention too; the old
+// stopped-only count let the bottom row say "all healthy" while the summary
+// above it counted an UNHEALTHY one.
+func TestDashboardAttentionItemsIncludeUnhealthyRunning(t *testing.T) {
+	model := testModel()
+	items := model.dashboardAttentionItems()
+	if len(items) != 2 {
+		t.Fatalf("attention items = %#v, want radarr-1 (unhealthy) and jellyfin-1 (stopped)", items)
+	}
+	if items[0].name != "radarr-1" || items[0].reason != "unhealthy" {
+		t.Fatalf("items[0] = %#v, want the unhealthy one first (worst first)", items[0])
+	}
+	if items[1].name != "jellyfin-1" || items[1].reason != "stopped" {
+		t.Fatalf("items[1] = %#v, want the stopped one second", items[1])
+	}
+}
+
+// A container without a memory limit reports the host's total as its
+// limit, so summing limits counted the machine once per container.
+func TestFleetSummaryMemLimitIsHostCapacityNotSum(t *testing.T) {
+	model := testModel()
+	const host = 8 * 1024 * 1024 * 1024
+	for _, id := range []string{"1", "extra"} {
+		if id == "extra" {
+			model.snapshot.Standalone = append(model.snapshot.Standalone, domain.Container{
+				ID: domain.ResourceID{Host: "local", ID: id}, Name: "extra", State: domain.StateRunning,
+			})
+		}
+		model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: id}, MemoryUsage: host / 8, MemoryLimit: host})
+	}
+
+	summary := model.fleetSummary()
+	if summary.memLimit != host {
+		t.Fatalf("memLimit = %d, want the host's %d (not summed across containers)", summary.memLimit, host)
+	}
+	if summary.memUsed != host/4 {
+		t.Fatalf("memUsed = %d, want usage summed to %d", summary.memUsed, host/4)
+	}
+}
+
+func modelWithRunning(t *testing.T, cpu map[string]float64) Model {
+	t.Helper()
+	model := testModel()
+	model.snapshot.Standalone = nil
+	model.snapshot.Projects = nil
+	for name, pct := range cpu {
+		id := domain.ResourceID{Host: "local", ID: name}
+		model.snapshot.Standalone = append(model.snapshot.Standalone, domain.Container{ID: id, Name: name, State: domain.StateRunning})
+		model.appendStats(domain.ContainerStats{ID: id, CPUPercent: pct, MemoryUsage: uint64(pct), MemoryLimit: 100})
+	}
+	return model
+}
+
+func runningNames(model Model) []string {
+	running, _ := model.dashboardRunningContainers()
+	names := make([]string, len(running))
+	for i, ctr := range running {
+		names[i] = ctr.DisplayName()
+	}
+	return names
+}
+
+func TestDashboardSortOrdersHeaviestFirst(t *testing.T) {
+	model := modelWithRunning(t, map[string]float64{"alpha": 5, "bravo": 90, "charlie": 40})
+
+	if got := strings.Join(runningNames(model), ","); got != "alpha,bravo,charlie" {
+		t.Fatalf("name sort = %s, want alphabetical", got)
+	}
+	model.dashboardSort = dashboardSortCPU
+	if got := strings.Join(runningNames(model), ","); got != "bravo,charlie,alpha" {
+		t.Fatalf("CPU sort = %s, want heaviest first", got)
+	}
+	model.dashboardSort = dashboardSortMem
+	if got := strings.Join(runningNames(model), ","); got != "bravo,charlie,alpha" {
+		t.Fatalf("memory sort = %s, want highest fraction of limit first", got)
+	}
+
+	// Ties fall back to name so the order is stable between refreshes.
+	tied := modelWithRunning(t, map[string]float64{"zulu": 10, "alpha": 10})
+	tied.dashboardSort = dashboardSortCPU
+	if got := strings.Join(runningNames(tied), ","); got != "alpha,zulu" {
+		t.Fatalf("tied CPU sort = %s, want name order", got)
+	}
+}
+
+func TestDashboardSortNetworkUsesLatestRate(t *testing.T) {
+	model := modelWithRunning(t, map[string]float64{"alpha": 1, "bravo": 1})
+	for _, name := range []string{"alpha", "bravo"} {
+		id := domain.ResourceID{Host: "local", ID: name}
+		history := model.statsHistory[id]
+		rate := uint64(10)
+		if name == "bravo" {
+			rate = 5000
+		}
+		history.NetworkRx = []uint64{rate}
+		history.NetworkTx = []uint64{rate}
+		model.statsHistory[id] = history
+	}
+	model.dashboardSort = dashboardSortNet
+	if got := strings.Join(runningNames(model), ","); got != "bravo,alpha" {
+		t.Fatalf("network sort = %s, want the busiest first", got)
+	}
+}
+
+// The highlight follows its container when a refresh reorders the list,
+// rather than staying on the same row and silently changing target.
+func TestDashboardCursorFollowsContainerAcrossResort(t *testing.T) {
+	model := modelWithRunning(t, map[string]float64{"alpha": 5, "bravo": 90, "charlie": 40})
+	model.width, model.height = 120, 34
+	model.overlay = overlayDashboard
+	model.dashboardSort = dashboardSortCPU // bravo, charlie, alpha
+
+	model.dashboardMoveCursor(1) // charlie
+	shown, _, _, _, _ := model.dashboardBodyPlan()
+	if got := shown[model.dashboardSelectedIndex(shown)].DisplayName(); got != "charlie" {
+		t.Fatalf("cursor on %q, want charlie", got)
+	}
+
+	// alpha spikes and jumps to the top; the cursor must stay on charlie.
+	model.appendStats(domain.ContainerStats{ID: domain.ResourceID{Host: "local", ID: "alpha"}, CPUPercent: 99})
+	shown, _, _, _, _ = model.dashboardBodyPlan()
+	if shown[0].DisplayName() != "alpha" {
+		t.Fatalf("shown[0] = %q, want alpha after the spike", shown[0].DisplayName())
+	}
+	if got := shown[model.dashboardSelectedIndex(shown)].DisplayName(); got != "charlie" {
+		t.Fatalf("after re-sort cursor on %q, want it to follow charlie", got)
+	}
+
+	// Enter opens the container the cursor is on, not whatever now sits at
+	// the old row index.
+	model.rows = model.buildRows()
+	updated, _ := model.dashboardOpenSelected()
+	if got := updated.(Model).selectedID.ID; got != "charlie" {
+		t.Fatalf("enter opened %q, want charlie", got)
+	}
+}
+
+func TestDashboardSKeyCyclesSortAndKeepsCursorOnContainer(t *testing.T) {
+	model := modelWithRunning(t, map[string]float64{"alpha": 5, "bravo": 90})
+	model.width, model.height = 120, 34
+	model.overlay = overlayDashboard
+	model.dashboardMoveCursor(1) // bravo, by name order alpha,bravo
+
+	seen := []dashboardSortMode{model.dashboardSort}
+	cur := model
+	for range int(dashboardSortModeCount) {
+		updated, _ := cur.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+		cur = updated.(Model)
+		seen = append(seen, cur.dashboardSort)
+		if cur.overlay != overlayDashboard {
+			t.Fatalf("s closed the dashboard (overlay = %v)", cur.overlay)
+		}
+		shown, _, _, _, _ := cur.dashboardBodyPlan()
+		if got := shown[cur.dashboardSelectedIndex(shown)].DisplayName(); got != "bravo" {
+			t.Fatalf("after s (%v) cursor on %q, want it to stay on bravo", cur.dashboardSort, got)
+		}
+	}
+	want := []dashboardSortMode{dashboardSortName, dashboardSortCPU, dashboardSortMem, dashboardSortNet, dashboardSortName}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("sort sequence = %v, want %v (cycle and wrap)", seen, want)
+		}
+	}
+}
+
+func TestDashboardHeaderRowMarksActiveSortColumn(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+
+	byName := ansi.Strip(model.dashboardHeaderRow(renderer, 120))
+	if !strings.Contains(byName, "CONTAINER ▲") || strings.Contains(byName, "▼") {
+		t.Fatalf("name-sorted header = %q, want only CONTAINER ▲", byName)
+	}
+
+	model.dashboardSort = dashboardSortCPU
+	byCPU := ansi.Strip(model.dashboardHeaderRow(renderer, 120))
+	if !strings.Contains(byCPU, "▼CPU") || strings.Contains(byCPU, "▲") {
+		t.Fatalf("CPU-sorted header = %q, want ▼CPU and no name arrow", byCPU)
+	}
+	if got := lipgloss.Width(byCPU); got > 120 {
+		t.Fatalf("header width = %d, want <= 120", got)
+	}
+}
+
+func TestDashboardFleetSparkRowShowsMemoryGauge(t *testing.T) {
+	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
+	model := testModel()
+	summary := dashboardSummary{counts: map[string]int{}, totalCPU: 80, cpuCores: 8, memUsed: 2 << 30, memLimit: 8 << 30}
+
+	row := ansi.Strip(model.dashboardFleetSparkRow(renderer, summary, 120))
+	for _, want := range []string{"CPU ", "MEM ", "NET ", "10.0%", " 25%"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("fleet row = %q, missing %q (CPU is 80%% of one core = 10%% of 8 cores; RAM 2/8 GiB = 25%%)", row, want)
+		}
+	}
+	if got := lipgloss.Width(row); got > 120 {
+		t.Fatalf("fleet row width = %d, want <= 120", got)
 	}
 }
 
@@ -1279,8 +1338,8 @@ func TestDashboardRowSelectionIsRailOnlyNotBackground(t *testing.T) {
 		t.Fatal("no running container found to render a row for")
 	}
 
-	selected := model.dashboardRow(renderer, ctr, 120, true)
-	unselected := model.dashboardRow(renderer, ctr, 120, false)
+	selected := model.dashboardRow(renderer, ctr, 120, true, false)
+	unselected := model.dashboardRow(renderer, ctr, 120, false, false)
 
 	// Rail: the selected row starts with the "▌" marker; the unselected
 	// row does not.

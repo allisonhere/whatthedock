@@ -416,10 +416,33 @@ Press `d` for the Dashboard.
 It shows a quick view of the host, running containers, CPU, memory, network
 activity, and problems.
 
+- **Cards.** Four cards across the top show fleet CPU, memory, network, and a
+  status bar (running / restarting / stopped / dead / unhealthy). CPU and memory
+  are measured against the host's capacity, each border is tinted by how hot
+  that metric is, and the borders flash briefly on every refresh. On a small
+  terminal the cards collapse to a one-line summary so the list keeps its rows.
+- **List.** Each row has the container's uptime (`UP`), restart count (`RST`,
+  fetched every 30 seconds, `↻N` when it has restarted), CPU and memory bars,
+  and network trends. Rows are banded, hot rows are tinted, and the selected row
+  is washed with the theme's accent. `UP` and `RST` appear when the row is wide
+  enough.
+- **Stacks.** `g` groups the list under a header per Compose stack, with each
+  stack's running/stopped counts, summed CPU and memory, and a `⚠` for
+  containers that need attention. Standalone containers come last.
+- **Attention row.** The bottom row names the containers that need attention
+  (dead, unhealthy, restarting, stopped), worst first.
+- **Graph style.** The `←` / `→` keys cycle the Graph style, and every style
+  changes the CPU, memory and network columns of the list: `gauge` is a thin
+  bar and `bars` a chunky bar (both show the latest value); `wave` is a smoothed
+  history that fades with age, `blocks` an unsmoothed history, and `braille` a
+  high-resolution history.
+
 | Key | What it does |
 |---|---|
 | `j` / `k` | Move through rows |
 | `Enter` | Open the highlighted container |
+| `s` | Sort by name, CPU, memory, or network (heaviest first); the highlight stays on its container |
+| `g` | Group by Compose stack / back to a flat list |
 | `p` | Jump to Problems |
 | `Esc` / `q` / `d` | Close Dashboard |
 

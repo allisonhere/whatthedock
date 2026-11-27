@@ -1195,8 +1195,8 @@ func TestRenderLogLinePreservesTextWhenStripped(t *testing.T) {
 // text ended whatthedock's outer background style early, showing the
 // terminal's raw default background for everything after it (reported as
 // a stray background appearing right after a log line's timestamp).
-// cleanDockerLogLine now strips embedded ANSI codes the same way it
-// already strips the Docker multiplexed-stream framing header.
+// cleanDockerLogLine strips embedded ANSI codes. (Docker's multiplexed
+// framing is removed by the provider, not here.)
 func TestCleanDockerLogLineStripsEmbeddedANSI(t *testing.T) {
 	line := "2026-08-12T12:00:00Z \x1b[32mINFO\x1b[0m server started"
 	if got := cleanDockerLogLine(line); got != "2026-08-12T12:00:00Z INFO server started" {
@@ -1204,13 +1204,11 @@ func TestCleanDockerLogLineStripsEmbeddedANSI(t *testing.T) {
 	}
 }
 
-// TestCleanDockerLogLineStripsHeaderAndANSITogether checks both cleanups
-// compose correctly on a line that has the Docker stream header AND
-// embedded ANSI codes from the container's own colorized output.
-func TestCleanDockerLogLineStripsHeaderAndANSITogether(t *testing.T) {
-	line := "\x01\x00\x00\x00\x00\x00\x00\x08\x1b[31mERROR\x1b[0m failed"
-	if got := cleanDockerLogLine(line); got != "ERROR failed" {
-		t.Fatalf("cleanDockerLogLine(%q) = %q, want %q", line, got, "ERROR failed")
+// A leading control byte is real content now that no header is guessed at.
+func TestCleanDockerLogLineKeepsLeadingTab(t *testing.T) {
+	line := "\tat com.example.Main.run(Main.java:42)"
+	if got := cleanDockerLogLine(line); got != line {
+		t.Fatalf("cleanDockerLogLine(%q) = %q, want unchanged", line, got)
 	}
 }
 
@@ -2081,7 +2079,7 @@ func TestStatsViewShowsHeatSparklineAndDeltas(t *testing.T) {
 	// Every Stats row, CPU included, renders as an ordinary sparkline
 	// following the chosen Graph style — the always-gauge treatment is
 	// Dashboard-only (see renderCPUGauge's doc comment).
-	for _, want := range []string{"▓▓▓▓░", "▂▃", "↗ 72.0%", "↗ +4"} {
+	for _, want := range []string{"▓▓▓▓░", "▁▆", "↗ 72.0%", "↗ +4"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing hybrid stats treatment %q:\n%s", want, view)
 		}
@@ -2153,9 +2151,17 @@ func TestHeatSparklineStylesEachGlyph(t *testing.T) {
 	renderer := tideui.NewRenderer(whatthedockTheme(), tideui.StyleOptions{Density: tideui.Compact, PaneCorners: tideui.RoundCorners})
 	graph := statGraph{values: []float64{0, 50, 100}, maxValue: 100, fallbackLevel: 1}
 
-	raw := renderSparkline(renderer, defaultSettings(), graph, lipgloss.Color("#7dcfff"), 10)
-	if view := ansi.Strip(raw); view != "▁▇▇" {
-		t.Fatalf("renderSparkline() = %q, want ▁▇▇", view)
+	// Blocks draws each sample raw: 0 → ▁, half → ▄, full → █.
+	settings := defaultSettings()
+	settings.GraphStyle = graphStyleBlocks
+	raw := renderSparkline(renderer, settings, graph, lipgloss.Color("#7dcfff"), 10)
+	if view := ansi.Strip(raw); view != "▁▄█" {
+		t.Fatalf("blocks renderSparkline() = %q, want ▁▄█", view)
+	}
+	// The default wave smooths the same series into a trend.
+	wave := renderSparkline(renderer, defaultSettings(), graph, lipgloss.Color("#7dcfff"), 10)
+	if view := ansi.Strip(wave); view != "▂▄▆" {
+		t.Fatalf("wave renderSparkline() = %q, want the smoothed ▂▄▆", view)
 	}
 }
 

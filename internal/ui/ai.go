@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -96,9 +95,7 @@ func fetchRecentLogLines(ctx context.Context, provider app.Provider, id domain.R
 		return nil
 	}
 	defer stream.Close()
-	scanner := bufio.NewScanner(stream)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner := newLogScanner(stream)
 	lines := make([]string, 0, maxLines)
 	for scanner.Scan() && len(lines) < maxLines {
 		lines = append(lines, truncateRunes(cleanDockerLogLine(scanner.Text()), aiLogLineMaxRunes))

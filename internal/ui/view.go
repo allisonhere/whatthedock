@@ -1040,6 +1040,9 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 	unit := 1 + graphGlyphSpacing(settings)
 	maxValues := max(1, width/unit)
 	values := graph.values
+	if settings.GraphStyle == graphStyleWave {
+		values = smoothSeries(values) // wave rounds single-poll spikes into the trend
+	}
 	if len(values) > maxValues {
 		values = values[len(values)-maxValues:]
 	}
@@ -1062,15 +1065,16 @@ func renderSparkline(renderer tideui.Renderer, settings appSettings, graph statG
 	return strings.Join(out, "")
 }
 
+// graphGlyphs is the glyph ladder, shortest to tallest. Every sparkline
+// style except braille uses the same eight block heights — what tells wave,
+// blocks and bars apart is how the series is drawn (smoothed, raw, spaced),
+// not the glyphs. Wave used to have its own jagged 14-glyph list that
+// wasn't monotonic, so a bigger value could draw shorter than a smaller one.
 func graphGlyphs(settings appSettings) []string {
-	switch settings.GraphStyle {
-	case graphStyleBlocks, graphStyleBars, graphStyleGauge:
-		return []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
-	case graphStyleBraille:
+	if settings.GraphStyle == graphStyleBraille {
 		return []string{"⣀", "⣤", "⣶", "⣿"}
-	default:
-		return []string{"▁", "▂", "▂", "▃", "▄", "▅", "▇", "█", "▆", "▄", "▃", "▅", "▆", "▇"}
 	}
+	return []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 }
 
 // brailleDotBits maps each dot's position in a Unicode braille cell's 2x4
@@ -1298,11 +1302,9 @@ func graphHeatColor(t float64) lipgloss.Color {
 }
 
 // graphGlyphHeight is how tall each sparkline glyph actually draws, as a
-// fraction of a full cell. Color keys off this rather than a sample's
-// index in the series because graphStyleWave's glyph list is deliberately
-// non-monotonic — the same character reappears at different sequence
-// positions — so indexing by position would mis-color it. Keying on the
-// character means the color always agrees with what the glyph looks like.
+// fraction of a full cell. Color keys off the drawn glyph's height rather
+// than a sample's index in the series, so the color always agrees with
+// what the glyph looks like whatever ladder or style produced it.
 var graphGlyphHeight = map[string]float64{
 	"▁": 0.0 / 7, "▂": 1.0 / 7, "▃": 2.0 / 7, "▄": 3.0 / 7,
 	"▅": 4.0 / 7, "▆": 5.0 / 7, "▇": 6.0 / 7, "█": 7.0 / 7,
@@ -1820,9 +1822,16 @@ func (m Model) snapshotContainers() []domain.Container {
 // line never disagrees with the tree/Problems pane about what a container
 // counts as.
 type dashboardSummary struct {
-	counts               map[string]int
-	totalCPU             float64
-	memUsed, memLimit    uint64
+	counts   map[string]int
+	totalCPU float64
+	memUsed  uint64
+	// memLimit is the host's memory capacity, not a sum of per-container
+	// limits: a container with no memory limit reports the *host's* total
+	// as its limit, so summing across N containers counted the machine N
+	// times over. The largest limit any container reports is the best
+	// estimate of the real capacity available (a fleet where every
+	// container is capped reports the biggest cap, an underestimate).
+	memLimit             uint64
 	netRxRate, netTxRate uint64
 	// peakPressure is the single hottest signal anywhere in the fleet —
 	// the max over running containers of that container's CPU% or (when it
@@ -1859,7 +1868,7 @@ func (m Model) fleetSummary() dashboardSummary {
 		summary.totalCPU += history.lastStats.CPUPercent
 		summary.cpuCores = math.Max(summary.cpuCores, history.lastStats.CPUCores)
 		summary.memUsed += history.lastStats.MemoryUsage
-		summary.memLimit += history.lastStats.MemoryLimit
+		summary.memLimit = maxUint(summary.memLimit, history.lastStats.MemoryLimit)
 		pressure := history.lastStats.CPUPercent
 		if history.lastStats.MemoryLimit > 0 {
 			pressure = math.Max(pressure, float64(history.lastStats.MemoryUsage)/float64(history.lastStats.MemoryLimit)*100)
@@ -3762,6 +3771,8 @@ var helpSections = []helpSection{
 			{"/", "search inside Help while Help is open"},
 			{"d", "dashboard: fleet summary and container stats"},
 			{"Dashboard Enter", "open highlighted container"},
+			{"Dashboard s", "cycle sort: name, CPU, memory, network"},
+			{"Dashboard g", "group the list by Compose stack"},
 			{"Dashboard p", "jump from dashboard to Problems"},
 			{"T", "theme picker"},
 			{", / Ctrl+,", "settings"},
@@ -3933,17 +3944,11 @@ func (m Model) appLogBodyBudget() int {
 	return m.softOverlayBodyBudget()
 }
 
-// dashboardHeaderRows is the fixed block dashboardOverlay always renders
-// above the container list — the fleet summary line, the aggregate CPU/NET
-// sparkline row, the mood strip, and the column header row. Subtracted
-// from softOverlayBodyBudget's allowance to get the list's own budget
-// (same shape as helpBodyBudget subtracting the status legend) and used by
-// dashboardBodyPlan/dashboardHitTest to map list rows to screen lines, so
-// it must stay equal to the number of lines that block actually renders.
-const dashboardHeaderRows = 4
-
+// dashboardListBudget is how many list lines fit under the header block
+// (see dashboardHeaderLineCount), within softOverlayBodyBudget's allowance
+// — same shape as helpBodyBudget subtracting the status legend.
 func (m Model) dashboardListBudget() int {
-	return max(3, m.softOverlayBodyBudget()-dashboardHeaderRows)
+	return max(3, m.softOverlayBodyBudget()-m.dashboardHeaderLineCount())
 }
 
 // dashboardWarnPct/dashboardCritPct are the absolute utilization
@@ -4024,17 +4029,145 @@ var dashboardStatusWords = map[string]string{
 	"!": "UNHEALTHY",
 }
 
-// dashboardRunningContainers returns every running container sorted by
-// display name (dashboardOverlay's order today; Compose-project grouping
-// is a natural next step once it can be designed properly — see the
-// package's goal #8 notes — but the sort lives in exactly one place so
-// swapping it for a grouped order later only touches this function) plus
-// how many non-running containers exist, matching fleetSummary/
+// dashboardSortMode is the Dashboard list's ordering. Name is alphabetical;
+// the metric modes put the heaviest container first, so the "N more"
+// overflow hides the quiet ones rather than the culprits.
+type dashboardSortMode int
+
+const (
+	dashboardSortName dashboardSortMode = iota
+	dashboardSortCPU
+	dashboardSortMem
+	dashboardSortNet
+	dashboardSortModeCount
+)
+
+func (s dashboardSortMode) String() string {
+	switch s {
+	case dashboardSortCPU:
+		return "CPU"
+	case dashboardSortMem:
+		return "memory"
+	case dashboardSortNet:
+		return "network"
+	default:
+		return "name"
+	}
+}
+
+// dashboardSortKey is the value a metric sort mode ranks ctr by, taken from
+// the same latest-sample data its row displays: CPU%, memory as a fraction
+// of its limit, and current ↓+↑ rate. A container that hasn't been polled
+// yet ranks as 0.
+func (m Model) dashboardSortKey(ctr domain.Container) float64 {
+	history := m.statsHistory[ctr.ID]
+	stats := history.lastStats
+	switch m.dashboardSort {
+	case dashboardSortCPU:
+		return statsCPU(stats)
+	case dashboardSortMem:
+		if stats != nil && stats.MemoryLimit > 0 {
+			return float64(stats.MemoryUsage) / float64(stats.MemoryLimit)
+		}
+	case dashboardSortNet:
+		var total uint64
+		if n := len(history.NetworkRx); n > 0 {
+			total += history.NetworkRx[n-1]
+		}
+		if n := len(history.NetworkTx); n > 0 {
+			total += history.NetworkTx[n-1]
+		}
+		return float64(total)
+	}
+	return 0
+}
+
+// dashboardSelectedIndex is the highlighted row within shown. The cursor
+// follows its container by ID rather than by position, so a re-sort after
+// a stats refresh doesn't slide the highlight onto a different container;
+// only when that container is no longer listed does it fall back to the
+// stored row index.
+func (m Model) dashboardSelectedIndex(shown []domain.Container) int {
+	if len(shown) == 0 {
+		return 0
+	}
+	if m.dashboardCursorID.ID != "" {
+		for i, ctr := range shown {
+			if ctr.ID == m.dashboardCursorID {
+				return i
+			}
+		}
+	}
+	return clamp(m.dashboardCursor, 0, len(shown)-1)
+}
+
+// attentionItem is one container the Dashboard's bottom row calls out: a
+// stopped, dead, restarting or unhealthy one (anything statusGlyph doesn't
+// show as a plain "●"), with the reason in the same words as the summary
+// line's counts.
+type attentionItem struct {
+	name   string
+	reason string
+	rank   int
+}
+
+// dashboardAttentionItems lists every container needing attention, worst
+// first (dead, unhealthy, restarting, stopped), then by name. Unlike the
+// stopped-only count this replaces, it includes running-but-unhealthy
+// containers, so the bottom row can't read "all healthy" while the summary
+// line above it counts an UNHEALTHY one.
+func (m Model) dashboardAttentionItems() []attentionItem {
+	var items []attentionItem
+	for _, ctr := range m.snapshotContainers() {
+		glyph := statusGlyph(ctr)
+		if glyph == "●" {
+			continue
+		}
+		reason := strings.ToLower(dashboardStatusWords[glyph])
+		if reason == "" {
+			reason = statusText(ctr)
+		}
+		rank := 4
+		switch glyph {
+		case "✖":
+			rank = 0
+		case "!":
+			rank = 1
+		case "▲":
+			rank = 2
+		case "○":
+			rank = 3
+		}
+		items = append(items, attentionItem{name: ctr.DisplayName(), reason: reason, rank: rank})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].rank != items[j].rank {
+			return items[i].rank < items[j].rank
+		}
+		return items[i].name < items[j].name
+	})
+	return items
+}
+
+// dashboardRunningContainers returns every running container in the
+// Dashboard's current order — by stack first when grouping is on, then by
+// name or heaviest-first by the chosen metric (name as the tiebreak) —
+// plus how many non-running containers exist, matching fleetSummary/
 // statusGlyph's own running/not-running split so the Dashboard and
 // Problems pane never disagree about what counts as "stopped."
 func (m Model) dashboardRunningContainers() (running []domain.Container, stopped int) {
 	containers := m.snapshotContainers()
 	sort.Slice(containers, func(i, j int) bool {
+		if m.dashboardGrouped {
+			if gi, gj := dashboardGroupOf(containers[i]), dashboardGroupOf(containers[j]); gi != gj {
+				return dashboardGroupLess(gi, gj)
+			}
+		}
+		if m.dashboardSort != dashboardSortName {
+			if ki, kj := m.dashboardSortKey(containers[i]), m.dashboardSortKey(containers[j]); ki != kj {
+				return ki > kj
+			}
+		}
 		return containers[i].DisplayName() < containers[j].DisplayName()
 	})
 	for _, ctr := range containers {
@@ -4047,15 +4180,37 @@ func (m Model) dashboardRunningContainers() (running []domain.Container, stopped
 	return running, stopped
 }
 
-// dashboardVisiblePlan trims running down to what budget rows can show,
-// reserving exactly one of those rows for a "N more" indicator the moment
-// it doesn't all fit.
-func dashboardVisiblePlan(running []domain.Container, budget int) (shown []domain.Container, more int) {
-	if len(running) <= budget {
+// dashboardVisiblePlan trims running down to what budget lines can show,
+// reserving exactly one of those lines for a "N more" indicator the moment
+// it doesn't all fit. With grouping on, each stack's header costs a line
+// too, and a header is never left stranded without a container under it.
+func dashboardVisiblePlan(running []domain.Container, budget int, grouped bool) (shown []domain.Container, more int) {
+	startsGroup := func(i int) bool {
+		return grouped && (i == 0 || dashboardGroupOf(running[i-1]) != dashboardGroupOf(running[i]))
+	}
+	need := 0
+	for i := range running {
+		need++
+		if startsGroup(i) {
+			need++
+		}
+	}
+	if need <= budget {
 		return running, 0
 	}
-	cut := max(0, budget-1)
-	return running[:cut], len(running) - cut
+	limit, used := max(0, budget-1), 0
+	for i := range running {
+		cost := 1
+		if startsGroup(i) {
+			cost++
+		}
+		if used+cost > limit {
+			break
+		}
+		used += cost
+		shown = running[:i+1]
+	}
+	return shown, len(running) - len(shown)
 }
 
 // dashboardBodyPlan is the single source of truth for which running
@@ -4067,8 +4222,8 @@ func dashboardVisiblePlan(running []domain.Container, budget int) (shown []domai
 func (m Model) dashboardBodyPlan() (shown []domain.Container, more, stopped, statusLineIdx, totalLines int) {
 	running, stopped := m.dashboardRunningContainers()
 	budget := m.dashboardListBudget()
-	shown, more = dashboardVisiblePlan(running, budget)
-	statusLineIdx = dashboardHeaderRows + len(shown)
+	shown, more = dashboardVisiblePlan(running, budget, m.dashboardGrouped)
+	statusLineIdx = m.dashboardHeaderLineCount() + len(m.dashboardListLines(shown))
 	if more > 0 || len(shown) == 0 {
 		statusLineIdx++
 	}
@@ -4076,35 +4231,48 @@ func (m Model) dashboardBodyPlan() (shown []domain.Container, more, stopped, sta
 	return shown, more, stopped, statusLineIdx, totalLines
 }
 
-// dashboardOverlay renders the full fleet dashboard: a header line
-// (status counts plus aggregate CPU/memory/network, see fleetSummary), a
-// column header, one row per running container, and a bottom status row
-// that only turns into a warning when something actually needs attention
-// (see dashboardProblemsRow) — deliberately sized far wider than every
-// other overlay (m.width-4 instead of the usual m.width-8-ish cap) since
-// the point of this screen is showing as much of the fleet at once as is still
-// comfortable to scan, not stretching every rule and row across huge monitors.
+// dashboardOverlay renders the full fleet dashboard: four stat cards (CPU,
+// MEM, NET, FLEET — or, on a small terminal, a one-line summary with gauges
+// and a heat ribbon, see dashboardUsesCards), a column header, one row per
+// running container (under a header per stack when grouped), and a bottom
+// row that names whatever needs attention (see dashboardProblemsRow) —
+// deliberately sized far wider than every other overlay (m.width-4 instead
+// of the usual m.width-8-ish cap) since the point of this screen is
+// showing as much of the fleet at once as is still comfortable to scan,
+// not stretching every rule and row across huge monitors.
 func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	width := dashboardPanelWidth(m.width)
 	contentWidth := width - 4
 	summary := m.fleetSummary()
+	attention := m.dashboardAttentionItems()
 
 	// age counts pulse frames (150ms each) since the last poll kicked off —
-	// drives the mood strip's brief post-refresh brightening.
+	// drives the post-refresh brightening of the cards' borders / the ribbon.
 	age := m.statusPulseFrame - m.dashboardRefreshFrame
 
-	lines := []string{
-		dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
-		dashboardPadLine(renderer, m.dashboardFleetSparkRow(renderer, summary, contentWidth), contentWidth),
-		m.dashboardMoodStrip(renderer, summary, age, contentWidth),
-		dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth),
+	var lines []string
+	if m.dashboardUsesCards() {
+		for _, card := range m.dashboardCards(renderer, summary, attention, age, contentWidth) {
+			lines = append(lines, dashboardPadLine(renderer, card, contentWidth))
+		}
+	} else {
+		lines = append(lines,
+			dashboardPadLine(renderer, m.dashboardSummaryLine(renderer, summary, contentWidth), contentWidth),
+			dashboardPadLine(renderer, m.dashboardFleetSparkRow(renderer, summary, contentWidth), contentWidth),
+			m.dashboardMoodStrip(renderer, summary, age, contentWidth),
+		)
 	}
+	lines = append(lines, dashboardPadLine(renderer, m.dashboardHeaderRow(renderer, contentWidth), contentWidth))
 
-	shown, more, stopped, _, _ := m.dashboardBodyPlan()
-	cursor := clamp(m.dashboardCursor, 0, max(0, len(shown)-1))
-	for i, ctr := range shown {
-		selected := m.dashboardCursorActive && len(shown) > 0 && i == cursor
-		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, ctr, contentWidth, selected), contentWidth))
+	shown, more, _, _, _ := m.dashboardBodyPlan()
+	cursor := m.dashboardSelectedIndex(shown)
+	for _, line := range m.dashboardListLines(shown) {
+		if line.isHeader() {
+			lines = append(lines, dashboardPadLine(renderer, m.dashboardGroupRow(renderer, line.group, contentWidth), contentWidth))
+			continue
+		}
+		selected := m.dashboardCursorActive && line.index == cursor
+		lines = append(lines, dashboardPadLine(renderer, m.dashboardRow(renderer, shown[line.index], contentWidth, selected, line.index%2 == 1), contentWidth))
 	}
 	switch {
 	case more > 0:
@@ -4112,13 +4280,19 @@ func (m Model) dashboardOverlay(renderer tideui.Renderer) *tideui.Overlay {
 	case len(shown) == 0:
 		lines = append(lines, dashboardPadLine(renderer, renderer.Styles.DetailMeta.Render("No running containers."), contentWidth))
 	}
-	lines = append(lines, dashboardPadLine(renderer, m.dashboardProblemsRow(renderer, stopped, m.statusPulseFrame, contentWidth), contentWidth))
+	lines = append(lines, dashboardPadLine(renderer, m.dashboardProblemsRow(renderer, attention, m.statusPulseFrame, contentWidth), contentWidth))
 
+	group := "group"
+	if m.dashboardGrouped {
+		group = "ungroup"
+	}
 	content := renderer.RenderSoftBody(width, strings.Join(lines, "\n")+"\n\n"+
 		renderer.RenderSoftHints(contentWidth,
 			tideui.SoftHint{Key: "esc/d/q", Label: "close"},
 			tideui.SoftHint{Key: "↑↓/jk", Label: "select"},
 			tideui.SoftHint{Key: "enter", Label: "open"},
+			tideui.SoftHint{Key: "s", Label: "sort: " + m.dashboardSort.String()},
+			tideui.SoftHint{Key: "g", Label: group},
 			tideui.SoftHint{Key: "←→", Label: "graph style"},
 		))
 	overlay := renderer.SoftPanelOverlay(tideui.SoftPanel{Prefix: "whatthedock", Title: "dashboard", Content: content, Width: width})
@@ -4160,9 +4334,14 @@ func (m Model) dashboardHitTest(msg tea.MouseMsg) (rowIndex int, isStatusRow, ok
 		return 0, false, false
 	}
 	y := msg.Y - bodyTop
+	header := m.dashboardHeaderLineCount()
+	lines := m.dashboardListLines(shown)
 	switch {
-	case y >= dashboardHeaderRows && y < dashboardHeaderRows+len(shown):
-		return y - dashboardHeaderRows, false, true
+	case y >= header && y < header+len(lines):
+		if line := lines[y-header]; !line.isHeader() {
+			return line.index, false, true
+		}
+		return 0, false, false // a stack header isn't a clickable row
 	case y == statusLineIdx:
 		return 0, true, true
 	}
@@ -4266,23 +4445,38 @@ func (m Model) dashboardMoodStrip(renderer tideui.Renderer, summary dashboardSum
 func (m Model) dashboardFleetSparkRow(renderer tideui.Renderer, summary dashboardSummary, width int) string {
 	bg := renderer.Styles.Theme.Bg
 	label := renderer.Styles.DetailMeta.Copy().Background(bg)
+	value := lipgloss.NewStyle().Background(bg).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg))
 
 	cpuGauge := func(w int) string {
 		return renderCPUGauge(renderer, statGraph{values: m.fleetCPUHistory}, summary.cpuCores*100, w, bg)
 	}
+	// MEM is a fill gauge of fleet memory against the host's capacity (see
+	// dashboardSummary.memLimit), not a trend: memory is a level, not a rate.
+	memGauge := func(w int) string {
+		return renderCPUGauge(renderer, statGraph{values: []float64{float64(summary.memUsed)}}, float64(summary.memLimit), w, bg)
+	}
+	netSpark := func(w int) string { return m.fleetNetSpark(renderer, w, bg) }
 
-	// "CPU " (4) + spark + "   NET " (7) + spark. Split the leftover evenly;
-	// drop NET, then the whole row, as the panel narrows.
+	// Full row: "CPU " + gauge + " 12.3%" + "  MEM " + gauge + " 19%" +
+	// "  NET " + spark — 28 fixed columns, the rest split three ways. The
+	// values sit beside the bars so a glance reads both "how full" and "how
+	// much". Drop MEM (and the values), then NET, then the whole row, as the
+	// panel narrows.
+	if each := (width - 28) / 3; each >= dashboardMinSparkW {
+		cpuVal, memVal := "n/a", "n/a"
+		if summary.cpuCores > 0 {
+			cpuVal = fmt.Sprintf("%.1f%%", summary.totalCPU/summary.cpuCores)
+		}
+		if summary.memLimit > 0 {
+			memVal = fmt.Sprintf("%.0f%%", float64(summary.memUsed)/float64(summary.memLimit)*100)
+		}
+		return label.Render("CPU ") + cpuGauge(each) + value.Render(" "+rightAlignRunes(cpuVal, 6)) +
+			label.Render("  MEM ") + memGauge(each) + value.Render(" "+rightAlignRunes(memVal, 4)) +
+			label.Render("  NET ") + netSpark(each)
+	}
+	// "CPU " (4) + spark + "   NET " (7) + spark.
 	if each := (width - 11) / 2; each >= dashboardMinSparkW {
-		var netMax, latestNet uint64
-		for _, v := range m.fleetNetHistory {
-			netMax = maxUint(netMax, v)
-		}
-		if len(m.fleetNetHistory) > 0 {
-			latestNet = m.fleetNetHistory[len(m.fleetNetHistory)-1]
-		}
-		net := dashboardNetSpark(renderer, m.settings, uintStatGraph(m.fleetNetHistory, netMax, byteLevel(latestNet), formatByteDelta, formatBytes), each, bg)
-		return label.Render("CPU ") + cpuGauge(each) + label.Render("   NET ") + net
+		return label.Render("CPU ") + cpuGauge(each) + label.Render("   NET ") + netSpark(each)
 	}
 	if width-4 >= dashboardMinSparkW {
 		return label.Render("CPU ") + cpuGauge(width-4)
@@ -4341,7 +4535,13 @@ func (m Model) dashboardSummaryLine(renderer tideui.Renderer, summary dashboardS
 	// metric" failure mode this redesign is trying to avoid — so the
 	// aggregate stays neutral here even though the per-row CPU number
 	// (a real single-container percentage) does use the threshold.
+	// With a known core count the fleet figure is the share of the whole
+	// machine in use (matching the gauge beneath it), not the raw sum of
+	// per-core percentages, which reads as a tiny number on a big host.
 	cpuText := fmt.Sprintf("CPU %.1f%%", summary.totalCPU)
+	if summary.cpuCores > 0 {
+		cpuText = fmt.Sprintf("CPU %.1f%% of %.0f cores", summary.totalCPU/summary.cpuCores, summary.cpuCores)
+	}
 	cpuSeg := segment{rendered: plain.Render(cpuText), plain: cpuText}
 
 	ramColor := baseFg
@@ -4424,6 +4624,8 @@ type dashboardColumns struct {
 	pctWidth    int
 	cpuSparkW   int
 	memMeterW   int
+	upW         int // uptime column; 0 when the row has no room for it
+	restartW    int // restart-count column; shown together with upW
 	netColWidth int // combined "↓X ↑Y" width, used when !splitNet
 	netSparkW   int // per-direction trend width, used when splitNet
 	splitNet    bool
@@ -4436,6 +4638,15 @@ const (
 	dashboardNetNumWidth = 6 // e.g. "46.1K", "348B" — no "/s", the ↓/↑ glyph already implies "rate"
 	dashboardMinSparkW   = 6
 	dashboardColGap      = 2
+)
+
+const (
+	dashboardUpWidth      = 4 // "36h", "11mo"
+	dashboardRestartWidth = 4 // "↻12", "↻99+"
+	// dashboardMetaWidth is what the UP + RST columns cost a row, gaps
+	// included. They're only shown when the sparklines still get their
+	// minimum width afterwards.
+	dashboardMetaWidth = dashboardUpWidth + dashboardColGap + dashboardRestartWidth + dashboardColGap
 )
 
 // dashboardNarrowBaseline/dashboardMediumBaseline/dashboardWideBaseline
@@ -4464,9 +4675,16 @@ const (
 func (m Model) dashboardColumnsFor(width int) dashboardColumns {
 	tier := dashboardTierFor(width)
 	nameWidth := 22
+	if tier == dashboardTierWide {
+		nameWidth = 30 // room for stack-prefixed names like "monitoring-prometheus-1"
+	}
 	fixed := dashboardRailWidth + nameWidth + dashboardColGap + 1 /*glyph*/ + dashboardColGap
 	remaining := max(0, width-fixed)
 
+	// Whatever width the fixed columns leave over is handed to the bars and
+	// trends rather than left as blank space at the row's right edge: the
+	// baselines below are each tier's non-flexible columns, and everything
+	// past them is shared out, so a row always spans the panel.
 	cols := dashboardColumns{tier: tier, nameWidth: nameWidth, pctWidth: dashboardPctWidth}
 	switch tier {
 	case dashboardTierNarrow:
@@ -4474,16 +4692,35 @@ func (m Model) dashboardColumnsFor(width int) dashboardColumns {
 	case dashboardTierMedium:
 		cols.memMeterW = dashboardMeterWidth
 		cols.netColWidth = 2*(1+dashboardNetNumWidth) + 1
-		if spark := remaining - dashboardMediumBaseline; spark >= dashboardMinSparkW {
-			cols.cpuSparkW = min(spark, 16)
+		spare := remaining - dashboardMediumBaseline
+		if spare-dashboardMetaWidth >= dashboardMinSparkW {
+			cols.upW, cols.restartW = dashboardUpWidth, dashboardRestartWidth
+			spare -= dashboardMetaWidth
+		}
+		if spare >= dashboardMinSparkW {
+			// The CPU gauge and the memory meter share the room, 2:1 — as
+			// long as the gauge keeps its minimum width.
+			memExtra := spare / 3
+			if spare-memExtra < dashboardMinSparkW {
+				memExtra = 0
+			}
+			cols.memMeterW += memExtra
+			cols.cpuSparkW = spare - memExtra
 		}
 	case dashboardTierWide:
 		cols.memMeterW = dashboardMeterWidth
 		cols.splitNet = true
-		if leftover := max(0, remaining-dashboardWideBaseline); leftover/3 >= dashboardMinSparkW {
-			spark := min(leftover/3, 24)
-			cols.cpuSparkW = spark
-			cols.netSparkW = spark
+		spare := max(0, remaining-dashboardWideBaseline)
+		if (spare-dashboardMetaWidth)*2/7 >= dashboardMinSparkW {
+			cols.upW, cols.restartW = dashboardUpWidth, dashboardRestartWidth
+			spare -= dashboardMetaWidth
+		}
+		// The CPU gauge and both network trends get an equal share, the
+		// memory meter half of one; the rounding remainder goes to CPU.
+		if share := spare * 2 / 7; share >= dashboardMinSparkW {
+			cols.memMeterW += share / 2
+			cols.netSparkW = share
+			cols.cpuSparkW = spare - 2*share - share/2
 		}
 	}
 	return cols
@@ -4535,25 +4772,64 @@ func truncateEllipsis(name string, width int) string {
 func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
 	cols := m.dashboardColumnsFor(width)
 	bg := renderer.Styles.Theme.Bg
-	style := renderer.Styles.DetailMeta.Copy().Background(bg)
-
-	prefix := strings.Repeat(" ", dashboardRailWidth+cols.nameWidth+dashboardColGap+1+dashboardColGap)
-	cpu := rightAlignRunes("CPU", cols.pctWidth)
-	if cols.cpuSparkW > 0 {
-		cpu += strings.Repeat(" ", dashboardColGap+cols.cpuSparkW)
+	idle := renderer.Styles.DetailMeta.Copy().Background(bg)
+	active := lipgloss.NewStyle().Background(bg).Foreground(styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)).Bold(true)
+	// cell styles a pre-padded label bright and bold when its column is the
+	// current sort key, dim otherwise.
+	cell := func(text string, mode dashboardSortMode) string {
+		if m.dashboardSort == mode {
+			return active.Render(text)
+		}
+		return idle.Render(text)
 	}
-	mem := rightAlignRunes("MEM", cols.pctWidth)
+	spaces := func(n int) string { return idle.Render(strings.Repeat(" ", n)) }
+
+	// The sort arrow sits on the label's inner side (before right-aligned
+	// CPU/MEM, after left-aligned CONTAINER/NET) so the label text itself
+	// stays flush with the numbers it heads.
+	nameLabel := "CONTAINER"
+	if m.dashboardSort == dashboardSortName {
+		nameLabel += " ▲"
+	}
+	prefix := spaces(dashboardRailWidth) + cell(padRunes(nameLabel, cols.nameWidth), dashboardSortName) +
+		spaces(dashboardColGap+1+dashboardColGap)
+	if cols.upW > 0 {
+		prefix += idle.Render(rightAlignRunes("UP", cols.upW)) + spaces(dashboardColGap) +
+			idle.Render(rightAlignRunes("RST", cols.restartW)) + spaces(dashboardColGap)
+	}
+
+	cpuLabel := "CPU"
+	if m.dashboardSort == dashboardSortCPU {
+		cpuLabel = "▼" + cpuLabel
+	}
+	cpu := cell(rightAlignRunes(cpuLabel, cols.pctWidth), dashboardSortCPU)
+	if cols.cpuSparkW > 0 {
+		cpu += spaces(dashboardColGap + cols.cpuSparkW)
+	}
+	memLabel := "MEM"
+	if m.dashboardSort == dashboardSortMem {
+		memLabel = "▼" + memLabel
+	}
+	mem := cell(rightAlignRunes(memLabel, cols.pctWidth), dashboardSortMem)
 	if cols.memMeterW > 0 {
-		mem += strings.Repeat(" ", dashboardColGap+cols.memMeterW)
+		mem += spaces(dashboardColGap + cols.memMeterW)
 	}
 	netWidth := cols.netColWidth
 	if cols.splitNet {
 		netWidth = 2*(2+dashboardNetNumWidth+1+cols.netSparkW) + 3
 	}
-	net := padRunes("NET", netWidth)
+	netLabel := "NET"
+	if m.dashboardSort == dashboardSortNet {
+		netLabel += " ▼"
+	}
+	// The combined (non-split) net column is right-aligned, so a row's last
+	// glyph sits flush with the panel edge however much room the column got.
+	net := cell(padRunes(netLabel, netWidth), dashboardSortNet)
+	if !cols.splitNet {
+		net = cell(rightAlignRunes(netLabel, netWidth), dashboardSortNet)
+	}
 
-	header := prefix + cpu + strings.Repeat(" ", dashboardColGap) + mem + strings.Repeat(" ", dashboardColGap) + net
-	return ansi.Truncate(style.Render(header), width, "")
+	return ansi.Truncate(prefix+cpu+spaces(dashboardColGap)+mem+spaces(dashboardColGap)+net, width, "")
 }
 
 // dashboardRow renders one running container's line: a selection rail,
@@ -4585,13 +4861,26 @@ func (m Model) dashboardHeaderRow(renderer tideui.Renderer, width int) string {
 // own — this was reported live as random-colored boxes in the Mem/Net
 // columns on a real terminal. ansi.Truncate at the end is a hard backstop
 // against ever exceeding width, independent of the column math above.
-func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int, selected bool) string {
+func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, width int, selected, stripe bool) string {
 	cols := m.dashboardColumnsFor(width)
 	history := m.statsHistory[ctr.ID]
 	stats := history.lastStats
 
 	rowBg := renderer.Styles.Theme.Bg
 	baseFg := styleForeground(renderer.Styles.DetailBody, renderer.Styles.Theme.Fg)
+	// Colour bands: every other row is lifted a touch toward the text
+	// colour (zebra striping, so the eye can follow a long row across the
+	// gaps), and the selected row is washed toward the theme's accent.
+	if stripe {
+		rowBg = lipgloss.Color(lerpHexColor(string(rowBg), string(baseFg), 0.05))
+	}
+	if selected {
+		accent := renderer.Styles.Theme.Selected
+		if accent == "" {
+			accent = renderer.Styles.Theme.BorderFocus
+		}
+		rowBg = lipgloss.Color(lerpHexColor(string(rowBg), string(accent), 0.22))
+	}
 
 	// Hot-row tint: when this container's CPU or memory-of-limit crosses
 	// dashboardWarnPct, wash the whole row's background a little toward the
@@ -4612,9 +4901,9 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	}
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(baseFg)
 
-	// Selection rail: a left-edge "▌" marker is the only selection
-	// indicator — no full-row background wash. SoftRail keeps its own
-	// 2-cell width, so dashboardRailWidth's column math stays valid.
+	// Selection rail: a left-edge "▌" marker, on top of the row's accent
+	// wash (see above). SoftRail keeps its own 2-cell width, so
+	// dashboardRailWidth's column math stays valid.
 	rail := renderer.SoftRail(selected, rowBg)
 	// foregroundSpan only ever sets foreground (see its own doc comment) —
 	// it's meant to sit inside one continuous outer-styled Render call,
@@ -4632,7 +4921,7 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 		Render(rightAlignRunes(fmt.Sprintf("%.1f%%", cpuPct), cols.pctWidth))
 	cpuPart := cpuNum
 	if cols.cpuSparkW > 0 {
-		cpuPart += plain.Render("  ") + renderCPUGauge(renderer, cpuStatGraph(stats, history), cpuGaugeOneCore, cols.cpuSparkW, rowBg)
+		cpuPart += plain.Render("  ") + dashboardGraph(renderer, m.settings.GraphStyle, dashboardCPUSeries(stats, history), cols.cpuSparkW, rowBg)
 	}
 
 	memPct, hasLimit, memText := 0.0, false, "n/a"
@@ -4650,7 +4939,7 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 	}
 	memPart := memNumStyle.Render(rightAlignRunes(memText, cols.pctWidth))
 	if cols.memMeterW > 0 {
-		memPart += plain.Render("  ") + dashboardMemMeter(renderer, m.settings, memPct, hasLimit, cols.memMeterW, rowBg)
+		memPart += plain.Render("  ") + dashboardGraph(renderer, m.settings.GraphStyle, dashboardMemSeries(stats, history), cols.memMeterW, rowBg)
 	}
 
 	var rx, tx uint64
@@ -4663,52 +4952,44 @@ func (m Model) dashboardRow(renderer tideui.Renderer, ctr domain.Container, widt
 
 	var netPart string
 	if cols.splitNet {
-		rxGraph := uintStatGraph(history.NetworkRx, history.maxNetwork, byteLevel(rx), formatByteDelta, formatBytes)
-		txGraph := uintStatGraph(history.NetworkTx, history.maxNetwork, byteLevel(tx), formatByteDelta, formatBytes)
 		down := plain.Render("↓ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(rx)).
 			Render(rightAlignRunes(formatCompactBytes(rx), dashboardNetNumWidth))
 		up := plain.Render("↑ ") + lipgloss.NewStyle().Background(rowBg).Foreground(dashboardNetGraphColor(tx)).
 			Render(rightAlignRunes(formatCompactBytes(tx), dashboardNetNumWidth))
-		netPart = down + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, rxGraph, cols.netSparkW, rowBg) +
-			plain.Render("   ") + up + plain.Render(" ") + dashboardNetSpark(renderer, m.settings, txGraph, cols.netSparkW, rowBg)
+		netPart = down + plain.Render(" ") + dashboardGraph(renderer, m.settings.GraphStyle, dashboardNetSeries(history.NetworkRx, history.maxNetwork), cols.netSparkW, rowBg) +
+			plain.Render("   ") + up + plain.Render(" ") + dashboardGraph(renderer, m.settings.GraphStyle, dashboardNetSeries(history.NetworkTx, history.maxNetwork), cols.netSparkW, rowBg)
 	} else {
 		combined := fmt.Sprintf("↓%s ↑%s", formatCompactBytes(rx), formatCompactBytes(tx))
-		netPart = plain.Render(padRunes(combined, cols.netColWidth))
+		netPart = plain.Render(rightAlignRunes(combined, cols.netColWidth))
 	}
 
-	row := rail + name + plain.Render("  ") + glyph + plain.Render("  ") +
+	// Uptime and restart count sit between the glyph and the metrics, when
+	// the row has room (see dashboardColumnsFor).
+	metaPart := ""
+	if cols.upW > 0 {
+		dim := lipgloss.NewStyle().Background(rowBg).Foreground(renderer.Styles.Theme.Dimmed)
+		restartText, restartStyle := "", dim
+		if count, known := m.dashboardRestartCount(ctr); known {
+			switch {
+			case count == 0:
+				restartText = "–"
+			case count > 99:
+				restartText, restartStyle = "↻99+", lipgloss.NewStyle().Background(rowBg).Foreground(activePalette.Bad).Bold(true)
+			default:
+				color := activePalette.Warn
+				if count >= 5 {
+					color = activePalette.Bad
+				}
+				restartText, restartStyle = fmt.Sprintf("↻%d", count), lipgloss.NewStyle().Background(rowBg).Foreground(color).Bold(true)
+			}
+		}
+		metaPart = dim.Render(rightAlignRunes(compactUptime(ctr.Status), cols.upW)) + plain.Render("  ") +
+			restartStyle.Render(rightAlignRunes(restartText, cols.restartW)) + plain.Render("  ")
+	}
+
+	row := rail + name + plain.Render("  ") + glyph + plain.Render("  ") + metaPart +
 		cpuPart + plain.Render("  ") + memPart + plain.Render("  ") + netPart
 	return ansi.Truncate(row, width, "")
-}
-
-// dashboardGaugeBar mirrors renderGaugeBar's graphStyleGauge look — a
-// single thin proportional bar: "━" filled, one "╸" leading-edge cap at
-// the fill boundary, "─" for the remainder — so picking that Graph style
-// in Settings gives the Dashboard the same shape it gives the
-// single-container Stats pane. Unlike renderGaugeBar, color is a plain
-// caller-supplied value rather than being derived from
-// settings.GraphColor/statHeatColor's relative gradient: see
-// dashboardWarnPct's doc comment for why the Dashboard's colors stay on
-// the absolute-threshold scale regardless of that setting.
-func dashboardGaugeBar(renderer tideui.Renderer, frac float64, color lipgloss.Color, width int, bg lipgloss.Color) string {
-	width = max(1, width)
-	if frac < 0 {
-		frac = 0
-	} else if frac > 1 {
-		frac = 1
-	}
-	filled := clamp(int(frac*float64(width)+0.5), 0, width)
-	dim := renderer.Styles.Theme.Dimmed
-	switch {
-	case filled <= 0:
-		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
-	case filled >= width:
-		return lipgloss.NewStyle().Background(bg).Foreground(color).Bold(true).Render(strings.Repeat("━", width))
-	default:
-		fill := lipgloss.NewStyle().Background(bg).Foreground(color).Bold(true).Render(strings.Repeat("━", filled-1) + "╸")
-		rest := lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width-filled))
-		return fill + rest
-	}
 }
 
 // cpuGaugeOneCore is a single container's gauge capacity. Container CPU%
@@ -4795,138 +5076,6 @@ func renderCPUGauge(renderer tideui.Renderer, graph statGraph, capacity float64,
 	return b.String()
 }
 
-// dashboardMemMeter draws the memory column's visualization. With
-// settings.GraphStyle == graphStyleGauge it's a single proportional
-// dashboardGaugeBar (matching what that style does everywhere else in the
-// app); otherwise it's a restrained "█"/"░" meter filled proportional to
-// sqrt(pct/100) rather than pct/100 directly — real container memory
-// usage is very often single-digit percentages, and a linear 0-100% meter
-// would render nearly every healthy container as entirely empty,
-// indistinguishable from 0% and useless for at-a-glance comparison across
-// a fleet. The square-root curve keeps low values visually distinct (0.4%
-// and 2.7% land on 1 and 2 filled cells of 10 respectively, matching this
-// redesign's own worked examples) while still saturating sensibly as
-// usage climbs toward its limit. Either shape colors via
-// dashboardMemColor, never settings.GraphColor's relative gradient (see
-// dashboardWarnPct's doc comment). hasLimit false (no memory limit
-// reported) falls back to a dim dashed line — the same "unknown, not
-// necessarily bad" treatment dashboardNetSpark gives zero traffic —
-// rather than guessing a color.
-func dashboardMemMeter(renderer tideui.Renderer, settings appSettings, pct float64, hasLimit bool, width int, bg lipgloss.Color) string {
-	width = max(0, width)
-	if width == 0 {
-		return ""
-	}
-	dim := renderer.Styles.Theme.Dimmed
-	if !hasLimit {
-		return lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("─", width))
-	}
-	color := dashboardMemColor(pct)
-	if settings.GraphStyle == graphStyleGauge {
-		return dashboardGaugeBar(renderer, pct/100, color, width, bg)
-	}
-	frac := pct / 100
-	if frac < 0 {
-		frac = 0
-	} else if frac > 1 {
-		frac = 1
-	}
-	filled := clamp(int(math.Sqrt(frac)*float64(width)+0.5), 0, width)
-	full := lipgloss.NewStyle().Background(bg).Foreground(color).Render(strings.Repeat("█", filled))
-	empty := lipgloss.NewStyle().Background(bg).Foreground(dim).Render(strings.Repeat("░", width-filled))
-	return full + empty
-}
-
-// dashboardSpark renders graph's values as a compact sparkline using the
-// caller's Graph style (settings.GraphStyle) for glyph shape/spacing —
-// graphGlyphs/graphGlyphSpacing are the exact same functions the single-
-// container Stats pane's own sparkline uses, so Blocks/Braille/Bars/(the
-// default) Wave all look the same style the user picked in Settings.
-// graphStyleGauge instead collapses to a single dashboardGaugeBar for the
-// latest value, matching that style's meaning everywhere else in the app.
-//
-// Each glyph's color comes from calling colorFor on that glyph's own
-// sample value, so a real spike in the history — a tall bar — is also
-// colored hot, not whatever color the *current* value happens to be. This
-// is safe in a way the shared renderSparkline path's statHeatColor isn't:
-// statHeatColor scales a glyph's color by that sample's level *relative to
-// the container's own historical max*, so a container sitting near its
-// own usual plateau glows the same hot orange/red as one actually maxed
-// out, regardless of how small that plateau is in absolute terms (see
-// dashboardWarnPct's doc comment for why the Dashboard rejects that).
-// colorFor here is always one of the Dashboard's own absolute-threshold
-// graders (dashboardGraphColor, dashboardNetGraphColor's wrapper) — a
-// quiet container's flat history still grades entirely green because
-// green is an absolute cutoff, not "below this container's own max" — so
-// per-sample coloring carries none of that downside. settings.GraphColor
-// is never consulted; that setting only affects the single-container Stats
-// pane.
-func dashboardSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, colorFor func(value float64) lipgloss.Color, width int, bg lipgloss.Color) string {
-	width = max(1, width)
-	if settings.GraphStyle == graphStyleGauge {
-		value, maxValue := 0.0, graph.maxValue
-		if len(graph.values) > 0 {
-			value = graph.values[len(graph.values)-1]
-		}
-		if maxValue <= 0 {
-			maxValue = 1
-		}
-		return dashboardGaugeBar(renderer, value/maxValue, colorFor(value), width, bg)
-	}
-
-	if settings.GraphStyle == graphStyleBraille {
-		// settings.GraphColor is a Stats-pane setting the Dashboard never
-		// honours (see this function's doc comment), so force the gradient
-		// mode rather than letting Mono/Metric leak in here through the
-		// shared renderer. colorFor(0) is this metric's own cold-end
-		// identity color, which only the Metric mode would ever read.
-		brailleSettings := settings
-		brailleSettings.GraphColor = graphColorGradient
-		return renderBrailleGraph(renderer, brailleSettings, graph.values, graph.maxValue, colorFor(0), width, bg)
-	}
-
-	glyphs := graphGlyphs(settings)
-	spacing := graphGlyphSpacing(settings)
-	unit := 1 + spacing
-	slots := max(1, width/unit)
-	gap := ""
-	if spacing > 0 {
-		gap = lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", spacing))
-	}
-	flatCell := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(glyphs[0]) + gap
-
-	if len(graph.values) == 0 || graph.maxValue <= 0 {
-		return strings.Repeat(flatCell, slots)
-	}
-	values := graph.values
-	if len(values) > slots {
-		values = values[len(values)-slots:]
-	}
-	var b strings.Builder
-	for _, v := range values {
-		level := clamp(int(v/graph.maxValue*float64(len(glyphs)-1)+0.5), 0, len(glyphs)-1)
-		glyph := glyphs[level]
-		// Color by the glyph's own height through the shared
-		// green/yellow/orange/red palette, the same way the Stats pane's
-		// sparklines grade (see statGlyphColor), rather than by colorFor's
-		// absolute value scale. colorFor's landmarks are tens of megabytes
-		// per second; a fleet whose containers idle in the hundreds of
-		// bytes lands every sample on the gradient's cold end, so every
-		// glyph rendered the same flat identity blue and the color carried
-		// no information at all. Height-keyed color always varies with the
-		// shape that's actually drawn — the tradeoff being that it reads
-		// relative to this container's own recent peak, so a hot glyph
-		// means "busy for this container", not "busy in absolute terms".
-		// colorFor still grades the gauge branch above, where a single bar
-		// has no shape of its own to key off.
-		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(graphHeatColor(graphGlyphHeight[glyph])).Render(glyph) + gap)
-	}
-	if pad := slots - len(values); pad > 0 {
-		b.WriteString(strings.Repeat(flatCell, pad))
-	}
-	return b.String()
-}
-
 // dashboardNetGraphColor grades a byte rate into the Dashboard's own
 // continuous heat gradient — heatColorFrom blended from Net's blue
 // identity color — landing on the same 32MB/128MB/512MB landmarks the
@@ -4969,48 +5118,16 @@ func netHeatT(value uint64) float64 {
 	return 1.0
 }
 
-// dashboardNetSpark is dashboardSpark for network traffic specifically:
-// when there's no history yet, or every sample in it is zero, it renders
-// a flat dashed line instead of the style's own lowest glyph — "zero
-// traffic" and "very low but nonzero traffic" need to look different, and
-// a dim dash reads unambiguously as "quiet" rather than "chart with tiny
-// bars," regardless of which Graph style is selected (this also happens
-// to be exactly graphStyleGauge's own empty-bar look, so gauge style
-// needs no special-casing here at all).
-//
-// The quiet check deliberately looks at the *whole* history, not just the
-// latest sample: network traffic is bursty enough that any single 2-second
-// poll can easily land on exactly zero bytes even for an active
-// container, and an earlier version that blanked the whole line the
-// instant the latest sample hit zero made the sparkline visibly vanish
-// and redraw every time traffic paused for one tick — the opposite of the
-// smooth scrolling a sparkline is supposed to give. A momentarily-zero
-// latest sample now just renders as that one low glyph among its
-// neighbors, same as it already does for CPU.
-//
-// Once past that check, each sample is graded individually by
-// dashboardNetGraphColor (wrapped for dashboardSpark's per-value
-// colorFor), keeping Net in the same green-baseline-to-red family as the
-// CPU sparkline and memory meter, and letting a real historical spike
-// still read as a hot glyph even after traffic has since dropped back
-// down.
+// dashboardNetSpark draws the fleet-wide network trend — the NET card and
+// the compact gauge row — in the chosen Graph style. See dashboardNetSeries
+// for how an all-zero window reads as quiet while a lone zero among real
+// traffic stays drawn.
 func dashboardNetSpark(renderer tideui.Renderer, settings appSettings, graph statGraph, width int, bg lipgloss.Color) string {
-	width = max(1, width)
-	quiet := len(graph.values) == 0 || graph.maxValue <= 0
-	if !quiet {
-		quiet = true
-		for _, v := range graph.values {
-			if v != 0 {
-				quiet = false
-				break
-			}
-		}
+	values := make([]uint64, len(graph.values))
+	for i, v := range graph.values {
+		values[i] = uint64(v)
 	}
-	if quiet {
-		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render(strings.Repeat("─", width))
-	}
-	colorFor := func(v float64) lipgloss.Color { return dashboardNetGraphColor(uint64(v)) }
-	return dashboardSpark(renderer, settings, graph, colorFor, width, bg)
+	return dashboardGraph(renderer, settings.GraphStyle, dashboardNetSeries(values, uint64(graph.maxValue)), width, bg)
 }
 
 // dashboardProblemsRow is the Dashboard's bottom status/action row: a
@@ -5023,24 +5140,85 @@ func dashboardNetSpark(renderer tideui.Renderer, settings appSettings, graph sta
 // the shared statusPulseFrame clock (frame) — the same slow pulse the
 // connected-status dot uses — so the warning stays alive in peripheral
 // vision; a healthy fleet's all-clear line never moves.
-func (m Model) dashboardProblemsRow(renderer tideui.Renderer, stopped, frame, width int) string {
+func (m Model) dashboardProblemsRow(renderer tideui.Renderer, items []attentionItem, frame, width int) string {
 	bg := renderer.Styles.Theme.Bg
-	if stopped == 0 {
+	if len(items) == 0 {
 		return lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("✓ All monitored containers healthy")
 	}
 	noun, verb := "containers", "need"
-	if stopped == 1 {
+	if len(items) == 1 {
 		noun, verb = "container", "needs"
 	}
 	pulse := (math.Sin(2*math.Pi*float64(frame)/24) + 1) / 2
 	warnColor := lipgloss.Color(lerpHexColor("#7a5c1f", "#f0c674", pulse))
 	left := lipgloss.NewStyle().Background(bg).Foreground(warnColor).Bold(true).
-		Render(fmt.Sprintf("⚠ %d %s %s attention", stopped, noun, verb))
+		Render(fmt.Sprintf("⚠ %d %s %s attention", len(items), noun, verb))
 	action := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Fg).Bold(true).Render("p") +
 		lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed).Render("  View problems")
+	filler := func(n int) string { return lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", n)) }
+
+	// Name the offenders in whatever room is left between the count and the
+	// action, worst first, ending in "+N more" if they don't all fit.
+	detail := dashboardAttentionDetail(renderer, items, width-lipgloss.Width(left)-lipgloss.Width(action)-4)
+	if detail != "" {
+		left += filler(2) + detail
+	}
 	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(action))
-	line := left + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", gap)) + action
-	return ansi.Truncate(line, width, "")
+	return ansi.Truncate(left+filler(gap)+action, width, "")
+}
+
+// dashboardAttentionDetail renders "name (reason) · name (reason) · +N more"
+// within budget columns, or "" when not even the first name fits. Each
+// reason is tinted by severity: red for dead/unhealthy, amber for
+// restarting, muted for plainly stopped.
+func dashboardAttentionDetail(renderer tideui.Renderer, items []attentionItem, budget int) string {
+	const sep = " · "
+	sepW := lipgloss.Width(sep)
+	moreWidth := func(remaining int) int { return sepW + lipgloss.Width(fmt.Sprintf("+%d more", remaining)) }
+	bg := renderer.Styles.Theme.Bg
+	dim := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Dimmed)
+	nameStyle := lipgloss.NewStyle().Background(bg).Foreground(renderer.Styles.Theme.Fg)
+	reasonColor := func(rank int) lipgloss.Color {
+		switch rank {
+		case 0, 1:
+			return activePalette.Bad
+		case 2:
+			return activePalette.Warn
+		default:
+			return renderer.Styles.Theme.Dimmed
+		}
+	}
+
+	var b strings.Builder
+	used, shown := 0, 0 // used counts only the names rendered so far
+	for i, item := range items {
+		width := lipgloss.Width(item.name + " (" + item.reason + ")")
+		if shown > 0 {
+			width += sepW
+		}
+		// Keep room for the trailing "+N more" whenever others remain.
+		need := used + width
+		if remaining := len(items) - i - 1; remaining > 0 {
+			need += moreWidth(remaining)
+		}
+		if need > budget {
+			break
+		}
+		if shown > 0 {
+			b.WriteString(dim.Render(sep))
+		}
+		b.WriteString(nameStyle.Render(item.name))
+		b.WriteString(lipgloss.NewStyle().Background(bg).Foreground(reasonColor(item.rank)).Render(" (" + item.reason + ")"))
+		used += width
+		shown++
+	}
+	if shown == 0 {
+		return ""
+	}
+	if shown < len(items) {
+		b.WriteString(dim.Render(sep + fmt.Sprintf("+%d more", len(items)-shown)))
+	}
+	return b.String()
 }
 
 // aboutContentWidth mirrors the panel-width math in renderOverlay so the

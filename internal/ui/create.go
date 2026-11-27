@@ -2536,6 +2536,95 @@ func pruneComposeBaseBackupsRemote(ctx context.Context, system config.System, ba
 	}
 }
 
+// composeFileMode returns the permission bits of the first of refs that
+// exists as a regular file. Compose files routinely hold secrets (env
+// values, passwords), so a rewrite must not widen a 0600 file to 0644.
+func composeFileMode(refs ...string) (os.FileMode, bool) {
+	for _, ref := range refs {
+		if info, err := os.Stat(ref); err == nil && info.Mode().IsRegular() {
+			return info.Mode().Perm(), true
+		}
+	}
+	return 0, false
+}
+
+// writeComposeTemp writes data to temp, giving it the mode of the first of
+// refs that exists. With no such file it behaves like a plain 0644 create
+// (still subject to the umask), as before.
+func writeComposeTemp(temp string, data []byte, refs ...string) error {
+	mode, ok := composeFileMode(refs...)
+	if !ok {
+		return os.WriteFile(temp, data, 0o644)
+	}
+	if err := os.WriteFile(temp, data, mode); err != nil {
+		return err
+	}
+	// WriteFile's mode is masked by the umask and ignored for a stale temp
+	// file left by an earlier run.
+	return os.Chmod(temp, mode)
+}
+
+// promoteComposeTemp renames temp over final. When final is a symlink the
+// link's target is replaced, not the link itself; if the target lives on a
+// different filesystem (rename can't cross one) the content is written
+// through the link instead.
+func promoteComposeTemp(temp, final string) error {
+	target := final
+	if resolved, err := filepath.EvalSymlinks(final); err == nil {
+		target = resolved
+	}
+	err := os.Rename(temp, target)
+	if err == nil || target == final {
+		return err
+	}
+	data, readErr := os.ReadFile(temp)
+	if readErr != nil {
+		return err
+	}
+	if writeErr := os.WriteFile(target, data, 0o644); writeErr != nil {
+		return writeErr
+	}
+	_ = os.Remove(temp)
+	return nil
+}
+
+// remoteComposeWriteScript builds the command remoteWriteComposeTemp runs: it
+// seeds temp with `cp -p` from the first of refs that exists remotely (mode
+// and, where permitted, owner), then overwrites the content in place, which
+// keeps them. The content itself travels on stdin.
+func remoteComposeWriteScript(temp string, refs ...string) string {
+	script := "cat > " + systems.ShellQuote(temp)
+	if len(refs) == 0 {
+		return script
+	}
+	quoted := make([]string, len(refs))
+	for i, ref := range refs {
+		quoted[i] = systems.ShellQuote(ref)
+	}
+	return "ref=; for f in " + strings.Join(quoted, " ") + `; do if [ -f "$f" ]; then ref=$f; break; fi; done; ` +
+		`if [ -n "$ref" ]; then cp -p -- "$ref" ` + systems.ShellQuote(temp) + ` 2>/dev/null; fi; ` + script
+}
+
+// remoteWriteComposeTemp is writeComposeTemp's SSH counterpart.
+func remoteWriteComposeTemp(ctx context.Context, system config.System, temp, content string, refs ...string) error {
+	_, err := sshRun(ctx, system, remoteComposeWriteScript(temp, refs...), content)
+	return err
+}
+
+// remoteComposePromoteScript builds the command remotePromoteComposeTemp
+// runs: mv onto the symlink-resolved path so a linked compose file keeps
+// being a link.
+func remoteComposePromoteScript(temp, final string) string {
+	quoted := systems.ShellQuote(final)
+	return "mv -- " + systems.ShellQuote(temp) + ` "$(readlink -f -- ` + quoted + ` 2>/dev/null || printf %s ` + quoted + `)"`
+}
+
+// remotePromoteComposeTemp is promoteComposeTemp's SSH counterpart.
+func remotePromoteComposeTemp(ctx context.Context, system config.System, temp, final string) error {
+	_, err := sshRun(ctx, system, remoteComposePromoteScript(temp, final), "")
+	return err
+}
+
 func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) error {
 	if strings.TrimSpace(spec.BaseFile) == "" {
 		return errors.New("compose file is required")
@@ -2557,14 +2646,14 @@ func defaultApplyComposeCreate(ctx context.Context, spec composeCreateSpec) erro
 	composeProgress(spec, "writing compose override for "+spec.Service+"…")
 	tempSpec := spec
 	tempSpec.OverrideFile = spec.OverrideFile + ".tmp"
-	if err := os.WriteFile(tempSpec.OverrideFile, []byte(spec.Content), 0o644); err != nil {
+	if err := writeComposeTemp(tempSpec.OverrideFile, []byte(spec.Content), spec.OverrideFile, spec.BaseFile); err != nil {
 		return err
 	}
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_ = os.Remove(tempSpec.OverrideFile)
 		return err
 	}
-	if err := os.Rename(tempSpec.OverrideFile, spec.OverrideFile); err != nil {
+	if err := promoteComposeTemp(tempSpec.OverrideFile, spec.OverrideFile); err != nil {
 		_ = os.Remove(tempSpec.OverrideFile)
 		return err
 	}
@@ -2670,7 +2759,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 	tempSpec := spec
 	tempSpec.BaseFile = spec.BaseFile + ".tmp"
 	tempSpec.OverrideFile = ""
-	if err := os.WriteFile(tempSpec.BaseFile, []byte(spec.Content), 0o644); err != nil {
+	if err := writeComposeTemp(tempSpec.BaseFile, []byte(spec.Content), spec.BaseFile); err != nil {
 		return err
 	}
 	composeProgress(spec, "validating stack "+spec.Project+"…")
@@ -2678,7 +2767,7 @@ func defaultApplyComposeStack(ctx context.Context, spec composeCreateSpec) error
 		_ = os.Remove(tempSpec.BaseFile)
 		return err
 	}
-	if err := os.Rename(tempSpec.BaseFile, spec.BaseFile); err != nil {
+	if err := promoteComposeTemp(tempSpec.BaseFile, spec.BaseFile); err != nil {
 		_ = os.Remove(tempSpec.BaseFile)
 		return err
 	}
@@ -2699,7 +2788,7 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 	finalSpec := spec
 	finalSpec.OverrideFile = ""
 	tempBase := spec.BaseFile + ".tmp"
-	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
+	if err := remoteWriteComposeTemp(ctx, spec.System, tempBase, spec.Content, spec.BaseFile); err != nil {
 		return err
 	}
 	tempSpec := finalSpec
@@ -2713,7 +2802,7 @@ func applyComposeStackRemote(ctx context.Context, spec composeCreateSpec) error 
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
-	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+	if err := remotePromoteComposeTemp(ctx, spec.System, tempBase, spec.BaseFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
@@ -2735,7 +2824,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 		baseOnly.OverrideFile = ""
 		composeProgress(spec, "writing compose file for "+spec.Service+"…")
 		tempBase := spec.BaseFile + ".tmp"
-		if err := os.WriteFile(tempBase, []byte(spec.Content), 0o644); err != nil {
+		if err := writeComposeTemp(tempBase, []byte(spec.Content), spec.BaseFile); err != nil {
 			return err
 		}
 		tempSpec := baseOnly
@@ -2749,7 +2838,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 			_ = os.Remove(tempBase)
 			return err
 		}
-		if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+		if err := promoteComposeTemp(tempBase, spec.BaseFile); err != nil {
 			_ = os.Remove(tempBase)
 			return err
 		}
@@ -2770,7 +2859,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 	baseOnly.OverrideFile = ""
 	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	tempBase := spec.BaseFile + ".tmp"
-	if err := os.WriteFile(tempBase, merged, 0o644); err != nil {
+	if err := writeComposeTemp(tempBase, merged, spec.BaseFile); err != nil {
 		return err
 	}
 	tempSpec := baseOnly
@@ -2784,7 +2873,7 @@ func mergeComposeCreateIntoBase(ctx context.Context, spec composeCreateSpec, bas
 		_ = os.Remove(tempBase)
 		return err
 	}
-	if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+	if err := promoteComposeTemp(tempBase, spec.BaseFile); err != nil {
 		_ = os.Remove(tempBase)
 		return err
 	}
@@ -2817,14 +2906,14 @@ func applyComposeCreateRemote(ctx context.Context, spec composeCreateSpec) error
 	composeProgress(spec, "writing compose override for "+spec.Service+"…")
 	tempSpec := spec
 	tempSpec.OverrideFile = spec.OverrideFile + ".tmp"
-	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempSpec.OverrideFile), spec.Content); err != nil {
+	if err := remoteWriteComposeTemp(ctx, spec.System, tempSpec.OverrideFile, spec.Content, spec.OverrideFile, spec.BaseFile); err != nil {
 		return err
 	}
 	if err := composeCommand(ctx, tempSpec, "config"); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
 		return err
 	}
-	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempSpec.OverrideFile)+" "+systems.ShellQuote(spec.OverrideFile), ""); err != nil {
+	if err := remotePromoteComposeTemp(ctx, spec.System, tempSpec.OverrideFile, spec.OverrideFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempSpec.OverrideFile), "")
 		return err
 	}
@@ -2840,7 +2929,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 		baseOnly.OverrideFile = ""
 		composeProgress(spec, "writing compose file for "+spec.Service+"…")
 		tempBase := spec.BaseFile + ".tmp"
-		if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), spec.Content); err != nil {
+		if err := remoteWriteComposeTemp(ctx, spec.System, tempBase, spec.Content, spec.BaseFile); err != nil {
 			return err
 		}
 		tempSpec := baseOnly
@@ -2854,7 +2943,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 			return err
 		}
-		if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+		if err := remotePromoteComposeTemp(ctx, spec.System, tempBase, spec.BaseFile); err != nil {
 			_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 			return err
 		}
@@ -2875,7 +2964,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 	baseOnly.OverrideFile = ""
 	composeProgress(spec, "writing compose file for "+spec.Service+"…")
 	tempBase := spec.BaseFile + ".tmp"
-	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), string(merged)); err != nil {
+	if err := remoteWriteComposeTemp(ctx, spec.System, tempBase, string(merged), spec.BaseFile); err != nil {
 		return err
 	}
 	tempSpec := baseOnly
@@ -2889,7 +2978,7 @@ func mergeComposeCreateIntoBaseRemote(ctx context.Context, spec composeCreateSpe
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
-	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+	if err := remotePromoteComposeTemp(ctx, spec.System, tempBase, spec.BaseFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}
@@ -2990,10 +3079,10 @@ func defaultApplyComposeDelete(ctx context.Context, spec composeCreateSpec) erro
 		return err
 	}
 	tempBase := spec.BaseFile + ".tmp"
-	if err := os.WriteFile(tempBase, updated, 0o644); err != nil {
+	if err := writeComposeTemp(tempBase, updated, spec.BaseFile); err != nil {
 		return err
 	}
-	if err := os.Rename(tempBase, spec.BaseFile); err != nil {
+	if err := promoteComposeTemp(tempBase, spec.BaseFile); err != nil {
 		_ = os.Remove(tempBase)
 		return err
 	}
@@ -3023,10 +3112,10 @@ func applyComposeDeleteRemote(ctx context.Context, spec composeCreateSpec) error
 		return err
 	}
 	tempBase := spec.BaseFile + ".tmp"
-	if _, err := sshRun(ctx, spec.System, "cat > "+systems.ShellQuote(tempBase), string(updated)); err != nil {
+	if err := remoteWriteComposeTemp(ctx, spec.System, tempBase, string(updated), spec.BaseFile); err != nil {
 		return err
 	}
-	if _, err := sshRun(ctx, spec.System, "mv "+systems.ShellQuote(tempBase)+" "+systems.ShellQuote(spec.BaseFile), ""); err != nil {
+	if err := remotePromoteComposeTemp(ctx, spec.System, tempBase, spec.BaseFile); err != nil {
 		_, _ = sshRun(ctx, spec.System, "rm -f "+systems.ShellQuote(tempBase), "")
 		return err
 	}

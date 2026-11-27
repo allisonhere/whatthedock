@@ -162,12 +162,12 @@ func TestFetchRecentLogLinesReturnsNilOnError(t *testing.T) {
 	}
 }
 
-// TestFetchRecentLogLinesCleansAndCapsLines checks the multiplexed-stream
-// header stripping (cleanDockerLogLine) and the maxLines cap both apply.
+// TestFetchRecentLogLinesCleansAndCapsLines checks ANSI stripping
+// (cleanDockerLogLine) and the maxLines cap both apply.
 func TestFetchRecentLogLinesCleansAndCapsLines(t *testing.T) {
 	raw := ""
-	for i := 0; i < 5; i++ {
-		raw += "\x01\x00\x00\x00\x00\x00\x00\x08line " + strconv.Itoa(i) + "\n"
+	for i := range 5 {
+		raw += "\x1b[32mline " + strconv.Itoa(i) + "\x1b[0m\n"
 	}
 	provider := &fakeLogsProvider{content: raw}
 	got := fetchRecentLogLines(context.Background(), provider, domain.ResourceID{Host: "local", ID: "1"}, 3)
@@ -175,7 +175,7 @@ func TestFetchRecentLogLinesCleansAndCapsLines(t *testing.T) {
 		t.Fatalf("fetchRecentLogLines() returned %d lines, want capped to 3: %#v", len(got), got)
 	}
 	if got[0] != "line 0" {
-		t.Fatalf("got[0] = %q, want the docker stream header stripped -> \"line 0\"", got[0])
+		t.Fatalf("got[0] = %q, want ANSI stripped -> \"line 0\"", got[0])
 	}
 }
 

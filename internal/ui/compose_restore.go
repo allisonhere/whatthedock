@@ -79,10 +79,10 @@ func restoreComposeBackupLocal(base string) (string, error) {
 		return "", err
 	}
 	temp := base + ".tmp"
-	if err := os.WriteFile(temp, content, 0o644); err != nil {
+	if err := writeComposeTemp(temp, content, base); err != nil {
 		return "", err
 	}
-	if err := os.Rename(temp, base); err != nil {
+	if err := promoteComposeTemp(temp, base); err != nil {
 		_ = os.Remove(temp)
 		return "", err
 	}
@@ -109,10 +109,10 @@ func restoreComposeBackupRemote(ctx context.Context, system config.System, base 
 		return "", err
 	}
 	temp := base + ".tmp"
-	if _, err := sshRun(ctx, system, "cat > "+systems.ShellQuote(temp), string(content)); err != nil {
+	if err := remoteWriteComposeTemp(ctx, system, temp, string(content), base); err != nil {
 		return "", err
 	}
-	if _, err := sshRun(ctx, system, "mv "+systems.ShellQuote(temp)+" "+systems.ShellQuote(base), ""); err != nil {
+	if err := remotePromoteComposeTemp(ctx, system, temp, base); err != nil {
 		_, _ = sshRun(ctx, system, "rm -f "+systems.ShellQuote(temp), "")
 		return "", err
 	}

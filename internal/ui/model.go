@@ -437,6 +437,25 @@ type Model struct {
 	// shows no selection highlight at all. Reset to false on open.
 	dashboardCursorActive bool
 
+	// dashboardCursorID is the container the cursor is on, so the highlight
+	// stays on it when a metric sort reorders rows between refreshes (see
+	// dashboardSelectedIndex). Empty until the cursor has been moved.
+	dashboardCursorID domain.ResourceID
+
+	// dashboardSort is the Dashboard list's ordering, cycled with "s".
+	// It survives closing and reopening the overlay.
+	dashboardSort dashboardSortMode
+
+	// dashboardGrouped, toggled with "g", lists the Dashboard's containers
+	// under a header per Compose stack. Like dashboardSort it survives
+	// closing and reopening the overlay.
+	dashboardGrouped bool
+
+	// dashboardMeta caches what the Dashboard has learned from a full
+	// inspect of each container (see dashboardMeta), refreshed on a slow
+	// timer alongside the stats poll.
+	dashboardMeta map[domain.ResourceID]dashboardMeta
+
 	// fleetCPUHistory/fleetNetHistory are the Dashboard header's own
 	// aggregate sparkline rings — one sample appended per poll interval
 	// from fleetSummary (see appendFleetHistory), capped at the same 24
@@ -871,6 +890,12 @@ type statsTickMsg struct {
 type dashboardStatsMsg struct {
 	stats domain.ContainerStats
 	err   error // one container's fetch failing shouldn't blank the rest
+
+	// hasMeta/restarts carry the container's restart count when this poll
+	// also inspected it (the inspect is only repeated every
+	// dashboardMetaTTL, not on every stats tick).
+	hasMeta  bool
+	restarts int
 }
 
 type dashboardTickMsg struct{}
@@ -1545,6 +1570,12 @@ func (m Model) updateStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// appending into history nobody's looking at anymore.
 		if m.overlay != overlayDashboard {
 			return m, nil
+		}
+		if msg.hasMeta {
+			if m.dashboardMeta == nil {
+				m.dashboardMeta = map[domain.ResourceID]dashboardMeta{}
+			}
+			m.dashboardMeta[msg.stats.ID] = dashboardMeta{restarts: msg.restarts, fetched: time.Now()}
 		}
 		if msg.err == nil {
 			m.appendStats(msg.stats)
@@ -2441,6 +2472,10 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.dashboardOpenSelected()
 		case "p":
 			return m.dashboardOpenProblems()
+		case "s":
+			m.dashboardCycleSort()
+		case "g":
+			m.dashboardToggleGrouping()
 		case "left", "h":
 			m.cycleDashboardGraphStyle(-1)
 		case "right", "l":
@@ -3696,6 +3731,7 @@ func (m Model) openAboutOverlay() (tea.Model, tea.Cmd) {
 func (m Model) openDashboardOverlay() (tea.Model, tea.Cmd) {
 	m.overlay = overlayDashboard
 	m.dashboardCursor = 0
+	m.dashboardCursorID = domain.ResourceID{}
 	m.dashboardCursorActive = false
 	m.dashboardRefreshFrame = m.statusPulseFrame
 	return m, m.dashboardRefreshCmd()
@@ -4707,7 +4743,7 @@ func (m Model) handleDashboardMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if isStatusRow {
 			return m.dashboardOpenProblems()
 		}
-		m.dashboardCursor = row
+		m.dashboardCursor, m.dashboardCursorID = row, domain.ResourceID{}
 		return m.dashboardOpenSelected()
 	}
 	return m, nil
@@ -4842,8 +4878,19 @@ func (m *Model) dashboardMoveCursor(delta int) {
 		m.dashboardCursor = 0
 		return
 	}
-	m.dashboardCursor = clamp(m.dashboardCursor+delta, 0, len(shown)-1)
+	index := clamp(m.dashboardSelectedIndex(shown)+delta, 0, len(shown)-1)
+	m.dashboardCursor = index
+	m.dashboardCursorID = shown[index].ID
 	m.dashboardCursorActive = true
+}
+
+// dashboardCycleSort advances the Dashboard's sort mode, pinning the cursor
+// to its current container first so the highlight follows it to its new row.
+func (m *Model) dashboardCycleSort() {
+	if shown, _, _, _, _ := m.dashboardBodyPlan(); m.dashboardCursorActive && len(shown) > 0 {
+		m.dashboardCursorID = shown[m.dashboardSelectedIndex(shown)].ID
+	}
+	m.dashboardSort = (m.dashboardSort + 1) % dashboardSortModeCount
 }
 
 // dashboardOpenSelected closes the Dashboard and focuses the inspector on
@@ -4856,7 +4903,7 @@ func (m Model) dashboardOpenSelected() (tea.Model, tea.Cmd) {
 	if len(shown) == 0 {
 		return m, nil
 	}
-	index := clamp(m.dashboardCursor, 0, len(shown)-1)
+	index := m.dashboardSelectedIndex(shown)
 	if !m.moveTreeCursorTo(shown[index].ID) {
 		return m, nil
 	}
@@ -5164,11 +5211,14 @@ func (m Model) dashboardRefreshCmd() tea.Cmd {
 	}
 	provider := m.provider
 	var cmds []tea.Cmd
+	now := time.Now()
 	for _, ctr := range m.snapshotContainers() {
 		if !ctr.IsRunning() {
 			continue
 		}
 		id := ctr.ID
+		meta, haveMeta := m.dashboardMeta[id]
+		needMeta := !haveMeta || now.Sub(meta.fetched) > dashboardMetaTTL
 		cmds = append(cmds, func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 			defer cancel()
@@ -5176,7 +5226,15 @@ func (m Model) dashboardRefreshCmd() tea.Cmd {
 			if stats.ID.ID == "" {
 				stats.ID = id
 			}
-			return dashboardStatsMsg{stats: stats, err: err}
+			msg := dashboardStatsMsg{stats: stats, err: err}
+			if needMeta {
+				inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 4*time.Second)
+				defer inspectCancel()
+				if inspected, inspectErr := provider.Container(inspectCtx, id); inspectErr == nil {
+					msg.hasMeta, msg.restarts = true, inspected.RestartCount
+				}
+			}
+			return msg
 		})
 	}
 	cmds = append(cmds, dashboardTickCmd(m.settings.StatsRefresh))
@@ -5509,13 +5567,34 @@ func forwardLogs(in <-chan string, out chan<- string, done <-chan struct{}) {
 	}
 }
 
+// maxLogLineBytes caps one log line. A longer line is delivered in
+// maxLogLineBytes-sized chunks instead of failing the scanner, which would
+// otherwise end the whole stream silently.
+const maxLogLineBytes = 1024 * 1024
+
+func splitLogLines(data []byte, atEOF bool) (int, []byte, error) {
+	advance, token, err := bufio.ScanLines(data, atEOF)
+	if advance > 0 || token != nil || err != nil {
+		return advance, token, err
+	}
+	if len(data) >= maxLogLineBytes {
+		return maxLogLineBytes, data[:maxLogLineBytes], nil
+	}
+	return 0, nil, nil
+}
+
+func newLogScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLogLineBytes+1)
+	scanner.Split(splitLogLines)
+	return scanner
+}
+
 func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.CancelFunc, done <-chan struct{}) {
 	defer cancel()
 	defer close(lines)
 	defer reader.Close()
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner := newLogScanner(reader)
 	for scanner.Scan() {
 		select {
 		case lines <- cleanDockerLogLine(scanner.Text()):
@@ -5525,23 +5604,19 @@ func readLogLines(reader io.ReadCloser, lines chan<- string, cancel context.Canc
 	}
 }
 
-// cleanDockerLogLine strips the Docker multiplexed-stream framing header
-// (the 8 raw bytes non-TTY log streams prefix each line with) and any
-// ANSI escape codes the container's own process wrote into its output —
-// many apps (Portainer among them) colorize their own logs. Left in,
-// those raw codes flow straight into renderLogLine's tokenizer and the
-// final styled line; an embedded reset sequence from the container's own
-// text ends whatthedock's own outer background style early, not just its
-// own span, showing the terminal's raw default background for everything
-// after it — reported live as a stray background color appearing right
-// after a log line's timestamp. Stripping here, once, at the single
-// choke point every log line passes through before display, is cheaper
-// and more robust than trying to make the renderer coexist with
-// arbitrary embedded ANSI state.
+// cleanDockerLogLine strips any ANSI escape codes the container's own
+// process wrote into its output — many apps (Portainer among them) colorize
+// their own logs. Left in, those raw codes flow straight into
+// renderLogLine's tokenizer and the final styled line; an embedded reset
+// sequence from the container's own text ends whatthedock's own outer
+// background style early, not just its own span, showing the terminal's raw
+// default background for everything after it — reported live as a stray
+// background color appearing right after a log line's timestamp. Stripping
+// here, once, at the single choke point every log line passes through before
+// display, is cheaper and more robust than trying to make the renderer
+// coexist with arbitrary embedded ANSI state. Docker's multiplexed-stream
+// framing is already removed by the provider's Logs (see docker.Logs).
 func cleanDockerLogLine(line string) string {
-	if len(line) > 8 && line[0] < ' ' {
-		line = line[8:]
-	}
 	return ansi.Strip(line)
 }
 

@@ -2264,9 +2264,9 @@ func TestApplyComposeCreateRemoteWritesAndAppliesOverSSH(t *testing.T) {
 		// override path below runs unchanged.
 		"cat '/srv/media-stack/compose.yml'",
 		"mkdir -p '/srv/media-stack'",
-		"cat > '/srv/media-stack/compose.whatthedock.cache.yml.tmp'\x00stdin=" + spec.Content,
+		remoteComposeWriteScript("/srv/media-stack/compose.whatthedock.cache.yml.tmp", "/srv/media-stack/compose.whatthedock.cache.yml", "/srv/media-stack/compose.yml") + "\x00stdin=" + spec.Content,
 		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml.tmp' 'config'",
-		"mv '/srv/media-stack/compose.whatthedock.cache.yml.tmp' '/srv/media-stack/compose.whatthedock.cache.yml'",
+		remoteComposePromoteScript("/srv/media-stack/compose.whatthedock.cache.yml.tmp", "/srv/media-stack/compose.whatthedock.cache.yml"),
 		"docker 'compose' '-p' 'media-stack' '-f' '/srv/media-stack/compose.yml' '-f' '/srv/media-stack/compose.whatthedock.cache.yml' 'up' '-d' 'cache'",
 	}
 	if len(fake.calls) != len(wantScripts) {
@@ -2338,7 +2338,7 @@ func TestApplyComposeCreateRemoteMergesIntoBaseWhenServiceAlreadyDefined(t *test
 	var wroteTemp, promoted, removedOverride, ranUp bool
 	for _, call := range fake.calls {
 		switch {
-		case strings.HasPrefix(call, "cat > '/srv/media-stack/compose.yml.tmp'"):
+		case strings.HasPrefix(call, remoteComposeWriteScript("/srv/media-stack/compose.yml.tmp", "/srv/media-stack/compose.yml")+"\x00stdin="):
 			wroteTemp = true
 			if !strings.Contains(call, "redis:7") || strings.Contains(call, "redis:6") {
 				t.Fatalf("merged temp base has wrong image: %q", call)
@@ -2346,7 +2346,7 @@ func TestApplyComposeCreateRemoteMergesIntoBaseWhenServiceAlreadyDefined(t *test
 			if !strings.Contains(call, "nginx:latest") {
 				t.Fatalf("merged temp base lost the unrelated service: %q", call)
 			}
-		case call == "mv '/srv/media-stack/compose.yml.tmp' '/srv/media-stack/compose.yml'":
+		case call == remoteComposePromoteScript("/srv/media-stack/compose.yml.tmp", "/srv/media-stack/compose.yml"):
 			promoted = true
 		case call == "rm -f '/srv/media-stack/compose.whatthedock.cache.yml'":
 			removedOverride = true
@@ -2355,7 +2355,7 @@ func TestApplyComposeCreateRemoteMergesIntoBaseWhenServiceAlreadyDefined(t *test
 			if strings.Contains(call, "compose.whatthedock.cache.yml") {
 				t.Fatalf("up -d still references the stale override: %q", call)
 			}
-		case strings.HasPrefix(call, "cat > '/srv/media-stack/compose.whatthedock.cache.yml"):
+		case strings.Contains(call, "cat > '/srv/media-stack/compose.whatthedock.cache.yml"):
 			t.Fatalf("wrote an override despite the service already being defined in base: %q", call)
 		}
 	}
@@ -2449,7 +2449,7 @@ func TestApplyComposeDeleteRemoteRemovesServiceFromBaseWhenDefined(t *testing.T)
 	// The rewritten base is staged to a temp file, then promoted atomically.
 	var wrote string
 	for _, call := range fake.calls {
-		if strings.HasPrefix(call, "cat > '/srv/media-stack/compose.yml.tmp'\x00stdin=") {
+		if strings.HasPrefix(call, remoteComposeWriteScript("/srv/media-stack/compose.yml.tmp", "/srv/media-stack/compose.yml")+"\x00stdin=") {
 			wrote = call
 		}
 	}
@@ -2463,7 +2463,7 @@ func TestApplyComposeDeleteRemoteRemovesServiceFromBaseWhenDefined(t *testing.T)
 		t.Fatalf("rewritten base lost an unrelated service: %q", wrote)
 	}
 	last := fake.calls[len(fake.calls)-1]
-	if last != "mv '/srv/media-stack/compose.yml.tmp' '/srv/media-stack/compose.yml'" {
+	if last != remoteComposePromoteScript("/srv/media-stack/compose.yml.tmp", "/srv/media-stack/compose.yml") {
 		t.Fatalf("last call = %q, want the staged base promoted atomically", last)
 	}
 	sawBackup := false

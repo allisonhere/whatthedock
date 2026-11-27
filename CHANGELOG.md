@@ -9,14 +9,63 @@ only re-cut a build are folded into the nearest entry.
 - `l` on a stack row shows the merged, service-tagged logs of every service in
   the stack (filter, pause, follow and copy work as usual).
 - Pause/unpause (`Alt+p`) and kill (command palette) for the selected container.
+- Dashboard: `s` sorts the list by name, CPU, memory, or network (heaviest
+  first), and the header marks the active column. The highlight follows its
+  container when a refresh reorders the rows.
+- Dashboard: the header is now four stat cards (CPU, MEM, NET, FLEET) with
+  heat-tinted borders that pulse on refresh and a segmented status bar; small
+  terminals keep the compact summary.
+- Dashboard: `g` groups containers under a header per Compose stack, with a
+  per-stack rollup of counts, CPU, memory and attention.
+- Dashboard: UP and RST columns show each container's uptime and restart count
+  (the count is inspected every 30 seconds, not every poll), rows are banded,
+  and the selected row is washed with the accent colour.
+- Dashboard: the bottom row names the containers that need attention, with the
+  reason.
+- Dashboard: every Graph style now redraws the CPU, memory and network columns of
+  the container list (before, only network and memory changed, and CPU never
+  did). `gauge` and `bars` fill a bar with the latest value (thin, or chunky
+  with eighth-cell precision); `wave`, `blocks` and `braille` draw the recent
+  history of each metric.
 
 ### Fixed
 - `Alt+r` (restart) never fired: the key handler matched `r` and then checked
   for Alt, but Bubble Tea reports the key as `alt+r`.
+- Dashboard: fleet RAM summed every container's limit, so containers without a
+  limit (which report the host's total) counted the whole machine once each. It
+  now shows the host's capacity once.
+- Dashboard: the bottom row said "all healthy" while the header counted an
+  UNHEALTHY container. Unhealthy and restarting containers now count as needing
+  attention.
+- Dashboard: fleet CPU is shown as a share of the whole machine, with the core
+  count, instead of a sum of per-core percentages.
+- Container CPU% was a lifetime average, not current load: Docker's one-shot
+  stats carry no previous sample, so it divided the container's CPU time since
+  start by the host's uptime. CPU is now measured against the previous poll of
+  the same container (the first poll of a container shows 0%).
+- Logs could show garbage or lose their first characters on a line: the
+  multiplexed stdout/stderr stream was un-framed by guessing per line, which
+  broke whenever a frame header's length byte happened to be a newline. Logs are
+  now demultiplexed properly (TTY containers pass through untouched), and a log
+  line over 1 MiB is split instead of silently ending the stream.
+- The keychain-mode SSH tunnel never recovered after a network drop or
+  sleep/wake: the local socket stayed up, so the dead connection was reused until
+  the app restarted. It now reconnects on its own (re-reading the password from
+  the keychain), and opening a channel on a stalled connection times out.
+- The keychain-mode SSH handshake had no timeout when the caller's context had no
+  deadline, so a server that accepted the connection and went silent hung the
+  app at startup. It is now bounded to 10 seconds.
+- Editing, creating, deleting or restoring a Compose file reset its permissions to
+  `0644`, making a `0600` file with secrets world-readable, and replaced a
+  symlinked file with a regular one. The original mode is now kept (remotely via
+  `cp -p`) and writes go through a symlink to its target.
 
 ### Changed
 - Settings is now a split panel: a section list on the left and the selected
   section's rows on the right. `Esc` leaves the rows first, then closes.
+- Graph style `wave` is now a smoothed trend whose older samples fade, in the
+  Dashboard and the Stats pane. Its old glyph list was not monotonic, so a bigger
+  value could draw shorter than a smaller one.
 
 ## [0.1.29] - 2026-10-18
 

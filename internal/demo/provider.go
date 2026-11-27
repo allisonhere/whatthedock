@@ -133,7 +133,9 @@ func demoStats(ctr domain.Container, tick int) domain.ContainerStats {
 		CPUPercent:  clampFloat(float64((len(ctr.DisplayName())%6)+1)*4.5+float64(wave)*1.7, 0, 100),
 		CPUCores:    8,
 		MemoryUsage: 192*1024*1024 + base + byteWave,
-		MemoryLimit: 2 * 1024 * 1024 * 1024,
+		// Like a real container with no memory limit, report the host's
+		// total memory; the Dashboard's fleet RAM is measured against it.
+		MemoryLimit: 4 * 1024 * 1024 * 1024,
 		NetworkRx:   40*1024*1024 + base*2 + uint64(tick%9)*5*1024*1024,
 		NetworkTx:   12*1024*1024 + base + uint64((tick+3)%7)*3*1024*1024,
 		BlockRead:   80*1024*1024 + base + uint64((tick+5)%8)*4*1024*1024,
@@ -583,7 +585,7 @@ func (p *Provider) add(seed containerSeed) {
 		ImageID:       "sha256:" + strings.ReplaceAll(seed.ID, "-", ""),
 		Created:       seed.Created,
 		State:         seed.State,
-		Status:        statusFor(seed.State, seed.Health),
+		Status:        statusFor(seed.State, seed.Health, time.Since(seed.Created)),
 		Health:        seed.Health,
 		Restarting:    seed.Restarting,
 		RestartCount:  seed.RestartCount,
@@ -599,16 +601,20 @@ func (p *Provider) add(seed containerSeed) {
 	p.logs[seed.ID] = seed.Logs
 }
 
-func statusFor(state domain.ContainerState, health domain.HealthState) string {
+// statusFor mimics Docker's list-summary status text. age is how long the
+// container has existed, so each demo container reports its own uptime
+// instead of every one saying "Up 36 hours".
+func statusFor(state domain.ContainerState, health domain.HealthState, age time.Duration) string {
+	up := fmt.Sprintf("%d hours", max(1, int(age.Hours())))
 	switch {
 	case state == domain.StateRestarting:
 		return "Restarting (1) 3 seconds ago"
 	case state == domain.StateStopped:
 		return "Exited (0) 2 hours ago"
 	case health != "":
-		return "Up 36 hours (" + string(health) + ")"
+		return "Up " + up + " (" + string(health) + ")"
 	case state == domain.StateRunning:
-		return "Up 36 hours"
+		return "Up " + up
 	default:
 		return string(state)
 	}

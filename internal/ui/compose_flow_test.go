@@ -224,11 +224,11 @@ func TestComposeEditFlowRemoteMergesChangedFieldsAndBacksUp(t *testing.T) {
 	sawBackup, sawPromote := false, false
 	for _, call := range fake.calls {
 		switch {
-		case strings.HasPrefix(call, "cat > '"+base+".tmp'"):
+		case strings.HasPrefix(call, remoteComposeWriteScript(base+".tmp", base)+"\x00stdin="):
 			staged = call
 		case strings.HasPrefix(call, "cp -p '"+base+"'"):
 			sawBackup = true
-		case call == "mv '"+base+".tmp' '"+base+"'":
+		case call == remoteComposePromoteScript(base+".tmp", base):
 			sawPromote = true
 		}
 	}
