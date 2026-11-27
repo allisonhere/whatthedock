@@ -1,4 +1,14 @@
-.PHONY: fmt fmt-check test race vet build demo test-update check
+.PHONY: fmt fmt-check test race vet build demo test-update check icons
+
+# icons regenerates the embedded app icons from assets/icon-source.png: the
+# white corners become transparent, then 512px and 256px copies are made.
+icons:
+	magick assets/icon-source.png -alpha set -fuzz 6% -fill none \
+		-draw "color 0,0 floodfill" -draw "color 1253,0 floodfill" \
+		-draw "color 0,1253 floodfill" -draw "color 1253,1253 floodfill" \
+		-channel A -blur 0x1 -level 50%,100% +channel -trim +repage \
+		-resize 512x512 -background none -gravity center -extent 512x512 -strip assets/icon-512.png
+	magick assets/icon-512.png -resize 256x256 -strip assets/icon-256.png
 
 fmt:
 	gofmt -w .

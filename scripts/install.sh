@@ -73,4 +73,12 @@ case ":$PATH:" in
 	*) echo "install: $install_dir is not on your PATH — add it, e.g. export PATH=\"$install_dir:\$PATH\"" >&2 ;;
 esac
 
+# Linux: add the app icon and a launcher entry. A release built before the
+# subcommand existed would start the TUI instead of installing anything, so
+# only run it if this binary knows it.
+if [ "$os" = linux ] && grep -aq 'whatthedock install-desktop' "$install_dir/whatthedock"; then
+	"$install_dir/whatthedock" install-desktop >&2 ||
+		echo "install: could not add the launcher entry (whatthedock itself is installed)" >&2
+fi
+
 "$install_dir/whatthedock" --version

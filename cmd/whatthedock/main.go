@@ -32,6 +32,10 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
 		os.Exit(runDoctorCommand(context.Background(), os.Args[2:], os.Stdout, version, commit, date))
 	}
+	// "install-desktop" installs the app icon and launcher entry (Linux).
+	if len(os.Args) > 1 && os.Args[1] == "install-desktop" {
+		os.Exit(installDesktopCommand(os.Stdout, os.Stderr))
+	}
 
 	demoMode := flag.Bool("demo", false, "run against WhatTheDock's built-in demo Docker environment")
 	showVersion := flag.Bool("version", false, "print version and exit")

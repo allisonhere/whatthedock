@@ -66,6 +66,11 @@ The installer downloads the latest release binary, checks that it runs, and
 puts it in `/usr/local/bin`. If that is not writable, it uses `~/.local/bin`.
 Set `INSTALL_DIR` if you want another location.
 
+On Linux it also adds the app icon and a launcher entry (`WhatTheDock` in your
+application menu, run in your terminal) under `~/.local/share`. If you already
+have your own `WhatTheDock.desktop`, it is left as it is and only the icon is
+added. After `go install`, run `whatthedock install-desktop` to do the same.
+
 Build from source:
 
 ```bash

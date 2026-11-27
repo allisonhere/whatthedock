@@ -6,6 +6,10 @@ only re-cut a build are folded into the nearest entry.
 ## [Unreleased]
 
 ### Added
+- WhatTheDock has an app icon. The release installer adds it and a launcher
+  entry under `~/.local/share` on Linux (a `WhatTheDock.desktop` you already
+  have is left alone), and `whatthedock install-desktop` does the same after
+  `go install`.
 - `l` on a stack row shows the merged, service-tagged logs of every service in
   the stack (filter, pause, follow and copy work as usual).
 - Pause/unpause (`Alt+p`) and kill (command palette) for the selected container.
